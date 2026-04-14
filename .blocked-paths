@@ -1,0 +1,13 @@
+# EcodiaOS Laptop Agent — Privacy Blocklist
+# One path per line. Everything under these paths is off-limits.
+# The agent will refuse all read/write/list/delete operations.
+# Edit this file on the laptop to add or remove paths.
+
+# Tate's private folder
+D:\PRIVATE
+C:\Users\tater\Documents\PRIVATE
+
+# Common sensitive locations (adjust username if needed)
+C:\Users\tater\AppData\Local\Microsoft\Credentials
+C:\Users\tater\AppData\Local\Google\Chrome\User Data\Default\Login Data
+C:\Users\tater\AppData\Local\Microsoft\Edge\User Data\Default\Login Data

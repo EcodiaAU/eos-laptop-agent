@@ -4,6 +4,33 @@ const os = require('os')
 const { execSync } = require('child_process')
 const { isWindows } = require('../lib/platform')
 
+// ── Privacy blocklist ────────────────────────────────────────────────
+// Paths listed here are completely off-limits. No read, write, list,
+// or delete operations. The agent will refuse with a clear error.
+// Edit .blocked-paths in the agent root to add/remove paths.
+const BLOCKED_PATHS_FILE = path.join(__dirname, '..', '.blocked-paths')
+function loadBlockedPaths() {
+  try {
+    return fs.readFileSync(BLOCKED_PATHS_FILE, 'utf-8')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith('#'))
+      .map(l => path.resolve(l))
+  } catch { return [] }
+}
+
+function isBlocked(targetPath) {
+  const resolved = path.resolve(targetPath)
+  const blocked = loadBlockedPaths()
+  return blocked.some(b => resolved.startsWith(b) || resolved === b)
+}
+
+function guardPath(targetPath) {
+  if (isBlocked(targetPath)) {
+    throw new Error(`ACCESS DENIED: ${targetPath} is in the privacy blocklist. This path is off-limits.`)
+  }
+}
+
 const BINARY_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.svg',
   '.pdf', '.zip', '.gz', '.tar', '.7z', '.rar',
@@ -18,12 +45,14 @@ function isBinary(filePath) {
 }
 
 async function readFile({ path: filePath, encoding }) {
+  guardPath(filePath)
   const binary = encoding === 'base64' || isBinary(filePath)
   const content = fs.readFileSync(filePath, binary ? 'base64' : 'utf-8')
   return { content, encoding: binary ? 'base64' : 'utf-8', path: filePath }
 }
 
 async function writeFile({ path: filePath, content, encoding }) {
+  guardPath(filePath)
   const dir = path.dirname(filePath)
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
   if (encoding === 'base64') {
@@ -36,9 +65,11 @@ async function writeFile({ path: filePath, content, encoding }) {
 }
 
 async function listDir({ path: dirPath, recursive = false, maxDepth = 3 }) {
+  guardPath(dirPath)
   const entries = []
   function walk(dir, depth) {
     if (depth >= maxDepth) return
+    if (isBlocked(dir)) return
     let items
     try { items = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
     for (const item of items) {
@@ -54,6 +85,7 @@ async function listDir({ path: dirPath, recursive = false, maxDepth = 3 }) {
 }
 
 async function deleteFile({ path: filePath }) {
+  guardPath(filePath)
   const stat = fs.statSync(filePath)
   if (stat.isDirectory()) {
     fs.rmSync(filePath, { recursive: true, force: true })
@@ -64,6 +96,7 @@ async function deleteFile({ path: filePath }) {
 }
 
 async function fileInfo({ path: filePath }) {
+  guardPath(filePath)
   const stat = fs.statSync(filePath)
   return {
     path: filePath,
