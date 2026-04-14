@@ -1,0 +1,15 @@
+{
+  "name": "eos-laptop-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "EcodiaOS Laptop Agent - remote machine control service",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "puppeteer": "^24.40.0"
+  }
+}
