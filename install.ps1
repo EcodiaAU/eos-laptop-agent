@@ -29,6 +29,10 @@ if (Get-Command pm2 -ErrorAction SilentlyContinue) {
     Write-Host "Start manually: set AGENT_TOKEN=<token> && node index.js"
 }
 
+# input.* module: uses PowerShell built-ins (System.Windows.Forms + user32.dll P/Invoke).
+# No additional dependencies needed on Windows.
+Write-Host "input.* tools: PowerShell built-ins available - no extra install needed." -ForegroundColor Green
+
 Write-Host ""
 Write-Host "=== Done ===" -ForegroundColor Cyan
 Write-Host "Agent will be available at http://localhost:7456"

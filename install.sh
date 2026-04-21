@@ -31,6 +31,21 @@ else
   echo "Start manually: AGENT_TOKEN=<token> node index.js"
 fi
 
+# input.* module dependency: cliclick (Mac only, no deps on Linux/Windows)
+if [[ "$(uname)" == "Darwin" ]]; then
+  if ! command -v cliclick &>/dev/null; then
+    if command -v brew &>/dev/null; then
+      echo "Installing cliclick (required for input.* tools on Mac)..."
+      brew install cliclick
+    else
+      echo "WARNING: cliclick not installed. input.* tools will not work."
+      echo "  Install Homebrew first, then: brew install cliclick"
+    fi
+  else
+    echo "cliclick: $(cliclick --version 2>/dev/null || echo 'installed')"
+  fi
+fi
+
 echo ""
 echo "=== Done ==="
 echo "Agent will be available at http://localhost:7456"
