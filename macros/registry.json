@@ -1,0 +1,375 @@
+{
+  "version": 2,
+  "authored_by": "fork_mojldsgx_7b55bf",
+  "authored_at": "2026-04-29T15:00:00+10:00",
+  "updated_by": "fork_motxeno8_531d99",
+  "updated_at": "2026-05-06T20:45:00+10:00",
+  "discipline": {
+    "wait_sleep": "Polling waits (waitForPageReady, waitForVisualSettle, pollFor2FA) preferred over static sleeps. Static sleeps are fallback only.",
+    "minimum_sleeps": {
+      "after_url_bar_focus": 200,
+      "after_url_type": 200,
+      "after_field_click": 800,
+      "after_autofill_click": 400,
+      "twofa_poll_max": 15000
+    }
+  },
+  "macros": [
+    {
+      "name": "apple-signin",
+      "handler": "macroHandlers/apple-signin.js",
+      "description": "Apple ID sign-in via Chrome autofill on developer / appstoreconnect / icloud / developer_resources.",
+      "params": {
+        "target": {
+          "type": "string",
+          "default": "developer",
+          "values": [
+            "developer",
+            "appstoreconnect",
+            "icloud",
+            "developer_resources"
+          ]
+        },
+        "email": {
+          "type": "string",
+          "default": "code@ecodia.au"
+        },
+        "code2fa": {
+          "type": "string",
+          "optional": true
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "vercel-login",
+      "handler": "macroHandlers/vercel-login.js",
+      "description": "vercel.com/login via GitHub OAuth, relying on Tate's authenticated GitHub session in Chrome.",
+      "params": {
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "coexist-admin-signin",
+      "handler": "macroHandlers/coexist-admin-signin.js",
+      "description": "Co-Exist admin app sign-in via Chrome autofill on saved admin credential.",
+      "params": {
+        "url": {
+          "type": "string",
+          "default": "https://app.coexistaus.org/login"
+        },
+        "email": {
+          "type": "string",
+          "optional": true
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "xcode-organizer-upload",
+      "handler": "macroHandlers/xcode-organizer-upload.js",
+      "description": "Upload an iOS .xcarchive to App Store Connect via Xcode Organizer GUI on SY094 (MacInCloud Mac). Uses Tate Apple ID logged in to Xcode (no ASC API key required). Polling-wait discipline; 700s outer timeout.",
+      "params": {
+        "archive_path": {
+          "type": "string",
+          "required": true,
+          "note": "Full path on SY094 to the .xcarchive bundle"
+        },
+        "ipa_path": {
+          "type": "string",
+          "optional": true,
+          "note": "Ignored - use transporter-upload for .ipa flows"
+        },
+        "ssh_host": {
+          "type": "string",
+          "default": "SY094.macincloud.com"
+        },
+        "ssh_user": {
+          "type": "string",
+          "default": "user276189"
+        },
+        "ssh_pass": {
+          "type": "string",
+          "required": true,
+          "source": "kv_store creds.macincloud.password"
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 700000
+        }
+      },
+      "preconditions": [
+        "macincloud-login macro has been run; Xcode > Settings > Accounts holds Tate's Apple ID",
+        "ssh2 npm package available on agent host (Corazon: installed 29 Apr 2026 by fork_mojpge0a_3c7dcd)"
+      ]
+    },
+    {
+      "name": "transporter-upload",
+      "handler": "macroHandlers/transporter-upload.js",
+      "description": "Upload an iOS .ipa to App Store Connect via Apple Transporter.app GUI on SY094 (MacInCloud Mac). Uses Tate Apple ID logged in to Transporter (no API key required). Polling-wait discipline; 1000s outer timeout.",
+      "params": {
+        "ipa_path": {
+          "type": "string",
+          "required": true,
+          "note": "Full path on SY094 to .ipa file"
+        },
+        "ssh_host": {
+          "type": "string",
+          "default": "SY094.macincloud.com"
+        },
+        "ssh_user": {
+          "type": "string",
+          "default": "user276189"
+        },
+        "ssh_pass": {
+          "type": "string",
+          "required": true,
+          "source": "kv_store creds.macincloud.password"
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 1000000
+        }
+      },
+      "preconditions": [
+        "macincloud-login macro has been run; Transporter.app holds Tate's Apple ID",
+        "ssh2 npm package available on agent host (installed 29 Apr 2026)"
+      ]
+    },
+    {
+      "name": "macincloud-login",
+      "handler": "macroHandlers/macincloud-login.js",
+      "description": "One-time supervised macro to seed Tate Apple ID into Xcode > Settings > Accounts on SY094 (MacInCloud Mac). Drives Xcode dialog up to password field, then PAUSES for operator to type password + 2FA. Path: SSH + AppleScript via ssh2 npm. After 2FA clears once, Xcode keychain holds session ~30 days, unblocking xcode-organizer-upload + transporter-upload.",
+      "params": {
+        "apple_email": {
+          "type": "string",
+          "default": "code@ecodia.au"
+        },
+        "ssh_host": {
+          "type": "string",
+          "default": "SY094.macincloud.com"
+        },
+        "ssh_user": {
+          "type": "string",
+          "default": "user276189"
+        },
+        "ssh_pass": {
+          "type": "string",
+          "required": true,
+          "source": "kv_store creds.macincloud.password"
+        },
+        "stage_only": {
+          "type": "boolean",
+          "optional": true,
+          "default": false,
+          "note": "If true, only stage AppleScript on SY094 without invoking osascript. Used for SSH-path verification when supervised operator is not at VNC."
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 120000
+        }
+      },
+      "preconditions": [
+        "ssh2 npm package available on agent host (installed 29 Apr 2026)",
+        "SY094.macincloud.com reachable on port 22 (verify with sshHelper.runRemote `echo ok`)",
+        "Xcode 26.3 present at /Applications/Xcode.app on SY094",
+        "Supervised operator (Tate) at SY094 VNC console to type Apple ID password + 2FA when AppleScript pauses"
+      ],
+      "pause_point": "After typing apple_email + clicking Continue. Xcode focuses the password field. AppleScript exits with stdout 'OK PAUSED_AT_PASSWORD email=<email>'. Macro itself does NOT type passwords; supervised operator does."
+    },
+    {
+      "name": "github-login",
+      "handler": "macroHandlers/github-login.js",
+      "description": "GitHub login via Chrome autofill. Verifies logged-in state on github.com, drives /login flow if logged out. Polling waits, 2FA-aware.",
+      "params": {
+        "email": {
+          "type": "string",
+          "default": "code@ecodia.au"
+        },
+        "code2fa": {
+          "type": "string",
+          "optional": true
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "stripe-dashboard",
+      "handler": "macroHandlers/stripe-dashboard.js",
+      "description": "Verify / log in to Stripe dashboard at https://dashboard.stripe.com via Chrome autofill. Polling waits, 2FA-aware.",
+      "params": {
+        "url": {
+          "type": "string",
+          "default": "https://dashboard.stripe.com/"
+        },
+        "email": {
+          "type": "string",
+          "default": "code@ecodia.au"
+        },
+        "code2fa": {
+          "type": "string",
+          "optional": true
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "gmail-send",
+      "handler": "macroHandlers/gmail-send.js",
+      "description": "Compose and send an email via Tate Corazon Chrome at gmail.google.com (Workspace tate@ecodia.au profile). Supports to/cc/bcc/subject/body. send=false leaves a draft instead.",
+      "params": {
+        "to": {
+          "type": "string",
+          "required": true
+        },
+        "subject": {
+          "type": "string",
+          "default": ""
+        },
+        "body": {
+          "type": "string",
+          "default": ""
+        },
+        "cc": {
+          "type": "string",
+          "optional": true
+        },
+        "bcc": {
+          "type": "string",
+          "optional": true
+        },
+        "send": {
+          "type": "boolean",
+          "default": true
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "supabase-dashboard",
+      "handler": "macroHandlers/supabase-dashboard.js",
+      "description": "Verify / log in to Supabase dashboard (https://supabase.com/dashboard). Default path is GitHub OAuth (Tate GitHub session in Chrome). Set use_github=false for email/password autofill.",
+      "params": {
+        "url": {
+          "type": "string",
+          "default": "https://supabase.com/dashboard"
+        },
+        "use_github": {
+          "type": "boolean",
+          "default": true
+        },
+        "email": {
+          "type": "string",
+          "default": "code@ecodia.au"
+        },
+        "code2fa": {
+          "type": "string",
+          "optional": true
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 60000
+        }
+      }
+    },
+    {
+      "name": "vercel-redeploy",
+      "handler": "macroHandlers/vercel-redeploy.js",
+      "description": "Trigger Redeploy on the most recent Vercel deployment. Drives the project deployments page in Tate Corazon Chrome (logged-in Vercel session). Useful when an env-var change needs a fresh build with the same source.",
+      "params": {
+        "org": {
+          "type": "string",
+          "optional": true,
+          "note": "Vercel org/team slug (e.g. 'ecodiatate'). Combined with project to build URL."
+        },
+        "project": {
+          "type": "string",
+          "optional": true,
+          "note": "Vercel project slug (e.g. 'ecodiaos-frontend'). Combined with org."
+        },
+        "url": {
+          "type": "string",
+          "optional": true,
+          "note": "Override deployments URL directly (skips org/project)"
+        },
+        "overview_url": {
+          "type": "string",
+          "optional": true
+        },
+        "use_production_overview": {
+          "type": "boolean",
+          "default": false
+        },
+        "timeout_ms": {
+          "type": "number",
+          "default": 90000
+        }
+      }
+    },
+    {
+      "name": "asc-build-review-submit",
+      "handler": "macroHandlers/asc-build-review-submit.js",
+      "paramSchema": {
+        "build_id": "string?",
+        "app_name": "'Co-Exist'|'EcodiaOS'?",
+        "dry_run": "boolean?"
+      },
+      "params": {
+        "build_id": {
+          "type": "string",
+          "optional": true,
+          "note": "Informational; chain-runner navigates to the build page before invocation"
+        },
+        "app_name": {
+          "type": "string",
+          "optional": true,
+          "values": [
+            "Co-Exist",
+            "EcodiaOS"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean",
+          "optional": true,
+          "default": false,
+          "note": "If true, halt before step 5 (Save click)"
+        }
+      },
+      "description": "Submit a TestFlight build for App Review on App Store Connect via Tate's logged-in Chrome on Corazon",
+      "tags": [
+        "asc",
+        "testflight",
+        "review",
+        "corazon-chrome"
+      ],
+      "lastUsed": null,
+      "runCount": 0,
+      "validationStatus": "untested_spec",
+      "preconditions": [
+        "Foreground window is Chrome with title containing 'App Store Connect' (handler asserts this; throws WrongForegroundWindowError otherwise)",
+        "Chain-runner has populated URL bar / clipboard with appstoreconnect destination before invocation"
+      ],
+      "authored_by": "fork_motxeno8_531d99",
+      "authored_at": "2026-05-06T20:45:00+10:00",
+      "capture_source": "~/ecodiaos/macros/captures/asc-build-review-submit-2026-05-06-1018.md (Recording 2)"
+    }
+  ]
+}

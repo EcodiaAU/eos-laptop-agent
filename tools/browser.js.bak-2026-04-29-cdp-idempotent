@@ -1,0 +1,153 @@
+const path = require('path')
+const { homeDir } = require('../lib/platform')
+
+const PROFILE_DIR = path.join(homeDir, '.eos-browser')
+const CDP_URL = 'http://localhost:9222'
+let browser = null
+let page = null
+
+const VIEWPORTS = {
+  iphone: { width: 390, height: 844, deviceScaleFactor: 3, isMobile: true, hasTouch: true, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' },
+  pixel: { width: 412, height: 915, deviceScaleFactor: 3, isMobile: true, hasTouch: true, ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36' },
+  ipad: { width: 820, height: 1180, deviceScaleFactor: 2, isMobile: true, hasTouch: true, ua: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' },
+  desktop: { width: 1440, height: 900, deviceScaleFactor: 1, isMobile: false, hasTouch: false, ua: null },
+  tablet: { width: 768, height: 1024, deviceScaleFactor: 2, isMobile: true, hasTouch: true, ua: null },
+}
+
+async function ensureBrowser() {
+  if (browser && browser.connected) return
+  const puppeteer = require('puppeteer')
+
+  try {
+    browser = await puppeteer.connect({ browserURL: CDP_URL, defaultViewport: null })
+    const pages = await browser.pages()
+    page = pages[pages.length - 1] || await browser.newPage()
+    return
+  } catch(e) {}
+
+  browser = await puppeteer.launch({
+    headless: false,
+    userDataDir: PROFILE_DIR,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--remote-debugging-port=9222'],
+  })
+  const pages = await browser.pages()
+  page = pages[0] || await browser.newPage()
+}
+
+async function enableCDP() {
+  const { execSync, spawn } = require('child_process')
+  try { execSync('taskkill /F /IM chrome.exe', { stdio: 'ignore' }) } catch(e) {}
+  await new Promise(r => setTimeout(r, 1500))
+  spawn('chrome', ['--remote-debugging-port=9222', '--restore-last-session'], {
+    detached: true, stdio: 'ignore', shell: true
+  }).unref()
+  await new Promise(r => setTimeout(r, 2500))
+  browser = null
+  page = null
+  return { cdpEnabled: true, port: 9222, note: 'Chrome restarted with CDP. Call navigate() to use.' }
+}
+
+async function switchTab(p) {
+  await ensureBrowser()
+  const pages = await browser.pages()
+  if (p.url) {
+    for (const pg of pages) {
+      if (pg.url().includes(p.url)) { page = pg; await page.bringToFront(); return { switched: true, url: pg.url() } }
+    }
+    page = await browser.newPage()
+  }
+  return { switched: false, opened: true }
+}
+
+// Set viewport + UA. Either pass a preset name (preset:'iphone'|'pixel'|'ipad'|'desktop'|'tablet')
+// or explicit width/height/deviceScaleFactor/isMobile/hasTouch/ua.
+async function setViewport(p) {
+  await ensureBrowser()
+  p = p || {}
+  let v
+  if (p.preset && VIEWPORTS[p.preset]) v = { ...VIEWPORTS[p.preset] }
+  else v = { width: p.width || 1440, height: p.height || 900, deviceScaleFactor: p.deviceScaleFactor || 1, isMobile: !!p.isMobile, hasTouch: !!p.hasTouch, ua: p.ua || null }
+  if (typeof p.width === 'number') v.width = p.width
+  if (typeof p.height === 'number') v.height = p.height
+  if (typeof p.deviceScaleFactor === 'number') v.deviceScaleFactor = p.deviceScaleFactor
+  if (typeof p.isMobile === 'boolean') v.isMobile = p.isMobile
+  if (typeof p.hasTouch === 'boolean') v.hasTouch = p.hasTouch
+  if (typeof p.ua === 'string') v.ua = p.ua
+  await page.setViewport({ width: v.width, height: v.height, deviceScaleFactor: v.deviceScaleFactor, isMobile: v.isMobile, hasTouch: v.hasTouch })
+  if (v.ua) await page.setUserAgent(v.ua)
+  return { applied: { width: v.width, height: v.height, isMobile: v.isMobile, hasTouch: v.hasTouch, ua: v.ua ? v.ua.slice(0,60)+'...' : null }, preset: p.preset || null }
+}
+
+async function navigate(p) {
+  await ensureBrowser()
+  if (p.viewport || p.preset) {
+    await setViewport(p.viewport ? p.viewport : { preset: p.preset })
+  }
+  const waitUntil = p.waitUntil || 'networkidle2'
+  const timeout = p.timeout || 30000
+  await page.goto(p.url, { waitUntil, timeout })
+  return { url: page.url(), title: await page.title() }
+}
+
+async function click(p) {
+  await ensureBrowser()
+  if (p.text) {
+    const clicked = await page.evaluate((t) => {
+      const els = [...document.querySelectorAll('a, button, [role="button"], input[type="submit"]')]
+      const el = els.find(e => e.textContent.trim().includes(t))
+      if (el) { el.click(); return true }
+      return false
+    }, p.text)
+    return { clicked, by: 'text', text: p.text }
+  }
+  await page.click(p.selector)
+  return { clicked: true, by: 'selector', selector: p.selector }
+}
+
+async function type(p) {
+  await ensureBrowser()
+  await page.type(p.selector, p.text, { delay: p.delay || 0 })
+  return { typed: true, selector: p.selector, length: p.text.length }
+}
+
+// Wait for selector / function / timeout. p: { selector?, function?, timeout? (ms, default 10000), state? ('attached'|'visible'|'hidden') }
+async function waitFor(p) {
+  await ensureBrowser()
+  const timeout = p.timeout || 10000
+  if (p.selector) {
+    await page.waitForSelector(p.selector, { timeout, visible: p.state === 'visible', hidden: p.state === 'hidden' })
+    return { waited: true, by: 'selector', selector: p.selector }
+  }
+  if (p.function) {
+    await page.waitForFunction(new Function('return (' + p.function + ')'), { timeout })
+    return { waited: true, by: 'function' }
+  }
+  await new Promise(r => setTimeout(r, p.ms || 500))
+  return { waited: true, by: 'ms', ms: p.ms || 500 }
+}
+
+async function pageScreenshot(p) {
+  await ensureBrowser()
+  p = p || {}
+  let target = page
+  if (p.selector) target = await page.$(p.selector)
+  const buffer = await (target || page).screenshot({ fullPage: p.fullPage || false, encoding: 'base64' })
+  return { image: buffer, format: 'png', url: page.url() }
+}
+
+async function evaluate(p) {
+  await ensureBrowser()
+  const result = await page.evaluate(new Function('return (' + p.script + ')'))
+  return { result }
+}
+
+async function close() {
+  if (browser) {
+    await browser.close().catch(() => {})
+    browser = null
+    page = null
+  }
+  return { closed: true }
+}
+
+module.exports = { navigate, click, type, pageScreenshot, evaluate, close, enableCDP, switchTab, setViewport, waitFor }

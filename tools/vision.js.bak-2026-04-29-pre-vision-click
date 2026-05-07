@@ -1,0 +1,63 @@
+// vision.js - vision-first locator primitive.
+//
+// vision.locate({ target, expected_count?, screenshot_base64? })
+//
+// Captures a full-screen screenshot (or accepts one passed in), then
+// proxies it to the EcodiaOS backend at /api/laptop-vision/locate which
+// holds the Anthropic vision credential. Returns:
+//   { matches: [{x,y,bbox,confidence,label}], ambiguous, reasoning }
+//
+// The agent does NOT hold an Anthropic key. The backend proxy does.
+// Doctrine: ~/ecodiaos/patterns/macros-learn-by-doing-vision-first-run-with-question-surface.md
+//
+// Shipped 29 Apr 2026 (fork_mojsk7dl_c4424f, completion-ship of fork_mojs0mm2_79180b primitives).
+
+const screenshotMod = require('./screenshot');
+
+const BACKEND_URL = process.env.ECODIAOS_BACKEND_URL || 'https://api.admin.ecodia.au';
+
+async function locate(params) {
+  const { target, expected_count, screenshot_base64 } = params || {};
+  if (!target || typeof target !== 'string') {
+    throw new Error('vision.locate: target (string) required');
+  }
+
+  // Capture if not supplied. screenshot.screenshot returns { image: <base64>, format }.
+  let imgB64 = screenshot_base64;
+  if (!imgB64) {
+    const shot = await screenshotMod.screenshot({});
+    imgB64 = shot && (shot.image || shot.base64 || shot.data);
+    if (!imgB64) {
+      throw new Error('vision.locate: screenshot capture returned no image data: ' + JSON.stringify(Object.keys(shot || {})));
+    }
+  }
+
+  const body = { screenshot_base64: imgB64, target };
+  if (expected_count != null) body.expected_count = expected_count;
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 45_000);
+  let resp;
+  try {
+    resp = await fetch(`${BACKEND_URL}/api/laptop-vision/locate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(t);
+  }
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`vision.locate: backend ${resp.status}: ${text.slice(0, 500)}`);
+  }
+  let parsed;
+  try { parsed = JSON.parse(text); } catch {
+    throw new Error('vision.locate: backend returned non-JSON: ' + text.slice(0, 300));
+  }
+  return parsed;
+}
+
+module.exports = { locate };

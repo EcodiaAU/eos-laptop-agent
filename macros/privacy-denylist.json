@@ -1,0 +1,30 @@
+{
+  "version": 0,
+  "authored_by": "worker_b1_macro_recorder_v2",
+  "authored_at": "2026-05-06",
+  "description": "Privacy denylist v0 for macro-recorder.ahk. Hardcoded substring/exe matching. Clicks/keys in any matched context are SKIPPED with a meta event recording the matched rule.",
+  "foreground_exe_blocklist": [
+    "1Password.exe",
+    "Bitwarden.exe",
+    "KeePass.exe",
+    "KeePassXC.exe",
+    "Lastpass.exe"
+  ],
+  "url_substring_blocklist": [
+    "bank",
+    "paypal",
+    "stripe.com/dashboard",
+    "admin.google.com",
+    "appleid.apple.com",
+    "billing",
+    "payment",
+    "checkout",
+    "wallet"
+  ],
+  "window_title_substring_blocklist": [
+    "Windows Hello",
+    "Windows Security",
+    "Sign in",
+    "Password"
+  ]
+}
