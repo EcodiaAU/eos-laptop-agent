@@ -3,3 +3,17 @@ node_modules/
 .env
 .next
 venv
+
+# Embedded installers - keep locally, don't nest as repo
+pm2-installer/
+
+# Daemon-local per-machine artefacts (NOT source)
+daemons/.env
+daemons/gkg-capture.log
+daemons/sessions/
+daemons/state/
+
+# Build / cache / OS
+*.log
+.DS_Store
+Thumbs.db
