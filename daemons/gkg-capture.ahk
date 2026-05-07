@@ -176,11 +176,11 @@ RandomSlug(n) {
 
 IsoNow() {
     ; UTC ISO-8601
-    return FormatTime("YYYYMMDDHH24MISS", "yyyy-MM-ddTHH:mm:ss") "Z"
+    return FormatTime(A_NowUTC, "yyyy-MM-ddTHH:mm:ss") "Z"
 }
 
 UnixSeconds() {
-    return DateDiff(A_Now, "19700101000000", "Seconds")
+    return DateDiff(A_NowUTC, "19700101000000", "Seconds")
 }
 
 Log(msg) {
