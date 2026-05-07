@@ -1,4 +1,30 @@
-const { execSync } = require('child_process')
+const { execSync, spawnSync } = require('child_process')
+
+// Windows CREATE_NO_WINDOW: prevents powershell console flash on every screenshot.
+// 29 Apr 2026 12:42 AEST patch.
+const CREATE_NO_WINDOW = 0x08000000
+
+function runPsHidden(file, args, timeoutMs = 15000) {
+  const r = spawnSync(file, args, {
+    encoding: 'utf-8',
+    timeout: timeoutMs,
+    windowsHide: true,
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsVerbatimArguments: false,
+    detached: false,
+    creationFlags: CREATE_NO_WINDOW,
+  })
+  if (r.error) throw r.error
+  if (r.status !== 0) {
+    const err = new Error('Command failed: ' + file + ' status=' + r.status + ' stderr=' + (r.stderr || ''))
+    err.status = r.status
+    err.stdout = r.stdout
+    err.stderr = r.stderr
+    throw err
+  }
+  return r.stdout || ''
+}
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -24,7 +50,7 @@ async function screenshot({ region, format = 'png' }) {
       ].join('\n')
       fs.writeFileSync(scriptFile, psScript, 'utf-8')
       try {
-        const out = execSync(`powershell.exe -ExecutionPolicy Bypass -File "${scriptFile}"`, { encoding: 'utf-8', timeout: 15000 })
+        const out = runPsHidden('powershell.exe', ['-ExecutionPolicy', 'Bypass', '-File', scriptFile], 15000)
         const [w, h] = out.trim().split('x').map(Number)
         const image = fs.readFileSync(tmpFile, 'base64')
         fs.unlinkSync(tmpFile)

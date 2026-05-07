@@ -1,7 +1,27 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { execSync } = require('child_process')
+const { execSync, spawnSync } = require('child_process')
+
+// Windows CREATE_NO_WINDOW for diskUsage wmic call. 29 Apr 2026 12:43 AEST patch.
+const CREATE_NO_WINDOW = 0x08000000
+
+function execHidden(file, args, timeoutMs = 10000) {
+  if (process.platform === 'win32') {
+    const r = spawnSync(file, args, {
+      encoding: 'utf-8', timeout: timeoutMs, windowsHide: true, shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'], windowsVerbatimArguments: false,
+      detached: false, creationFlags: CREATE_NO_WINDOW,
+    })
+    if (r.error) throw r.error
+    if (r.status !== 0) {
+      const e = new Error('Command failed: ' + file + ' status=' + r.status); e.stdout=r.stdout; e.stderr=r.stderr
+      throw e
+    }
+    return r.stdout || ''
+  }
+  return execSync(file + ' ' + args.join(' '), { encoding: 'utf-8', timeout: timeoutMs })
+}
 const { isWindows } = require('../lib/platform')
 
 // ── Privacy blocklist ────────────────────────────────────────────────
@@ -112,7 +132,7 @@ async function fileInfo({ path: filePath }) {
 async function diskUsage() {
   try {
     if (isWindows) {
-      const out = execSync('wmic logicaldisk get size,freespace,caption', { encoding: 'utf-8' })
+      const out = execHidden('wmic', ['logicaldisk', 'get', 'size,freespace,caption'])
       const lines = out.trim().split('\n').slice(1).filter(l => l.trim())
       const drives = lines.map(line => {
         const parts = line.trim().split(/\s+/)

@@ -1,4 +1,36 @@
-const { execSync } = require('child_process')
+const { execSync, spawnSync } = require('child_process')
+
+// Windows CREATE_NO_WINDOW flag - prevents cmd/powershell window flash on every input call.
+// 29 Apr 2026 12:42 AEST patch: shell.js was patched but input.js + screenshot.js still flashed.
+const CREATE_NO_WINDOW = 0x08000000
+
+function runHidden(file, args, options = {}) {
+  if (process.platform === 'win32') {
+    // spawnSync DOES respect creationFlags - libuv passes it through to CreateProcess.
+    // CREATE_NO_WINDOW prevents the powershell console window from appearing at all,
+    // which windowsHide:true alone cannot do when the parent (PM2 daemon) has a console.
+    const r = spawnSync(file, args, {
+      encoding: 'utf-8',
+      timeout: options.timeout || 15000,
+      windowsHide: true,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsVerbatimArguments: false,
+      detached: false,
+      creationFlags: CREATE_NO_WINDOW,
+    })
+    if (r.error) throw r.error
+    if (r.status !== 0) {
+      const err = new Error('Command failed: ' + file + ' status=' + r.status + ' stderr=' + (r.stderr || ''))
+      err.status = r.status
+      err.stdout = r.stdout
+      err.stderr = r.stderr
+      throw err
+    }
+    return r.stdout || ''
+  }
+  return execSync(file + ' ' + args.map(a => '"' + a.replace(/"/g, '\\"') + '"').join(' '), { encoding: 'utf-8', timeout: options.timeout || 15000 })
+}
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -12,10 +44,7 @@ function runPs(script) {
   const tmpFile = path.join(os.tmpdir(), `eos-input-${Date.now()}-${Math.random().toString(36).slice(2)}.ps1`)
   try {
     fs.writeFileSync(tmpFile, script, 'utf-8')
-    return execSync(`powershell.exe -ExecutionPolicy Bypass -File "${tmpFile}"`, {
-      encoding: 'utf-8',
-      timeout: 15000,
-    })
+    return runHidden('powershell.exe', ['-ExecutionPolicy', 'Bypass', '-File', tmpFile], { timeout: 15000 })
   } finally {
     if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile)
   }
@@ -301,7 +330,13 @@ Write-Output "ok"
       for (const ch of text) {
         const escaped = ch.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
         runCli(`cliclick t:"${escaped}"`)
-        execSync(`sleep ${(del / 1000).toFixed(3)}`, { timeout: del + 1000 })
+        if (process.platform === 'win32') {
+          // Use Node's setTimeout-equivalent (sync wait via Atomics) instead of cmd.exe sleep
+          const end = Date.now() + del
+          while (Date.now() < end) { /* spin-wait for short delays */ }
+        } else {
+          execSync(`sleep ${(del / 1000).toFixed(3)}`, { timeout: del + 1000 })
+        }
       }
     } else {
       const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
