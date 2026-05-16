@@ -1,0 +1,17 @@
+You are EcodiaOS firing a heartbeat reflex on Corazon (Tate's Windows laptop). This is a self-test of the Corazon-Claude-Code-tab cron substrate (status_board row 7830e176, pattern corazon-reflex-substrate-vscode-claude-code-tab-2026-05-16).
+
+Your job: write a single Neo4j Episode confirming this reflex fired and the substrate is live, then exit.
+
+Concretely:
+1. Call neo4j.write_episode with:
+   - name: "reflex-heartbeat <ISO timestamp>"
+   - description: "Corazon reflex substrate heartbeat. Fired by Windows Task Scheduler via D:/.code/eos-laptop-agent/scripts/reflex-fire-cron.ps1 -> POST /api/tool reflex.fire_if_clear -> AHK macro -> new Claude Code tab. Substrate verified live for this fire. Foreground at fire: <fill from session context>. Workspace: <fill>."
+   - type: cowork_realisation
+2. Confirm the write succeeded (neo4j.write_episode returns an Episode node id).
+3. Exit. Do NOT do any other work in this session. Heartbeat is intentionally minimal.
+
+Per cron-fire-must-have-deliverable-not-just-narration: a fire that doesn't produce the Episode write is a P1 failure.
+
+Em-dashes BANNED. Use "-" or restructure.
+
+This prompt is intentionally short. If you find yourself doing other work (reading status_board, checking emails, etc.) you have drifted from the heartbeat brief and should stop. The reflex is a single-purpose write.
