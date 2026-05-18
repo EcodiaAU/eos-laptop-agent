@@ -102,6 +102,17 @@ try {
   console.error('Coord routes failed to mount:', e.message)
 }
 
+// Cowork REST surface: POST /api/cowork/dispatch-worker.
+// Wrapped defensively so a syntax error or missing dep in routes/cowork.js
+// never takes down the laptop-agent startup. The observer_signal.py self-heal
+// hook depends on this endpoint; failing-closed is the right posture.
+try {
+  require('./routes/cowork').mount(app, auth)
+  console.log('Cowork route mounted: /api/cowork/dispatch-worker')
+} catch (e) {
+  console.error('Cowork route failed to mount:', e.message)
+}
+
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
 app.listen(PORT, () => {
