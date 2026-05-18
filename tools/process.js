@@ -1,4 +1,5 @@
-const { execSync, spawn } = require('child_process')
+const { spawn } = require('child_process')
+const { runSilent, CREATE_NO_WINDOW } = require('./_lib/silentExec')
 const { isWindows } = require('../lib/platform')
 
 async function listProcesses({ filter } = {}) {
@@ -7,7 +8,7 @@ async function listProcesses({ filter } = {}) {
       const cmd = filter
         ? `tasklist /FI "IMAGENAME eq ${filter}" /FO CSV`
         : 'tasklist /FO CSV'
-      const out = execSync(cmd, { encoding: 'utf-8', timeout: 10000 })
+      const out = runSilent(cmd, { encoding: 'utf-8', timeout: 10000 })
       const lines = out.trim().split('\n')
       const headers = lines[0].replace(/"/g, '').split(',')
       const procs = lines.slice(1).map(line => {
@@ -22,7 +23,7 @@ async function listProcesses({ filter } = {}) {
     const cmd = filter
       ? `ps aux | head -1; ps aux | grep -i "${filter}" | grep -v grep`
       : 'ps aux --sort=-%mem | head -50'
-    const out = execSync(cmd, { encoding: 'utf-8', timeout: 10000 })
+    const out = runSilent(cmd, { encoding: 'utf-8', timeout: 10000 })
     const lines = out.trim().split('\n')
     const procs = lines.slice(1).map(line => {
       const parts = line.split(/\s+/)
@@ -40,7 +41,7 @@ async function listProcesses({ filter } = {}) {
 async function killProcess({ pid, force = false }) {
   try {
     if (isWindows) {
-      execSync(`taskkill ${force ? '/F' : ''} /PID ${pid}`, { encoding: 'utf-8', timeout: 10000 })
+      runSilent(`taskkill ${force ? '/F' : ''} /PID ${pid}`, { encoding: 'utf-8', timeout: 10000 })
     } else {
       process.kill(parseInt(pid), force ? 'SIGKILL' : 'SIGTERM')
     }
@@ -55,7 +56,8 @@ async function launchApp({ command, args = [], detached = true }) {
     const child = spawn(command, args, {
       detached,
       stdio: 'ignore',
-      windowsHide: false,
+      windowsHide: true,
+      creationFlags: CREATE_NO_WINDOW,
     })
     if (detached) child.unref()
     return { launched: true, pid: child.pid, command }

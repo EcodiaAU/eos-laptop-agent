@@ -1,5 +1,6 @@
 const path = require('path')
 const { homeDir } = require('../lib/platform')
+const { runSilent, CREATE_NO_WINDOW } = require('./_lib/silentExec')
 
 const PROFILE_DIR = path.join(homeDir, '.eos-browser')
 const CDP_URL = 'http://localhost:9222'
@@ -30,13 +31,13 @@ async function ensureBrowser() {
 
 // Restart Chrome with remote debugging enabled (connects to user's Chrome profile)
 async function enableCDP() {
-  const { spawnSync, execSync } = require('child_process')
-  try { execSync('taskkill /F /IM chrome.exe', { stdio: 'ignore' }) } catch(e) {}
+  try { runSilent('taskkill /F /IM chrome.exe', { stdio: 'ignore' }) } catch(e) {}
   await new Promise(r => setTimeout(r, 1500))
   // Launch Chrome with CDP and user profile
   const { spawn } = require('child_process')
   spawn('chrome', ['--remote-debugging-port=9222', '--restore-last-session'], {
-    detached: true, stdio: 'ignore', shell: true
+    detached: true, stdio: 'ignore', shell: true,
+    windowsHide: true, creationFlags: CREATE_NO_WINDOW,
   }).unref()
   await new Promise(r => setTimeout(r, 2500))
   browser = null

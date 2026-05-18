@@ -40,10 +40,18 @@ async function move(p) {
 }
 
 async function scroll(p) {
+  // AHK v2 has no {WheelDown N} count syntax; use Click "WheelDown" in a Loop.
+  // Previous {WheelDown 3} form parsed as invalid Send key, AHK popped a hidden
+  // error dialog (windowsHide:true) and the spawnSync would hang until timeout.
   const dir = (p.direction || 'down') === 'down' ? 'WheelDown' : 'WheelUp'
-  const amt = p.amount || 3
-  runAHK('MouseMove ' + p.x + ', ' + p.y + '\nSend "{' + dir + ' ' + amt + '}"')
-  return { scrolled: true, direction: p.direction, amount: amt }
+  const amt = Math.max(1, p.amount || 3)
+  const script =
+    'MouseMove ' + (p.x | 0) + ', ' + (p.y | 0) + '\n' +
+    'Loop ' + amt + ' {\n' +
+    '  Click "' + dir + '"\n' +
+    '}'
+  runAHK(script)
+  return { scrolled: true, direction: p.direction || 'down', amount: amt, x: p.x | 0, y: p.y | 0 }
 }
 
 async function drag(p) {

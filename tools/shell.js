@@ -1,5 +1,6 @@
 const { spawn } = require('child_process')
 const { shellCmd } = require('../lib/platform')
+const { CREATE_NO_WINDOW } = require('./_lib/silentExec')
 
 async function shell({ command, cwd, timeout = 30000, env: extraEnv }) {
   return new Promise((resolve) => {
@@ -7,6 +8,7 @@ async function shell({ command, cwd, timeout = 30000, env: extraEnv }) {
       cwd: cwd || process.cwd(),
       env: { ...process.env, ...extraEnv },
       windowsHide: true,
+      creationFlags: CREATE_NO_WINDOW,
     })
 
     let stdout = ''

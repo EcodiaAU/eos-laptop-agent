@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { execSync } = require('child_process')
+const { runSilent } = require('./_lib/silentExec')
 const { isWindows } = require('../lib/platform')
 
 // ── Privacy blocklist ────────────────────────────────────────────────
@@ -112,7 +112,7 @@ async function fileInfo({ path: filePath }) {
 async function diskUsage() {
   try {
     if (isWindows) {
-      const out = execSync('wmic logicaldisk get size,freespace,caption', { encoding: 'utf-8' })
+      const out = runSilent('wmic logicaldisk get size,freespace,caption', { encoding: 'utf-8' })
       const lines = out.trim().split('\n').slice(1).filter(l => l.trim())
       const drives = lines.map(line => {
         const parts = line.trim().split(/\s+/)
@@ -120,7 +120,7 @@ async function diskUsage() {
       })
       return { drives }
     }
-    const out = execSync('df -h / /home 2>/dev/null || df -h /', { encoding: 'utf-8' })
+    const out = runSilent('df -h / /home 2>/dev/null || df -h /', { encoding: 'utf-8' })
     const lines = out.trim().split('\n').slice(1)
     const mounts = lines.map(line => {
       const parts = line.split(/\s+/)

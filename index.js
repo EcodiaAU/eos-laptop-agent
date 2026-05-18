@@ -22,6 +22,9 @@ const tools = {}
 const toolDir = path.join(__dirname, 'tools')
 for (const file of fs.readdirSync(toolDir)) {
   if (!file.endsWith('.js')) continue
+  // Skip *.test.js, *.spec.js and similar harness files - they call process.exit()
+  // at the end of a run, which would kill the server during autoload.
+  if (/\.(test|spec|bench)\.js$/.test(file)) continue
   const mod = require(path.join(toolDir, file))
   const moduleName = path.basename(file, '.js')
   for (const [name, fn] of Object.entries(mod)) {
@@ -75,13 +78,29 @@ app.post('/api/tool', auth, async (req, res) => {
   const fn = tools[tool]
   if (!fn) return res.status(404).json({ error: `Unknown tool: ${tool}`, available: Object.keys(tools) })
 
+  // Thread ctx into tool handlers that accept it (coord.* family). Falls back
+  // gracefully for tools that ignore the second arg.
+  const ctx = {
+    tab_id: req.headers['x-tab-id'] || (params && params.tab_id),
+    tab_credential: req.headers['x-tab-credential'] || (params && params.tab_credential),
+  }
+
   try {
-    const result = await fn(params)
+    const result = await fn(params, ctx)
     res.json({ ok: true, result })
   } catch (err) {
     res.status(500).json({ error: err.message, tool })
   }
 })
+
+// Coord substrate: register-worker REST + /api/mcp/coord JSON-RPC shim
+try {
+  require('./routes/comms').mount(app, auth)
+  require('./routes/mcpCoord').mount(app, auth)
+  console.log('Coord routes mounted: /api/comms/register-worker + /api/mcp/coord')
+} catch (e) {
+  console.error('Coord routes failed to mount:', e.message)
+}
 
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 

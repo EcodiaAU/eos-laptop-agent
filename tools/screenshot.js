@@ -1,4 +1,4 @@
-const { execSync } = require('child_process')
+const { runSilent } = require('./_lib/silentExec')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -24,7 +24,7 @@ async function screenshot({ region, format = 'png' }) {
       ].join('\n')
       fs.writeFileSync(scriptFile, psScript, 'utf-8')
       try {
-        const out = execSync(`powershell.exe -ExecutionPolicy Bypass -File "${scriptFile}"`, { encoding: 'utf-8', timeout: 15000 })
+        const out = runSilent(`powershell.exe -ExecutionPolicy Bypass -File "${scriptFile}"`, { encoding: 'utf-8', timeout: 15000 })
         const [w, h] = out.trim().split('x').map(Number)
         const image = fs.readFileSync(tmpFile, 'base64')
         fs.unlinkSync(tmpFile)
@@ -36,12 +36,12 @@ async function screenshot({ region, format = 'png' }) {
     }
 
     if (isMac) {
-      execSync(`screencapture -x "${tmpFile}"`, { timeout: 10000 })
+      runSilent(`screencapture -x "${tmpFile}"`, { timeout: 10000 })
     } else if (isLinux) {
       try {
-        execSync(`scrot "${tmpFile}"`, { timeout: 10000 })
+        runSilent(`scrot "${tmpFile}"`, { timeout: 10000 })
       } catch {
-        execSync(`import -window root "${tmpFile}"`, { timeout: 10000 })
+        runSilent(`import -window root "${tmpFile}"`, { timeout: 10000 })
       }
     }
 

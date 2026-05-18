@@ -1,28 +1,30 @@
-const { execSync } = require('child_process')
+const { runSilent } = require('./_lib/silentExec')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const { isWindows, isMac, isLinux } = require('../lib/platform')
+const psd = require('../lib/ps-daemon')
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function runPs(script) {
-  const tmpFile = path.join(os.tmpdir(), `eos-input-${Date.now()}-${Math.random().toString(36).slice(2)}.ps1`)
-  try {
-    fs.writeFileSync(tmpFile, script, 'utf-8')
-    return execSync(`powershell.exe -ExecutionPolicy Bypass -File "${tmpFile}"`, {
-      encoding: 'utf-8',
-      timeout: 15000,
-    })
-  } finally {
-    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile)
+// Routes through the long-lived PowerShell daemon (lib/ps-daemon). Eliminates
+// the ~500ms cold-spawn tax per call - input.* is the most-called surface in
+// the substrate (30+ calls per dispatch), so this is the biggest aggregate win
+// of the daemon migration. Falls back to per-call spawnSync via runSilent if
+// the daemon is unavailable. Throws on non-zero exit to preserve the old
+// runSilent semantics so callers don't need fail-soft refactoring.
+async function runPs(script) {
+  const r = await psd.runOrFallback(script, { timeout_ms: 15000 })
+  if (!r.ok) {
+    throw new Error('input PS failed: ' + (r.error || r.stderr || 'exit code ' + r.exit_code))
   }
+  return r
 }
 
 function runCli(cmd) {
-  return execSync(cmd, { encoding: 'utf-8', timeout: 15000 })
+  return runSilent(cmd, { encoding: 'utf-8', timeout: 15000 })
 }
 
 // Escape text for PowerShell SendKeys.SendWait().
@@ -118,7 +120,7 @@ function parseShortcutToCliclick(keys) {
 
 function requireCliclick() {
   try {
-    execSync('which cliclick', { encoding: 'utf-8', timeout: 3000 })
+    runSilent('which cliclick', { encoding: 'utf-8', timeout: 3000 })
   } catch {
     throw new Error('cliclick not installed. Run: brew install cliclick')
   }
@@ -194,7 +196,7 @@ for ($i = 0; $i -lt $clicks; $i++) {
 }
 Write-Output "ok"
 `
-    runPs(ps)
+    await runPs(ps)
     return { ok: true }
   }
 
@@ -239,7 +241,7 @@ for ($i = 1; $i -le $steps; $i++) {
 }
 Write-Output "ok"
 `
-    runPs(ps)
+    await runPs(ps)
     return { ok: true }
   }
 
@@ -289,7 +291,7 @@ foreach ($c in $chars) {
 ` : `[System.Windows.Forms.SendKeys]::SendWait('${escaped.replace(/'/g, "''")}')`}
 Write-Output "ok"
 `
-    runPs(ps)
+    await runPs(ps)
     return { ok: true, chars: text.length }
   }
 
@@ -301,7 +303,7 @@ Write-Output "ok"
       for (const ch of text) {
         const escaped = ch.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
         runCli(`cliclick t:"${escaped}"`)
-        execSync(`sleep ${(del / 1000).toFixed(3)}`, { timeout: del + 1000 })
+        runSilent(`sleep ${(del / 1000).toFixed(3)}`, { timeout: del + 1000 })
       }
     } else {
       const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
@@ -337,7 +339,7 @@ Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.SendKeys]::SendWait('${sk.replace(/'/g, "''")}')
 Write-Output "ok"
 `
-    runPs(ps)
+    await runPs(ps)
     return { ok: true }
   }
 
@@ -371,7 +373,7 @@ Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.SendKeys]::SendWait('${sk.replace(/'/g, "''")}')
 Write-Output "ok"
 `
-    runPs(ps)
+    await runPs(ps)
     return { ok: true }
   }
 
@@ -427,7 +429,7 @@ for ($i = 1; $i -le $steps; $i++) {
 [Win32Api.MouseOps]::mouse_event(${up}, 0, 0, 0, 0)
 Write-Output "ok"
 `
-    runPs(ps)
+    await runPs(ps)
     return { ok: true }
   }
 
@@ -457,7 +459,8 @@ Add-Type -AssemblyName System.Windows.Forms
 $pos = [System.Windows.Forms.Cursor]::Position
 Write-Output "$($pos.X),$($pos.Y)"
 `
-    const out = runPs(ps).trim()
+    const r = await runPs(ps)
+    const out = (r.stdout || '').trim()
     const [x, y] = out.split(',').map(Number)
     return { x, y }
   }

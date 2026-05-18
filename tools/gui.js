@@ -1,0 +1,475 @@
+// gui.js - batch primitive + semantic helpers for the laptop agent.
+//
+// LAYER 1 (batch):    gui.sequence collapses N round-trips into 1.
+// LAYER 3 (semantic): gui.focus_chrome / gui.open_url / gui.enable_chrome_cdp
+//                     compose lower primitives into named, generalisable flows.
+//
+// Sequence dispatcher accepts: input.*, mouse.*, screenshot.*, cdp.*, gui.*,
+// plus pseudo-tool 'wait'. Everything composes - a batched gui.sequence can
+// mix a pixel-coord input.click, a semantic gui.open_url, and a DOM-level
+// cdp.queryAll in one server-side run, returning structured data + a final
+// screenshot in one HTTP response.
+//
+// Doctrine: gui-batch-primitive-collapses-roundtrips-orthogonal-to-coord-brittleness-2026-05-17
+//           drive-chrome-via-input-tools-not-browser-tools
+//           chrome-cdp-attach-requires-explicit-user-data-dir-and-singleton-clear
+
+const fs = require('fs')
+const path = require('path')
+const os = require('os')
+const http = require('http')
+const { spawnSync, spawn } = require('child_process')
+
+const input = require('./input')
+const mouse = require('./mouse')
+const screenshot = require('./screenshot')
+
+const AHK = 'C:\\Users\\tjdTa\\AppData\\Local\\Programs\\AutoHotkey\\v2\\AutoHotkey64.exe'
+
+// ----- helpers -----
+
+function runAHK(script, timeoutMs) {
+  timeoutMs = timeoutMs || 8000
+  const tmp = path.join(os.tmpdir(), 'eos-gui-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.ahk')
+  fs.writeFileSync(tmp, '#Requires AutoHotkey v2.0\n' + script + '\nExitApp(0)', 'utf8')
+  try {
+    const r = spawnSync(AHK, [tmp], { timeout: timeoutMs, encoding: 'utf8', windowsHide: true })
+    return { exitCode: r.status, stdout: r.stdout || '', stderr: r.stderr || '' }
+  } finally {
+    try { fs.unlinkSync(tmp) } catch (e) {}
+  }
+}
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+
+function probeChromeCdp(port, timeoutMs) {
+  port = port || 9222
+  timeoutMs = timeoutMs || 1200
+  return new Promise(resolve => {
+    const req = http.get({ host: 'localhost', port: port, path: '/json/version', timeout: timeoutMs }, res => {
+      let body = ''
+      res.on('data', c => body += c)
+      res.on('end', () => { try { resolve({ ok: true, version: JSON.parse(body) }) } catch (e) { resolve({ ok: false }) } })
+    })
+    req.on('error', () => resolve({ ok: false }))
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false }) })
+  })
+}
+
+// ----- pseudo-tool: wait -----
+
+async function pseudoWait(params) {
+  const ms = (params && typeof params.ms === 'number') ? params.ms : 1000
+  await sleep(Math.max(0, ms))
+  return { ok: true, waitedMs: ms }
+}
+
+// ----- semantic helpers (callable directly OR via gui.sequence) -----
+
+// Bring Chrome to foreground. Spawn it if not running. Idempotent + safe.
+async function focusChrome(_params) {
+  const r = runAHK(
+    'if WinExist("ahk_exe chrome.exe") {\n' +
+    '  WinActivate\n' +
+    '  WinWaitActive("ahk_exe chrome.exe", , 2)\n' +
+    '} else {\n' +
+    '  ExitApp 2\n' +
+    '}\n'
+  )
+  if (r.exitCode === 2) {
+    spawn('cmd', ['/c', 'start', '', 'chrome.exe'], { detached: true, stdio: 'ignore' }).unref()
+    await sleep(2000)
+    runAHK('if WinExist("ahk_exe chrome.exe") { WinActivate }')
+    return { ok: true, action: 'launched', chromeFound: false }
+  }
+  return { ok: true, action: 'focused', chromeFound: true }
+}
+
+// Open a URL. Default mode "new_tab" (Ctrl+T) preserves Tate's other tabs.
+// "address_bar" mode (Ctrl+L) hijacks the current tab.
+async function openUrl(params) {
+  params = params || {}
+  const url = params.url
+  const mode = params.mode || 'new_tab'
+  const waitMs = (typeof params.waitMs === 'number') ? params.waitMs : 3500
+  if (!url) throw new Error('url required')
+
+  await focusChrome()
+  await sleep(250)
+
+  if (mode === 'new_tab') {
+    await input.shortcut({ keys: ['ctrl', 't'] })
+    await sleep(300)
+  } else if (mode === 'address_bar') {
+    await input.shortcut({ keys: ['ctrl', 'l'] })
+    await sleep(200)
+  } else {
+    throw new Error('mode must be new_tab or address_bar, got ' + mode)
+  }
+  await input.type({ text: url })
+  await sleep(150)
+  await input.key({ key: 'enter' })
+  await sleep(waitMs)
+  return { ok: true, navigated: url, mode: mode }
+}
+
+// Close the current tab (Ctrl+W).
+async function closeTab(_params) {
+  await focusChrome()
+  await sleep(150)
+  await input.shortcut({ keys: ['ctrl', 'w'] })
+  await sleep(200)
+  return { ok: true, closed: 'current_tab' }
+}
+
+// Switch to next tab (Ctrl+Tab) or previous (Ctrl+Shift+Tab).
+async function switchTab(params) {
+  params = params || {}
+  const dir = params.direction || 'next'
+  await focusChrome()
+  await sleep(100)
+  if (dir === 'next') await input.shortcut({ keys: ['ctrl', 'tab'] })
+  else if (dir === 'previous' || dir === 'prev') await input.shortcut({ keys: ['ctrl', 'shift', 'tab'] })
+  else throw new Error('direction must be next or previous')
+  await sleep(200)
+  return { ok: true, direction: dir }
+}
+
+// Modify Chrome's pinned/desktop/start-menu shortcuts to include
+// --remote-debugging-port=PORT in their Arguments. After running this once,
+// the user's NEXT manual Chrome launch (taskbar click, desktop double-click,
+// start-menu open) brings up Chrome with CDP enabled - on their REAL Default
+// profile with all cookies/session intact. ZERO session loss vs the relaunch
+// approach. Idempotent: skips shortcuts that already have the flag.
+async function installCdpToChrome(params) {
+  params = params || {}
+  const port = params.port || 9222
+  // Chrome 136+ silently drops --remote-debugging-port unless --user-data-dir
+  // is also explicitly passed. We pin it to Default profile so cookies / tabs
+  // carry over. Plus --restore-last-session so the next relaunch is seamless.
+  const userData = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+  const flag = '--remote-debugging-port=' + port +
+               ' --user-data-dir="' + userData + '"' +
+               ' --profile-directory=Default' +
+               ' --restore-last-session'
+
+  // Discover all Chrome .lnk files on disk.
+  const candidates = [
+    path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Internet Explorer', 'Quick Launch', 'User Pinned', 'TaskBar', 'Google Chrome.lnk'),
+    path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Internet Explorer', 'Quick Launch', 'Google Chrome.lnk'),
+    path.join(os.homedir(), 'Desktop', 'Google Chrome.lnk'),
+    'C:\\Users\\Public\\Desktop\\Google Chrome.lnk',
+    path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Google Chrome.lnk'),
+    'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk',
+  ]
+
+  const found = candidates.filter(p => { try { return fs.statSync(p).isFile() } catch (e) { return false } })
+  if (found.length === 0) {
+    return { ok: false, error: 'no Chrome .lnk shortcuts found on disk' }
+  }
+
+  // PowerShell one-shot script that updates each .lnk via WScript.Shell COM API.
+  // Pass paths as a single string arg to avoid quoting headaches.
+  const psPaths = found.map(p => "'" + p.replace(/'/g, "''") + "'").join(',')
+  const psScript = [
+    '$paths = @(' + psPaths + ')',
+    '$shell = New-Object -ComObject WScript.Shell',
+    '$results = @()',
+    'foreach ($p in $paths) {',
+    '  try {',
+    '    $lnk = $shell.CreateShortcut($p)',
+    '    $args = if ($lnk.Arguments) { $lnk.Arguments } else { "" }',
+    '    if ($args -match "--remote-debugging-port=") {',
+    '      $results += "ALREADY_HAS_FLAG|$p"',
+    '    } else {',
+    '      $lnk.Arguments = ($args + " ' + flag + '").Trim()',
+    '      $lnk.Save()',
+    '      $results += "UPDATED|$p"',
+    '    }',
+    '  } catch {',
+    '    $results += "ERROR|$p|" + $_.Exception.Message',
+    '  }',
+    '}',
+    '$results -join "`n"',
+  ].join('\n')
+
+  const r = spawnSync('powershell', ['-NoProfile', '-Command', psScript], {
+    encoding: 'utf8',
+    timeout: 15000,
+  })
+
+  const lines = (r.stdout || '').trim().split(/\r?\n/).filter(Boolean)
+  const updated = []
+  const already = []
+  const errors = []
+  for (const ln of lines) {
+    const parts = ln.split('|')
+    if (parts[0] === 'UPDATED') updated.push(parts[1])
+    else if (parts[0] === 'ALREADY_HAS_FLAG') already.push(parts[1])
+    else if (parts[0] === 'ERROR') errors.push({ path: parts[1], error: parts.slice(2).join('|') })
+  }
+
+  return {
+    ok: errors.length === 0,
+    port: port,
+    flag: flag,
+    found: found.length,
+    updated: updated,
+    already_had_flag: already,
+    errors: errors,
+    next_step: 'Close + reopen Chrome via the modified shortcut (taskbar/desktop/start). CDP will then be live on :' + port + ' with Tate\'s real Default profile cookies intact.',
+  }
+}
+
+// LEGACY (kept for explicit force-relaunch): kills Chrome + relaunches with CDP.
+// Prefer gui.install_cdp_to_chrome which avoids tab loss.
+async function enableChromeCdp(params) {
+  params = params || {}
+  const port = params.port || 9222
+
+  const pre = await probeChromeCdp(port, 500)
+  if (pre.ok) return { ok: true, already_up: true, port: port, version: pre.version.Browser }
+
+  // Kill all chrome.exe instances. spawnSync separates args (no shell interp).
+  spawnSync('powershell', [
+    '-NoProfile',
+    '-Command',
+    'Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force'
+  ], { stdio: 'ignore' })
+  await sleep(2000)
+
+  const userData = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+  for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    const lock = path.join(userData, lockName)
+    try { if (fs.existsSync(lock)) fs.unlinkSync(lock) } catch (e) {}
+  }
+
+  const args = [
+    '--remote-debugging-port=' + port,
+    '--user-data-dir=' + userData,
+    '--profile-directory=Default',
+    '--restore-last-session',
+    '--no-first-run',
+    '--no-default-browser-check',
+  ]
+  const child = spawn('chrome.exe', args, { detached: true, stdio: 'ignore', windowsHide: false })
+  child.unref()
+
+  const start = Date.now()
+  while (Date.now() - start < 12000) {
+    await sleep(500)
+    const probe = await probeChromeCdp(port, 500)
+    if (probe.ok) {
+      return { ok: true, already_up: false, port: port, version: probe.version.Browser, ms_to_ready: Date.now() - start }
+    }
+  }
+  throw new Error('CDP did not come up on :' + port + ' within 12s after relaunch')
+}
+
+// Launch a CDP-enabled Chrome on the isolated EOS-CDP user-data-dir.
+// Idempotent: returns immediately if CDP already up on the port.
+// Otherwise spawns chrome.exe detached with the full flag set (Chrome 136+
+// requires explicit --user-data-dir for the CDP flag to take effect).
+// Does NOT touch the user's regular Chrome (different user-data-dir).
+async function launchCdpChrome(params) {
+  params = params || {}
+  const port = params.port || 9222
+  const dataDir = params.userDataDir || 'C:\\eos-chrome-cdp'
+
+  const pre = await probeChromeCdp(port, 600)
+  if (pre.ok) return { ok: true, already_up: true, port: port, version: pre.version.Browser }
+
+  const chromeCandidates = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ]
+  let chromeExe = null
+  for (const c of chromeCandidates) {
+    try { if (fs.statSync(c).isFile()) { chromeExe = c; break } } catch (e) {}
+  }
+  if (!chromeExe) throw new Error('chrome.exe not found in standard install paths')
+
+  const args = [
+    '--remote-debugging-port=' + port,
+    '--user-data-dir=' + dataDir,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ]
+  const child = spawn(chromeExe, args, { detached: true, stdio: 'ignore', windowsHide: false })
+  child.unref()
+
+  const start = Date.now()
+  while (Date.now() - start < 15000) {
+    await sleep(500)
+    const probe = await probeChromeCdp(port, 600)
+    if (probe.ok) {
+      return { ok: true, already_up: false, port: port, version: probe.version.Browser, ms_to_ready: Date.now() - start, dataDir: dataDir, chromeExe: chromeExe }
+    }
+  }
+  throw new Error('Chrome launched but CDP did not bind on :' + port + ' within 15s')
+}
+
+// ----- sequence dispatcher -----
+
+async function runStep(tool, params) {
+  params = params || {}
+  if (tool === 'wait') return pseudoWait(params)
+  if (tool === 'screenshot' || tool === 'screenshot.screenshot') return screenshot.screenshot(params)
+  if (tool.indexOf('input.') === 0) {
+    const fn = input[tool.slice(6)]
+    if (!fn) throw new Error('Unknown input tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('mouse.') === 0) {
+    const fn = mouse[tool.slice(6)]
+    if (!fn) throw new Error('Unknown mouse tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('cdp.') === 0) {
+    const cdp = require('./cdp')
+    const fn = cdp[tool.slice(4)]
+    if (!fn) throw new Error('Unknown cdp tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('vscode.') === 0) {
+    const vs = require('./vscode')
+    const fn = vs[tool.slice(7)]
+    if (!fn) throw new Error('Unknown vscode tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('cursor.') === 0) {
+    const cur = require('./cursor')
+    const fn = cur[tool.slice(7)]
+    if (!fn) throw new Error('Unknown cursor tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('explorer.') === 0) {
+    const exp = require('./explorer')
+    const fn = exp[tool.slice(9)]
+    if (!fn) throw new Error('Unknown explorer tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('window.') === 0) {
+    const win = require('./window')
+    const fn = win[tool.slice(7)]
+    if (!fn) throw new Error('Unknown window tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('uia.') === 0) {
+    const uia = require('./uia')
+    const fn = uia[tool.slice(4)]
+    if (!fn) throw new Error('Unknown uia tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('clipboard.') === 0) {
+    const cb = require('./clipboard')
+    const fn = cb[tool.slice(10)]
+    if (!fn) throw new Error('Unknown clipboard tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('notification.') === 0) {
+    const nf = require('./notification')
+    const fn = nf[tool.slice(13)]
+    if (!fn) throw new Error('Unknown notification tool: ' + tool)
+    return fn(params)
+  }
+  if (tool.indexOf('cowork.') === 0) {
+    const cw = require('./cowork')
+    const fn = cw[tool.slice(7)]
+    if (!fn) throw new Error('Unknown cowork tool: ' + tool)
+    return fn(params)
+  }
+  if (tool === 'gui.focus_chrome') return focusChrome(params)
+  if (tool === 'gui.open_url') return openUrl(params)
+  if (tool === 'gui.close_tab') return closeTab(params)
+  if (tool === 'gui.switch_tab') return switchTab(params)
+  if (tool === 'gui.enable_chrome_cdp') return enableChromeCdp(params)
+  if (tool === 'gui.install_cdp_to_chrome') return installCdpToChrome(params)
+  if (tool === 'gui.launch_cdp_chrome') return launchCdpChrome(params)
+  if (tool === 'gui.sequence') throw new Error('gui.sequence cannot dispatch itself; flatten the actions array')
+  throw new Error(
+    'gui.sequence does not dispatch tool: ' + tool +
+    ' (allowed: input.*, mouse.*, screenshot, wait, cdp.*, gui.focus_chrome, gui.open_url, gui.close_tab, gui.switch_tab, gui.enable_chrome_cdp)'
+  )
+}
+
+async function sequence(params) {
+  params = params || {}
+  const actions = params.actions
+  const stopOnError = params.stopOnError !== false
+  const finalScreenshot = params.finalScreenshot !== false
+  const keepIntermediateScreenshots = !!params.keepIntermediateScreenshots
+  const includeStepResults = !!params.includeStepResults
+
+  if (!Array.isArray(actions)) throw new Error('actions must be an array')
+  if (actions.length === 0) throw new Error('actions must not be empty')
+
+  const t0 = Date.now()
+  const steps = []
+  let completed = 0
+  let failed = 0
+  let lastScreenshotResult = null
+
+  for (let i = 0; i < actions.length; i++) {
+    const a = actions[i]
+    if (!a || typeof a.tool !== 'string') {
+      steps.push({ i: i, tool: null, ok: false, durationMs: 0, error: 'missing tool string' })
+      failed++
+      if (stopOnError) break
+      continue
+    }
+    const start = Date.now()
+    try {
+      const result = await runStep(a.tool, a.params || {})
+      const dur = Date.now() - start
+      const isShot = a.tool === 'screenshot' || a.tool === 'screenshot.screenshot' || a.tool === 'cdp.pageScreenshot'
+      if (isShot && result && result.image) lastScreenshotResult = result
+      const step = { i: i, tool: a.tool, ok: true, durationMs: dur }
+      if (isShot && keepIntermediateScreenshots && result.image) {
+        step.image = result.image
+        step.format = result.format || 'png'
+      }
+      if (includeStepResults && !isShot) {
+        step.result = result
+      }
+      steps.push(step)
+      completed++
+    } catch (err) {
+      const dur = Date.now() - start
+      steps.push({ i: i, tool: a.tool, ok: false, durationMs: dur, error: err.message })
+      failed++
+      if (stopOnError) break
+    }
+  }
+
+  const out = { completed: completed, failed: failed, totalMs: Date.now() - t0, steps: steps }
+
+  if (finalScreenshot) {
+    if (lastScreenshotResult) {
+      out.finalImage = lastScreenshotResult.image
+      out.finalFormat = lastScreenshotResult.format || 'png'
+    } else {
+      try {
+        const shot = await screenshot.screenshot({})
+        out.finalImage = shot.image
+        out.finalFormat = shot.format
+      } catch (err) {
+        out.finalScreenshotError = err.message
+      }
+    }
+  }
+
+  return out
+}
+
+module.exports = {
+  sequence: sequence,
+  focus_chrome: focusChrome,
+  open_url: openUrl,
+  close_tab: closeTab,
+  switch_tab: switchTab,
+  enable_chrome_cdp: enableChromeCdp,
+  install_cdp_to_chrome: installCdpToChrome,
+  launch_cdp_chrome: launchCdpChrome,
+}
