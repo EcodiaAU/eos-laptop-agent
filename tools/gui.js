@@ -144,9 +144,9 @@ async function pseudoWaitFor(params) {
         }
         case 'coord_inbox_has': {
           const coord = require('./coord')
-          const r = await coord.read_inbox({ topic: until.topic }, {})
-          // Note: read_inbox marks messages seen as a side effect. For pure
-          // probing without consuming, a future peek-style read would be cleaner.
+          // peek_inbox does NOT mark messages seen - safe to poll repeatedly
+          // without consuming the message a downstream read_inbox would want.
+          const r = await coord.peek_inbox({ topic: until.topic }, {})
           const msgs = (r && r.messages) || []
           lastValue = msgs.length
           if (msgs.length === 0) return false
@@ -541,6 +541,49 @@ async function runStep(tool, params) {
   )
 }
 
+// substituteBindings - replace ${varname} tokens in a params object with
+// values from the bindings map. Walks the object tree, replaces inside strings.
+// Tokens like ${var.field.nested} pluck nested object fields. Unknown vars
+// are left as ${...} so callers can spot misnames.
+function substituteBindings(params, bindings) {
+  if (!params || typeof params !== 'object') return params
+  if (!bindings || Object.keys(bindings).length === 0) return params
+  const TOKEN_RE = /\$\{([\w.]+)\}/g
+
+  function resolveToken(token) {
+    const parts = token.split('.')
+    let v = bindings[parts[0]]
+    for (let i = 1; i < parts.length; i++) {
+      if (v == null) return undefined
+      v = v[parts[i]]
+    }
+    return v
+  }
+
+  function walk(node) {
+    if (node == null) return node
+    if (typeof node === 'string') {
+      let out = node
+      let m
+      TOKEN_RE.lastIndex = 0
+      while ((m = TOKEN_RE.exec(node)) !== null) {
+        const v = resolveToken(m[1])
+        if (v === undefined) continue  // leave token in place
+        out = out.replace(m[0], typeof v === 'object' ? JSON.stringify(v) : String(v))
+      }
+      return out
+    }
+    if (Array.isArray(node)) return node.map(walk)
+    if (typeof node === 'object') {
+      const r = {}
+      for (const k of Object.keys(node)) r[k] = walk(node[k])
+      return r
+    }
+    return node
+  }
+  return walk(params)
+}
+
 async function sequence(params) {
   params = params || {}
   const actions = params.actions
@@ -548,6 +591,7 @@ async function sequence(params) {
   const finalScreenshot = params.finalScreenshot !== false
   const keepIntermediateScreenshots = !!params.keepIntermediateScreenshots
   const includeStepResults = !!params.includeStepResults
+  const bindings = (params.bindings && typeof params.bindings === 'object') ? Object.assign({}, params.bindings) : {}
 
   if (!Array.isArray(actions)) throw new Error('actions must be an array')
   if (actions.length === 0) throw new Error('actions must not be empty')
@@ -567,8 +611,11 @@ async function sequence(params) {
       continue
     }
     const start = Date.now()
+    // Substitute ${var} tokens in params from the bindings accumulated so far.
+    // Any prior step with `as: "name"` set bindings[name] = result.
+    const effectiveParams = substituteBindings(a.params || {}, bindings)
     try {
-      const result = await runStep(a.tool, a.params || {})
+      const result = await runStep(a.tool, effectiveParams)
       const dur = Date.now() - start
       const isShot = a.tool === 'screenshot' || a.tool === 'screenshot.screenshot' || a.tool === 'cdp.pageScreenshot'
       if (isShot && result && result.image) lastScreenshotResult = result
@@ -579,6 +626,11 @@ async function sequence(params) {
       }
       if (includeStepResults && !isShot) {
         step.result = result
+      }
+      // Capture result into bindings if action requested it
+      if (typeof a.as === 'string' && a.as.length > 0) {
+        bindings[a.as] = result
+        step.bound_as = a.as
       }
       steps.push(step)
       completed++

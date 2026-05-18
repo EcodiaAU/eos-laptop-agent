@@ -221,6 +221,22 @@ async function read_inbox(params, ctx) {
   return { topic: topic, count: messages.length, messages: messages }
 }
 
+// coord.peek_inbox - same shape as read_inbox but does NOT mark messages seen.
+// Used by gui.sequence wait_for {type: 'coord_inbox_has'} so the wait probe
+// doesn't consume the message that the next read_inbox caller will want.
+// Also useful for diagnostic / observer flows that want to see what's queued
+// without claiming it.
+async function peek_inbox(params, ctx) {
+  params = params || {}
+  ctx = ctx || {}
+  const topic = params.topic || inboxTopicFor(ctx)
+  const since = params.since ? new Date(params.since).getTime() : 0
+  const limit = params.limit || 50
+  const messages = readInboxForTopic(topic, since, limit)
+  // intentionally NO markSeen(messages)
+  return { topic: topic, count: messages.length, messages: messages, peek: true }
+}
+
 async function wait_for_inbox(params, ctx) {
   params = params || {}
   ctx = ctx || {}
@@ -339,6 +355,7 @@ async function signal_done(params, ctx) {
 module.exports = {
   send_message: send_message,
   read_inbox: read_inbox,
+  peek_inbox: peek_inbox,
   wait_for_inbox: wait_for_inbox,
   ack_message: ack_message,
   list_workers: list_workers,

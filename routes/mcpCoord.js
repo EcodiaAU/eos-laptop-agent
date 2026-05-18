@@ -55,6 +55,19 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: 'coord.peek_inbox',
+    description: 'Same as read_inbox but does NOT mark messages seen. Use for non-consuming probes (wait-loops, observer flows) where a downstream read_inbox should still see the message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string' },
+        since: { type: 'string', format: 'date-time' },
+        limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
     name: 'coord.wait_for_inbox',
     description: 'Long-poll for the next inbox message. Holds up to {timeout} seconds (default 300, max 600). Returns {trigger_message, also_unread[<=20], more_unread, hold_duration_ms, timed_out}.',
     inputSchema: {
