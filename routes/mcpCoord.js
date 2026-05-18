@@ -258,6 +258,11 @@ const TOOLS = Object.freeze([
       additionalProperties: true,
     },
   },
+  {
+    name: 'coord.conductor_heartbeat',
+    description: 'Update the registered conductor row last_seen_at to now. Called by the Corazon UserPromptSubmit hook each turn-start so loadActiveConductorRegistration returns the row. Without periodic heartbeat the conductor goes stale after 30min and inbound webhooks fall back to cold-spawn reflex.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+  },
 ])
 
 // PATCH 2026-05-18 drift-audit: MCP clients treat inputSchema.properties as an
