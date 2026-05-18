@@ -43,10 +43,21 @@ const WAKE_TOPIC_PREFIXES = ['chat.conductor.']
 // Default wake policy if none on disk. Tate can override via coord.set_wake_policy.
 const DEFAULT_WAKE_POLICY = Object.freeze({
   mode: 'toast',                       // 'toast' | 'flash' | 'auto_type' | 'silent'
-  notify_types: ['done', 'error'],     // body.type values that trigger wake. '*' = all.
+  // 2026-05-18: inbound_sms + inbound_telegram added. Per Tate verbatim
+  // ("a chat is opened on the first text i send per session then subscribes
+  // to further texts"). The session-subscription path routes inbound chat
+  // messages via coord.send_message instead of opening a fresh CC tab on
+  // every inbound. The conductor's wake substrate (flash/toast/auto_type)
+  // then surfaces the new message in the existing tab.
+  notify_types: ['done', 'error', 'inbound_sms', 'inbound_telegram'],
   toast_duration_ms: 6000,
   rate_limit_ms: 2000,                 // suppress consecutive wakes within this window
 })
+
+// 2026-05-18: conductor freshness threshold. A conductor whose last_seen_at
+// is older than this is treated as gone - inbound webhooks fall back to
+// reflex.fire (cold spawn) rather than coord-routing into a dead tab.
+const CONDUCTOR_STALE_THRESHOLD_MS = 30 * 60 * 1000  // 30 min
 
 // ── filesystem helpers ───────────────────────────────────────────────────
 
@@ -154,6 +165,18 @@ function loadConductorRegistration() {
     // Fallback: first registration on disk
     return readJsonSafe(path.join(CONDUCTORS_DIR, files[0]))
   } catch (e) { return null }
+}
+
+// 2026-05-18: return null when the registered conductor's last_seen_at is
+// stale. Inbound webhooks use this to decide route-to-coord vs cold-spawn.
+function loadActiveConductorRegistration() {
+  const c = loadConductorRegistration()
+  if (!c) return null
+  const lastSeenIso = c.last_seen_at || c.registered_at
+  if (!lastSeenIso) return null
+  const ageMs = Date.now() - new Date(lastSeenIso).getTime()
+  if (ageMs > CONDUCTOR_STALE_THRESHOLD_MS) return null
+  return c
 }
 
 function loadWakePolicy() {
@@ -639,13 +662,15 @@ async function register_conductor(params, ctx) {
     } catch (e) {}
   }
 
+  const now = new Date().toISOString()
   const row = {
     tab_id: tab_id,
     ide: ide,
     title_match: title_match || '',
     hwnd: hwnd || null,
     exe: exe || null,
-    registered_at: new Date().toISOString(),
+    registered_at: now,
+    last_seen_at: now,  // 2026-05-18: heartbeat field for stale-detection.
   }
   // v1: persist as default conductor. v2: keyed by tab_id when multi-conductor lands.
   atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), row)
@@ -669,13 +694,44 @@ async function unregister_conductor(params, ctx) {
 
 async function get_conductor_state(_params) {
   const conductor = loadConductorRegistration()
+  const active = loadActiveConductorRegistration()
   const policy = loadWakePolicy()
+  let stale_ms = null
+  if (conductor) {
+    const lastSeenIso = conductor.last_seen_at || conductor.registered_at
+    if (lastSeenIso) stale_ms = Date.now() - new Date(lastSeenIso).getTime()
+  }
   return {
     conductor: conductor,
+    // 2026-05-18: explicit liveness signal for inbound-channel-bridge callers.
+    // is_active=true means coord.send_message to chat.conductor.inbox will
+    // wake a real tab; false means callers should fall back to reflex.fire.
+    is_active: !!active,
+    stale_ms: stale_ms,
+    stale_threshold_ms: CONDUCTOR_STALE_THRESHOLD_MS,
     wake_policy: policy,
     wake_topic_prefixes: WAKE_TOPIC_PREFIXES,
     last_wake_at: _lastWakeAt ? new Date(_lastWakeAt).toISOString() : null,
   }
+}
+
+// 2026-05-18: conductor heartbeat. Called by the Corazon UserPromptSubmit
+// hook each turn-start. Updates last_seen_at so loadActiveConductorRegistration
+// returns the row. Without this, every conductor goes stale 30min after
+// register_conductor and falls through to cold-spawn.
+async function conductor_heartbeat(params, _ctx) {
+  params = params || {}
+  ensureDirs()
+  const conductor = loadConductorRegistration()
+  if (!conductor) return { ok: false, error: 'no_conductor_registered' }
+  conductor.last_seen_at = new Date().toISOString()
+  try {
+    atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), conductor)
+    if (conductor.tab_id && conductor.tab_id !== 'conductor') {
+      atomicWriteJson(path.join(CONDUCTORS_DIR, conductor.tab_id + '.json'), conductor)
+    }
+  } catch (e) {}
+  return { ok: true, last_seen_at: conductor.last_seen_at }
 }
 
 async function set_wake_policy(params, _ctx) {
@@ -711,6 +767,7 @@ module.exports = {
   register_conductor: register_conductor,
   unregister_conductor: unregister_conductor,
   get_conductor_state: get_conductor_state,
+  conductor_heartbeat: conductor_heartbeat,
   set_wake_policy: set_wake_policy,
   // Internal API for the /api/comms/register-worker route - NOT exposed as a tool.
   _registerWorkerInternal: registerWorkerInternal,
