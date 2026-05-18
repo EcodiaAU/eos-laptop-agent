@@ -17,8 +17,86 @@
 const http = require('http')
 
 const DEFAULT_PORT = 9222
-let connection = null  // { browser, page }
+let connection = null  // { browser, page } - legacy, kept for compat with selectTab
 let connectedPort = null
+// Map<alias, targetId>. Per-call page resolution (no singleton). Aliases let
+// concurrent callers address different tabs in parallel.
+const aliasToTargetId = new Map()
+let lastTouchedTargetId = null
+
+function _extractTargetId(page) {
+  try { return page.target()._targetId || (page.target()._targetInfo && page.target()._targetInfo.targetId) || null }
+  catch (_e) { return null }
+}
+
+// Per-call page resolver. Picks the lookup strategy from `opts.target`:
+//   {targetId}      stable CDP id
+//   {alias}         pre-registered name -> targetId
+//   {urlContains}   substring match on page URL
+//   {titleContains} substring match on page title
+//   {index}         browser.pages()[index]
+// Falls back to last-touched, then last page. Existing callers without
+// `target` keep the legacy behaviour via the lastTouched fallback.
+async function resolveTarget(opts) {
+  const c = await ensureConnected(opts)
+  const target = (opts && opts.target) || {}
+  const pages = await c.browser.pages()
+  const byId = async (tid) => {
+    for (const p of pages) if (_extractTargetId(p) === tid) return p
+    return null
+  }
+  if (target.targetId) {
+    const p = await byId(target.targetId)
+    if (p) { lastTouchedTargetId = target.targetId; return p }
+    throw new Error('no page matches targetId ' + target.targetId + ' (tab closed)')
+  }
+  if (target.alias) {
+    const tid = aliasToTargetId.get(target.alias)
+    if (!tid) throw new Error('alias not registered: ' + target.alias + '. Use cdp.attach_tab first.')
+    const p = await byId(tid)
+    if (p) { lastTouchedTargetId = tid; return p }
+    aliasToTargetId.delete(target.alias)
+    throw new Error('alias ' + target.alias + ' pointed at a closed tab; alias dropped')
+  }
+  if (target.urlContains) {
+    const needle = String(target.urlContains).toLowerCase()
+    for (const p of pages) {
+      try {
+        if (String(await p.url()).toLowerCase().indexOf(needle) !== -1) {
+          lastTouchedTargetId = _extractTargetId(p)
+          return p
+        }
+      } catch (_e) {}
+    }
+    throw new Error('no tab url contains: ' + target.urlContains)
+  }
+  if (target.titleContains) {
+    const needle = String(target.titleContains).toLowerCase()
+    for (const p of pages) {
+      try {
+        if (String(await p.title()).toLowerCase().indexOf(needle) !== -1) {
+          lastTouchedTargetId = _extractTargetId(p)
+          return p
+        }
+      } catch (_e) {}
+    }
+    throw new Error('no tab title contains: ' + target.titleContains)
+  }
+  if (typeof target.index === 'number') {
+    if (target.index < 0 || target.index >= pages.length) throw new Error('index out of range')
+    const p = pages[target.index]
+    lastTouchedTargetId = _extractTargetId(p)
+    return p
+  }
+  // fallback: last-touched, then last
+  if (lastTouchedTargetId) {
+    const p = await byId(lastTouchedTargetId)
+    if (p) return p
+    lastTouchedTargetId = null
+  }
+  if (pages.length === 0) throw new Error('no pages in browser')
+  return pages[pages.length - 1]
+}
 
 function probePort(port, timeoutMs) {
   port = port || DEFAULT_PORT
@@ -430,6 +508,258 @@ async function pdf(opts) {
   }
 }
 
+// cdp.realClick - real synthetic mouse click via Input.dispatchMouseEvent at
+// (x,y). The fix for "JS .click() does nothing on Material/MUI/custom-element
+// buttons" - those listen for the full pointerdown/mousedown/pointerup/mouseup/
+// click sequence, not the dispatch-event shortcut.
+//
+// Pass either {x,y} or {selector} (deep-walked, computes center). Optional
+// {tag} narrows the selector to that tag (e.g. 'BUTTON') so a parent P/SPAN
+// wrapping the same label text isn't grabbed instead of the real button.
+async function realClick(opts) {
+  opts = opts || {}
+  const c = await ensureConnected()
+  const client = await c.page.target().createCDPSession()
+  try {
+    let x = opts.x, y = opts.y
+    if (typeof x !== 'number' || typeof y !== 'number') {
+      const rect = await deepFindRect.call(null, opts)
+      if (!rect || !rect.ok) return { ok: false, error: 'no element matched for click', detail: rect && rect.error }
+      x = rect.x + rect.w / 2
+      y = rect.y + rect.h / 2
+    }
+    for (const t of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await client.send('Input.dispatchMouseEvent', { type: t, x: x, y: y, button: 'left', clickCount: 1 })
+    }
+    return { ok: true, x: x, y: y }
+  } finally {
+    try { await client.detach() } catch (e) {}
+  }
+}
+
+// cdp.deepFindRect - shadow-DOM aware element finder that returns the bounding
+// rect of the FIRST visible matching element. Filters by tag (default BUTTON),
+// by text substring, by aria-label substring, or by selector.
+//
+// Why this exists: cdp.clickText returns the first matching element which can
+// be a P or SPAN wrapping the same label text outside the modal. When you want
+// "the BUTTON inside the popover", filter by tag === 'BUTTON' AND only enumerate
+// visible nodes.
+async function deepFindRect(opts) {
+  opts = opts || {}
+  const c = await ensureConnected()
+  const result = await c.page.evaluate(function(args){
+    const wantTag = (args.tag || '').toUpperCase()
+    const wantText = (args.text || '').toLowerCase()
+    const wantAria = (args.aria || '').toLowerCase()
+    const wantSelector = args.selector || ''
+    const exact = !!args.exact
+    const matches = []
+    const walk = function(root){
+      let elems
+      try { elems = root.querySelectorAll ? root.querySelectorAll('*') : [] }
+      catch (e) { return }
+      for (const el of elems) {
+        const r = el.getBoundingClientRect()
+        if (r.width === 0 || r.height === 0) continue
+        const style = (el.ownerDocument && el.ownerDocument.defaultView)
+          ? el.ownerDocument.defaultView.getComputedStyle(el)
+          : null
+        if (style && (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0')) continue
+        if (wantSelector && !el.matches(wantSelector)) {
+          if (el.shadowRoot) walk(el.shadowRoot)
+          continue
+        }
+        if (wantTag && el.tagName !== wantTag) {
+          if (el.shadowRoot) walk(el.shadowRoot)
+          continue
+        }
+        const tc = (el.textContent || '').trim().toLowerCase()
+        if (wantText) {
+          const ok = exact ? (tc === wantText) : (tc.indexOf(wantText) !== -1)
+          if (!ok) { if (el.shadowRoot) walk(el.shadowRoot); continue }
+        }
+        if (wantAria) {
+          const a = (el.getAttribute('aria-label') || '').toLowerCase()
+          if (a.indexOf(wantAria) === -1) { if (el.shadowRoot) walk(el.shadowRoot); continue }
+        }
+        matches.push({
+          tag: el.tagName,
+          text: (el.textContent || '').trim().slice(0, 80),
+          aria: el.getAttribute('aria-label') || '',
+          x: Math.round(r.x), y: Math.round(r.y),
+          w: Math.round(r.width), h: Math.round(r.height),
+        })
+        if (el.shadowRoot) walk(el.shadowRoot)
+      }
+    }
+    walk(document)
+    if (matches.length === 0) return { ok: false, error: 'no match' }
+    return { ok: true, count: matches.length, ...matches[0], allMatches: matches.slice(0, 10) }
+  }, { tag: opts.tag, text: opts.text, aria: opts.aria, selector: opts.selector, exact: !!opts.exact })
+  return result
+}
+
+// cdp.nativeFill - fill a controlled input via the native HTMLInputElement
+// prototype setter, then dispatch input + change events. The fix for React/MUI/
+// SPA inputs where `el.value = 'x'` is silently overwritten on the next render
+// because the framework doesn't see a "real" user input.
+//
+// Selector strategies (try in order until one matches):
+//   - {selector}     CSS selector against light + shadow DOM
+//   - {placeholder}  input.placeholder === value
+//   - {currentValue} input.value === value (e.g. find the input currently
+//                    showing the default cron expression and replace it)
+//   - {ariaLabel}    aria-label substring match
+async function nativeFill(opts) {
+  opts = opts || {}
+  if (typeof opts.value !== 'string') throw new Error('value (string) required')
+  const c = await ensureConnected()
+  const result = await c.page.evaluate(function(args){
+    const collect = function(){
+      const out = []
+      const walk = function(root){
+        let elems
+        try { elems = root.querySelectorAll ? root.querySelectorAll('input,textarea') : [] }
+        catch (e) { return }
+        for (const el of elems) {
+          const r = el.getBoundingClientRect()
+          if (r.width === 0 || r.height === 0) continue
+          out.push(el)
+        }
+        try {
+          const sr = root.querySelectorAll ? root.querySelectorAll('*') : []
+          for (const el of sr) if (el.shadowRoot) walk(el.shadowRoot)
+        } catch (e) {}
+      }
+      walk(document)
+      return out
+    }
+    const inputs = collect()
+    let target = null
+    if (args.selector) target = inputs.find(function(el){ try { return el.matches(args.selector) } catch (e) { return false } })
+    if (!target && args.placeholder) target = inputs.find(function(el){ return (el.placeholder || '') === args.placeholder })
+    if (!target && args.currentValue) target = inputs.find(function(el){ return (el.value || '') === args.currentValue })
+    if (!target && args.ariaLabel) {
+      const lc = args.ariaLabel.toLowerCase()
+      target = inputs.find(function(el){ return ((el.getAttribute('aria-label') || '').toLowerCase()).indexOf(lc) !== -1 })
+    }
+    if (!target) return { ok: false, error: 'no input matched any strategy', candidates: inputs.slice(0, 5).map(function(el){ return { tag: el.tagName, type: el.type, value: (el.value||'').slice(0,40), placeholder: el.placeholder || '', aria: el.getAttribute('aria-label') || '' } }) }
+    const proto = target.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set
+    target.focus()
+    setter.call(target, args.value)
+    target.dispatchEvent(new Event('input', { bubbles: true }))
+    target.dispatchEvent(new Event('change', { bubbles: true }))
+    return { ok: true, tag: target.tagName, finalValue: target.value, placeholder: target.placeholder || '', aria: target.getAttribute('aria-label') || '' }
+  }, { value: opts.value, selector: opts.selector, placeholder: opts.placeholder, currentValue: opts.currentValue, ariaLabel: opts.ariaLabel })
+  return result
+}
+
+// cdp.findVisible - shadow-DOM aware enumeration of visible elements with
+// rect + text + tag + class. The eyes-of-the-blind-agent reflex for
+// "what is actually clickable in this modal right now?" without taking a
+// screenshot and OCRing it.
+async function findVisible(opts) {
+  opts = opts || {}
+  const c = await ensureConnected()
+  const result = await c.page.evaluate(function(args){
+    const tagFilter = (args.tag || '').toUpperCase()
+    const textFilter = (args.text || '').toLowerCase()
+    const minW = args.minW || 0
+    const minH = args.minH || 0
+    const limit = args.limit || 60
+    const out = []
+    const walk = function(root){
+      let elems
+      try { elems = root.querySelectorAll ? root.querySelectorAll('*') : [] }
+      catch (e) { return }
+      for (const el of elems) {
+        if (tagFilter && el.tagName !== tagFilter) {
+          if (el.shadowRoot) walk(el.shadowRoot)
+          continue
+        }
+        const r = el.getBoundingClientRect()
+        if (r.width < minW || r.height < minH) {
+          if (el.shadowRoot) walk(el.shadowRoot)
+          continue
+        }
+        if (r.width === 0 || r.height === 0) {
+          if (el.shadowRoot) walk(el.shadowRoot)
+          continue
+        }
+        const txt = (el.textContent || '').trim()
+        if (textFilter && txt.toLowerCase().indexOf(textFilter) === -1) {
+          if (el.shadowRoot) walk(el.shadowRoot)
+          continue
+        }
+        out.push({
+          tag: el.tagName,
+          text: txt.slice(0, 80),
+          aria: el.getAttribute('aria-label') || '',
+          role: el.getAttribute('role') || '',
+          cls: ((el.className || '') + '').slice(0, 50),
+          x: Math.round(r.x), y: Math.round(r.y),
+          w: Math.round(r.width), h: Math.round(r.height),
+        })
+        if (out.length >= limit) return
+        if (el.shadowRoot) walk(el.shadowRoot)
+      }
+    }
+    walk(document)
+    return { ok: true, count: out.length, items: out }
+  }, { tag: opts.tag, text: opts.text, minW: opts.minW, minH: opts.minH, limit: opts.limit })
+  return result
+}
+
+// cdp.clickByTag - cdp.clickText but with mandatory tag filter AND falls back
+// to a real CDP mouse-event sequence if JS .click() didn't change DOM. Use
+// this when clicking buttons in modals/popovers built with MUI/Material/
+// custom-element libraries that ignore synthetic .click().
+async function clickByTag(opts) {
+  opts = opts || {}
+  const tag = (opts.tag || 'BUTTON').toUpperCase()
+  if (!opts.text && !opts.aria) throw new Error('text or aria required')
+  const rect = await deepFindRect({ tag: tag, text: opts.text, aria: opts.aria, exact: !!opts.exact })
+  if (!rect || !rect.ok) return { ok: false, error: 'no ' + tag + ' matched', detail: rect && rect.error }
+  // Try JS click first - cheaper, succeeds on plain DOM buttons.
+  const c = await ensureConnected()
+  const jsResult = await c.page.evaluate(function(args){
+    const candidates = []
+    const walk = function(root){
+      let elems
+      try { elems = root.querySelectorAll ? root.querySelectorAll(args.tag.toLowerCase()) : [] }
+      catch (e) { return }
+      for (const el of elems) {
+        const r = el.getBoundingClientRect()
+        if (r.width === 0 || r.height === 0) continue
+        if (args.text) {
+          const tc = (el.textContent || '').trim().toLowerCase()
+          const ok = args.exact ? (tc === args.text.toLowerCase()) : (tc.indexOf(args.text.toLowerCase()) !== -1)
+          if (!ok) { if (el.shadowRoot) walk(el.shadowRoot); continue }
+        }
+        if (args.aria && (el.getAttribute('aria-label') || '').toLowerCase().indexOf(args.aria.toLowerCase()) === -1) {
+          if (el.shadowRoot) walk(el.shadowRoot); continue
+        }
+        candidates.push(el)
+        if (el.shadowRoot) walk(el.shadowRoot)
+      }
+    }
+    walk(document)
+    if (candidates.length === 0) return { ok: false, error: 'no candidate after walk' }
+    const before = document.activeElement
+    candidates[0].click()
+    return { ok: true, count: candidates.length, focusChanged: document.activeElement !== before }
+  }, { tag: tag, text: opts.text, aria: opts.aria, exact: !!opts.exact })
+  // If JS click reported a focus change, trust it. Otherwise escalate to real mouse.
+  if (jsResult && jsResult.ok && jsResult.focusChanged) {
+    return { ok: true, via: 'js', tag: tag, x: rect.x, y: rect.y, w: rect.w, h: rect.h }
+  }
+  // Escalate to real CDP mouse click.
+  const real = await realClick({ x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 })
+  return { ok: !!real.ok, via: 'cdp-mouse', tag: tag, x: real.x, y: real.y, w: rect.w, h: rect.h, jsAttempted: jsResult }
+}
+
 // cdp.send - raw DevTools Protocol passthrough. Power user surface.
 async function sendCdp(opts) {
   opts = opts || {}
@@ -468,4 +798,9 @@ module.exports = {
   networkLog: networkLog,
   pdf: pdf,
   send: sendCdp,
+  realClick: realClick,
+  deepFindRect: deepFindRect,
+  nativeFill: nativeFill,
+  findVisible: findVisible,
+  clickByTag: clickByTag,
 }
