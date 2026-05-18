@@ -25,18 +25,33 @@ const crypto = require('crypto')
 const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
 const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
 const MESSAGES_DIR = path.join(COORD_ROOT, 'messages')
+const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
 const INBOX_DIR = path.join(COORD_ROOT, 'inbox')
 const STATE_DIR = path.join(COORD_ROOT, 'state')  // already used by dispatcher for .spawned markers
+const CONDUCTORS_DIR = path.join(COORD_ROOT, 'conductors')  // conductor registration rows
+const WAKE_POLICY_FILE = path.join(COORD_ROOT, 'wake_policy.json')
 
 const DEAD_HEARTBEAT_MS = 90 * 1000  // 90s without heartbeat = dead
 const MAX_WAIT_TIMEOUT_S = 600       // 10min cap on long-poll
 const WAIT_POLL_INTERVAL_MS = 1000   // 1s poll inside wait_for_inbox
 const ALSO_UNREAD_CAP = 20           // wait_for_inbox bulk-return cap
 
+// Topics that trigger a conductor wake notification on persistMessage.
+// Match-by-prefix so chat.conductor.inbox + chat.conductor.<scope>.inbox both wake.
+const WAKE_TOPIC_PREFIXES = ['chat.conductor.']
+
+// Default wake policy if none on disk. Tate can override via coord.set_wake_policy.
+const DEFAULT_WAKE_POLICY = Object.freeze({
+  mode: 'toast',                       // 'toast' | 'flash' | 'auto_type' | 'silent'
+  notify_types: ['done', 'error'],     // body.type values that trigger wake. '*' = all.
+  toast_duration_ms: 6000,
+  rate_limit_ms: 2000,                 // suppress consecutive wakes within this window
+})
+
 // ── filesystem helpers ───────────────────────────────────────────────────
 
 function ensureDirs() {
-  for (const d of [COORD_ROOT, WORKERS_DIR, MESSAGES_DIR, INBOX_DIR, STATE_DIR]) {
+  for (const d of [COORD_ROOT, WORKERS_DIR, MESSAGES_DIR, INBOX_DIR, STATE_DIR, CONDUCTORS_DIR]) {
     try { fs.mkdirSync(d, { recursive: true }) } catch (e) {}
   }
 }
@@ -109,6 +124,139 @@ function loadFromDisk() {
 
 loadFromDisk()
 
+// ── conductor wake substrate ─────────────────────────────────────────────
+//
+// Problem: coord.signal_done writes to chat.conductor.inbox at the file
+// substrate, but the conductor is a Claude Code chat tab with no daemon
+// polling the inbox. Without a wake hook, the message sits there until a
+// human prompts the tab. This kills autonomous worker→conductor handoff.
+//
+// Fix: any persistMessage() targeting chat.conductor.* fires a non-blocking
+// wakeConductor() that surfaces the message to the human (toast) and
+// optionally to the conductor tab itself (flash / auto_type).
+//
+// Future-proof shape:
+//   - Multiple conductors supported via parent_conductor_tab_id on the
+//     worker row. v1: single global conductor; v2 trivially routes per-msg.
+//   - Wake mode is policy, not hardcoded - opt-in to focus-stealing.
+//   - Notify-types filter: 'progress' floods, 'done' is the load-bearing one.
+
+let _lastWakeAt = 0  // in-memory rate-limit (across requests this process serves)
+
+function loadConductorRegistration() {
+  try {
+    const files = fs.readdirSync(CONDUCTORS_DIR).filter(f => f.endsWith('.json'))
+    if (files.length === 0) return null
+    // v1: single global conductor at conductors/default.json.
+    // v2 keys by parent_conductor_tab_id; loadConductorByTabId() would dispatch.
+    const def = readJsonSafe(path.join(CONDUCTORS_DIR, 'default.json'))
+    if (def) return def
+    // Fallback: first registration on disk
+    return readJsonSafe(path.join(CONDUCTORS_DIR, files[0]))
+  } catch (e) { return null }
+}
+
+function loadWakePolicy() {
+  const onDisk = readJsonSafe(WAKE_POLICY_FILE)
+  if (!onDisk) return Object.assign({}, DEFAULT_WAKE_POLICY)
+  return Object.assign({}, DEFAULT_WAKE_POLICY, onDisk)
+}
+
+function isWakeTopic(topic) {
+  if (!topic) return false
+  for (const prefix of WAKE_TOPIC_PREFIXES) {
+    if (topic.indexOf(prefix) === 0) return true
+  }
+  return false
+}
+
+function shouldWake(msg, policy) {
+  if (!isWakeTopic(msg.to)) return false
+  if (policy.mode === 'silent') return false
+  const types = policy.notify_types || ['done', 'error']
+  if (types.indexOf('*') !== -1) return true
+  const t = (msg.body && typeof msg.body === 'object') ? msg.body.type : null
+  if (!t) return false  // body has no type field - don't wake (free-form messages are noise)
+  return types.indexOf(t) !== -1
+}
+
+function buildWakeNotice(msg) {
+  const body = (msg.body && typeof msg.body === 'object') ? msg.body : {}
+  const t = body.type || 'message'
+  const taskId = body.task_id || msg.task_id || ''
+  const from = msg.from || 'unknown'
+  // Title kept short for Win10/11 toast truncation tolerance.
+  const title = 'EcodiaOS: ' + t + (taskId ? ' [' + taskId.slice(0, 32) + ']' : '')
+  let line2 = ''
+  if (t === 'done') {
+    line2 = (body.result_summary || '').slice(0, 200)
+    if (body.result_pointer) line2 += (line2 ? '  ->  ' : '') + body.result_pointer
+  } else if (t === 'error') {
+    line2 = (body.error || body.result_summary || '').slice(0, 200)
+  } else if (t === 'progress') {
+    line2 = (body.summary || '').slice(0, 200)
+  } else {
+    line2 = JSON.stringify(body).slice(0, 200)
+  }
+  if (!line2) line2 = 'from ' + from
+  return { title: title, body: line2 }
+}
+
+// Non-blocking. Errors swallowed - wake is best-effort, message persist must succeed
+// even if notification path is wedged (high memory pressure, PS daemon dead, etc).
+async function wakeConductor(msg) {
+  try {
+    const policy = loadWakePolicy()
+    if (!shouldWake(msg, policy)) return
+    const now = Date.now()
+    if (now - _lastWakeAt < (policy.rate_limit_ms || 0)) return
+    _lastWakeAt = now
+    const notice = buildWakeNotice(msg)
+
+    // Tier A: toast - always fires (visible without focus-stealing).
+    try {
+      const notification = require('./notification')
+      // Don't await - toast can take 6s+ under load; persistMessage must not wait.
+      notification.toast({ title: notice.title, body: notice.body, durationMs: policy.toast_duration_ms || 6000 })
+        .catch(() => {})
+    } catch (e) {}
+
+    // Tier B + C only if conductor is registered.
+    const conductor = loadConductorRegistration()
+    if (!conductor) return
+
+    if (policy.mode === 'flash' || policy.mode === 'auto_type') {
+      try {
+        const notification = require('./notification')
+        notification.flash_window({ titleContains: conductor.title_match || '', count: 4 }).catch(() => {})
+      } catch (e) {}
+    }
+
+    if (policy.mode === 'auto_type') {
+      // Focus-steals. Opt-in only. Tate must explicitly set mode='auto_type'.
+      // Skips if the conductor window itself is already foreground (no need to wake).
+      try {
+        const win = require('./window')
+        const fg = await win.foreground().catch(() => null)
+        const titleMatch = conductor.title_match || ''
+        const alreadyFocused = fg && titleMatch && (fg.title || '').indexOf(titleMatch) !== -1
+        if (!alreadyFocused) {
+          await win.focus_window({ titleContains: titleMatch })
+          await new Promise(r => setTimeout(r, 300))
+          const input = require('./input')
+          // Compose a short wake message Tate/conductor sees in chat input pre-Enter.
+          const wakeText = '[wake] ' + notice.title + '\n' + notice.body
+          await input.type({ text: wakeText })
+          await new Promise(r => setTimeout(r, 200))
+          await input.key({ key: 'enter' })
+        }
+      } catch (e) {}
+    }
+  } catch (e) {
+    // Never let wake break persistMessage
+  }
+}
+
 // ── core ops (no auth here - that's the route layer's job) ───────────────
 
 function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conductor_tab_id, account_active_when_spawned }) {
@@ -145,6 +293,11 @@ function persistMessage(msg) {
   ids.add(msg.id)
   // Marker file (empty - presence indicates membership; mtime preserves order)
   try { fs.writeFileSync(path.join(inboxDirForTopic(msg.to), msg.id), '', 'utf8') } catch (e) {}
+  // Fire conductor wake hook (non-blocking, swallowed errors). Only triggers
+  // for chat.conductor.* topics and message types listed in wake_policy.
+  if (isWakeTopic(msg.to)) {
+    setImmediate(() => { wakeConductor(msg).catch(() => {}) })
+  }
 }
 
 function deliverMessageToTopic(from, to, body, task_id, in_reply_to) {
@@ -331,6 +484,12 @@ async function report_progress(params, ctx) {
 async function signal_done(params, ctx) {
   params = params || {}
   ctx = ctx || {}
+  // Look up parent_conductor_tab_id from the worker row so the wake hook can
+  // route per-conductor (v2). Falls through silently if not set.
+  let parent_conductor_tab_id = null
+  if (ctx.tab_id && workers.has(ctx.tab_id)) {
+    parent_conductor_tab_id = workers.get(ctx.tab_id).parent_conductor_tab_id || null
+  }
   const r = await send_message({
     to: 'chat.conductor.inbox',
     body: {
@@ -339,15 +498,201 @@ async function signal_done(params, ctx) {
       result_summary: params.result_summary,
       result_pointer: params.result_pointer || null,
       terminate: !!params.terminate,
+      parent_conductor_tab_id: parent_conductor_tab_id,
     },
     task_id: params.task_id,
   }, ctx)
   if (ctx.tab_id && workers.has(ctx.tab_id)) {
     const w = workers.get(ctx.tab_id)
     w.terminated_at = new Date().toISOString()
+    w.terminated_reason = w.terminated_reason || 'signal_done'
     try { atomicWriteJson(path.join(WORKERS_DIR, ctx.tab_id + '.json'), w) } catch (e) {}
+    // 2026-05-18 worker-registry-truth pattern: signal_done MUST unlink the
+    // .spawned marker so any consumer reading mtime as a liveness proxy
+    // (Cursor sweeper) gets a correct gone-is-not-running answer.
+    try { fs.unlinkSync(path.join(STATE_DIR, ctx.tab_id + '.spawned')) } catch (e) {}
   }
   return r
+}
+
+// ── sweep loop ───────────────────────────────────────────────────────────
+// Periodic janitor: mark stale workers terminated + unlink their .spawned
+// markers. Per pattern worker-registry-truth-is-on-disk-not-mtime-2026-05-18.
+// Workers that crash or have their tab closed never call signal_done; their
+// registry rows would stay ALIVE forever without this sweep.
+// Cadence: every 60s. Threshold: 2x DEAD_HEARTBEAT_MS = 180s with no beat.
+
+const SWEEP_INTERVAL_MS = 60 * 1000
+const SWEEP_STALE_THRESHOLD_MS = DEAD_HEARTBEAT_MS * 2  // 180s
+
+function sweepStaleWorkers() {
+  const now = Date.now()
+  const nowIso = new Date(now).toISOString()
+  let marked = 0
+  let unlinked = 0
+  for (const [tab_id, w] of workers.entries()) {
+    if (w.terminated_at) {
+      // Already terminated - ensure .spawned is gone too (cheap idempotent op).
+      try {
+        if (fs.existsSync(path.join(STATE_DIR, tab_id + '.spawned'))) {
+          fs.unlinkSync(path.join(STATE_DIR, tab_id + '.spawned'))
+          unlinked++
+        }
+      } catch (e) {}
+      continue
+    }
+    const lastHbMs = new Date(w.last_heartbeat_at || w.registered_at).getTime()
+    const stale_ms = now - lastHbMs
+    if (stale_ms > SWEEP_STALE_THRESHOLD_MS) {
+      w.terminated_at = nowIso
+      w.terminated_reason = 'stale_heartbeat'
+      w.stale_at_termination_ms = stale_ms
+      try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+      try {
+        if (fs.existsSync(path.join(STATE_DIR, tab_id + '.spawned'))) {
+          fs.unlinkSync(path.join(STATE_DIR, tab_id + '.spawned'))
+          unlinked++
+        }
+      } catch (e) {}
+      marked++
+    }
+  }
+  if (marked > 0 || unlinked > 0) {
+    try { process.stderr.write(`[coord-sweep] marked=${marked} unlinked=${unlinked}\n`) } catch (e) {}
+  }
+  return { marked, unlinked }
+}
+
+// Start the sweep loop unless explicitly disabled (e.g. for unit tests).
+let _sweepTimer = null
+function startSweepLoop() {
+  if (_sweepTimer) return
+  _sweepTimer = setInterval(sweepStaleWorkers, SWEEP_INTERVAL_MS)
+  if (_sweepTimer.unref) _sweepTimer.unref()
+}
+function stopSweepLoop() {
+  if (_sweepTimer) { clearInterval(_sweepTimer); _sweepTimer = null }
+}
+if (process.env.COORD_DISABLE_SWEEP !== '1') {
+  startSweepLoop()
+}
+
+// 2026-05-18 brief-on-disk-canonical: workers call this on first turn to get
+// the authoritative brief from disk (the dispatcher's audit file). Clipboard
+// paste then becomes just an identity-trigger; brief content authority lives
+// on the filesystem where it can't be truncated by a paste race. See pattern
+// brief-on-disk-is-canonical-not-chat-paste-2026-05-18.
+async function verify_paste(params, ctx) {
+  params = params || {}
+  ctx = ctx || {}
+  if (!ctx.tab_id) return { ok: false, error: 'tab_id required (X-Tab-Id header or params.tab_id)' }
+  const w = workers.get(ctx.tab_id)
+  if (!w) return { ok: false, error: 'worker not registered: ' + ctx.tab_id }
+  // task_id either from caller or from the worker row written at register time.
+  const task_id = params.task_id || w.task_id
+  if (!task_id) return { ok: false, error: 'task_id required (no task_id on worker row)' }
+  const briefFile = path.join(BRIEFS_DIR, task_id + '.md')
+  let brief_body = null
+  try { brief_body = fs.readFileSync(briefFile, 'utf8') } catch (e) {
+    return { ok: false, error: 'brief file unreadable: ' + briefFile + ' (' + e.message + ')' }
+  }
+  const brief_sha256 = crypto.createHash('sha256').update(brief_body).digest('hex')
+  return {
+    ok: true,
+    task_id: task_id,
+    tab_id: ctx.tab_id,
+    brief_file: briefFile.replace(/\\/g, '/'),
+    brief_size_bytes: Buffer.byteLength(brief_body, 'utf8'),
+    brief_sha256: brief_sha256,
+    brief_body: brief_body,
+    registered_at: w.registered_at,
+    parent_conductor_tab_id: w.parent_conductor_tab_id || null,
+    note: 'Authoritative brief from disk. Treat this as the source-of-truth, NOT whatever was pasted into your chat (the paste may have been truncated by a clipboard race under memory pressure).',
+  }
+}
+
+// ── conductor wake tools ─────────────────────────────────────────────────
+
+async function register_conductor(params, ctx) {
+  params = params || {}
+  ctx = ctx || {}
+  ensureDirs()
+  // tab_id can come from ctx (worker-style header) OR explicit param.
+  // For the conductor, ctx.tab_id is usually absent so the param is canonical.
+  const tab_id = params.tab_id || ctx.tab_id || 'conductor'
+  const ide = params.ide || 'cursor'  // cursor | stable | insiders
+  // title_match: substring to look up the conductor's window during wake.
+  // If not provided, try foreground at register-time as a one-shot probe.
+  let title_match = params.title_match || null
+  let hwnd = params.hwnd || null
+  let exe = params.exe || null
+
+  if (!title_match) {
+    try {
+      const win = require('./window')
+      const fg = await win.foreground()
+      if (fg) {
+        title_match = fg.title || ''
+        hwnd = fg.hwnd
+        exe = fg.exe
+      }
+    } catch (e) {}
+  }
+
+  const row = {
+    tab_id: tab_id,
+    ide: ide,
+    title_match: title_match || '',
+    hwnd: hwnd || null,
+    exe: exe || null,
+    registered_at: new Date().toISOString(),
+  }
+  // v1: persist as default conductor. v2: keyed by tab_id when multi-conductor lands.
+  atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), row)
+  if (tab_id !== 'conductor') {
+    atomicWriteJson(path.join(CONDUCTORS_DIR, tab_id + '.json'), row)
+  }
+  return { ok: true, conductor: row }
+}
+
+async function unregister_conductor(params, ctx) {
+  params = params || {}
+  const tab_id = params.tab_id || (ctx && ctx.tab_id) || null
+  ensureDirs()
+  const removed = []
+  try { fs.unlinkSync(path.join(CONDUCTORS_DIR, 'default.json')); removed.push('default') } catch (e) {}
+  if (tab_id && tab_id !== 'conductor') {
+    try { fs.unlinkSync(path.join(CONDUCTORS_DIR, tab_id + '.json')); removed.push(tab_id) } catch (e) {}
+  }
+  return { ok: true, removed: removed }
+}
+
+async function get_conductor_state(_params) {
+  const conductor = loadConductorRegistration()
+  const policy = loadWakePolicy()
+  return {
+    conductor: conductor,
+    wake_policy: policy,
+    wake_topic_prefixes: WAKE_TOPIC_PREFIXES,
+    last_wake_at: _lastWakeAt ? new Date(_lastWakeAt).toISOString() : null,
+  }
+}
+
+async function set_wake_policy(params, _ctx) {
+  params = params || {}
+  ensureDirs()
+  const current = loadWakePolicy()
+  const next = Object.assign({}, current)
+  if (typeof params.mode === 'string') {
+    const valid = ['toast', 'flash', 'auto_type', 'silent']
+    if (valid.indexOf(params.mode) === -1) throw new Error('mode must be one of: ' + valid.join(', '))
+    next.mode = params.mode
+  }
+  if (Array.isArray(params.notify_types)) next.notify_types = params.notify_types.slice()
+  if (typeof params.toast_duration_ms === 'number') next.toast_duration_ms = Math.max(1500, Math.min(params.toast_duration_ms, 15000))
+  if (typeof params.rate_limit_ms === 'number') next.rate_limit_ms = Math.max(0, Math.min(params.rate_limit_ms, 60000))
+  atomicWriteJson(WAKE_POLICY_FILE, next)
+  return { ok: true, wake_policy: next }
 }
 
 // ── exports ──────────────────────────────────────────────────────────────
@@ -362,7 +707,17 @@ module.exports = {
   heartbeat: heartbeat,
   report_progress: report_progress,
   signal_done: signal_done,
+  verify_paste: verify_paste,
+  register_conductor: register_conductor,
+  unregister_conductor: unregister_conductor,
+  get_conductor_state: get_conductor_state,
+  set_wake_policy: set_wake_policy,
   // Internal API for the /api/comms/register-worker route - NOT exposed as a tool.
   _registerWorkerInternal: registerWorkerInternal,
   _inboxTopicFor: inboxTopicFor,
+  _loadConductorRegistration: loadConductorRegistration,
+  // Sweep API for tests and for the daemon harness.
+  _sweepStaleWorkers: sweepStaleWorkers,
+  _startSweepLoop: startSweepLoop,
+  _stopSweepLoop: stopSweepLoop,
 }
