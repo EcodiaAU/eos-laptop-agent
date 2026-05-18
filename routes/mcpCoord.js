@@ -129,6 +129,17 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: 'coord.verify_paste',
+    description: 'Fetch the canonical brief from disk for your task_id. The brief that was pasted into your chat may be truncated by a clipboard race under memory pressure — this tool returns the audit-file version that the dispatcher wrote BEFORE the paste, so it cannot be corrupted by paste-side issues. Call this FIRST on every dispatched worker. Treat the returned brief_body as source-of-truth. Returns {ok, task_id, tab_id, brief_file, brief_size_bytes, brief_sha256, brief_body, registered_at, parent_conductor_tab_id}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Optional; defaults to your worker row\'s task_id.' },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
     name: 'coord.signal_done',
     description: 'Sugar for signalling task completion to chat.conductor.inbox. If terminate=true, marks your worker row terminated_at. result_pointer can name a file path or status_board row id holding the full output.',
     inputSchema: {
@@ -210,7 +221,62 @@ const TOOLS = Object.freeze([
     description: 'List currently-flaky accounts + expired entries for audit. Returns {active[], expired[], ttl_ms}.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: true },
   },
+  {
+    name: 'coord.register_conductor',
+    description: 'Register THIS Claude Code tab as the conductor. Persists ide + window title-match so the wake hook can flash/focus this tab when a chat.conductor.* message lands. Call once per conductor tab (and after IDE relaunch / window-title change). If title_match is omitted, captures the current foreground window title.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab_id: { type: 'string', description: 'Optional explicit conductor tab id; defaults to "conductor"' },
+        ide: { type: 'string', description: 'cursor | stable | insiders' },
+        title_match: { type: 'string', description: 'Substring used to refind the window during wake. Auto-captured from foreground if omitted.' },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
+    name: 'coord.unregister_conductor',
+    description: 'Remove the registered conductor row(s). Wake hook still fires the toast (which does not depend on registration) but skips flash / auto_type.',
+    inputSchema: { type: 'object', properties: { tab_id: { type: 'string' } }, additionalProperties: true },
+  },
+  {
+    name: 'coord.get_conductor_state',
+    description: 'Read the currently-registered conductor + active wake policy + last-wake timestamp. Diagnostic / preflight.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+  },
+  {
+    name: 'coord.set_wake_policy',
+    description: 'Configure how the conductor is woken when messages land in chat.conductor.*. mode = "toast" (default - notification only) | "flash" (toast + flash conductor taskbar) | "auto_type" (toast + flash + focus + paste wake message into chat, then press enter) | "silent" (disable wake entirely). notify_types filters by body.type ("done", "error", "progress", or "*" for all). Defaults: mode=toast, notify_types=[done, error].',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['toast', 'flash', 'auto_type', 'silent'] },
+        notify_types: { type: 'array', items: { type: 'string' } },
+        toast_duration_ms: { type: 'integer', minimum: 1500, maximum: 15000 },
+        rate_limit_ms: { type: 'integer', minimum: 0, maximum: 60000 },
+      },
+      additionalProperties: true,
+    },
+  },
 ])
+
+// PATCH 2026-05-18 drift-audit: MCP clients treat inputSchema.properties as an
+// allowlist regardless of additionalProperties=true. Workers calling coord.*
+// with passthrough {tab_id, tab_credential} had those args stripped by the
+// client before they reached extractCtx, so every coord call returned
+// "tab_id required". Inject the two ctx props into every tool's properties so
+// the MCP client passes them through. Object.freeze is shallow so the inner
+// properties objects are mutable.
+const CTX_PROPS = Object.freeze({
+  tab_id: { type: 'string', description: 'Worker tab id passthrough (MCP transports without X-Tab-Id header).' },
+  tab_credential: { type: 'string', description: 'Worker tab credential passthrough (MCP transports without X-Tab-Credential header).' },
+})
+for (const t of TOOLS) {
+  if (!t || !t.inputSchema || t.inputSchema.type !== 'object') continue
+  if (!t.inputSchema.properties) t.inputSchema.properties = {}
+  if (!t.inputSchema.properties.tab_id) t.inputSchema.properties.tab_id = CTX_PROPS.tab_id
+  if (!t.inputSchema.properties.tab_credential) t.inputSchema.properties.tab_credential = CTX_PROPS.tab_credential
+}
 
 const TOOL_NAMES = new Set(TOOLS.map(t => t.name))
 
