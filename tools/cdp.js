@@ -147,14 +147,16 @@ async function attach(opts) {
   const port = opts.port || DEFAULT_PORT
   const probe = await probePort(port)
   if (!probe.ok) throw new Error('CDP not listening on :' + port + ': ' + probe.error)
-  const c = await ensureConnected({ port: port })
+  await ensureConnected({ port: port })
+  const page = await resolveTarget(opts)
   return {
     ok: true,
     port: port,
     chromeVersion: probe.version.Browser,
     protocolVersion: probe.version['Protocol-Version'],
-    currentUrl: await c.page.url(),
-    currentTitle: await c.page.title(),
+    currentUrl: await page.url(),
+    currentTitle: await page.title(),
+    parallelism: 'per-call target resolution (alias / urlContains / titleContains / index / targetId)',
   }
 }
 
@@ -166,9 +168,9 @@ async function runJs(opts) {
   const timeout = opts.timeout || 5000
   if (typeof js !== 'string' || !js.trim()) throw new Error('js (string) required')
   try {
-    const c = await ensureConnected()
+    const page = await resolveTarget(opts)
     const value = await Promise.race([
-      c.page.evaluate(js),
+      page.evaluate(js),
       new Promise((_, rej) => setTimeout(() => rej(new Error('cdp.runJs timed out after ' + timeout + 'ms')), timeout)),
     ])
     return { ok: true, value: value }
@@ -182,9 +184,9 @@ async function click(opts) {
   const selector = opts.selector
   const timeout = opts.timeout || 5000
   if (!selector) throw new Error('selector required')
-  const c = await ensureConnected()
-  await c.page.waitForSelector(selector, { timeout: timeout, visible: true })
-  await c.page.click(selector)
+  const page = await resolveTarget(opts)
+  await page.waitForSelector(selector, { timeout: timeout, visible: true })
+  await page.click(selector)
   return { ok: true, clicked: selector }
 }
 
@@ -193,17 +195,17 @@ async function wait(opts) {
   const selector = opts.selector
   const timeout = opts.timeout || 10000
   if (!selector) throw new Error('selector required')
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   const w = { timeout: timeout }
   if (opts.visible) w.visible = true
   if (opts.hidden) w.hidden = true
-  await c.page.waitForSelector(selector, w)
+  await page.waitForSelector(selector, w)
   return { ok: true, found: selector }
 }
 
-async function url_() {
-  const c = await ensureConnected()
-  return { url: await c.page.url(), title: await c.page.title() }
+async function url_(opts) {
+  const page = await resolveTarget(opts)
+  return { url: await page.url(), title: await page.title() }
 }
 
 async function navigate(opts) {
@@ -212,18 +214,18 @@ async function navigate(opts) {
   const waitUntil = opts.waitUntil || 'domcontentloaded'
   const timeout = opts.timeout || 30000
   if (!url) throw new Error('url required')
-  const c = await ensureConnected()
-  await c.page.goto(url, { waitUntil: waitUntil, timeout: timeout })
-  return { ok: true, url: await c.page.url(), title: await c.page.title() }
+  const page = await resolveTarget(opts)
+  await page.goto(url, { waitUntil: waitUntil, timeout: timeout })
+  return { ok: true, url: await page.url(), title: await page.title() }
 }
 
 async function text(opts) {
   opts = opts || {}
   const selector = opts.selector
   if (!selector) throw new Error('selector required')
-  const c = await ensureConnected()
-  await c.page.waitForSelector(selector, { timeout: 5000 })
-  const txt = await c.page.$eval(selector, el => (el.textContent || '').trim())
+  const page = await resolveTarget(opts)
+  await page.waitForSelector(selector, { timeout: 5000 })
+  const txt = await page.$eval(selector, el => (el.textContent || '').trim())
   return { selector: selector, text: txt }
 }
 
@@ -241,8 +243,8 @@ async function queryAll(opts) {
   const fields = opts.fields || {}
   const limit = opts.limit || 100
   if (!selector) throw new Error('selector required')
-  const c = await ensureConnected()
-  const rows = await c.page.evaluate((sel, fld, lim) => {
+  const page = await resolveTarget(opts)
+  const rows = await page.evaluate((sel, fld, lim) => {
     const extract = (target, what) => {
       if (!target) return null
       if (what === '' || what === 'text' || what === 'textContent') return (target.textContent || '').trim()
@@ -271,19 +273,19 @@ async function queryAll(opts) {
 async function pageScreenshot(opts) {
   opts = opts || {}
   const fullPage = !!opts.fullPage
-  const c = await ensureConnected()
-  const buf = await c.page.screenshot({ fullPage: fullPage, type: 'png' })
+  const page = await resolveTarget(opts)
+  const buf = await page.screenshot({ fullPage: fullPage, type: 'png' })
   return { image: buf.toString('base64'), format: 'png', fullPage: fullPage }
 }
 
-// List all tabs/pages, with index + url + title.
-async function listTabs() {
-  const c = await ensureConnected()
+// List all tabs/pages with index + url + title + targetId (for pinning aliases).
+async function listTabs(opts) {
+  const c = await ensureConnected(opts)
   const pages = await c.browser.pages()
   const tabs = []
   for (let i = 0; i < pages.length; i++) {
     try {
-      tabs.push({ index: i, url: await pages[i].url(), title: await pages[i].title() })
+      tabs.push({ index: i, url: await pages[i].url(), title: await pages[i].title(), targetId: _extractTargetId(pages[i]) })
     } catch (e) {
       tabs.push({ index: i, error: e.message })
     }
@@ -291,22 +293,50 @@ async function listTabs() {
   return { count: tabs.length, tabs: tabs }
 }
 
-// Switch the cached "current page" to a specific tab by index or url-substring.
+// LEGACY: bring tab to front + set implicit-fallback target. Use cdp.attach_tab
+// for stable named aliasing in new code - that's what unlocks true parallelism.
 async function selectTab(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
-  const pages = await c.browser.pages()
-  let target = null
-  if (typeof opts.index === 'number') target = pages[opts.index]
-  else if (opts.urlContains) {
-    for (const p of pages) {
-      if ((await p.url()).indexOf(opts.urlContains) !== -1) { target = p; break }
-    }
+  const target = opts.target || { index: opts.index, urlContains: opts.urlContains, titleContains: opts.titleContains }
+  const page = await resolveTarget({ target })
+  await page.bringToFront()
+  lastTouchedTargetId = _extractTargetId(page)
+  return { ok: true, url: await page.url(), title: await page.title(), brought_to_front: true }
+}
+
+// === alias management - per-tab named pins for parallel addressing ======
+
+async function attachTab(opts) {
+  opts = opts || {}
+  if (!opts.alias) throw new Error('alias required')
+  if (!opts.urlContains && !opts.titleContains && typeof opts.index !== 'number' && !opts.targetId) {
+    throw new Error('one of urlContains | titleContains | index | targetId required')
   }
-  if (!target) throw new Error('no matching tab')
-  await target.bringToFront()
-  connection.page = target
-  return { ok: true, url: await target.url(), title: await target.title() }
+  const page = await resolveTarget({ target: { urlContains: opts.urlContains, titleContains: opts.titleContains, index: opts.index, targetId: opts.targetId } })
+  const tid = _extractTargetId(page)
+  if (!tid) throw new Error('could not extract targetId from page')
+  aliasToTargetId.set(opts.alias, tid)
+  return { ok: true, alias: opts.alias, targetId: tid, url: await page.url(), title: await page.title() }
+}
+
+async function detachTab(opts) {
+  opts = opts || {}
+  if (!opts.alias) throw new Error('alias required')
+  const dropped = aliasToTargetId.delete(opts.alias)
+  return { ok: true, alias: opts.alias, dropped: dropped }
+}
+
+async function listAliases(opts) {
+  const c = await ensureConnected(opts)
+  const pages = await c.browser.pages()
+  const out = []
+  for (const [alias, tid] of aliasToTargetId.entries()) {
+    let live = null
+    for (const p of pages) if (_extractTargetId(p) === tid) { live = p; break }
+    if (!live) { out.push({ alias, targetId: tid, alive: false }); continue }
+    out.push({ alias, targetId: tid, alive: true, url: await live.url(), title: await live.title() })
+  }
+  return { count: out.length, aliases: out }
 }
 
 async function detach() {
@@ -326,12 +356,12 @@ async function clickText(opts) {
   const isExact = !!opts.exact
   const timeout = opts.timeout || 5000
   if (!text) throw new Error('text required')
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   const start = Date.now()
   let lastErr = ''
   while (Date.now() - start < timeout) {
     try {
-      const result = await c.page.evaluate(function(args){
+      const result = await page.evaluate(function(args){
         var t = args.text, isExact = args.isExact, sel = args.sel
         var lower = t.toLowerCase()
         var nodes = Array.from(document.querySelectorAll(sel))
@@ -363,8 +393,8 @@ async function fillByLabel(opts) {
   const value = opts.value
   if (!label) throw new Error('label required')
   if (typeof value !== 'string') throw new Error('value (string) required')
-  const c = await ensureConnected()
-  const result = await c.page.evaluate(function(args){
+  const page = await resolveTarget(opts)
+  const result = await page.evaluate(function(args){
     var lower = args.label.toLowerCase()
     var candidates = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable=true]'))
     for (var i = 0; i < candidates.length; i++) {
@@ -406,8 +436,8 @@ async function fillByLabel(opts) {
 // cdp.cookies - list cookies (filterable by domain substring).
 async function cookies(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
-  const all = await c.page.cookies()
+  const page = await resolveTarget(opts)
+  const all = await page.cookies()
   let filtered = all
   if (opts.domain) {
     var d = opts.domain.toLowerCase()
@@ -419,7 +449,7 @@ async function cookies(opts) {
 // cdp.setCookie - set a cookie on the current page or named url.
 async function setCookie(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   if (!opts.name || typeof opts.value === 'undefined') throw new Error('name + value required')
   const cookie = { name: opts.name, value: String(opts.value) }
   if (opts.domain) cookie.domain = opts.domain
@@ -429,43 +459,43 @@ async function setCookie(opts) {
   if (opts.httpOnly) cookie.httpOnly = true
   if (opts.secure) cookie.secure = true
   if (opts.sameSite) cookie.sameSite = opts.sameSite
-  await c.page.setCookie(cookie)
+  await page.setCookie(cookie)
   return { ok: true, set: opts.name }
 }
 
 // cdp.viewport - resize the page viewport (mobile emulation etc.)
 async function viewport(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   const width = opts.width || 1366
   const height = opts.height || 768
   const deviceScaleFactor = opts.deviceScaleFactor || 1
   const isMobile = !!opts.isMobile
   const hasTouch = !!opts.hasTouch
-  await c.page.setViewport({ width: width, height: height, deviceScaleFactor: deviceScaleFactor, isMobile: isMobile, hasTouch: hasTouch })
-  if (opts.userAgent) await c.page.setUserAgent(opts.userAgent)
+  await page.setViewport({ width: width, height: height, deviceScaleFactor: deviceScaleFactor, isMobile: isMobile, hasTouch: hasTouch })
+  if (opts.userAgent) await page.setUserAgent(opts.userAgent)
   return { ok: true, viewport: { width: width, height: height, deviceScaleFactor: deviceScaleFactor, isMobile: isMobile, hasTouch: hasTouch } }
 }
 
 // cdp.scrollTo - scroll to selector or absolute y or bottom.
 async function scrollTo(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   if (opts.selector) {
-    const found = await c.page.$(opts.selector)
+    const found = await page.$(opts.selector)
     if (!found) return { ok: false, error: 'selector not found: ' + opts.selector }
-    await c.page.evaluate(function(s){
+    await page.evaluate(function(s){
       var el = document.querySelector(s)
       if (el) el.scrollIntoView({behavior:'instant', block:'center'})
     }, opts.selector)
     return { ok: true, scrolledTo: opts.selector }
   }
   if (typeof opts.y === 'number') {
-    await c.page.evaluate(function(y){ window.scrollTo({top:y, behavior:'instant'}) }, opts.y)
+    await page.evaluate(function(y){ window.scrollTo({top:y, behavior:'instant'}) }, opts.y)
     return { ok: true, scrolledTo: opts.y }
   }
   if (opts.bottom) {
-    await c.page.evaluate(function(){ window.scrollTo({top: document.body.scrollHeight, behavior:'instant'}) })
+    await page.evaluate(function(){ window.scrollTo({top: document.body.scrollHeight, behavior:'instant'}) })
     return { ok: true, scrolledTo: 'bottom' }
   }
   throw new Error('scrollTo requires selector, y, or bottom: true')
@@ -476,7 +506,7 @@ async function networkLog(opts) {
   opts = opts || {}
   const captureMs = Math.min(opts.captureMs || 5000, 30000)
   const filter = opts.urlContains || null
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   const events = []
   const onReq = function(req){
     var u = req.url()
@@ -488,20 +518,20 @@ async function networkLog(opts) {
     if (filter && u.indexOf(filter) === -1) return
     events.push({ type: 'response', status: res.status(), url: u, at: Date.now() })
   }
-  c.page.on('request', onReq)
-  c.page.on('response', onRes)
+  page.on('request', onReq)
+  page.on('response', onRes)
   await new Promise(r => setTimeout(r, captureMs))
-  c.page.off('request', onReq)
-  c.page.off('response', onRes)
+  page.off('request', onReq)
+  page.off('response', onRes)
   return { ok: true, captureMs: captureMs, eventCount: events.length, events: events.slice(0, 200) }
 }
 
 // cdp.pdf - export current page as PDF bytes (base64).
 async function pdf(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
+  const page = await resolveTarget(opts)
   try {
-    const buf = await c.page.pdf({ format: opts.format || 'A4', printBackground: !!opts.printBackground })
+    const buf = await page.pdf({ format: opts.format || 'A4', printBackground: !!opts.printBackground })
     return { ok: true, pdfBase64: buf.toString('base64'), bytes: buf.length }
   } catch (e) {
     return { ok: false, error: 'pdf failed (often requires headless): ' + e.message }
@@ -518,8 +548,8 @@ async function pdf(opts) {
 // wrapping the same label text isn't grabbed instead of the real button.
 async function realClick(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
-  const client = await c.page.target().createCDPSession()
+  const page = await resolveTarget(opts)
+  const client = await page.target().createCDPSession()
   try {
     let x = opts.x, y = opts.y
     if (typeof x !== 'number' || typeof y !== 'number') {
@@ -547,8 +577,8 @@ async function realClick(opts) {
 // visible nodes.
 async function deepFindRect(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
-  const result = await c.page.evaluate(function(args){
+  const page = await resolveTarget(opts)
+  const result = await page.evaluate(function(args){
     const wantTag = (args.tag || '').toUpperCase()
     const wantText = (args.text || '').toLowerCase()
     const wantAria = (args.aria || '').toLowerCase()
@@ -614,8 +644,8 @@ async function deepFindRect(opts) {
 async function nativeFill(opts) {
   opts = opts || {}
   if (typeof opts.value !== 'string') throw new Error('value (string) required')
-  const c = await ensureConnected()
-  const result = await c.page.evaluate(function(args){
+  const page = await resolveTarget(opts)
+  const result = await page.evaluate(function(args){
     const collect = function(){
       const out = []
       const walk = function(root){
@@ -662,8 +692,8 @@ async function nativeFill(opts) {
 // screenshot and OCRing it.
 async function findVisible(opts) {
   opts = opts || {}
-  const c = await ensureConnected()
-  const result = await c.page.evaluate(function(args){
+  const page = await resolveTarget(opts)
+  const result = await page.evaluate(function(args){
     const tagFilter = (args.tag || '').toUpperCase()
     const textFilter = (args.text || '').toLowerCase()
     const minW = args.minW || 0
@@ -720,11 +750,11 @@ async function clickByTag(opts) {
   opts = opts || {}
   const tag = (opts.tag || 'BUTTON').toUpperCase()
   if (!opts.text && !opts.aria) throw new Error('text or aria required')
-  const rect = await deepFindRect({ tag: tag, text: opts.text, aria: opts.aria, exact: !!opts.exact })
+  const rect = await deepFindRect({ tag: tag, text: opts.text, aria: opts.aria, exact: !!opts.exact, target: opts.target })
   if (!rect || !rect.ok) return { ok: false, error: 'no ' + tag + ' matched', detail: rect && rect.error }
   // Try JS click first - cheaper, succeeds on plain DOM buttons.
-  const c = await ensureConnected()
-  const jsResult = await c.page.evaluate(function(args){
+  const page = await resolveTarget(opts)
+  const jsResult = await page.evaluate(function(args){
     const candidates = []
     const walk = function(root){
       let elems
@@ -755,9 +785,61 @@ async function clickByTag(opts) {
   if (jsResult && jsResult.ok && jsResult.focusChanged) {
     return { ok: true, via: 'js', tag: tag, x: rect.x, y: rect.y, w: rect.w, h: rect.h }
   }
-  // Escalate to real CDP mouse click.
-  const real = await realClick({ x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 })
+  // Escalate to real CDP mouse click (same tab).
+  const real = await realClick({ x: rect.x + rect.w / 2, y: rect.y + rect.h / 2, target: opts.target })
   return { ok: !!real.ok, via: 'cdp-mouse', tag: tag, x: real.x, y: real.y, w: rect.w, h: rect.h, jsAttempted: jsResult }
+}
+
+// cdp.helpers - self-describing inventory of high-leverage helpers.
+// Call this mid-session when you forget what's available. Each entry names
+// the helper, when to reach for it, and a minimal example.
+//
+// Recursive-improvement rule: when a new helper lands in this file, also add
+// its entry below. The hook at C:/Users/tjdTa/.claude/hooks/ecodia/
+// cdp_helper_nudge.py also needs a matching anti-pattern detector. The
+// doctrine pattern is at
+// backend/patterns/cdp-helper-library-and-recursive-improvement-2026-05-18.md
+async function helpers() {
+  return {
+    ok: true,
+    doctrine: 'backend/patterns/cdp-helper-library-and-recursive-improvement-2026-05-18.md',
+    helpers: [
+      {
+        name: 'cdp.realClick',
+        whenToUse: 'Material/MUI/custom-element buttons that ignore JS .click(). Sends full Input.dispatchMouseEvent sequence.',
+        example: "cdp.realClick({x: 946, y: 874}) OR cdp.realClick({tag: 'BUTTON', text: 'Save'})",
+      },
+      {
+        name: 'cdp.deepFindRect',
+        whenToUse: 'Lock onto the real BUTTON when a P/SPAN wraps the same label outside the modal. Shadow-DOM aware, visible-rect filtered.',
+        example: "cdp.deepFindRect({tag: 'BUTTON', text: 'Save', exact: true})",
+      },
+      {
+        name: 'cdp.nativeFill',
+        whenToUse: "React/MUI controlled inputs where el.value = 'x' reverts on next render. Uses native HTMLInputElement.prototype setter.",
+        example: "cdp.nativeFill({placeholder: '0 9 * * *', value: '0 */6 * * *'})",
+      },
+      {
+        name: 'cdp.findVisible',
+        whenToUse: '"What is on screen right now?" - shadow-DOM aware enumeration with rect + text + aria + role. Eyes-of-the-blind reflex.',
+        example: "cdp.findVisible({tag: 'BUTTON', text: 'save', limit: 10})",
+      },
+      {
+        name: 'cdp.clickByTag',
+        whenToUse: 'Default reach-for click helper. Cheap JS click first, auto-escalates to real CDP mouse if focus did not move.',
+        example: "cdp.clickByTag({tag: 'BUTTON', text: 'Save'})",
+      },
+    ],
+    hardRules: [
+      'Never send Escape (closes parent panels in GCP / Material UIs)',
+      'Filter by tag:BUTTON when clicking by text (P/SPAN can wrap the same label)',
+      'Use cdp.nativeFill for any controlled input, not el.value =',
+      'Wait 6-10s post-navigate, 1500-2500ms after autocomplete fill',
+      "Tate's Chrome cookies authenticate every API call - no token replay needed",
+    ],
+    recursiveImprovement: 'Every new CDP failure mode lands a new helper + doctrine line SAME-TURN, not "next time."',
+    nudgeHook: 'C:/Users/tjdTa/.claude/hooks/ecodia/cdp_helper_nudge.py (PreToolUse on Bash, fires [CDP-HELPER NUDGE] when anti-patterns appear in cdp.runJs JS)',
+  }
 }
 
 // cdp.send - raw DevTools Protocol passthrough. Power user surface.
@@ -766,8 +848,8 @@ async function sendCdp(opts) {
   const method = opts.method
   const params = opts.params || {}
   if (!method) throw new Error('method required')
-  const c = await ensureConnected()
-  const client = await c.page.target().createCDPSession()
+  const page = await resolveTarget(opts)
+  const client = await page.target().createCDPSession()
   try {
     const result = await client.send(method, params)
     return { ok: true, method: method, result: result }
@@ -778,6 +860,10 @@ async function sendCdp(opts) {
 
 module.exports = {
   attach: attach,
+  detach: detach,
+  attach_tab: attachTab,
+  detach_tab: detachTab,
+  list_aliases: listAliases,
   runJs: runJs,
   click: click,
   wait: wait,
@@ -788,7 +874,6 @@ module.exports = {
   pageScreenshot: pageScreenshot,
   listTabs: listTabs,
   selectTab: selectTab,
-  detach: detach,
   clickText: clickText,
   fillByLabel: fillByLabel,
   cookies: cookies,
@@ -803,4 +888,5 @@ module.exports = {
   nativeFill: nativeFill,
   findVisible: findVisible,
   clickByTag: clickByTag,
+  helpers: helpers,
 }
