@@ -17,21 +17,16 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const { spawnSync } = require('child_process')
+const psd = require('../lib/ps-daemon')
 
-function runPs(script, timeoutMs) {
-  timeoutMs = timeoutMs || 12000
-  const tmp = path.join(os.tmpdir(), 'eos-uia-' + Date.now() + '.ps1')
-  fs.writeFileSync(tmp, script, 'utf8')
-  try {
-    const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmp], {
-      encoding: 'utf8',
-      timeout: timeoutMs,
-      windowsHide: true,
-    })
-    return { exitCode: r.status, stdout: (r.stdout || '').trim(), stderr: (r.stderr || '').trim() }
-  } finally {
-    try { fs.unlinkSync(tmp) } catch (e) {}
-  }
+// Routes through the long-lived PowerShell daemon. UIA's per-call cost is
+// dominated by Add-Type UIAutomationClient/UIAutomationTypes (~500ms) which
+// the daemon amortises to ZERO (pre-loaded at daemon spawn, cached forever).
+// Falls back to per-call spawnSync if the daemon is unavailable. Removes the
+// tempfile-write step + Defender-scan race entirely on the daemon path.
+async function runPs(script, timeoutMs) {
+  const r = await psd.runOrFallback(script, { timeout_ms: timeoutMs || 12000 })
+  return { exitCode: r.ok ? 0 : (r.exit_code || 1), stdout: (r.stdout || '').trim(), stderr: (r.stderr || r.error || '').trim() }
 }
 
 const UIA_PRELUDE = `
@@ -74,7 +69,7 @@ foreach ($w in $children) {
 }
 $out | ConvertTo-Json -Compress
 `
-  const r = runPs(script, 10000)
+  const r = await runPs(script, 10000)
   if (r.exitCode !== 0) throw new Error('uia.windows PS failed: ' + r.stderr)
   let arr; try { arr = JSON.parse(r.stdout) } catch (e) { arr = [] }
   if (!Array.isArray(arr)) arr = [arr]
@@ -124,7 +119,7 @@ function Walk-Tree {
 $tree = Walk-Tree $top 0 ${depth}
 $tree | ConvertTo-Json -Depth ${depth + 2} -Compress
 `
-  const r = runPs(script, 30000)
+  const r = await runPs(script, 30000)
   if (r.exitCode !== 0) throw new Error('uia.tree PS failed: ' + r.stderr)
   if (r.stdout === 'NO_TOP_WINDOW') return { ok: false, error: 'no matching top-level window' }
   let tree; try { tree = JSON.parse(r.stdout) } catch (e) { return { ok: false, error: 'tree parse failed', raw: r.stdout.slice(0, 500) } }
@@ -159,7 +154,7 @@ if (-not $el) { Write-Output 'NOT_FOUND'; exit 0 }
 $c = $el.Current
 @{ name = $c.Name; className = $c.ClassName; automationId = $c.AutomationId; controlType = $c.ControlType.LocalizedControlType; bounds = @($c.BoundingRectangle.X, $c.BoundingRectangle.Y, $c.BoundingRectangle.Width, $c.BoundingRectangle.Height); isEnabled = $c.IsEnabled } | ConvertTo-Json -Compress
 `
-  const r = runPs(script, 15000)
+  const r = await runPs(script, 15000)
   if (r.exitCode !== 0) throw new Error('uia.find PS failed: ' + r.stderr)
   if (r.stdout === 'NO_TOP_WINDOW') return { ok: false, error: 'no matching window' }
   if (r.stdout === 'NOT_FOUND') return { ok: false, error: 'element not found in window' }
@@ -195,7 +190,7 @@ if (-not $ip) {
 $ip.Invoke()
 Write-Output 'INVOKED'
 `
-  const r = runPs(script, 15000)
+  const r = await runPs(script, 15000)
   if (r.exitCode !== 0) throw new Error('uia.invoke PS failed: ' + r.stderr)
   if (r.stdout.indexOf('NO_TOP_WINDOW') >= 0) return { ok: false, error: 'no matching window' }
   if (r.stdout.indexOf('NOT_FOUND') >= 0) return { ok: false, error: 'element not found' }
@@ -229,7 +224,7 @@ if (-not $vp) { Write-Output 'NO_VALUE_PATTERN'; exit 0 }
 $vp.SetValue('${value.replace(/'/g, "''")}')
 Write-Output 'SET'
 `
-  const r = runPs(script, 15000)
+  const r = await runPs(script, 15000)
   if (r.exitCode !== 0) throw new Error('uia.set_value PS failed: ' + r.stderr)
   if (r.stdout.indexOf('NO_TOP_WINDOW') >= 0) return { ok: false, error: 'no matching window' }
   if (r.stdout.indexOf('NOT_FOUND') >= 0) return { ok: false, error: 'element not found' }

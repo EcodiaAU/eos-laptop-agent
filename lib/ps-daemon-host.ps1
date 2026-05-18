@@ -54,7 +54,7 @@ while ($true) {
       if ($ps.HadErrors) {
         $errMsgs = @()
         foreach ($e in $ps.Streams.Error) { $errMsgs += $e.ToString() }
-        $stderr = ($errMsgs -join "` + 'n')
+        $stderr = ($errMsgs -join [Environment]::NewLine)
       }
     }
     $rs.Close()

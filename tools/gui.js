@@ -64,6 +64,151 @@ async function pseudoWait(params) {
   return { ok: true, waitedMs: ms }
 }
 
+// ----- pseudo-tool: wait_for -----
+// Blocks until a condition becomes true, or returns {timed_out:true} after
+// timeout_ms. This is the "wait UNTIL X" primitive that turns a flat gui.sequence
+// into a real chained flow ("navigate -> wait for ready_state complete -> click").
+// Six condition kinds covering the common cases:
+//   - cdp_url_contains   {contains: '/dashboard'}
+//   - cdp_url_matches    {pattern: '^https://app\\..*'}
+//   - cdp_ready_state    {state: 'complete'}                                 (default complete)
+//   - cdp_element_visible{selector: 'button.submit'}
+//   - cdp_eval_truthy    {script: 'document.querySelector("foo")?.disabled === false'}
+//   - file_exists        {path: 'D:/.../done.marker'}
+//   - cmd_returns_zero   {cmd: 'curl', args: ['-fsS','http://localhost:7456/api/health'], shell?: false}
+//   - foreground_window_matches {exe?: 'Cursor', title_contains?: 'Claude Code', title_matches?: '...'}
+//   - coord_inbox_has    {topic: 'chat.conductor.inbox', body_contains?: 'SMOKE_OK'}
+// Returns {ok: true, waited_ms, last_value, timed_out: false} on success or
+//        {ok: false, waited_ms, last_error, timed_out: true} on timeout
+// (unless throw_on_timeout: true, in which case it throws on timeout).
+async function pseudoWaitFor(params) {
+  params = params || {}
+  const until = params.until
+  if (!until || typeof until !== 'object') throw new Error('wait_for requires {until: {type, ...}}')
+  const timeoutMs = Math.max(50, Math.min(params.timeout_ms || 10000, 600000))
+  const pollMs = Math.max(50, Math.min(params.poll_ms || 200, 5000))
+  const throwOnTimeout = !!params.throw_on_timeout
+  const start = Date.now()
+  let lastError = null
+  let lastValue = null
+
+  async function probe() {
+    try {
+      switch (until.type) {
+        case 'cdp_url_contains':
+        case 'cdp_url_matches': {
+          const cdp = require('./cdp')
+          const r = await cdp.url({})
+          const u = (r && (r.url || r.value)) || ''
+          lastValue = u
+          if (until.type === 'cdp_url_contains') return u.indexOf(until.contains || '') !== -1
+          return new RegExp(until.pattern || '.*').test(u)
+        }
+        case 'cdp_ready_state': {
+          const cdp = require('./cdp')
+          const r = await cdp.runJs({ script: 'document.readyState' })
+          lastValue = r && r.value
+          return r && r.value === (until.state || 'complete')
+        }
+        case 'cdp_element_visible':
+        case 'cdp_element_exists': {
+          const cdp = require('./cdp')
+          const r = await cdp.queryAll({ selector: until.selector })
+          const count = (r && (r.count || (r.elements && r.elements.length))) || 0
+          lastValue = count
+          return count > 0
+        }
+        case 'cdp_eval_truthy': {
+          const cdp = require('./cdp')
+          const r = await cdp.runJs({ script: until.script })
+          lastValue = r && r.value
+          return !!(r && r.value)
+        }
+        case 'file_exists': {
+          lastValue = until.path
+          return fs.existsSync(until.path)
+        }
+        case 'cmd_returns_zero': {
+          const r = spawnSync(until.cmd, until.args || [], { timeout: 5000, encoding: 'utf8', windowsHide: true, shell: !!until.shell })
+          lastValue = r.status
+          return r.status === 0
+        }
+        case 'foreground_window_matches': {
+          const win = require('./window')
+          const fg = await win.foreground()
+          lastValue = fg
+          if (until.exe && fg.exe !== until.exe) return false
+          if (until.title_contains && (fg.title || '').indexOf(until.title_contains) === -1) return false
+          if (until.title_matches && !new RegExp(until.title_matches).test(fg.title || '')) return false
+          return true
+        }
+        case 'coord_inbox_has': {
+          const coord = require('./coord')
+          const r = await coord.read_inbox({ topic: until.topic }, {})
+          // Note: read_inbox marks messages seen as a side effect. For pure
+          // probing without consuming, a future peek-style read would be cleaner.
+          const msgs = (r && r.messages) || []
+          lastValue = msgs.length
+          if (msgs.length === 0) return false
+          if (!until.body_contains) return true
+          return msgs.some(m => JSON.stringify(m.body || {}).indexOf(until.body_contains) !== -1)
+        }
+        default:
+          throw new Error('unknown wait_for type: ' + until.type)
+      }
+    } catch (e) {
+      lastError = e.message
+      return false
+    }
+  }
+
+  if (await probe()) {
+    return { ok: true, waited_ms: Date.now() - start, condition: until.type, last_value: lastValue, timed_out: false }
+  }
+  while (Date.now() - start < timeoutMs) {
+    await sleep(pollMs)
+    if (await probe()) {
+      return { ok: true, waited_ms: Date.now() - start, condition: until.type, last_value: lastValue, timed_out: false }
+    }
+  }
+  if (throwOnTimeout) {
+    throw new Error('wait_for timed out after ' + timeoutMs + 'ms (last_error: ' + (lastError || 'none') + ')')
+  }
+  return { ok: false, waited_ms: Date.now() - start, condition: until.type, last_value: lastValue, last_error: lastError, timed_out: true }
+}
+
+// ----- pseudo-tool: branch -----
+// If-then-else inside a sequence. Probes the condition ONCE (with a short
+// timeout), then runs `then` actions if true, `else` actions if false.
+async function pseudoBranch(params) {
+  params = params || {}
+  if (!params.condition) throw new Error('branch requires {condition, then, else?}')
+  const thenActions = Array.isArray(params.then) ? params.then : []
+  const elseActions = Array.isArray(params.else) ? params.else : []
+  const probeTimeoutMs = params.probe_timeout_ms || 1000
+
+  const probeResult = await pseudoWaitFor({ until: params.condition, timeout_ms: probeTimeoutMs, poll_ms: 100, throw_on_timeout: false })
+  const taken = probeResult.ok ? 'then' : 'else'
+  const branchActions = probeResult.ok ? thenActions : elseActions
+
+  const steps = []
+  for (let i = 0; i < branchActions.length; i++) {
+    const a = branchActions[i]
+    if (!a || typeof a.tool !== 'string') {
+      steps.push({ i, ok: false, error: 'missing tool string' })
+      continue
+    }
+    const t0 = Date.now()
+    try {
+      const result = await runStep(a.tool, a.params || {})
+      steps.push({ i, tool: a.tool, ok: true, durationMs: Date.now() - t0, result: result })
+    } catch (err) {
+      steps.push({ i, tool: a.tool, ok: false, durationMs: Date.now() - t0, error: err.message })
+    }
+  }
+  return { ok: true, taken: taken, probe: probeResult, steps: steps }
+}
+
 // ----- semantic helpers (callable directly OR via gui.sequence) -----
 
 // Bring Chrome to foreground. Spawn it if not running. Idempotent + safe.
@@ -315,6 +460,8 @@ async function launchCdpChrome(params) {
 async function runStep(tool, params) {
   params = params || {}
   if (tool === 'wait') return pseudoWait(params)
+  if (tool === 'wait_for') return pseudoWaitFor(params)
+  if (tool === 'branch') return pseudoBranch(params)
   if (tool === 'screenshot' || tool === 'screenshot.screenshot') return screenshot.screenshot(params)
   if (tool.indexOf('input.') === 0) {
     const fn = input[tool.slice(6)]
