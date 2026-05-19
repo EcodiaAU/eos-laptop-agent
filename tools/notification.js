@@ -17,6 +17,7 @@ function runPs(script, timeoutMs) {
     encoding: 'utf8',
     timeout: timeoutMs,
     windowsHide: true,
+    creationFlags: 0x08000000,
   })
   return { exitCode: r.status, stdout: (r.stdout || ''), stderr: (r.stderr || '') }
 }

@@ -325,7 +325,7 @@ function macroExitMeaning(code) {
 
 function isEditorWindowUp(titleHint) {
   try {
-    const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', `Get-Process | Where-Object { $_.MainWindowTitle -like "*${titleHint.replace(/"/g, '`"')}*" } | Measure-Object | ForEach-Object { $_.Count }`], { encoding: 'utf8', timeout: 5000, windowsHide: true })
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', `Get-Process | Where-Object { $_.MainWindowTitle -like "*${titleHint.replace(/"/g, '`"')}*" } | Measure-Object | ForEach-Object { $_.Count }`], { encoding: 'utf8', timeout: 5000, windowsHide: true, creationFlags: 0x08000000 })
     const count = parseInt((result.stdout || '0').trim(), 10)
     return count > 0
   } catch {
@@ -766,4 +766,509 @@ async function fire_if_clear(params = {}) {
   return { ...fireResult, foreground_at_fire: fg }
 }
 
-module.exports = { fire, fire_if_clear, foreground_window, list_mouths, last_fires, append_to_master }
+// =========================================================================
+// one-conductor-many-channels primitives (2026-05-19)
+//
+// `append_to_conductor` lands an inbound message as the next turn in the
+// currently-active Claude Code conductor chat. It uses the cursor-preview
+// IDE bridge to focus the right tab without OS focus-stealing, then sends
+// one Ctrl+V + Enter keystroke targeted by hwnd/pid.
+//
+// `seed_conductor` cold-starts a fresh conductor chat when no active
+// conductor is registered. Picks the most-recently-started IDE that has a
+// workspace open (avoiding empty-workspace fallback instances).
+//
+// Both primitives ALWAYS queue the message to coord.send_message first
+// (chat.conductor.inbox) so the FIFO/safety-net story holds even if the
+// keystroke step fails. Doctrine:
+// backend/patterns/one-conductor-many-channels-2026-05-19.md
+// =========================================================================
+
+const _coord = require('./coord')
+const _ide = require('./ide')
+
+const CONDUCTOR_STALE_THRESHOLD_MS = 30 * 60 * 1000
+
+// AHK macro that targets a specific window handle (hwnd) instead of a fragile
+// title substring. Reads REFLEX_TARGET_HWND (decimal) + REFLEX_TARGET_PID
+// from env. Pastes clipboard (already set via IDE bridge) and submits. The
+// in-IDE bridge has already focused chat input via claude-vscode.focus, so
+// the keystrokes land in the chat webview input.
+const APPEND_BY_HWND_MACRO = `
+hwndStr := EnvGet("REFLEX_TARGET_HWND")
+pidStr := EnvGet("REFLEX_TARGET_PID")
+hwnd := hwndStr + 0
+pid := pidStr + 0
+
+activated := false
+if (hwnd > 0 && WinExist("ahk_id " hwnd)) {
+  WinActivate "ahk_id " hwnd
+  if WinWaitActive("ahk_id " hwnd, , 3) {
+    activated := true
+  }
+}
+if (!activated && pid > 0 && WinExist("ahk_pid " pid)) {
+  WinActivate "ahk_pid " pid
+  if WinWaitActive("ahk_pid " pid, , 3) {
+    activated := true
+  }
+}
+if (!activated) {
+  ExitApp(2)
+}
+
+Sleep 350
+Send "{Esc}"
+Sleep 150
+
+; clipboard was already set via the IDE bridge. paste + enter.
+Send "^v"
+Sleep 350
+Send "{Enter}"
+`
+
+// AHK macro for the SEED path. Opens a new Claude Code chat via command
+// palette in the target IDE window, then pastes. We send {F1} (= palette
+// shortcut, less prone to interception than Ctrl+Shift+P).
+const SEED_BY_HWND_MACRO = `
+hwndStr := EnvGet("REFLEX_TARGET_HWND")
+pidStr := EnvGet("REFLEX_TARGET_PID")
+hwnd := hwndStr + 0
+pid := pidStr + 0
+
+activated := false
+if (hwnd > 0 && WinExist("ahk_id " hwnd)) {
+  WinActivate "ahk_id " hwnd
+  if WinWaitActive("ahk_id " hwnd, , 3) {
+    activated := true
+  }
+}
+if (!activated && pid > 0 && WinExist("ahk_pid " pid)) {
+  WinActivate "ahk_pid " pid
+  if WinWaitActive("ahk_pid " pid, , 3) {
+    activated := true
+  }
+}
+if (!activated) {
+  ExitApp(2)
+}
+
+Sleep 400
+Send "{Esc}"
+Sleep 200
+
+; Open command palette + run "Claude Code: Open in New Tab".
+Send "{F1}"
+Sleep 700
+SendText "Claude Code: Open in New Tab"
+Sleep 400
+Send "{Enter}"
+Sleep 2800  ; webview mount
+
+; Clipboard already set via IDE bridge. Paste + submit.
+Send "^v"
+Sleep 400
+Send "{Enter}"
+`
+
+// Map conductor.exe -> tools/ide.js IDE filter.
+const EXE_TO_IDE_FILTER = {
+  'Code': 'stable',
+  'Code.exe': 'stable',
+  'Code - Insiders': 'insiders',
+  'Code - Insiders.exe': 'insiders',
+  'Cursor': 'cursor',
+  'Cursor.exe': 'cursor',
+}
+
+function _ideFilterForConductor(conductor) {
+  if (!conductor) return null
+  if (conductor.ide_bridge_port) return { port: conductor.ide_bridge_port }  // most precise
+  if (conductor.ide_pid) return { pid: conductor.ide_pid }
+  if (conductor.exe) return EXE_TO_IDE_FILTER[conductor.exe] ? { ide: EXE_TO_IDE_FILTER[conductor.exe] } : null
+  return null
+}
+
+function _stripPort(filter) {
+  // ide.js doesn't accept {port}; we need to translate by reading the registry
+  // ourselves and matching port.
+  if (!filter || !filter.port) return filter
+  const instances = _listInstancesAlive()
+  const match = instances.find(i => i.port === filter.port)
+  if (match) return { pid: match.pid }
+  return null
+}
+
+function _listInstancesAlive() {
+  try {
+    const path = require('path')
+    const fs = require('fs')
+    const os = require('os')
+    const REG = path.join(os.homedir(), '.ecodia-preview', 'instances.json')
+    const reg = JSON.parse(fs.readFileSync(REG, 'utf8')) || {}
+    return Object.entries(reg).map(([pid, info]) => ({
+      pid: Number(pid),
+      port: info.port,
+      ide: info.ide,
+      workspaceRoots: info.workspaceRoots || [],
+      startedAt: info.startedAt,
+    })).filter(i => {
+      try { process.kill(i.pid, 0); return true } catch { return false }
+    })
+  } catch {
+    return []
+  }
+}
+
+function _isConductorActive(conductor) {
+  if (!conductor) return false
+  const lastSeenIso = conductor.last_seen_at || conductor.registered_at
+  if (!lastSeenIso) return false
+  return (Date.now() - new Date(lastSeenIso).getTime()) <= CONDUCTOR_STALE_THRESHOLD_MS
+}
+
+async function _ideCommand(ideFilter, cmd, args) {
+  const filter = _stripPort(ideFilter) || ideFilter
+  return _ide.command({ ...filter, cmd, args, returnResult: false })
+}
+
+async function _ideSetClipboard(ideFilter, text) {
+  const filter = _stripPort(ideFilter) || ideFilter
+  return _ide.clipboard_write({ ...filter, text })
+}
+
+async function _ideHwndAndPid(ideFilter) {
+  // The IDE bridge's /ide/info returns pid + appName but not hwnd directly.
+  // We have pid from registry; combine with foreground/window probe by pid
+  // if needed. For the macro we pass both - the macro tries hwnd first then
+  // falls back to pid, so either alone is sufficient.
+  const filter = _stripPort(ideFilter) || ideFilter
+  const info = await _ide.info(filter).catch(() => null)
+  return {
+    pid: info?.pid || filter?.pid || null,
+    hwnd: null,  // not exposed via /ide/info; PID activation is sufficient
+  }
+}
+
+function _buildChannelHeader(envelope) {
+  const tz = (() => {
+    try {
+      return new Intl.DateTimeFormat('en-AU', {
+        timeZone: 'Australia/Brisbane', hour: '2-digit', minute: '2-digit', hour12: false,
+      }).format(new Date(envelope.received_at)) + ' AEST'
+    } catch {
+      return envelope.received_at
+    }
+  })()
+  const reply = envelope.channel === 'sms'
+    ? 'Reply via sms_tate MCP (<=160 GSM unless decision content needs more).'
+    : envelope.channel === 'telegram'
+    ? `Reply via Telegram bot API: POST https://api.telegram.org/bot<token>/sendMessage with {chat_id: ${envelope.thread_id}, text, parse_mode:"Markdown"}. Bot token at kv_store.creds.telegram_bot.bot_token.`
+    : 'Reply via the channel-appropriate MCP.'
+  const mediaBits = (envelope.media || []).map((m, i) => `  media[${i}]: ${m.content_type} ${m.bytes || '?'}B at ${m.url} (auth_hint=${m.auth_hint || 'none'})`).join('\n')
+  const mediaBlock = mediaBits ? `\nMedia attached (fetch via curl within this turn; URLs may expire):\n${mediaBits}\n` : ''
+  const replyToBlock = envelope.reply_to ? `\nIn reply to: ${String(envelope.reply_to.snippet || '').slice(0, 200)}\n` : ''
+  return `[inbound from ${envelope.sender_name} via ${envelope.channel} | ${envelope.thread_id} | ${tz} | idempotency_key=${envelope.idempotency_key}]
+${reply}${mediaBlock}${replyToBlock}`
+}
+
+function _buildAppendPrompt(envelope) {
+  const header = _buildChannelHeader(envelope)
+  const policy = envelope.from_kind === 'tate'
+    ? 'Tate-policy: this is a turn-level directive from the principal. Decide and act; do not request confirmation for routine business. Per sms-segment-economics for SMS replies; Telegram allows longer + markdown.'
+    : envelope.from_kind === 'client'
+    ? 'Client-policy: per no-client-contact-without-tate-goahead, DRAFT ONLY. Save to kv_store.cowork.inbound-' + envelope.channel + '-draft.' + envelope.idempotency_key + '. status_board.upsert a thread row with status="draft_pending_tate_relay", next_action_by="tate". If urgency=critical, ALSO sms.tate body="Inbound ' + envelope.channel + ' from ' + envelope.sender_name + ': <first 30 chars>. Draft at kv ' + envelope.idempotency_key + '."'
+    : 'Unknown-sender policy: do not reply. Log + surface to Tate.'
+  return `${header}
+
+${envelope.body || '(no text body; see media block above)'}
+
+---
+${policy}
+
+Per cron-fire-must-have-deliverable-not-just-narration: produce a substrate write before exit (reply OR draft kv_store OR status_board row OR Episode).`
+}
+
+function _buildSeedPrompt(envelope, threadMirror) {
+  const append = _buildAppendPrompt(envelope)
+  const priorBlock = (threadMirror && Array.isArray(threadMirror.exchanges) && threadMirror.exchanges.length > 0)
+    ? '\n[Prior thread (newest last):\n' + threadMirror.exchanges.map(e => `  ${e.from === 'tate' ? 'Tate' : 'You'}: ${String(e.body || '').slice(0, 240)}`).join('\n') + '\n]\n'
+    : '\n[Cold start - no prior thread.]\n'
+  return `[CONDUCTOR SEED 2026-05-19]
+You are the EcodiaOS conductor in this Claude Code chat tab. From now on, inbound SMS / Telegram / future channels arrive here as new turns. Your native chat history is your memory. Doctrine at backend/patterns/one-conductor-many-channels-2026-05-19.md.
+${priorBlock}
+${append}`
+}
+
+/**
+ * Append a new inbound message to the active conductor chat as the next turn.
+ *
+ * params:
+ *   envelope: canonical inbound envelope (see spec §A)
+ *   idempotency_key: string (24h dedupe window)
+ *   source: string (audit tag, e.g. 'sms-webhook')
+ *   force_paste: bool (skip in_turn check; default false)
+ *   dry_run: bool (return plan without firing)
+ *
+ * returns: { ok, fired, mode, reason?, conductor_tab_id?, ide_pid?, ide_bridge_port?, exit_code?, duration_ms? }
+ */
+async function append_to_conductor({ envelope, idempotency_key, source, force_paste, dry_run } = {}) {
+  if (!envelope || typeof envelope !== 'object') {
+    return { ok: false, fired: false, reason: 'envelope_required' }
+  }
+  if (!envelope.channel || !envelope.body && (!envelope.media || envelope.media.length === 0)) {
+    return { ok: false, fired: false, reason: 'envelope_missing_channel_or_body' }
+  }
+  const idemKey = idempotency_key || envelope.idempotency_key || null
+
+  // Step 1: ALWAYS queue to coord inbox first (FIFO + safety net).
+  try {
+    await _coord.send_message({
+      to: 'chat.conductor.inbox',
+      body: {
+        type: 'inbound_' + envelope.channel,
+        envelope,
+        idempotency_key: idemKey,
+        source: source || envelope.channel,
+        queued_at: new Date().toISOString(),
+      },
+    }, {})
+  } catch (err) {
+    // Inbox write failing is bad but not fatal; fall through to paste attempt.
+  }
+
+  // Step 2: probe conductor state.
+  const conductor = _coord._loadConductorRegistration ? _coord._loadConductorRegistration() : null
+  if (!_isConductorActive(conductor)) {
+    return {
+      ok: false, fired: false,
+      reason: conductor ? 'conductor_stale' : 'no_conductor',
+      queued: true,
+    }
+  }
+  if (conductor.in_turn && !force_paste) {
+    // Mid-turn: defer paste. Stop hook will drain on turn end.
+    return {
+      ok: true, fired: false, mode: 'queued_mid_turn',
+      reason: 'conductor_in_turn',
+      conductor_tab_id: conductor.tab_id || null,
+      queued: true,
+    }
+  }
+
+  if (dry_run) {
+    return {
+      ok: true, fired: false, dry_run: true,
+      mode: 'append',
+      conductor_tab_id: conductor.tab_id || null,
+      conductor_exe: conductor.exe || null,
+      conductor_hwnd: conductor.hwnd || null,
+      conductor_ide_pid: conductor.ide_pid || null,
+      conductor_ide_bridge_port: conductor.ide_bridge_port || null,
+    }
+  }
+
+  // Step 3: dedupe by idempotency_key.
+  const log = readLog()
+  if (isDuplicate(log, idemKey)) {
+    return { ok: true, fired: false, dedupe: 'duplicate', idempotency_key: idemKey, mode: 'append' }
+  }
+
+  // Step 4: figure out which IDE to drive.
+  const ideFilter = _ideFilterForConductor(conductor)
+  if (!ideFilter) {
+    return { ok: false, fired: false, reason: 'cannot_resolve_ide_for_conductor', conductor }
+  }
+
+  const prompt = _buildAppendPrompt(envelope)
+
+  // Step 5: set clipboard via IDE bridge (focusless).
+  let clipboardOk = false
+  try {
+    await _ideSetClipboard(ideFilter, prompt)
+    clipboardOk = true
+  } catch (err) {
+    // Fall through; AHK macro will use OS clipboard. Worst case we set it
+    // via spawnSync echo+clip, but the IDE bridge is the preferred path.
+  }
+
+  // Step 6: focus the chat input via IDE bridge.
+  let bridgeFocusOk = false
+  try {
+    // claude-vscode.editor.openLast brings up (or re-mounts) the last Claude
+    // Code chat in the current tab.
+    await _ideCommand(ideFilter, 'claude-vscode.editor.openLast').catch(() => {})
+    // claude-vscode.focus forces focus into chat input (one-way, no toggle).
+    await _ideCommand(ideFilter, 'claude-vscode.focus').catch(() => {})
+    // Raise the IDE's editor group so the chat tab is visible.
+    await _ideCommand(ideFilter, 'workbench.action.focusActiveEditorGroup').catch(() => {})
+    bridgeFocusOk = true
+  } catch (err) {
+    // Fall through; AHK still tries WinActivate by hwnd/pid.
+  }
+
+  // Step 7: resolve hwnd + pid for the AHK keystroke.
+  const { pid: idePid } = await _ideHwndAndPid(ideFilter).catch(() => ({ pid: null }))
+  const targetPid = idePid || conductor.ide_pid || null
+  const targetHwnd = conductor.hwnd || 0
+
+  if (!targetPid && !targetHwnd) {
+    return { ok: false, fired: false, reason: 'no_target_pid_or_hwnd', queued: true, clipboard_set: clipboardOk, bridge_focus_ok: bridgeFocusOk }
+  }
+
+  // Step 8: AHK keystroke - Ctrl+V + Enter.
+  const firedAt = new Date().toISOString()
+  const macroResult = runAhkMacro({
+    script: APPEND_BY_HWND_MACRO,
+    env: {
+      REFLEX_TARGET_HWND: String(targetHwnd || 0),
+      REFLEX_TARGET_PID: String(targetPid || 0),
+    },
+    timeout_ms: 15000,
+  })
+
+  appendFire(log, {
+    fired_at: firedAt,
+    editor: conductor.exe || 'unknown',
+    source: source || 'append_to_conductor',
+    idempotency_key: idemKey,
+    auto_submit: true,
+    prompt_preview: prompt.slice(0, 120),
+    prompt_chars: prompt.length,
+    exit_code: macroResult.exit_code,
+    duration_ms: macroResult.duration_ms,
+    mode: 'append_to_conductor',
+    channel: envelope.channel,
+    conductor_tab_id: conductor.tab_id || null,
+    conductor_ide_pid: targetPid,
+    conductor_hwnd: targetHwnd,
+  })
+
+  return {
+    ok: macroResult.exit_code === 0,
+    fired: true,
+    fired_at: firedAt,
+    mode: 'append',
+    conductor_tab_id: conductor.tab_id || null,
+    ide_pid: targetPid,
+    ide_bridge_port: conductor.ide_bridge_port || null,
+    clipboard_set: clipboardOk,
+    bridge_focus_ok: bridgeFocusOk,
+    exit_code: macroResult.exit_code,
+    duration_ms: macroResult.duration_ms,
+    error: macroResult.error,
+    macro_exit_meaning: macroExitMeaning(macroResult.exit_code),
+  }
+}
+
+/**
+ * Cold-start: open a fresh Claude Code chat in the most-recently-started
+ * IDE that has a workspace open, paste the seed prompt. The new chat's
+ * conductor_heartbeat.py hook will auto-register it as conductor on its
+ * first turn (no active conductor exists at the moment seed_conductor
+ * runs, so register_conductor succeeds without takeover).
+ */
+async function seed_conductor({ envelope, idempotency_key, source, thread_mirror, target_ide, dry_run } = {}) {
+  if (!envelope || typeof envelope !== 'object') {
+    return { ok: false, fired: false, reason: 'envelope_required' }
+  }
+  const idemKey = idempotency_key || envelope.idempotency_key || null
+
+  // Always queue to inbox first (the seeded chat's heartbeat hook will pick
+  // it up as a <inbound_messages_pending> prelude on first turn).
+  try {
+    await _coord.send_message({
+      to: 'chat.conductor.inbox',
+      body: {
+        type: 'inbound_' + envelope.channel,
+        envelope, idempotency_key: idemKey,
+        source: source || envelope.channel,
+        queued_at: new Date().toISOString(),
+        cold_seed: true,
+      },
+    }, {})
+  } catch {}
+
+  const instances = _listInstancesAlive()
+  if (instances.length === 0) {
+    return { ok: false, fired: false, reason: 'no_ide_instances_alive', queued: true }
+  }
+
+  // Prefer: explicit target_ide, then most-recently-started with non-empty
+  // workspaceRoots, then most-recently-started any.
+  const sorted = instances.slice().sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+  const withWorkspace = sorted.filter(i => (i.workspaceRoots || []).length > 0)
+  let target = null
+  if (target_ide) {
+    const re = target_ide.toLowerCase()
+    target = sorted.find(i => (i.ide || '').toLowerCase().includes(re)) || null
+  }
+  if (!target) target = withWorkspace[0] || sorted[0]
+  if (!target) {
+    return { ok: false, fired: false, reason: 'no_ide_picked', queued: true }
+  }
+
+  if (dry_run) {
+    return {
+      ok: true, fired: false, dry_run: true, mode: 'seed',
+      target_ide: target.ide, target_pid: target.pid, target_port: target.port,
+    }
+  }
+
+  const log = readLog()
+  if (isDuplicate(log, idemKey)) {
+    return { ok: true, fired: false, dedupe: 'duplicate', idempotency_key: idemKey, mode: 'seed' }
+  }
+
+  const prompt = _buildSeedPrompt(envelope, thread_mirror)
+
+  // Set clipboard via the target IDE's bridge.
+  let clipboardOk = false
+  try {
+    await _ide.clipboard_write({ pid: target.pid, text: prompt })
+    clipboardOk = true
+  } catch {}
+
+  const firedAt = new Date().toISOString()
+  const macroResult = runAhkMacro({
+    script: SEED_BY_HWND_MACRO,
+    env: {
+      REFLEX_TARGET_HWND: '0',
+      REFLEX_TARGET_PID: String(target.pid),
+    },
+    timeout_ms: 25000,
+  })
+
+  appendFire(log, {
+    fired_at: firedAt,
+    editor: target.ide || 'unknown',
+    source: source || 'seed_conductor',
+    idempotency_key: idemKey,
+    auto_submit: true,
+    prompt_preview: prompt.slice(0, 120),
+    prompt_chars: prompt.length,
+    exit_code: macroResult.exit_code,
+    duration_ms: macroResult.duration_ms,
+    mode: 'seed_conductor',
+    channel: envelope.channel,
+    target_pid: target.pid,
+    target_port: target.port,
+  })
+
+  return {
+    ok: macroResult.exit_code === 0,
+    fired: true,
+    fired_at: firedAt,
+    mode: 'seed',
+    target_ide: target.ide,
+    target_pid: target.pid,
+    target_port: target.port,
+    clipboard_set: clipboardOk,
+    exit_code: macroResult.exit_code,
+    duration_ms: macroResult.duration_ms,
+    error: macroResult.error,
+    macro_exit_meaning: macroExitMeaning(macroResult.exit_code),
+  }
+}
+
+module.exports = { fire, fire_if_clear, foreground_window, list_mouths, last_fires, append_to_master, append_to_conductor, seed_conductor }

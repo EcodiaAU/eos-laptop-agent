@@ -37,10 +37,18 @@ const win = require('./window')
 const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
 const STATE_DIR = path.join(COORD_ROOT, 'state')
+const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
+const MESSAGES_DIR = path.join(COORD_ROOT, 'messages')
 const BRIEF_INLINE_CAP_BYTES = 100 * 1024  // 100KB - over this, paste pointer instead
 const SPAWNED_AT_TIMEOUT_MS = 60000
 const SPAWNED_AT_POLL_INTERVAL_MS = 750
 const MAX_RECOVERY_ATTEMPTS = 3
+// 2026-05-18 drift-audit hardening: workers that never call any coord.* primitive
+// after dispatch are orphans (model never started, clipboard race under memory
+// pressure, OOM, or stuck on auth gate). Default-on detection at 90s; callers
+// can opt out via worker_acknowledgment_timeout_ms=0 for fire-and-forget.
+const DEFAULT_WORKER_ACK_TIMEOUT_MS = 90000
+const WORKER_ACK_POLL_INTERVAL_MS = 2000
 
 // HTTP helper for synchronous worker registration (no external deps; use node's http module)
 function postJson(urlStr, body, bearerToken) {
@@ -143,7 +151,28 @@ function composeBrief(opts) {
     '  task_id: ' + task_id + '\n' +
     '  tab_credential: ' + tab_credential + '\n' +
     'Registration has already happened on your behalf. Do NOT run any curl bootstrap.\n' +
-    'When calling coord.* tools, include tab_id="' + tab_id + '" and tab_credential="' + tab_credential + '" in params.\n'
+    '\n' +
+    'CRITICAL - MCP coord tool calling convention:\n' +
+    'The MCP coord connector is workspace-wide (shared by ALL tabs), so it CANNOT auto-detect\n' +
+    'which tab is calling. You MUST include your tab_id + tab_credential as ARGUMENTS in EVERY\n' +
+    'coord.* call. Example:\n' +
+    '  mcp__coord__coord_heartbeat({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", status:"alive"})\n' +
+    '  mcp__coord__coord_signal_done({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", task_id:"' + task_id + '", result_summary:"...", terminate:true})\n' +
+    'If you omit tab_id/tab_credential the call will return {ok:false, error:"tab_id required"}.\n' +
+    'Do NOT try direct HTTP to localhost:7456 - that requires the AGENT_TOKEN bearer which workers\n' +
+    'do not have. Always use the MCP coord connector with identity-in-args.\n'
+
+  const verifyFirst =
+    'FIRST ACTION (mandatory, before any task work):\n' +
+    '  mcp__coord__coord_verify_paste({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", task_id:"' + task_id + '"})\n' +
+    'This returns {ok, brief_body, brief_sha256, brief_size_bytes, ...} from the dispatcher audit\n' +
+    'file on disk. The text below YOUR TASK in this chat is the brief AT-PASTE-TIME and may have\n' +
+    'been truncated by a clipboard race under memory pressure (it is the known load-bearing\n' +
+    'failure mode). The audit file is written BEFORE the paste and cannot be corrupted by paste\n' +
+    'issues, so it is the canonical source of truth.\n' +
+    'Discipline: use verify_paste result brief_body as your authoritative task spec. If the\n' +
+    'pasted task below disagrees with verify_paste.brief_body, trust verify_paste. If\n' +
+    'verify_paste returns ok:false, send a coord.send_message error and terminate.\n'
 
   const taskBlock = brief_storage === 'file'
     ? 'YOUR TASK:\nThe full task brief is at:\n  ' + brief_file_path + '\nRead that file in full, then execute.\n'
@@ -157,7 +186,7 @@ function composeBrief(opts) {
     '- You can only emit messages TO chat.conductor.inbox or chat.' + tab_id + '.scratch.\n' +
     '- Heartbeat via coord.heartbeat() at start + end of every turn.\n'
 
-  return [header, '', identity, '', taskBlock, '', constraints].join('\n')
+  return [header, '', identity, '', verifyFirst, '', taskBlock, '', constraints].join('\n')
 }
 
 // Poll for the spawned_at confirmation file written by the coord MCP server
@@ -205,7 +234,17 @@ async function dispatch_worker(params) {
   const account = params.account || 'current'
   const brief_body = params.brief || ''
   const task_id = params.task_id || uuid()
-  const parent_conductor_tab_id = params.parent_conductor_tab_id || null
+  // Auto-stamp parent_conductor_tab_id from the registered conductor so the
+  // worker row records WHO dispatched it. Enables future multi-conductor wake
+  // routing. Falls through to null if no conductor registered (matches v1).
+  let parent_conductor_tab_id = params.parent_conductor_tab_id || null
+  if (!parent_conductor_tab_id) {
+    try {
+      const coord = require('./coord')
+      const reg = coord._loadConductorRegistration && coord._loadConductorRegistration()
+      if (reg && reg.tab_id) parent_conductor_tab_id = reg.tab_id
+    } catch (e) {}
+  }
   // coord_url default points at the laptop-agent's own coord substrate (port 7456).
   // Earlier prototype used a separate stub on 7457; that path is deprecated.
   const coord_url = params.coord_url || 'http://localhost:7456'
@@ -371,10 +410,106 @@ async function dispatch_worker(params) {
     }
   }
 
-  // Registration already succeeded synchronously above; we do NOT poll for a
-  // worker-side bootstrap because that path was found unreliable (workers don't
-  // always run the bootstrap curl on first turn). The brief got pasted; whether
-  // the worker model executes the task is its problem from here.
+  // PASTE-VERIFY flag: workers can read this to confirm clipboard didn't truncate
+  // or corrupt their brief. Contains task_id + checksum of brief_body the worker
+  // expects to have received.
+  try {
+    const verifyFlag = {
+      task_id: task_id,
+      tab_id: tab_id,
+      brief_size_bytes: brief_size_bytes,
+      brief_sha256: crypto.createHash('sha256').update(brief_body).digest('hex'),
+      pasted_at: new Date().toISOString(),
+    }
+    fs.writeFileSync(path.join(BRIEFS_DIR, task_id + '-PASTE-VERIFY.flag'), JSON.stringify(verifyFlag, null, 2), 'utf8')
+  } catch (e) {}
+
+  // Orphan-tab detection (2026-05-18 hardening). Wait up to N ms for any sign
+  // of life from the spawned worker:
+  //   (a) workers/<tab_id>.json.last_heartbeat_at advances past registered_at
+  //       (worker called coord.heartbeat)
+  //   (b) any message in messages/ has body.from === tab_id (worker called
+  //       coord.send_message / report_progress / signal_done)
+  // If timeout fires with no signal, the worker is classified as orphan_tab.
+  // Optional redispatch_on_orphan=true triggers a single auto-retry.
+  const ackTimeoutMs = (typeof params.worker_acknowledgment_timeout_ms === 'number')
+    ? Math.max(0, Math.min(600000, params.worker_acknowledgment_timeout_ms))
+    : DEFAULT_WORKER_ACK_TIMEOUT_MS
+  let acknowledged = false
+  let ack_via = null
+  let ack_elapsed_ms = 0
+  if (ackTimeoutMs > 0) {
+    const workerFile = path.join(WORKERS_DIR, tab_id + '.json')
+    const start = Date.now()
+    let baseline_heartbeat = null
+    try {
+      const data = JSON.parse(fs.readFileSync(workerFile, 'utf8'))
+      baseline_heartbeat = data.last_heartbeat_at
+    } catch (e) {}
+    while (Date.now() - start < ackTimeoutMs) {
+      // Check 1: heartbeat advanced past baseline
+      try {
+        const data = JSON.parse(fs.readFileSync(workerFile, 'utf8'))
+        if (data.last_heartbeat_at && data.last_heartbeat_at > baseline_heartbeat) {
+          acknowledged = true
+          ack_via = 'heartbeat'
+          break
+        }
+      } catch (e) {}
+      // Check 2: any message from this tab_id in messages/
+      try {
+        const files = fs.readdirSync(MESSAGES_DIR).filter(f => f.endsWith('.json'))
+        // Newest-first scan up to last 60 files
+        files.sort((a, b) => b.localeCompare(a))
+        for (const mf of files.slice(0, 60)) {
+          try {
+            const m = JSON.parse(fs.readFileSync(path.join(MESSAGES_DIR, mf), 'utf8'))
+            // body.from is the convention this codebase uses (outer from
+            // defaults to 'conductor' for chat.conductor.inbox writes)
+            const fromTab = (m && m.body && m.body.from) || (m && m.from)
+            if (fromTab === tab_id) {
+              acknowledged = true
+              ack_via = 'message:' + ((m && m.body && m.body.type) || 'unknown')
+              break
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      if (acknowledged) break
+      await sleep(WORKER_ACK_POLL_INTERVAL_MS)
+    }
+    ack_elapsed_ms = Date.now() - start
+  }
+
+  // Orphan case: timeout fired with no acknowledgment.
+  if (ackTimeoutMs > 0 && !acknowledged) {
+    const redispatch_on_orphan = params.redispatch_on_orphan === true
+    let redispatched = null
+    if (redispatch_on_orphan && !params._is_redispatch) {
+      // Single redispatch with the same brief; recurse-once via _is_redispatch sentinel.
+      try {
+        const retryParams = Object.assign({}, params, { _is_redispatch: true, redispatch_on_orphan: false })
+        redispatched = await dispatch_worker(retryParams)
+      } catch (e) {
+        redispatched = { ok: false, error: 'redispatch threw: ' + e.message }
+      }
+    }
+    return {
+      ok: false,
+      tab_id: tab_id,
+      tab_credential: tab_credential,
+      account_active_when_spawned: account_active_when_spawned,
+      registered_at: register_result.body.registered_at,
+      task_id: task_id,
+      tab_handle: tab_handle,
+      orphan: true,
+      orphan_reason: 'no coord.* call from spawned worker within ' + ackTimeoutMs + 'ms',
+      ack_elapsed_ms: ack_elapsed_ms,
+      brief_file_audit: auditFilePath.replace(/\\/g, '/'),
+      redispatched: redispatched,
+      note: 'Worker tab spawned + brief pasted but model never sent a coord.* call (heartbeat/progress/done). Causes: model never started, clipboard race under memory pressure, OOM, or auth gate. Call cowork.kill_worker({tab_id}) and retry, or pass redispatch_on_orphan=true to auto-retry once.',
+    }
+  }
 
   return {
     ok: true,
@@ -390,7 +525,12 @@ async function dispatch_worker(params) {
     tab_handle: tab_handle,
     coord_url: coord_url,
     task_id: task_id,
-    note: 'Worker registered synchronously by dispatcher. Brief pasted into spawned tab. Task execution is the worker model\'s responsibility from this point.',
+    acknowledged: acknowledged,
+    ack_via: ack_via,
+    ack_elapsed_ms: ack_elapsed_ms,
+    note: ackTimeoutMs > 0
+      ? ('Worker acknowledged in ' + ack_elapsed_ms + 'ms via ' + ack_via + '. Task execution from here is the worker model\'s responsibility.')
+      : 'Fire-and-forget mode (ack timeout=0). Worker registered + brief pasted; no acknowledgment wait performed.',
   }
 }
 
@@ -555,30 +695,78 @@ function inFlightCriticalCount() {
 
 async function swap_creds(params, ctx) {
   params = params || {}
-  const targetAccount = params.account
   const force = !!params.force  // ignore in_critical_section (use with care)
-  if (!targetAccount) throw new Error('account required')
+  if (!params.account) throw new Error('account required')
+
+  // Normalize account input. Accepts short ("tate") OR full ("tate@ecodia.au");
+  // returns canonical full form. Backups on disk use short form (tate.json) by
+  // convention; we look up that path via shortForm(canonical).
+  const usage = require('./usage')
+  const canonical = usage._normalizeAccount(params.account)
+  if (!canonical) {
+    throw new Error('unknown account: ' + params.account + ' (accepts short "tate"/"code"/"money" or full "tate@ecodia.au"; known: ' + usage._KNOWN_ACCOUNTS.join(',') + ')')
+  }
+  const targetShort = usage._shortForm(canonical)
 
   ensureDirs()
   const t0 = Date.now()
   const holder = (ctx && ctx.tab_id) || 'conductor'
 
-  // Try to read current active account label
-  let from_account = 'unknown'
+  // Locate backup file. Try short ("tate.json") first per current convention,
+  // fall back to full ("tate@ecodia.au.json") if some operator named it that way.
+  let backupPath = path.join(CREDS_BACKUP_DIR, targetShort + '.json')
+  if (!fs.existsSync(backupPath)) {
+    const altBackup = path.join(CREDS_BACKUP_DIR, canonical + '.json')
+    if (fs.existsSync(altBackup)) {
+      backupPath = altBackup
+    } else {
+      return {
+        ok: false,
+        error: 'creds_backup_missing',
+        detail: 'no backup at ' + backupPath + ' or ' + altBackup,
+        hint: 'capture via: cp ~/.claude/.credentials.json ~/.ecodia-creds/' + targetShort + '.json after manually logging into ' + canonical,
+      }
+    }
+  }
+
+  // Pre-compute SHAs so the noop check is file-content-based, not label-based.
+  // Label-based noop was the load-bearing bug: after a prior swap where the
+  // label-update silently failed, the label would lie and we'd noop a swap that
+  // SHOULD have actually moved the file.
+  const backupBuf = fs.readFileSync(backupPath)
+  const backup_sha = sha256Hex(backupBuf)
+
+  let current_sha = null
+  let current_mtime = null
   try {
-    const usage = require('./usage')
-    from_account = usage._getActiveAccount()
+    const buf = fs.readFileSync(CREDENTIALS_FILE)
+    current_sha = sha256Hex(buf)
+    current_mtime = fs.statSync(CREDENTIALS_FILE).mtimeMs
   } catch (e) {}
 
-  if (from_account === targetAccount) {
-    return { ok: true, noop: true, from_account: from_account, to_account: targetAccount, swap_ms: 0, in_flight_count_at_swap: 0, reason: 'already-active' }
+  // SHA-based noop: the file is ALREADY what we'd write. Still resync the label
+  // in case it drifted from a prior failed swap.
+  if (current_sha && current_sha === backup_sha) {
+    let label_synced = false
+    try {
+      usage._setActiveAccount(canonical, 'swap_creds:noop-label-sync:' + holder)
+      label_synced = true
+    } catch (e) {}
+    return {
+      ok: true,
+      noop: true,
+      to_account: canonical,
+      reason: 'creds_file_already_matches_target',
+      current_sha256: current_sha,
+      label_synced: label_synced,
+      swap_ms: Date.now() - t0,
+    }
   }
 
-  // Verify backup exists BEFORE acquiring lock
-  const backupPath = path.join(CREDS_BACKUP_DIR, targetAccount + '.json')
-  if (!fs.existsSync(backupPath)) {
-    return { ok: false, error: 'creds_backup_missing', detail: 'no backup at ' + backupPath, hint: 'capture via: cp ~/.claude/.credentials.json ~/.ecodia-creds/' + targetAccount + '.json after manually logging into that account' }
-  }
+  // Best-effort read of the prior label for audit (may be stale; we no longer
+  // gate on it).
+  let from_account_label = 'unknown'
+  try { from_account_label = usage._getActiveAccount() } catch (e) {}
 
   // Acquire lock
   const lock = await acquireSwapLock(holder)
@@ -591,57 +779,79 @@ async function swap_creds(params, ctx) {
       return { ok: false, error: 'critical_section_active', in_flight_count_at_swap: critCount, hint: 'pass force=true to override (worker may corrupt mid-write)' }
     }
 
-    // Snapshot current creds
-    let prior_sha = null
-    let prior_mtime = null
-    try {
-      const buf = fs.readFileSync(CREDENTIALS_FILE)
-      prior_sha = sha256Hex(buf)
-      prior_mtime = fs.statSync(CREDENTIALS_FILE).mtimeMs
-    } catch (e) {}
-
-    // Read new creds
-    const newBuf = fs.readFileSync(backupPath)
-    const new_sha = sha256Hex(newBuf)
-
     // Atomic swap: write to tmp in same dir, rename over .credentials.json
     const credsDir = path.dirname(CREDENTIALS_FILE)
     const tmpPath = path.join(credsDir, '.credentials.json.swap-' + process.pid + '-' + Date.now())
-    fs.writeFileSync(tmpPath, newBuf)
+    fs.writeFileSync(tmpPath, backupBuf)
     fs.renameSync(tmpPath, CREDENTIALS_FILE)
 
-    // Update active_account
+    // Update active_account label. Pass canonical FULL form (e.g. "tate@ecodia.au")
+    // so usage._setActiveAccount's KNOWN_ACCOUNTS validation passes. This was
+    // bug #1: cowork was passing the same input the user provided (often short
+    // "tate") and the validation silently rejected, leaving the label stuck on
+    // whatever it was before.
+    let label_updated = false
+    let label_error = null
     try {
-      const usage = require('./usage')
-      usage._setActiveAccount(targetAccount, 'swap_creds:' + holder)
+      usage._setActiveAccount(canonical, 'swap_creds:' + holder)
+      label_updated = true
     } catch (e) {
-      // Non-fatal: file is swapped, active_account label is just metadata
+      label_error = e.message
+    }
+
+    // Clobber detection. The parent CC session writes its in-memory OAuth bearer
+    // back to .credentials.json on refresh, silently reverting in-session swaps.
+    // We sleep briefly, re-read SHA, and surface a warning if the post-swap
+    // content has drifted. Default 1500ms; opt out with clobber_detection_ms=0.
+    let clobbered_by_parent = false
+    let post_sha = null
+    const clobberWindow = (typeof params.clobber_detection_ms === 'number')
+      ? Math.max(0, Math.min(10000, params.clobber_detection_ms))
+      : 1500
+    if (clobberWindow > 0) {
+      await sleep(clobberWindow)
+      try {
+        post_sha = sha256Hex(fs.readFileSync(CREDENTIALS_FILE))
+        if (post_sha !== backup_sha) clobbered_by_parent = true
+      } catch (e) {}
     }
 
     const swap_ms = Date.now() - t0
     const histEntry = {
       ts: new Date().toISOString(),
-      from_account: from_account,
-      to_account: targetAccount,
+      from_account: from_account_label,
+      to_account: canonical,
       swap_ms: swap_ms,
       in_flight_count_at_swap: critCount,
-      prior_sha256: prior_sha,
-      new_sha256: new_sha,
-      prior_mtime_ms: prior_mtime,
+      prior_sha256: current_sha,
+      new_sha256: backup_sha,
+      post_sha256: post_sha,
+      prior_mtime_ms: current_mtime,
+      label_updated: label_updated,
+      label_error: label_error,
+      clobbered_by_parent: clobbered_by_parent,
+      clobber_detection_ms: clobberWindow,
       holder: holder,
       forced: force,
     }
     const histPos = appendSwapHistory(histEntry)
 
     return {
-      ok: true,
-      from_account: from_account,
-      to_account: targetAccount,
+      ok: !clobbered_by_parent && label_updated,
+      from_account: from_account_label,
+      to_account: canonical,
       swap_ms: swap_ms,
       in_flight_count_at_swap: critCount,
-      prior_sha256: prior_sha,
-      new_sha256: new_sha,
+      prior_sha256: current_sha,
+      new_sha256: backup_sha,
+      post_sha256: post_sha,
+      label_updated: label_updated,
+      label_error: label_error,
+      clobbered_by_parent: clobbered_by_parent,
       swap_history_position: histPos,
+      hint: clobbered_by_parent
+        ? 'parent_session_oauth_refresh_reverted_swap: the file was rewritten back within ' + clobberWindow + 'ms by the parent Claude Code session\'s OAuth refresh. swap_creds is reliable for FRESH worker dispatch (worker reads creds at spawn before parent overwrites). For in-session swap of the current process, swap survival is not guaranteed.'
+        : undefined,
     }
   } finally {
     releaseSwapLock()

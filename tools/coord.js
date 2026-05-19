@@ -61,8 +61,10 @@ const CONDUCTOR_STALE_THRESHOLD_MS = 30 * 60 * 1000  // 30 min
 
 // ── filesystem helpers ───────────────────────────────────────────────────
 
+const CONDUCTORS_HISTORY_DIR = path.join(CONDUCTORS_DIR, 'history')
+
 function ensureDirs() {
-  for (const d of [COORD_ROOT, WORKERS_DIR, MESSAGES_DIR, INBOX_DIR, STATE_DIR, CONDUCTORS_DIR]) {
+  for (const d of [COORD_ROOT, WORKERS_DIR, MESSAGES_DIR, INBOX_DIR, STATE_DIR, CONDUCTORS_DIR, CONDUCTORS_HISTORY_DIR]) {
     try { fs.mkdirSync(d, { recursive: true }) } catch (e) {}
   }
 }
@@ -154,16 +156,33 @@ loadFromDisk()
 
 let _lastWakeAt = 0  // in-memory rate-limit (across requests this process serves)
 
+const IN_TURN_TTL_MS = 10 * 60 * 1000  // 10min: auto-clear in_turn if Stop hook never fired
+
 function loadConductorRegistration() {
   try {
-    const files = fs.readdirSync(CONDUCTORS_DIR).filter(f => f.endsWith('.json'))
-    if (files.length === 0) return null
-    // v1: single global conductor at conductors/default.json.
-    // v2 keys by parent_conductor_tab_id; loadConductorByTabId() would dispatch.
-    const def = readJsonSafe(path.join(CONDUCTORS_DIR, 'default.json'))
-    if (def) return def
-    // Fallback: first registration on disk
-    return readJsonSafe(path.join(CONDUCTORS_DIR, files[0]))
+    // Prefer current.json (the 2026-05-19 canonical name); fall back to
+    // default.json for backward compat.
+    let row = readJsonSafe(path.join(CONDUCTORS_DIR, 'current.json'))
+    if (!row) row = readJsonSafe(path.join(CONDUCTORS_DIR, 'default.json'))
+    if (!row) {
+      const files = (() => { try { return fs.readdirSync(CONDUCTORS_DIR).filter(f => f.endsWith('.json')) } catch { return [] } })()
+      if (files.length === 0) return null
+      row = readJsonSafe(path.join(CONDUCTORS_DIR, files[0]))
+      if (!row) return null
+    }
+    // TTL escape on stuck in_turn (crashed turn, Stop hook never fired).
+    if (row.in_turn && row.in_turn_set_at) {
+      const ageMs = Date.now() - new Date(row.in_turn_set_at).getTime()
+      if (ageMs > IN_TURN_TTL_MS) {
+        row.in_turn = false
+        row.in_turn_set_at = null
+        try {
+          atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), row)
+          atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), row)
+        } catch (e) {}
+      }
+    }
+    return row
   } catch (e) { return null }
 }
 
@@ -662,6 +681,32 @@ async function register_conductor(params, ctx) {
     } catch (e) {}
   }
 
+  // 2026-05-19 one-conductor-many-channels: richer fields for IDE-bridge
+  // targeting. Caller (conductor_heartbeat.py) passes claude_port, ide_pid,
+  // ide_bridge_port, workspace_root. We also detect takeover: if an existing
+  // conductor record has a DIFFERENT claude_port, archive it to history
+  // and the new claim wins. Same claude_port = same chat, just refresh.
+  const claude_port = params.claude_port || null
+  const ide_pid = params.ide_pid || null
+  const ide_bridge_port = params.ide_bridge_port || null
+  const workspace_root = params.workspace_root || null
+
+  const existing = loadConductorRegistration()
+  let prior_conductor_tab_id = null
+  let took_over = false
+  if (existing && claude_port && existing.claude_port && existing.claude_port !== claude_port) {
+    // Different Claude Code chat = takeover. Archive old.
+    prior_conductor_tab_id = existing.tab_id || existing.claude_port
+    try {
+      const archiveName = (existing.tab_id || 'conductor') + '-' + (existing.registered_at || Date.now()).replace(/[:.]/g, '-') + '.json'
+      atomicWriteJson(path.join(CONDUCTORS_HISTORY_DIR, archiveName), existing)
+    } catch (e) {}
+    took_over = true
+  } else if (existing && (!existing.claude_port || !claude_port)) {
+    // Backward-compat: existing record lacks claude_port. Treat as same conductor.
+    prior_conductor_tab_id = existing.tab_id || null
+  }
+
   const now = new Date().toISOString()
   const row = {
     tab_id: tab_id,
@@ -669,15 +714,52 @@ async function register_conductor(params, ctx) {
     title_match: title_match || '',
     hwnd: hwnd || null,
     exe: exe || null,
+    // 2026-05-19 extensions:
+    claude_port: claude_port,
+    ide_pid: ide_pid,
+    ide_bridge_port: ide_bridge_port,
+    workspace_root: workspace_root,
+    prior_conductor_tab_id: prior_conductor_tab_id,
+    in_turn: false,
+    in_turn_set_at: null,
     registered_at: now,
-    last_seen_at: now,  // 2026-05-18: heartbeat field for stale-detection.
+    last_seen_at: now,
   }
   // v1: persist as default conductor. v2: keyed by tab_id when multi-conductor lands.
   atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), row)
+  // Also write to current.json (the new canonical name per spec).
+  atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), row)
   if (tab_id !== 'conductor') {
     atomicWriteJson(path.join(CONDUCTORS_DIR, tab_id + '.json'), row)
   }
-  return { ok: true, conductor: row }
+  return { ok: true, conductor: row, took_over: took_over, prior_conductor_tab_id: prior_conductor_tab_id }
+}
+
+/**
+ * Set / clear the in_turn mutex on the active conductor record. The
+ * UserPromptSubmit hook sets in_turn=true at turn-start; the Stop hook clears
+ * it at turn-end. While true, reflex.append_to_conductor defers paste and
+ * leaves messages in coord inbox.
+ *
+ * Includes a 10-min TTL escape: if in_turn_set_at is older than that, the
+ * mutex auto-clears on read (handles crashed turns where Stop hook didn't fire).
+ */
+async function set_conductor_in_turn(params, _ctx) {
+  params = params || {}
+  ensureDirs()
+  const conductor = loadConductorRegistration()
+  if (!conductor) return { ok: false, error: 'no_conductor_registered' }
+  const desired = !!params.in_turn
+  conductor.in_turn = desired
+  conductor.in_turn_set_at = desired ? new Date().toISOString() : null
+  try {
+    atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), conductor)
+    atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), conductor)
+    if (conductor.tab_id && conductor.tab_id !== 'conductor') {
+      atomicWriteJson(path.join(CONDUCTORS_DIR, conductor.tab_id + '.json'), conductor)
+    }
+  } catch (e) {}
+  return { ok: true, in_turn: conductor.in_turn, in_turn_set_at: conductor.in_turn_set_at }
 }
 
 async function unregister_conductor(params, ctx) {
@@ -725,13 +807,24 @@ async function conductor_heartbeat(params, _ctx) {
   const conductor = loadConductorRegistration()
   if (!conductor) return { ok: false, error: 'no_conductor_registered' }
   conductor.last_seen_at = new Date().toISOString()
+  // 2026-05-19: heartbeat may refresh moving fields. Title/hwnd can shift when
+  // Tate resizes; ide_pid stable but workspace_root may change if he re-opens
+  // a different folder. Accept refresh of any of these.
+  if (params.title_match) conductor.title_match = String(params.title_match)
+  if (params.hwnd) conductor.hwnd = Number(params.hwnd)
+  if (params.exe) conductor.exe = String(params.exe)
+  if (params.claude_port) conductor.claude_port = Number(params.claude_port)
+  if (params.ide_pid) conductor.ide_pid = Number(params.ide_pid)
+  if (params.ide_bridge_port) conductor.ide_bridge_port = Number(params.ide_bridge_port)
+  if (params.workspace_root) conductor.workspace_root = String(params.workspace_root)
   try {
+    atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), conductor)
     atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), conductor)
     if (conductor.tab_id && conductor.tab_id !== 'conductor') {
       atomicWriteJson(path.join(CONDUCTORS_DIR, conductor.tab_id + '.json'), conductor)
     }
   } catch (e) {}
-  return { ok: true, last_seen_at: conductor.last_seen_at }
+  return { ok: true, last_seen_at: conductor.last_seen_at, in_turn: !!conductor.in_turn }
 }
 
 async function set_wake_policy(params, _ctx) {
@@ -768,6 +861,7 @@ module.exports = {
   unregister_conductor: unregister_conductor,
   get_conductor_state: get_conductor_state,
   conductor_heartbeat: conductor_heartbeat,
+  set_conductor_in_turn: set_conductor_in_turn,
   set_wake_policy: set_wake_policy,
   // Internal API for the /api/comms/register-worker route - NOT exposed as a tool.
   _registerWorkerInternal: registerWorkerInternal,

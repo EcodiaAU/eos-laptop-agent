@@ -661,6 +661,19 @@ async function nativeFill(opts) {
           const sr = root.querySelectorAll ? root.querySelectorAll('*') : []
           for (const el of sr) if (el.shadowRoot) walk(el.shadowRoot)
         } catch (e) {}
+        // Descend into same-origin iframes (cross-origin throws; swallowed).
+        // Origin: 2026-05-19 CarPlay-entitlement flow on idmsa.apple.com
+        // signin widget, which serves the email/password fields inside an
+        // iframe; flat nativeFill scope missed them. Recursive-improvement
+        // doctrine: extend the helper SAME-TURN.
+        try {
+          const ifs = root.querySelectorAll ? root.querySelectorAll('iframe') : []
+          for (const ifr of ifs) {
+            try {
+              if (ifr.contentDocument) walk(ifr.contentDocument)
+            } catch (e) { /* cross-origin */ }
+          }
+        } catch (e) {}
       }
       walk(document)
       return out

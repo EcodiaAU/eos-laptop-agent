@@ -39,6 +39,21 @@ const path = require('path')
 const os = require('os')
 const { spawnSync } = require('child_process')
 
+// CREATE_NO_WINDOW — required alongside windowsHide under PM2-parented agents
+// to fully suppress the Windows console flash. Per
+// ~/ecodiaos/patterns/windows-spawn-must-use-spawnSync-with-create-no-window-not-execSync-with-windowsHide.md
+const CREATE_NO_WINDOW = 0x08000000
+
+// ccusage CLI direct entry. Invoking node.exe + cli.js avoids the cmd.exe
+// /d /s /c shell wrapper and the npx-CLI re-exec — both of those layers were
+// empirically still flashing a console under PM2 even with CREATE_NO_WINDOW
+// (libuv seems to re-allocate a console for the npm-wrapper child). Falling
+// back to bare-node invocation eliminates the wrappers entirely.
+// Override via CCUSAGE_CLI_JS env if the global install lives elsewhere.
+const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS
+  || 'D:\\SSD_Turbo\\node-global\\node_modules\\ccusage\\dist\\cli.js'
+const NODE_EXE = process.execPath  // current node binary, always valid
+
 const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
 const USAGE_DIR = path.join(COORD_ROOT, 'usage')
 const AUDIT_DIR = path.join(USAGE_DIR, 'audit')
@@ -57,6 +72,29 @@ const FLAKY_TTL_MS = 10 * 60 * 1000  // 10min cooldown after a dispatch failure
 
 const KNOWN_ACCOUNTS = ['tate@ecodia.au', 'code@ecodia.au', 'money@ecodia.au']
 const DEFAULT_ACTIVE = 'money@ecodia.au'  // conductor pins here per spec
+
+// Accept short ("tate") or full ("tate@ecodia.au"), return canonical full form.
+// Returns null if input does not match any known account.
+// Authoritative entry point for any "is this a valid account?" check across
+// usage.js and cowork.js. Added 2026-05-18 to fix swap_creds short/full mismatch.
+function normalizeAccount(input) {
+  if (!input) return null
+  const s = String(input).trim().toLowerCase()
+  if (KNOWN_ACCOUNTS.includes(s)) return s
+  // Short form path: append the ecodia domain and re-check.
+  // KNOWN_ACCOUNTS is the single source of truth for valid suffixes.
+  for (const full of KNOWN_ACCOUNTS) {
+    const short = full.split('@')[0]
+    if (s === short) return full
+  }
+  return null
+}
+
+// Short form lookup for callers that need it (e.g. cowork.swap_creds backup file path).
+function shortForm(full) {
+  if (!full) return null
+  return String(full).split('@')[0]
+}
 
 function ensureDirs() {
   for (const d of [USAGE_DIR, AUDIT_DIR, WORKERS_DIR]) {
@@ -92,11 +130,12 @@ function getActiveAccount() {
 }
 
 function setActiveAccount(account, set_by) {
-  if (!KNOWN_ACCOUNTS.includes(account)) {
-    throw new Error('unknown account: ' + account + ' (known: ' + KNOWN_ACCOUNTS.join(',') + ')')
+  const canonical = normalizeAccount(account)
+  if (!canonical) {
+    throw new Error('unknown account: ' + account + ' (accepts short "tate" or full "tate@ecodia.au"; known: ' + KNOWN_ACCOUNTS.join(',') + ')')
   }
   ensureDirs()
-  const row = { account: account, since_ts: new Date().toISOString(), set_by: set_by || 'unknown' }
+  const row = { account: canonical, since_ts: new Date().toISOString(), set_by: set_by || 'unknown' }
   atomicWriteJson(ACTIVE_ACCOUNT_FILE, row)
   return row
 }
@@ -109,8 +148,14 @@ function setActiveAccount(account, set_by) {
 function runCcusageSession() {
   // npx -y ccusage@latest session --json (no install, uses npx cache)
   // Use a generous timeout - first run cold-installs ccusage (~30s on slow link).
-  const res = spawnSync('npx', ['-y', 'ccusage@latest', 'session', '--json'], {
-    shell: true,
+  // Bare-node invocation: no cmd.exe, no npx, no shell wrapper. With shell:false
+  // + stdio:'ignore' on stdin + windowsHide + CREATE_NO_WINDOW, libuv suppresses
+  // console allocation entirely.
+  const res = spawnSync(NODE_EXE, [CCUSAGE_CLI_JS, 'session', '--json'], {
+    shell: false,
+    windowsHide: true,
+    creationFlags: CREATE_NO_WINDOW,
+    stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 120_000,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -130,8 +175,11 @@ function runCcusageSession() {
 // Each row: { id, startTime, endTime, isActive, isGap, tokenCounts: {...}, totalTokens }
 // 5-hour rolling windows; isActive=true is the live window.
 function runCcusageBlocks() {
-  const res = spawnSync('npx', ['-y', 'ccusage@latest', 'blocks', '--json'], {
-    shell: true,
+  const res = spawnSync(NODE_EXE, [CCUSAGE_CLI_JS, 'blocks', '--json'], {
+    shell: false,
+    windowsHide: true,
+    creationFlags: CREATE_NO_WINDOW,
+    stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 120_000,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -494,23 +542,25 @@ function activeFlakySet() {
 }
 
 function markFlaky(account, reason) {
-  if (!KNOWN_ACCOUNTS.includes(account)) throw new Error('unknown account: ' + account)
+  const canonical = normalizeAccount(account)
+  if (!canonical) throw new Error('unknown account: ' + account + ' (accepts short or full form)')
   ensureDirs()
   const all = readFlaky()
-  all[account] = {
+  all[canonical] = {
     flaky_at: new Date().toISOString(),
     reason: String(reason || 'unspecified').slice(0, 500),
   }
   atomicWriteJson(FLAKY_FILE, all)
-  return all[account]
+  return all[canonical]
 }
 
 function clearFlaky(account) {
+  const canonical = normalizeAccount(account) || account
   ensureDirs()
   const all = readFlaky()
-  delete all[account]
+  delete all[canonical]
   atomicWriteJson(FLAKY_FILE, all)
-  return { ok: true, cleared: account }
+  return { ok: true, cleared: canonical }
 }
 
 // ── account picker ───────────────────────────────────────────────────────
@@ -679,4 +729,6 @@ module.exports = {
   _KNOWN_ACCOUNTS: KNOWN_ACCOUNTS,
   _BUFFER_FACTOR: BUFFER_FACTOR,
   _FLAKY_TTL_MS: FLAKY_TTL_MS,
+  _normalizeAccount: normalizeAccount,
+  _shortForm: shortForm,
 }

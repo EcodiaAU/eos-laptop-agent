@@ -92,44 +92,76 @@ async function pseudoWaitFor(params) {
   let lastError = null
   let lastValue = null
 
-  async function probe() {
+  // Multi-condition wait_for: until.any / until.all (audit §3.3)
+  // any: returns true when ANY sub-condition is true (race for first wins)
+  // all: returns true when ALL sub-conditions are true (gate for ready state)
+  // Backward-compat: if until.type is set, single-condition path runs unchanged.
+  if (Array.isArray(until.any) || Array.isArray(until.all)) {
+    const sub = Array.isArray(until.any) ? until.any : until.all
+    const mode = Array.isArray(until.any) ? 'any' : 'all'
+    let matched_index = null
+    async function multiProbe() {
+      const results = []
+      for (let i = 0; i < sub.length; i++) {
+        const r = await singleProbe(sub[i])
+        results.push(r)
+        if (mode === 'any' && r) { matched_index = i; return true }
+        if (mode === 'all' && !r) return false
+      }
+      if (mode === 'all') return results.every(Boolean)
+      return false
+    }
+    if (await multiProbe()) {
+      return { ok: true, waited_ms: Date.now() - start, condition: mode, matched_index: matched_index, timed_out: false }
+    }
+    while (Date.now() - start < timeoutMs) {
+      await sleep(pollMs)
+      if (await multiProbe()) {
+        return { ok: true, waited_ms: Date.now() - start, condition: mode, matched_index: matched_index, timed_out: false }
+      }
+    }
+    if (throwOnTimeout) throw new Error('wait_for (' + mode + ') timed out after ' + timeoutMs + 'ms')
+    return { ok: false, waited_ms: Date.now() - start, condition: mode, matched_index: matched_index, timed_out: true }
+  }
+
+  async function singleProbe(cond) {
     try {
-      switch (until.type) {
+      switch (cond.type) {
         case 'cdp_url_contains':
         case 'cdp_url_matches': {
           const cdp = require('./cdp')
           const r = await cdp.url({})
           const u = (r && (r.url || r.value)) || ''
           lastValue = u
-          if (until.type === 'cdp_url_contains') return u.indexOf(until.contains || '') !== -1
-          return new RegExp(until.pattern || '.*').test(u)
+          if (cond.type === 'cdp_url_contains') return u.indexOf(cond.contains || '') !== -1
+          return new RegExp(cond.pattern || '.*').test(u)
         }
         case 'cdp_ready_state': {
           const cdp = require('./cdp')
           const r = await cdp.runJs({ script: 'document.readyState' })
           lastValue = r && r.value
-          return r && r.value === (until.state || 'complete')
+          return r && r.value === (cond.state || 'complete')
         }
         case 'cdp_element_visible':
         case 'cdp_element_exists': {
           const cdp = require('./cdp')
-          const r = await cdp.queryAll({ selector: until.selector })
+          const r = await cdp.queryAll({ selector: cond.selector })
           const count = (r && (r.count || (r.elements && r.elements.length))) || 0
           lastValue = count
           return count > 0
         }
         case 'cdp_eval_truthy': {
           const cdp = require('./cdp')
-          const r = await cdp.runJs({ script: until.script })
+          const r = await cdp.runJs({ script: cond.script })
           lastValue = r && r.value
           return !!(r && r.value)
         }
         case 'file_exists': {
-          lastValue = until.path
-          return fs.existsSync(until.path)
+          lastValue = cond.path
+          return fs.existsSync(cond.path)
         }
         case 'cmd_returns_zero': {
-          const r = spawnSync(until.cmd, until.args || [], { timeout: 5000, encoding: 'utf8', windowsHide: true, shell: !!until.shell })
+          const r = spawnSync(cond.cmd, cond.args || [], { timeout: 5000, encoding: 'utf8', windowsHide: true, shell: !!cond.shell })
           lastValue = r.status
           return r.status === 0
         }
@@ -137,24 +169,24 @@ async function pseudoWaitFor(params) {
           const win = require('./window')
           const fg = await win.foreground()
           lastValue = fg
-          if (until.exe && fg.exe !== until.exe) return false
-          if (until.title_contains && (fg.title || '').indexOf(until.title_contains) === -1) return false
-          if (until.title_matches && !new RegExp(until.title_matches).test(fg.title || '')) return false
+          if (cond.exe && fg.exe !== cond.exe) return false
+          if (cond.title_contains && (fg.title || '').indexOf(cond.title_contains) === -1) return false
+          if (cond.title_matches && !new RegExp(cond.title_matches).test(fg.title || '')) return false
           return true
         }
         case 'coord_inbox_has': {
           const coord = require('./coord')
           // peek_inbox does NOT mark messages seen - safe to poll repeatedly
           // without consuming the message a downstream read_inbox would want.
-          const r = await coord.peek_inbox({ topic: until.topic }, {})
+          const r = await coord.peek_inbox({ topic: cond.topic }, {})
           const msgs = (r && r.messages) || []
           lastValue = msgs.length
           if (msgs.length === 0) return false
-          if (!until.body_contains) return true
-          return msgs.some(m => JSON.stringify(m.body || {}).indexOf(until.body_contains) !== -1)
+          if (!cond.body_contains) return true
+          return msgs.some(m => JSON.stringify(m.body || {}).indexOf(cond.body_contains) !== -1)
         }
         default:
-          throw new Error('unknown wait_for type: ' + until.type)
+          throw new Error('unknown wait_for type: ' + cond.type)
       }
     } catch (e) {
       lastError = e.message
@@ -162,12 +194,13 @@ async function pseudoWaitFor(params) {
     }
   }
 
-  if (await probe()) {
+  // Single-condition path - calls singleProbe with the until object as the condition
+  if (await singleProbe(until)) {
     return { ok: true, waited_ms: Date.now() - start, condition: until.type, last_value: lastValue, timed_out: false }
   }
   while (Date.now() - start < timeoutMs) {
     await sleep(pollMs)
-    if (await probe()) {
+    if (await singleProbe(until)) {
       return { ok: true, waited_ms: Date.now() - start, condition: until.type, last_value: lastValue, timed_out: false }
     }
   }
@@ -175,6 +208,186 @@ async function pseudoWaitFor(params) {
     throw new Error('wait_for timed out after ' + timeoutMs + 'ms (last_error: ' + (lastError || 'none') + ')')
   }
   return { ok: false, waited_ms: Date.now() - start, condition: until.type, last_value: lastValue, last_error: lastError, timed_out: true }
+}
+
+// ----- pseudo-tool: foreach -----
+// Iterate over an array (literal or ${var}-bound), bind each item to a name,
+// run a body of actions per item, collect per-iteration results.
+// Audit §3.1 - single largest expressive unlock.
+//
+// Spec: {
+//   items: [...] or "${var}",    // literal array OR resolved string from bindings
+//   as: "row",                    // bindings[as] = item per iteration
+//   index_as?: "i",               // optional: bindings[index_as] = 0,1,2...
+//   max_iterations?: 50,          // safety cap (default 100)
+//   stopOnError?: false,          // local override of sequence-level
+//   body: [<actions>]
+// }
+//
+// Iteration bindings are SCOPED: at iteration end, the as/index_as keys are
+// restored to whatever they were before (or deleted if they weren't set).
+// This prevents loop variables leaking into outer steps.
+async function pseudoForeach(params, parentBindings) {
+  params = params || {}
+  let items = params.items
+  // If items is a string, it's already been substituted by substituteBindings.
+  // If it became a JSON-stringified array (object capture), parse it.
+  if (typeof items === 'string') {
+    try { items = JSON.parse(items) } catch (e) { throw new Error('foreach.items is a string but not JSON-parseable: ' + items.slice(0, 100)) }
+  }
+  if (!Array.isArray(items)) throw new Error('foreach requires items to be an array (or ${var} that resolves to one)')
+  const itemName = params.as || 'item'
+  const indexName = params.index_as || null
+  const maxIters = Math.min(params.max_iterations || 100, 1000)
+  const localStopOnError = params.stopOnError === true  // default false for foreach (different from sequence-level)
+  const body = Array.isArray(params.body) ? params.body : []
+
+  const bindings = parentBindings || {}
+  const iterations = []
+  let completed = 0
+  let failed = 0
+  const upperLimit = Math.min(items.length, maxIters)
+
+  // Capture pre-iteration values for scoped restore
+  const hadItemBinding = Object.prototype.hasOwnProperty.call(bindings, itemName)
+  const prevItem = hadItemBinding ? bindings[itemName] : undefined
+  const hadIndexBinding = indexName ? Object.prototype.hasOwnProperty.call(bindings, indexName) : false
+  const prevIndex = hadIndexBinding ? bindings[indexName] : undefined
+
+  for (let i = 0; i < upperLimit; i++) {
+    bindings[itemName] = items[i]
+    if (indexName) bindings[indexName] = i
+    const iterStart = Date.now()
+    const stepResults = []
+    let iterFailed = 0
+    for (let j = 0; j < body.length; j++) {
+      const a = body[j]
+      if (!a || typeof a.tool !== 'string') {
+        stepResults.push({ j: j, ok: false, error: 'missing tool string' })
+        iterFailed++
+        if (localStopOnError) break
+        continue
+      }
+      const effParams = substituteBindings(a.params || {}, bindings)
+      // Step-level if inside loop body
+      if (a.if && typeof a.if === 'object') {
+        const probe = await pseudoWaitFor({ until: substituteBindings(a.if, bindings), timeout_ms: a.if_probe_timeout_ms || 1000, poll_ms: 100, throw_on_timeout: false })
+        if (!probe.ok) {
+          stepResults.push({ j: j, tool: a.tool, ok: true, skipped: true, if_probe: probe })
+          continue
+        }
+      }
+      const t0step = Date.now()
+      try {
+        const result = await runStep(a.tool, effParams)
+        const rec = { j: j, tool: a.tool, ok: true, durationMs: Date.now() - t0step }
+        if (typeof a.as === 'string' && a.as.length > 0) {
+          bindings[a.as] = result
+          rec.bound_as = a.as
+        }
+        stepResults.push(rec)
+      } catch (err) {
+        stepResults.push({ j: j, tool: a.tool, ok: false, durationMs: Date.now() - t0step, error: err.message })
+        iterFailed++
+        if (localStopOnError) break
+      }
+    }
+    const iterOk = iterFailed === 0
+    if (iterOk) completed++; else failed++
+    iterations.push({ i: i, item: items[i], ok: iterOk, durationMs: Date.now() - iterStart, steps: stepResults })
+  }
+
+  // Restore iteration bindings to pre-loop state (scoped)
+  if (hadItemBinding) bindings[itemName] = prevItem; else delete bindings[itemName]
+  if (indexName) {
+    if (hadIndexBinding) bindings[indexName] = prevIndex; else delete bindings[indexName]
+  }
+
+  return {
+    ok: failed === 0,
+    iterations: iterations,
+    completed: completed,
+    failed: failed,
+    items_total: items.length,
+    items_processed: upperLimit,
+  }
+}
+
+// ----- pseudo-tool: try (catch / finally) -----
+// Body always runs. Catch runs only if body fails. Finally always runs.
+// On caught failure, body's error is bound to ${err} inside the catch block.
+// Audit §3.2.
+async function pseudoTry(params, parentBindings) {
+  params = params || {}
+  const body = Array.isArray(params.body) ? params.body : []
+  const catchSpec = params.catch && typeof params.catch === 'object' ? params.catch : null
+  const finallyActions = Array.isArray(params.finally) ? params.finally : []
+  const bindings = parentBindings || {}
+
+  async function runBlock(actions, prefix) {
+    const results = []
+    let blockFailed = false
+    let lastError = null
+    for (let i = 0; i < actions.length; i++) {
+      const a = actions[i]
+      if (!a || typeof a.tool !== 'string') {
+        results.push({ i: i, ok: false, error: 'missing tool string' })
+        blockFailed = true
+        break
+      }
+      const effParams = substituteBindings(a.params || {}, bindings)
+      // Step-level if inside try block
+      if (a.if && typeof a.if === 'object') {
+        const probe = await pseudoWaitFor({ until: substituteBindings(a.if, bindings), timeout_ms: a.if_probe_timeout_ms || 1000, poll_ms: 100, throw_on_timeout: false })
+        if (!probe.ok) {
+          results.push({ i: i, tool: a.tool, ok: true, skipped: true, if_probe: probe })
+          continue
+        }
+      }
+      const t0step = Date.now()
+      try {
+        const result = await runStep(a.tool, effParams)
+        const rec = { i: i, tool: a.tool, ok: true, durationMs: Date.now() - t0step }
+        if (typeof a.as === 'string' && a.as.length > 0) {
+          bindings[a.as] = result
+          rec.bound_as = a.as
+        }
+        results.push(rec)
+      } catch (err) {
+        results.push({ i: i, tool: a.tool, ok: false, durationMs: Date.now() - t0step, error: err.message })
+        blockFailed = true
+        lastError = err.message
+        break  // stop on error within a try block (different from foreach default)
+      }
+    }
+    return { results: results, failed: blockFailed, error: lastError }
+  }
+
+  const bodyResult = await runBlock(body, 'body')
+  let catchResult = null
+  let taken = bodyResult.failed ? 'caught' : 'success'
+  if (bodyResult.failed && catchSpec && Array.isArray(catchSpec.body)) {
+    // Bind error to ${err} (or whatever name catchSpec.as)
+    const errBindingName = catchSpec.as || 'err'
+    const prevHad = Object.prototype.hasOwnProperty.call(bindings, errBindingName)
+    const prevVal = prevHad ? bindings[errBindingName] : undefined
+    bindings[errBindingName] = bodyResult.error
+    catchResult = await runBlock(catchSpec.body, 'catch')
+    if (prevHad) bindings[errBindingName] = prevVal; else delete bindings[errBindingName]
+    if (catchResult.failed) taken = 'rethrown'
+  } else if (bodyResult.failed) {
+    taken = 'rethrown'  // body failed and no catch
+  }
+  const finallyResult = await runBlock(finallyActions, 'finally')
+
+  return {
+    ok: taken !== 'rethrown',
+    taken: taken,
+    body_steps: bodyResult.results,
+    catch_steps: catchResult ? catchResult.results : null,
+    finally_steps: finallyResult.results,
+    finally_failed: finallyResult.failed,
+  }
 }
 
 // ----- pseudo-tool: branch -----
@@ -341,6 +554,8 @@ async function installCdpToChrome(params) {
   const r = spawnSync('powershell', ['-NoProfile', '-Command', psScript], {
     encoding: 'utf8',
     timeout: 15000,
+    windowsHide: true,
+    creationFlags: 0x08000000,
   })
 
   const lines = (r.stdout || '').trim().split(/\r?\n/).filter(Boolean)
@@ -380,7 +595,7 @@ async function enableChromeCdp(params) {
     '-NoProfile',
     '-Command',
     'Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force'
-  ], { stdio: 'ignore' })
+  ], { stdio: 'ignore', windowsHide: true, creationFlags: 0x08000000 })
   await sleep(2000)
 
   const userData = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
@@ -457,11 +672,13 @@ async function launchCdpChrome(params) {
 
 // ----- sequence dispatcher -----
 
-async function runStep(tool, params) {
+async function runStep(tool, params, bindings) {
   params = params || {}
   if (tool === 'wait') return pseudoWait(params)
   if (tool === 'wait_for') return pseudoWaitFor(params)
   if (tool === 'branch') return pseudoBranch(params)
+  if (tool === 'foreach') return pseudoForeach(params, bindings)
+  if (tool === 'try') return pseudoTry(params, bindings)
   if (tool === 'screenshot' || tool === 'screenshot.screenshot') return screenshot.screenshot(params)
   if (tool.indexOf('input.') === 0) {
     const fn = input[tool.slice(6)]
@@ -592,6 +809,8 @@ async function sequence(params) {
   const keepIntermediateScreenshots = !!params.keepIntermediateScreenshots
   const includeStepResults = !!params.includeStepResults
   const bindings = (params.bindings && typeof params.bindings === 'object') ? Object.assign({}, params.bindings) : {}
+  // Envelope-level whole-sequence timeout (audit §5.1). 0/undefined = unbounded.
+  const maxTotalMs = (typeof params.max_total_ms === 'number' && params.max_total_ms > 0) ? params.max_total_ms : 0
 
   if (!Array.isArray(actions)) throw new Error('actions must be an array')
   if (actions.length === 0) throw new Error('actions must not be empty')
@@ -601,8 +820,14 @@ async function sequence(params) {
   let completed = 0
   let failed = 0
   let lastScreenshotResult = null
+  let timedOutAtStep = null
 
   for (let i = 0; i < actions.length; i++) {
+    // Whole-sequence deadline check
+    if (maxTotalMs > 0 && (Date.now() - t0) > maxTotalMs) {
+      timedOutAtStep = i
+      break
+    }
     const a = actions[i]
     if (!a || typeof a.tool !== 'string') {
       steps.push({ i: i, tool: null, ok: false, durationMs: 0, error: 'missing tool string' })
@@ -614,8 +839,19 @@ async function sequence(params) {
     // Substitute ${var} tokens in params from the bindings accumulated so far.
     // Any prior step with `as: "name"` set bindings[name] = result.
     const effectiveParams = substituteBindings(a.params || {}, bindings)
+    // Step-level `if:` precondition (audit §3.4). Probes condition ONCE with
+    // a 1s timeout. If false, step is recorded as skipped and the sequence
+    // continues. Eliminates the branch{then:[X]} nesting for single-step skips.
+    if (a.if && typeof a.if === 'object') {
+      const probe = await pseudoWaitFor({ until: substituteBindings(a.if, bindings), timeout_ms: a.if_probe_timeout_ms || 1000, poll_ms: 100, throw_on_timeout: false })
+      if (!probe.ok) {
+        steps.push({ i: i, tool: a.tool, ok: true, skipped: true, durationMs: Date.now() - start, if_probe: probe })
+        completed++
+        continue
+      }
+    }
     try {
-      const result = await runStep(a.tool, effectiveParams)
+      const result = await runStep(a.tool, effectiveParams, bindings)
       const dur = Date.now() - start
       const isShot = a.tool === 'screenshot' || a.tool === 'screenshot.screenshot' || a.tool === 'cdp.pageScreenshot'
       if (isShot && result && result.image) lastScreenshotResult = result
@@ -643,6 +879,10 @@ async function sequence(params) {
   }
 
   const out = { completed: completed, failed: failed, totalMs: Date.now() - t0, steps: steps }
+  if (timedOutAtStep !== null) {
+    out.timed_out_at_step = timedOutAtStep
+    out.max_total_ms = maxTotalMs
+  }
 
   if (finalScreenshot) {
     if (lastScreenshotResult) {
