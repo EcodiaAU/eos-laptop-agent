@@ -154,6 +154,17 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: 'coord.signal_bound',
+    description: 'Send a launch-confirmation signal to chat.conductor.inbox. Call this on your FIRST turn to confirm you launched, read your brief, and connected to MCP. Sends body={type:"bound", task_id, parent_conductor_tab_id} to the conductor inbox. Does NOT terminate your worker row or unlink your .spawned marker (those happen at signal_done). Returns {message_id, created_at}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Task id from your brief or worker registration.' },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
     name: 'coord.pick_account',
     description: 'Select the highest-headroom Claude Max account for the next dispatch. Score: min(remaining_5h, remaining_weekly) * 0.85 - estimated_tokens. Returns {account, score, remaining_5h, remaining_weekly, reason, candidates[]}.',
     inputSchema: {
@@ -260,8 +271,26 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.conductor_heartbeat',
-    description: 'Update the registered conductor row last_seen_at to now. Called by the Corazon UserPromptSubmit hook each turn-start so loadActiveConductorRegistration returns the row. Without periodic heartbeat the conductor goes stale after 30min and inbound webhooks fall back to cold-spawn reflex.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+    description: 'Update the registered conductor row last_seen_at to now. Called by the Corazon UserPromptSubmit hook each turn-start so loadActiveConductorRegistration returns the row. Accepts optional refresh fields (title_match, hwnd, exe, claude_port, ide_pid, ide_bridge_port, workspace_root) to update moving values on each beat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title_match: { type: 'string' }, hwnd: { type: 'integer' }, exe: { type: 'string' },
+        claude_port: { type: 'integer' }, ide_pid: { type: 'integer' },
+        ide_bridge_port: { type: 'integer' }, workspace_root: { type: 'string' },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
+    name: 'coord.set_conductor_in_turn',
+    description: '2026-05-19 one-conductor-many-channels mutex: set in_turn=true at UserPromptSubmit (heartbeat hook), in_turn=false at Stop (turn-end hook). While in_turn=true, reflex.append_to_conductor defers paste and leaves the message in coord inbox; the Stop hook flushes the inbox at turn end. 10-min TTL auto-clear handles crashed turns.',
+    inputSchema: {
+      type: 'object',
+      properties: { in_turn: { type: 'boolean' } },
+      required: ['in_turn'],
+      additionalProperties: true,
+    },
   },
 ])
 

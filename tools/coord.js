@@ -557,6 +557,37 @@ async function signal_done(params, ctx) {
   return r
 }
 
+// signal_bound - sent by a spawned worker on first turn to confirm it launched
+// successfully, read its brief, and connected to MCP. Releases the scheduler's
+// launch-lock (dispatch_worker's worker_acknowledgment_timeout_ms window).
+//
+// Mirrors signal_done in structure: posts to chat.conductor.inbox with a typed
+// body so the conductor can filter by body.type === "bound". Does NOT terminate
+// the worker row or unlink the .spawned marker - those are done-specific side
+// effects. The .spawned marker must stay alive until the worker signals done.
+async function signal_bound(params, ctx) {
+  params = params || {}
+  ctx = ctx || {}
+  // Look up parent_conductor_tab_id from the worker row, same as signal_done.
+  let parent_conductor_tab_id = null
+  if (ctx.tab_id && workers.has(ctx.tab_id)) {
+    parent_conductor_tab_id = workers.get(ctx.tab_id).parent_conductor_tab_id || null
+  }
+  const r = await send_message({
+    to: 'chat.conductor.inbox',
+    body: {
+      type: 'bound',
+      task_id: params.task_id,
+      parent_conductor_tab_id: parent_conductor_tab_id,
+    },
+    task_id: params.task_id,
+  }, ctx)
+  // No worker-row termination and no .spawned unlink here.
+  // The worker is confirming it is ALIVE and has read its brief; it will
+  // keep running until it sends signal_done.
+  return r
+}
+
 // ── sweep loop ───────────────────────────────────────────────────────────
 // Periodic janitor: mark stale workers terminated + unlink their .spawned
 // markers. Per pattern worker-registry-truth-is-on-disk-not-mtime-2026-05-18.
@@ -856,6 +887,7 @@ module.exports = {
   heartbeat: heartbeat,
   report_progress: report_progress,
   signal_done: signal_done,
+  signal_bound: signal_bound,
   verify_paste: verify_paste,
   register_conductor: register_conductor,
   unregister_conductor: unregister_conductor,
