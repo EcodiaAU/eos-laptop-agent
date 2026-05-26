@@ -1,0 +1,450 @@
+// scheduler.test.js - tests for the Phase 3 autonomy substrate scheduler.
+//
+// Run with: node tools/scheduler.test.js
+// Exit 0 = all pass.
+//
+// Tests run sequentially (chained via .then) to avoid async ordering issues
+// from concurrent state mutation of creds/coord module exports.
+
+'use strict'
+
+let passed = 0
+let failed = 0
+const tests = []  // array of { name, fn } - run sequentially
+
+function assert(condition, label) {
+  if (condition) {
+    console.log('  PASS:', label)
+    passed++
+  } else {
+    console.error('  FAIL:', label)
+    failed++
+  }
+}
+
+function test(name, fn) {
+  tests.push({ name, fn })
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function makeRow(overrides) {
+  return Object.assign({
+    id: 'task-123',
+    name: 'morning-briefing',
+    type: 'cron',
+    status: 'active',
+    cron_expression: '0 9 * * *',
+    prompt: 'Run the morning briefing.',
+    preferred_account: 'tate',
+    actual_account: null,
+    retry_count: 0,
+    dispatched_tab_id: null,
+  }, overrides)
+}
+
+function makeStubPool(rowsForSelect) {
+  const queries = []
+  const pool = {
+    _queries: queries,
+    query(sql, params) {
+      queries.push({ sql, params: params || [] })
+      if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
+        return Promise.resolve({ rows: rowsForSelect || [], rowCount: (rowsForSelect || []).length })
+      }
+      return Promise.resolve({ rows: [], rowCount: 0 })
+    }
+  }
+  return pool
+}
+
+// ── import scheduler ──────────────────────────────────────────────────────────
+
+const scheduler = require('./scheduler')
+const credsModule = require('./creds')
+const coordModule = require('./coord')
+
+// ── Task 3.1: buildBrief ──────────────────────────────────────────────────────
+
+test('buildBrief: signal_bound instruction with task_id appears first', async () => {
+  const row = makeRow({ id: 'abc-def-123' })
+  const brief = scheduler.buildBrief(row)
+  assert(
+    brief.includes('coord.signal_bound now with { task_id: "abc-def-123"'),
+    'buildBrief: signal_bound instruction present with correct task_id'
+  )
+  assert(
+    brief.indexOf('signal_bound') < brief.indexOf(row.prompt),
+    'buildBrief: signal_bound appears before row.prompt'
+  )
+})
+
+test('buildBrief: row.prompt appears verbatim', async () => {
+  const prompt = 'Do something important with special chars: & < > "quotes".'
+  const row = makeRow({ prompt })
+  const brief = scheduler.buildBrief(row)
+  assert(brief.includes(prompt), 'buildBrief: row.prompt in brief verbatim')
+})
+
+test('buildBrief: signal_done section present with task_id', async () => {
+  const row = makeRow({ id: 'xyz-789' })
+  const brief = scheduler.buildBrief(row)
+  assert(brief.includes('signal_done'), 'buildBrief: signal_done instructions present')
+  assert(
+    brief.includes('task_id: "xyz-789"'),
+    'buildBrief: signal_done references correct task_id'
+  )
+})
+
+test('buildBrief: actual_account appears in brief when set', async () => {
+  const row = makeRow({ id: 'acct-test', actual_account: 'code' })
+  const brief = scheduler.buildBrief(row)
+  assert(brief.includes('code'), 'buildBrief: actual_account in brief')
+})
+
+// ── Task 3.1: launchLock ──────────────────────────────────────────────────────
+
+test('launchLock: serializes 2 concurrent acquires in order', async () => {
+  const lock = scheduler._launchLock
+  const order = []
+
+  const r1 = await lock.acquire()
+  order.push('acquired-1')
+
+  let r2Acquired = false
+  const p2 = lock.acquire().then(r => {
+    order.push('acquired-2')
+    r2Acquired = true
+    return r
+  })
+
+  assert(!r2Acquired, 'launchLock: lock-2 not acquired while lock-1 held')
+  r1()  // release lock-1
+
+  const r2 = await p2
+  assert(r2Acquired, 'launchLock: lock-2 acquired after lock-1 released')
+  assert(order[0] === 'acquired-1' && order[1] === 'acquired-2', 'launchLock: in-order release/acquire')
+  r2()  // release lock-2
+})
+
+// ── Task 3.2: leaseDueRows SQL shape ─────────────────────────────────────────
+
+test('leaseDueRows: SQL contains FOR UPDATE SKIP LOCKED and limit param', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  await scheduler.leaseDueRows(3)
+
+  const q = pool._queries[0]
+  assert(q && q.sql.includes('FOR UPDATE SKIP LOCKED'), 'leaseDueRows: FOR UPDATE SKIP LOCKED in SQL')
+  assert(q && q.params.indexOf(3) !== -1, 'leaseDueRows: limit param (3) passed')
+  assert(q && q.sql.toLowerCase().includes("status = 'active'"), 'leaseDueRows: filters status=active')
+})
+
+// ── Task 3.2: dispatchOne happy path ─────────────────────────────────────────
+
+test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  // Stub creds module exports in-place (same cached object scheduler uses).
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  let pickedAccount = null
+  let rotatedTo = null
+  credsModule.pick_healthiest_account = async () => { pickedAccount = 'code'; return 'code' }
+  credsModule.rotate_to = async (acct) => { rotatedTo = acct; return { previous: 'tate', current: acct } }
+
+  // Stub dispatcher.
+  let dispatched = null
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => {
+      dispatched = params
+      return { ok: true, tab_id: 'tab_test_abc', task_id: params.task_id }
+    },
+    kill_worker: async () => {}
+  })
+
+  // Stub coord.peek_inbox to return a bound signal immediately.
+  const origPeekInbox = coordModule.peek_inbox
+  const origReadInbox = coordModule.read_inbox
+  coordModule.peek_inbox = async () => ({
+    messages: [{ body: { type: 'bound', task_id: 'task-dispatch-happy' } }]
+  })
+  coordModule.read_inbox = async () => ({ messages: [] })
+
+  const row = makeRow({ id: 'task-dispatch-happy', preferred_account: 'code' })
+
+  let threw = false
+  try {
+    await scheduler.dispatchOne(row)
+  } catch (e) {
+    threw = true
+    console.error('  [dispatchOne happy path threw]:', e.message)
+  }
+
+  assert(!threw, 'dispatchOne happy path: no throw')
+  assert(pickedAccount === 'code', 'dispatchOne: pick_healthiest_account called, got code')
+  assert(rotatedTo === 'code', 'dispatchOne: rotate_to called with code')
+  assert(dispatched !== null, 'dispatchOne: dispatch_worker called')
+  assert(dispatched && dispatched.ide === 'stable', 'dispatchOne: ide=stable passed')
+
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!!runningUpdate, 'dispatchOne: row updated to status=running')
+  assert(
+    runningUpdate && runningUpdate.params.includes('code'),
+    'dispatchOne: actual_account=code in UPDATE params'
+  )
+
+  // Restore.
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+  coordModule.peek_inbox = origPeekInbox
+  coordModule.read_inbox = origReadInbox
+})
+
+// ── Task 3.2: dispatchOne AllAccountsCappedError defers ──────────────────────
+
+test('dispatchOne AllAccountsCappedError: defers row, does not mark failed', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  const origPick = credsModule.pick_healthiest_account
+  const { AllAccountsCappedError } = credsModule
+  credsModule.pick_healthiest_account = async () => {
+    throw new AllAccountsCappedError({ tate: null, code: null, money: null })
+  }
+
+  // Ensure dispatcher is set (non-null) to avoid null deref before creds throws.
+  scheduler._setDispatcher({ dispatch_worker: async () => ({}), kill_worker: async () => {} })
+
+  const row = makeRow({ id: 'task-capped-test' })
+  let threw = false
+  try {
+    await scheduler.dispatchOne(row)
+  } catch (e) {
+    threw = true
+  }
+
+  const deferUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  )
+  assert(!!deferUpdate, 'dispatchOne AllCapped: row deferred (status=active, next_run_at set)')
+  assert(threw, 'dispatchOne AllCapped: re-throws AllAccountsCappedError')
+
+  credsModule.pick_healthiest_account = origPick
+})
+
+// ── Task 3.2: launchLock released on dispatch_worker error ───────────────────
+
+test('launchLock: released in finally even when dispatch_worker throws', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'tate'
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'tate' })
+
+  const origPeekInbox = coordModule.peek_inbox
+  coordModule.peek_inbox = async () => ({ messages: [] })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async () => { throw new Error('dispatch failed intentionally') },
+    kill_worker: async () => {}
+  })
+
+  const row = makeRow({ id: 'task-lock-release-test' })
+  let threw = false
+  try {
+    await scheduler.dispatchOne(row)
+  } catch (e) {
+    threw = true
+  }
+
+  assert(threw, 'launchLock finally: dispatchOne re-throws')
+
+  // Lock must be released - must be acquirable immediately.
+  let lockAcquired = false
+  const lockP = scheduler._launchLock.acquire().then(release => {
+    lockAcquired = true
+    release()
+  })
+  // Give it a short time.
+  await new Promise(r => setTimeout(r, 100))
+  await lockP
+
+  assert(lockAcquired, 'launchLock finally: lock released after error (acquirable in <100ms)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+  coordModule.peek_inbox = origPeekInbox
+})
+
+// ── Task 3.3: markComplete cron reschedules ───────────────────────────────────
+
+test('markComplete cron: computes next_run_at and sets status=active', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => {} })
+
+  const row = makeRow({
+    id: 'task-cron-done',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    dispatched_tab_id: null,
+  })
+
+  await scheduler.markComplete(row, { status: 'success', result_summary: 'done fine' })
+
+  const activeUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  )
+  assert(!!activeUpdate, 'markComplete cron: UPDATE sets status=active with next_run_at')
+
+  if (activeUpdate && activeUpdate.params[0]) {
+    const nextRun = new Date(activeUpdate.params[0])
+    assert(!isNaN(nextRun.getTime()), 'markComplete cron: next_run_at parses to valid date')
+    assert(nextRun.getTime() > Date.now(), 'markComplete cron: next_run_at is in the future')
+  } else {
+    assert(false, 'markComplete cron: next_run_at param is not null')
+  }
+})
+
+// ── Task 3.3: markComplete one_shot sets completed ───────────────────────────
+
+test('markComplete one_shot: sets status=completed', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => {} })
+
+  const row = makeRow({
+    id: 'task-oneshot-done',
+    type: 'one_shot',
+    cron_expression: null,
+    dispatched_tab_id: null,
+  })
+
+  await scheduler.markComplete(row, { status: 'success', result_summary: 'one_shot done' })
+
+  const completedUpdate = pool._queries.find(q => q.sql.includes("status = 'completed'"))
+  assert(!!completedUpdate, 'markComplete one_shot: status set to completed')
+})
+
+// ── Task 3.3: staleLeaseRecovery SQL shapes ───────────────────────────────────
+
+test('staleLeaseRecovery: issues 3 SQL queries with correct shapes', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  await scheduler.staleLeaseRecovery()
+
+  assert(pool._queries.length === 3, 'staleLeaseRecovery: exactly 3 queries issued')
+
+  const retryable = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") &&
+    q.sql.includes("status = 'dispatching'") &&
+    q.sql.includes('retry_count + 1') &&
+    q.sql.includes('< $2')
+  )
+  assert(!!retryable, 'staleLeaseRecovery: retryable stale-dispatch query correct shape')
+
+  const maxRetryFailed = pool._queries.find(q =>
+    q.sql.includes("status = 'failed'") &&
+    q.sql.includes("status = 'dispatching'") &&
+    q.sql.includes('>= $2')
+  )
+  assert(!!maxRetryFailed, 'staleLeaseRecovery: max-retry exhausted -> failed query correct shape')
+
+  const orphaned = pool._queries.find(q =>
+    q.sql.includes("status = 'orphaned'") &&
+    q.sql.includes("status = 'running'")
+  )
+  assert(!!orphaned, 'staleLeaseRecovery: running too long -> orphaned query correct shape')
+})
+
+// ── Task 3.4: start() schedules 3 intervals ──────────────────────────────────
+
+test('start() schedules exactly 3 setIntervals and returns 3 handles', async () => {
+  const origSetInterval = global.setInterval
+  const origClearInterval = global.clearInterval
+  let callCount = 0
+  const savedHandles = []
+  global.setInterval = function (fn, ms) {
+    callCount++
+    const handle = { _id: callCount, unref: () => {} }
+    savedHandles.push(handle)
+    return handle
+  }
+  global.clearInterval = function (h) {}  // noop for cleanup in test
+
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ dispatch_worker: async () => ({}), kill_worker: async () => {} })
+
+  const handles = scheduler.start()
+
+  global.setInterval = origSetInterval
+  global.clearInterval = origClearInterval
+
+  assert(callCount === 3, 'start(): setInterval called 3 times (got ' + callCount + ')')
+  assert(handles && handles.dispatchInterval, 'start(): returns dispatchInterval')
+  assert(handles && handles.completionInterval, 'start(): returns completionInterval')
+  assert(handles && handles.staleInterval, 'start(): returns staleInterval')
+})
+
+// ── Task 3.4: startupCleanup tolerates close_tab errors ──────────────────────
+
+test('startupCleanup: tolerates close_tab errors and still nulls dispatched_tab_id', async () => {
+  const pool = makeStubPool([{ id: 'task-startup-1', dispatched_tab_id: 'tab_old_123' }])
+  scheduler._setPool(pool)
+
+  scheduler._setDispatcher({
+    kill_worker: async () => { throw new Error('close_tab intentional error') },
+    dispatch_worker: async () => ({})
+  })
+
+  let threw = false
+  try {
+    await scheduler.startupCleanup()
+  } catch (e) {
+    threw = true
+  }
+
+  assert(!threw, 'startupCleanup: no throw despite kill_worker error')
+  const nullUpdate = pool._queries.find(q => q.sql.includes('dispatched_tab_id = NULL'))
+  assert(!!nullUpdate, 'startupCleanup: dispatched_tab_id nulled despite close_tab error')
+})
+
+// ── SCHEDULER_ENABLED default off ─────────────────────────────────────────────
+
+test('SCHEDULER_ENABLED default is not "true"', async () => {
+  const val = process.env.SCHEDULER_ENABLED
+  assert(!val || val !== 'true', 'SCHEDULER_ENABLED: not "true" in default env (default off)')
+})
+
+// ── sequential test runner ────────────────────────────────────────────────────
+
+async function runAll() {
+  for (const { name, fn } of tests) {
+    console.log('\n--', name, '--')
+    try {
+      await fn()
+    } catch (e) {
+      console.error('  UNCAUGHT IN TEST:', e.message)
+      failed++
+    }
+  }
+
+  console.log('\n===========================================')
+  console.log('Results: ' + passed + ' passed, ' + failed + ' failed')
+  if (failed > 0) {
+    console.error(failed + ' test(s) FAILED')
+    process.exit(1)
+  } else {
+    console.log('All tests passed.')
+    process.exit(0)
+  }
+}
+
+runAll()

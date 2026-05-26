@@ -119,4 +119,18 @@ app.listen(PORT, () => {
   console.log(`EcodiaOS Laptop Agent running on :${PORT}`)
   console.log(`Tools loaded: ${Object.keys(tools).join(', ')}`)
   console.log(`Auth: ${TOKEN ? 'enabled' : 'DISABLED (set AGENT_TOKEN)'}`)
+
+  // Autonomy substrate scheduler (Phase 3). Off by default - requires explicit
+  // SCHEDULER_ENABLED=true + DATABASE_URL. Do NOT flip on until: (a) agent
+  // restart picks up signal_bound; (b) code.json + money.json are seeded;
+  // (c) Tate explicitly enables.
+  if (process.env.SCHEDULER_ENABLED === 'true') {
+    try {
+      const scheduler = require('./tools/scheduler')
+      scheduler.start()
+      console.log('Scheduler started (autonomy substrate Phase 3)')
+    } catch (e) {
+      console.error('Scheduler failed to start:', e.message)
+    }
+  }
 })
