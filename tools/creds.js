@@ -1,10 +1,19 @@
 // creds.js - per-account cred-rotation module for the autonomy substrate.
 //
+// Phase 1 of the autonomy substrate plan (2026-05-26). Implements credential
+// rotation for the scheduler: pick the healthiest account, swap credentials
+// atomically, and identify the current account without watching any file.
+//
 // HARD INVARIANTS (enforced by tests, never relax):
 // - Never reads ~/.claude/.credentials.json to react to changes.
 // - Never calls fs.watch on ~/.claude/.credentials.json or any other path.
 // - The only writes to ~/.claude/.credentials.json come from rotate_to().
 // - Any code path that "restores" the file from a backup is a regression.
+//
+// Tasks implemented:
+//   1.2 pick_healthiest_account + AllAccountsCappedError + _setUsageSource
+//   1.3 rotate_to (atomic via writeFileSync+renameSync) + current_account
+//   1.4 fs.watch regression guard (enforced by creds.test.js final test)
 //
 // Usage source injection: tests call _setUsageSource(mock) where mock implements:
 //   get_usage_state(account) -> { headroom_minutes, reset_at }
