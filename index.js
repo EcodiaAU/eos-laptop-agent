@@ -113,6 +113,34 @@ try {
   console.error('Cowork route failed to mount:', e.message)
 }
 
+// Phase 8: manual CC chat dispatch with cred rotation.
+//
+// POST /api/scheduler/manual_chat  { "brief": "...", "preferred_account": "tate"? }
+// Picks the healthiest account, atomically rotates ~/.claude/.credentials.json,
+// then dispatches a new CC chat tab via cowork.dispatch_worker. Returns
+// { ok, account, tab_id }. Use this instead of the IDE keybind when you want
+// cred rotation to happen automatically before the new chat reads its tokens.
+app.post('/api/scheduler/manual_chat', auth, async (req, res) => {
+  try {
+    const creds = require('./tools/creds')
+    const cowork = require('./tools/cowork')
+    const brief = (req.body && req.body.brief) || 'New manual chat (no brief provided).'
+    const preferred = req.body && req.body.preferred_account
+    const ide = (req.body && req.body.ide) || 'stable'
+    const taskId = (req.body && req.body.task_id) || ('manual-' + Date.now())
+
+    const account = await creds.pick_healthiest_account({
+      preferred: preferred || null,
+      required_headroom_minutes: 15,
+    })
+    await creds.rotate_to(account)
+    const result = await cowork.dispatch_worker({ brief, task_id: taskId, ide, account })
+    res.json({ ok: true, account, tab_id: result && result.tab_id, task_id: taskId })
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err), name: err.name || 'Error' })
+  }
+})
+
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
 app.listen(PORT, () => {
