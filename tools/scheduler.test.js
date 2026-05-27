@@ -363,9 +363,9 @@ test('staleLeaseRecovery: issues 3 SQL queries with correct shapes', async () =>
   assert(!!orphaned, 'staleLeaseRecovery: running too long -> orphaned query correct shape')
 })
 
-// ── Task 3.4: start() schedules 3 intervals ──────────────────────────────────
+// ── Task 3.4: start() schedules 4 intervals (3 core + Phase 7 cap observer) ──
 
-test('start() schedules exactly 3 setIntervals and returns 3 handles', async () => {
+test('start() schedules exactly 4 setIntervals and returns 4 handles', async () => {
   const origSetInterval = global.setInterval
   const origClearInterval = global.clearInterval
   let callCount = 0
@@ -387,10 +387,11 @@ test('start() schedules exactly 3 setIntervals and returns 3 handles', async () 
   global.setInterval = origSetInterval
   global.clearInterval = origClearInterval
 
-  assert(callCount === 3, 'start(): setInterval called 3 times (got ' + callCount + ')')
+  assert(callCount === 4, 'start(): setInterval called 4 times (got ' + callCount + ')')
   assert(handles && handles.dispatchInterval, 'start(): returns dispatchInterval')
   assert(handles && handles.completionInterval, 'start(): returns completionInterval')
   assert(handles && handles.staleInterval, 'start(): returns staleInterval')
+  assert(handles && handles.capObserverInterval, 'start(): returns capObserverInterval')
 })
 
 // ── Task 3.4: startupCleanup tolerates close_tab errors ──────────────────────
@@ -421,6 +422,129 @@ test('startupCleanup: tolerates close_tab errors and still nulls dispatched_tab_
 test('SCHEDULER_ENABLED default is not "true"', async () => {
   const val = process.env.SCHEDULER_ENABLED
   assert(!val || val !== 'true', 'SCHEDULER_ENABLED: not "true" in default env (default off)')
+})
+
+// ── Phase 7: usage-cap observer ───────────────────────────────────────────────
+//
+// These tests need creds.js to read a SANDBOXED .credentials.json + per-account
+// dir, so we set up isolated temp dirs and re-require creds with the new env.
+
+const _capObsFs = require('fs')
+const _capObsPath = require('path')
+const _capObsOs = require('os')
+const _capObsTmp = _capObsFs.mkdtempSync(_capObsPath.join(_capObsOs.tmpdir(), 'sched-capobs-'))
+const _capObsCredsDir = _capObsPath.join(_capObsTmp, 'creds')
+_capObsFs.mkdirSync(_capObsCredsDir, { recursive: true })
+const _capObsClaudePath = _capObsPath.join(_capObsTmp, 'claude', '.credentials.json')
+_capObsFs.mkdirSync(_capObsPath.dirname(_capObsClaudePath), { recursive: true })
+
+const _capObsTate = { claudeAiOauth: { accessToken: 'AT-tate-capobs', refreshToken: 'RT-tate-capobs', expiresAt: 9999999999000 } }
+const _capObsCode = { claudeAiOauth: { accessToken: 'AT-code-capobs', refreshToken: 'RT-code-capobs', expiresAt: 9999999999000 } }
+const _capObsMoney = { claudeAiOauth: { accessToken: 'AT-money-capobs', refreshToken: 'RT-money-capobs', expiresAt: 9999999999000 } }
+_capObsFs.writeFileSync(_capObsPath.join(_capObsCredsDir, 'tate.json'), JSON.stringify(_capObsTate))
+_capObsFs.writeFileSync(_capObsPath.join(_capObsCredsDir, 'code.json'), JSON.stringify(_capObsCode))
+_capObsFs.writeFileSync(_capObsPath.join(_capObsCredsDir, 'money.json'), JSON.stringify(_capObsMoney))
+
+// Rebind creds env + clear module cache so creds.js re-binds to sandbox paths.
+process.env.CREDS_DIR = _capObsCredsDir
+process.env.CLAUDE_CREDENTIALS_PATH = _capObsClaudePath
+delete require.cache[require.resolve('./creds')]
+const _capObsCreds = require('./creds')
+_capObsCreds._setUsageSource({
+  get_usage_state: (account) => {
+    const states = {
+      tate: { headroom_minutes: 5, reset_at: '2026-12-31T00:00:00Z' },
+      code: { headroom_minutes: 200, reset_at: '2026-12-31T00:00:00Z' },
+      money: { headroom_minutes: 100, reset_at: '2026-12-31T00:00:00Z' },
+    }
+    return states[account]
+  }
+})
+
+test('checkCapWarning: skips when current account is unknown', async () => {
+  // Inject a stub creds module returning 'unknown' so we don't depend on
+  // the real ~/.claude/.credentials.json (which DOES exist in dev).
+  scheduler._setCredsModule({
+    current_account: () => 'unknown',
+    pick_healthiest_account: async () => null,
+  })
+  scheduler._resetCapWarningLast()
+  const stubPool = makeStubPool([])
+  scheduler._setPool(stubPool)
+  scheduler._setUsageModule({ get_usage_state: async () => ({ state: {} }) })
+  const result = await scheduler.checkCapWarning()
+  assert(result.skipped === 'no_current_account', 'returns skipped=no_current_account when unknown')
+  // Restore the sandbox creds for subsequent tests.
+  delete require.cache[require.resolve('./creds')]
+  scheduler._setCredsModule(require('./creds'))
+})
+
+test('checkCapWarning: skips when headroom is ample', async () => {
+  // Seed credentials with tate.json -> current_account = 'tate'.
+  _capObsFs.copyFileSync(_capObsPath.join(_capObsCredsDir, 'tate.json'), _capObsClaudePath)
+  scheduler._resetCapWarningLast()
+  const stubPool = makeStubPool([])
+  scheduler._setPool(stubPool)
+  scheduler._setUsageModule({
+    get_usage_state: async () => ({
+      state: {
+        tate: { headroom_minutes: 200 },
+        code: { headroom_minutes: 100 },
+        money: { headroom_minutes: 50 }
+      }
+    })
+  })
+  const result = await scheduler.checkCapWarning()
+  assert(result.skipped === 'headroom_ample', 'returns skipped=headroom_ample at 200min')
+})
+
+test('checkCapWarning: fires INSERT when headroom is low + writes observer signal', async () => {
+  _capObsFs.copyFileSync(_capObsPath.join(_capObsCredsDir, 'tate.json'), _capObsClaudePath)
+  scheduler._resetCapWarningLast()
+  const stubPool = makeStubPool([])
+  scheduler._setPool(stubPool)
+  scheduler._setUsageModule({
+    get_usage_state: async () => ({
+      state: {
+        tate: { headroom_minutes: 5 },
+        code: { headroom_minutes: 200 },
+        money: { headroom_minutes: 100 }
+      }
+    })
+  })
+
+  const result = await scheduler.checkCapWarning()
+  assert(result.fired === true, 'returns fired=true')
+  assert(result.current === 'tate', 'identifies current=tate')
+  const insertCalls = stubPool._queries.filter(q => q.sql.includes('INSERT INTO observer_signals'))
+  assert(insertCalls.length === 1, 'wrote exactly one observer_signals row')
+  assert(insertCalls[0].params[0] === 'autonomy-substrate-usage-cap-observer', 'observer_name set')
+  assert(insertCalls[0].params[1] === 'usage_cap_warning', 'signal_kind set')
+  assert(insertCalls[0].params[2].includes('Current account (tate)') && insertCalls[0].params[2].includes('5 minutes'), 'message includes account + headroom')
+  assert(insertCalls[0].params[3].startsWith('usage_cap:tate:'), 'fingerprint scoped to account')
+})
+
+test('checkCapWarning: cooldown prevents double-fire within 1h', async () => {
+  _capObsFs.copyFileSync(_capObsPath.join(_capObsCredsDir, 'tate.json'), _capObsClaudePath)
+  scheduler._resetCapWarningLast()
+  const stubPool = makeStubPool([])
+  scheduler._setPool(stubPool)
+  scheduler._setUsageModule({
+    get_usage_state: async () => ({
+      state: {
+        tate: { headroom_minutes: 5 },
+        code: { headroom_minutes: 200 },
+        money: { headroom_minutes: 100 }
+      }
+    })
+  })
+
+  const first = await scheduler.checkCapWarning()
+  const second = await scheduler.checkCapWarning()
+  assert(first.fired === true, 'first call fires')
+  assert(second.skipped === 'cooldown', 'second call within cooldown is skipped')
+  const insertCalls = stubPool._queries.filter(q => q.sql.includes('INSERT INTO observer_signals'))
+  assert(insertCalls.length === 1, 'exactly one INSERT despite two calls')
 })
 
 // ── sequential test runner ────────────────────────────────────────────────────

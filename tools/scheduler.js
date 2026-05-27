@@ -22,7 +22,9 @@
 
 const { Pool } = require('pg')
 const cronParser = require('cron-parser')
-const creds = require('./creds')
+let _credsModule = require('./creds')
+function getCreds() { return _credsModule }
+exports._setCredsModule = function (m) { _credsModule = m }
 const coord = require('./coord')
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -211,11 +213,11 @@ exports.dispatchOne = async function dispatchOne(row) {
   let tabId = null
   try {
     // 1. Pick + rotate to healthiest account.
-    account = await creds.pick_healthiest_account({
+    account = await getCreds().pick_healthiest_account({
       preferred: row.preferred_account || null,
       required_headroom_minutes: 15,
     })
-    await creds.rotate_to(account)
+    await getCreds().rotate_to(account)
 
     // 2. Build brief with actual_account filled in.
     const rowWithAccount = Object.assign({}, row, { actual_account: account })
@@ -509,13 +511,92 @@ exports.startupCleanup = async function startupCleanup() {
   }
 }
 
+// ── usage-cap observer (Phase 7) ─────────────────────────────────────────────
+//
+// Every 5 minutes, checks the current account's headroom. If it is below
+// HEADROOM_WARN_THRESHOLD_MIN, writes an observer_signals row so any active CC
+// chat sees the warning in its <observer_signals> continuity block on the next
+// turn. Anti-spam: 1-hour cooldown per current-account fingerprint.
+
+const HEADROOM_WARN_THRESHOLD_MIN = 15
+const CAP_OBSERVER_INTERVAL_MS = 5 * 60 * 1000
+const CAP_OBSERVER_COOLDOWN_MS = 60 * 60 * 1000
+
+let _usageModule = null
+function getUsageModule() {
+  if (!_usageModule) _usageModule = require('./usage')
+  return _usageModule
+}
+exports._setUsageModule = function (mod) { _usageModule = mod }
+
+const _capWarningLast = { account: null, at: 0 }
+
+exports.checkCapWarning = async function checkCapWarning() {
+  const current = getCreds().current_account()
+  if (current === 'unknown') return { skipped: 'no_current_account' }
+
+  const usage = getUsageModule()
+  const stateResult = await usage.get_usage_state({})
+  const accountState = stateResult && stateResult.state && stateResult.state[current]
+  if (!accountState) return { skipped: 'no_state_for_current' }
+
+  const headroomMin = typeof accountState.headroom_minutes === 'number'
+    ? accountState.headroom_minutes
+    : (typeof accountState.remaining_minutes === 'number' ? accountState.remaining_minutes : null)
+
+  if (headroomMin === null || headroomMin > HEADROOM_WARN_THRESHOLD_MIN) {
+    return { skipped: 'headroom_ample', headroom_min: headroomMin }
+  }
+
+  const now = Date.now()
+  if (_capWarningLast.account === current && (now - _capWarningLast.at) < CAP_OBSERVER_COOLDOWN_MS) {
+    return { skipped: 'cooldown', cooldown_remaining_ms: CAP_OBSERVER_COOLDOWN_MS - (now - _capWarningLast.at) }
+  }
+
+  let nextAccount = null
+  let nextHeadroom = null
+  try {
+    nextAccount = await getCreds().pick_healthiest_account({ required_headroom_minutes: 30 })
+    if (nextAccount && nextAccount !== current) {
+      const nextState = stateResult.state[nextAccount]
+      if (nextState) {
+        nextHeadroom = typeof nextState.headroom_minutes === 'number'
+          ? nextState.headroom_minutes
+          : nextState.remaining_minutes
+      }
+    } else {
+      nextAccount = null
+    }
+  } catch (_e) {
+    nextAccount = null
+  }
+
+  const message = nextAccount
+    ? `Current account (${current}) is capping in ${Math.floor(headroomMin)} minutes. Next-healthiest account (${nextAccount}) has ${nextHeadroom ? Math.floor(nextHeadroom) : '?'} minutes of headroom. When convenient, finish your turn and open a new chat - it will land on ${nextAccount} automatically.`
+    : `Current account (${current}) is capping in ${Math.floor(headroomMin)} minutes. All other accounts are also low. Reduce non-urgent work until reset.`
+
+  const fingerprint = `usage_cap:${current}:${Math.floor(headroomMin / 5) * 5}m`
+
+  await getPool().query(
+    `INSERT INTO observer_signals (observer_name, signal_kind, message, fingerprint, priority, created_at)
+     VALUES ($1, $2, $3, $4, $5, now())`,
+    ['autonomy-substrate-usage-cap-observer', 'usage_cap_warning', message, fingerprint, 2]
+  )
+
+  _capWarningLast.account = current
+  _capWarningLast.at = now
+  return { fired: true, current, next: nextAccount, headroom_min: headroomMin }
+}
+
+exports._resetCapWarningLast = function () { _capWarningLast.account = null; _capWarningLast.at = 0 }
+
 // ── start ────────────────────────────────────────────────────────────────────
 //
-// Starts all three intervals. Wraps each in try/catch so one bad pass
-// does not tank the entire loop.
+// Starts all three intervals plus the usage-cap observer. Wraps each in
+// try/catch so one bad pass does not tank the entire loop.
 
 exports.start = function start() {
-  process.stderr.write('[scheduler] starting dispatch loop + completion poller + stale-lease recovery\n')
+  process.stderr.write('[scheduler] starting dispatch loop + completion poller + stale-lease recovery + cap observer\n')
 
   // Non-blocking startup cleanup.
   exports.startupCleanup().catch(e => {
@@ -563,10 +644,20 @@ exports.start = function start() {
     }
   }, STALE_LEASE_INTERVAL_MS)
 
+  // Usage-cap observer.
+  const capObserverInterval = setInterval(async () => {
+    try {
+      await exports.checkCapWarning()
+    } catch (e) {
+      process.stderr.write('[scheduler] checkCapWarning error: ' + e.message + '\n')
+    }
+  }, CAP_OBSERVER_INTERVAL_MS)
+
   // Unref so the intervals don't prevent process exit in test environments.
   if (dispatchInterval.unref) dispatchInterval.unref()
   if (completionInterval.unref) completionInterval.unref()
   if (staleInterval.unref) staleInterval.unref()
+  if (capObserverInterval.unref) capObserverInterval.unref()
 
-  return { dispatchInterval, completionInterval, staleInterval }
+  return { dispatchInterval, completionInterval, staleInterval, capObserverInterval }
 }
