@@ -165,6 +165,15 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: 'coord.close_my_tab',
+    description: 'Close your own IDE chat tab. Call this as the FINAL action right after coord.signal_done({terminate:true}). Targets the editor focused at the moment of call (which is your chat panel because you just made a tool call). Best-effort; failures do not crash the worker arc. Returns {ok, tab_id, closed, error}. WHY: without this, every dispatched worker tab accumulates in the IDE and burns memory (each Claude Code chat is a webview ~50-200MB).',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: true,
+    },
+  },
+  {
     name: 'coord.pick_account',
     description: 'Select the highest-headroom Claude Max account for the next dispatch. Score: min(remaining_5h, remaining_weekly) * 0.85 - estimated_tokens. Returns {account, score, remaining_5h, remaining_weekly, reason, candidates[]}.',
     inputSchema: {

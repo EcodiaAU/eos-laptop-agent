@@ -557,6 +557,55 @@ async function signal_done(params, ctx) {
   return r
 }
 
+// close_my_tab - worker self-closes its IDE chat tab after signal_done.
+//
+// Why: signal_done already marks the worker terminated in the registry, but
+// the IDE chat tab stays open. Without this, tabs accumulate and burn memory
+// (each Claude Code chat is a webview). The brief instructs workers to call
+// this as the LAST action right after signal_done({terminate:true}).
+//
+// Mechanism: targets the worker's own active editor (the chat panel the
+// worker is running inside) via the conductor's IDE bridge. Workers cannot
+// access ide.* MCP directly, so coord proxies it. Best-effort - swallows
+// failures rather than killing the worker arc on a transient IDE-bridge hiccup.
+async function close_my_tab(params, ctx) {
+  ctx = ctx || {}
+  if (!ctx.tab_id) {
+    return { ok: false, error: 'tab_id required (set X-Tab-Id header or pass tab_id param)' }
+  }
+  const conductor = loadConductorRegistration()
+  if (!conductor || !conductor.ide_bridge_port) {
+    return { ok: false, error: 'no_conductor_ide_port', tab_id: ctx.tab_id }
+  }
+  // Lazy-require ide to avoid circular deps.
+  let ide
+  try { ide = require('./ide') } catch (e) { return { ok: false, error: 'ide_module_unavailable' } }
+  let closed = false
+  let error = null
+  try {
+    // Dispatch the VS Code command that closes the focused editor. Workers
+    // calling this RIGHT AFTER signal_done from inside their own chat panel
+    // are still focused there, so this targets the worker's tab. The
+    // ide_port pin ensures we hit the right IDE instance (Stable vs Insiders).
+    const cmdResult = await ide.command({
+      cmd: 'workbench.action.closeActiveEditor',
+      ide_port: conductor.ide_bridge_port,
+    })
+    closed = !!(cmdResult && (cmdResult.ok || cmdResult.result === null || cmdResult.result === undefined))
+  } catch (e) {
+    error = e.message || String(e)
+  }
+  // Even if the IDE call failed, the worker is done - mark the registry record
+  // closed_tab so corazonWatchdog/sweep can tell tabs-leaked from clean exits.
+  if (workers.has(ctx.tab_id)) {
+    const w = workers.get(ctx.tab_id)
+    w.closed_tab_at = new Date().toISOString()
+    w.closed_tab_ok = closed
+    try { atomicWriteJson(path.join(WORKERS_DIR, ctx.tab_id + '.json'), w) } catch (e) {}
+  }
+  return { ok: true, tab_id: ctx.tab_id, closed: closed, error: error }
+}
+
 // signal_bound - sent by a spawned worker on first turn to confirm it launched
 // successfully, read its brief, and connected to MCP. Releases the scheduler's
 // launch-lock (dispatch_worker's worker_acknowledgment_timeout_ms window).
@@ -888,6 +937,7 @@ module.exports = {
   report_progress: report_progress,
   signal_done: signal_done,
   signal_bound: signal_bound,
+  close_my_tab: close_my_tab,
   verify_paste: verify_paste,
   register_conductor: register_conductor,
   unregister_conductor: unregister_conductor,

@@ -33,6 +33,7 @@ const input = require('./input')
 const clipboard = require('./clipboard')
 const screenshot = require('./screenshot')
 const win = require('./window')
+const ide = require('./ide')
 
 const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
@@ -183,6 +184,9 @@ function composeBrief(opts) {
     '- You are NOT the conductor. Do not orchestrate. Do not spawn workers.\n' +
     '- Report progress via coord.send_message (to: chat.conductor.inbox).\n' +
     '- When the task is complete, call coord.signal_done({task_id, result_summary, terminate: true}).\n' +
+    '- Then call mcp__coord__coord_close_my_tab({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"}) as your FINAL action.\n' +
+    '  This closes your IDE chat tab. Without it, every worker tab accumulates in the IDE.\n' +
+    '  The conductor reads your signal_done from the inbox - tab closure does not delete the message.\n' +
     '- You can only emit messages TO chat.conductor.inbox or chat.' + tab_id + '.scratch.\n' +
     '- Heartbeat via coord.heartbeat() at start + end of every turn.\n'
 
@@ -218,6 +222,14 @@ async function recoveryRepasteBrief(brief, tab_handle) {
       await cursor.focus()
       await sleep(400)
     } catch (e) {}
+  }
+  // Focus the CC chat input - same brief-paste-into-wrong-target bug fix as
+  // the primary paste loop. Best-effort.
+  try {
+    await ide.command({ cmd: 'claude-vscode.focus' })
+    await sleep(150)
+  } catch (_e) {
+    try { await ide.command({ cmd: 'claude-dev.SidebarProvider.focus' }); await sleep(150) } catch (_e2) {}
   }
   await clipboard.write({ text: brief })
   await sleep(200)
@@ -377,10 +389,32 @@ async function dispatch_worker(params) {
   // try/catch with a single retry-after-pause prevents the orphan-tab failure
   // class - dispatch already succeeded at register-worker + spawn-tab, so a
   // late clipboard fail used to leave a brief-less worker.
+  //
+  // CRITICAL: vscode.new_claude_code_chat sends Ctrl+Alt+Shift+C which opens
+  // a fresh CC chat tab but does NOT reliably focus the input box - focus
+  // often lands on the sidebar tree, editor pane, or stays on the previous
+  // editor. Without an explicit focus call, the Ctrl+V paste below lands
+  // somewhere weird and the brief never reaches the chat. Symptom: tabs open
+  // but stay empty. Fix: call claude-vscode.focus before each paste attempt.
   let pasted = false
   let paste_error = null
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
+      // Explicit focus the Claude Code chat input. Best-effort - failures here
+      // (older CC ext, command not registered in target IDE) fall through to
+      // the original paste flow which sometimes works on its own.
+      try {
+        await ide.command({ cmd: 'claude-vscode.focus' })
+        await sleep(150)
+      } catch (focusErr) {
+        // Try the older command name as a fallback (claude-dev extension lineage)
+        try {
+          await ide.command({ cmd: 'claude-dev.SidebarProvider.focus' })
+          await sleep(150)
+        } catch (_e2) {
+          // Best-effort - proceed to paste anyway
+        }
+      }
       await clipboard.write({ text: composedBrief })
       await sleep(250)
       await input.shortcut({ keys: ['ctrl', 'v'] })
