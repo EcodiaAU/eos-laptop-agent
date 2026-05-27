@@ -350,13 +350,105 @@ function readBody(req) {
     }
   })
 
+  // ── TEST 7: skip-active - do NOT consume the live session's refresh_token ──
+
+  await test('skips OAuth refresh when backup matches the live interactive session', async () => {
+    const account = 'tate'
+    // Live file == this backup (same tokens). Near-expiry so it WOULD refresh
+    // if not for the active-session guard.
+    const liveFile = path.join(CREDS_DIR, '_live.json')
+    const shared = { accessToken: 'AT-live-shared', refreshToken: 'RT-live-shared', expiresAt: Date.now() + 60 * 1000, scopes: ['x'], subscriptionType: 'max', rateLimitTier: 'standard' }
+    fs.writeFileSync(liveFile, JSON.stringify({ claudeAiOauth: shared }))
+    writeAccountFile(account, { claudeAiOauth: { accessToken: 'AT-live-shared', refreshToken: 'RT-live-shared', expiresAt: Date.now() + 60 * 1000 } })
+    process.env.CLAUDE_CREDENTIALS_PATH = liveFile
+
+    let oauthHit = false
+    const { srv, port } = await startStubServer(async (req, res) => { oauthHit = true; res.writeHead(500); res.end('{}') })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port
+
+    const refresher = freshRequire()
+    await refresher.refresh_account(account)
+    await stopStubServer(srv)
+    delete process.env.CLAUDE_CREDENTIALS_PATH
+
+    if (oauthHit) throw new Error('OAuth endpoint was called for the active account - refresh_token would have been consumed')
+    const saved = readAccountFile(account)
+    if (saved.claudeAiOauth.refreshToken !== 'RT-live-shared') throw new Error('active-account backup was mutated')
+  })
+
+  // ── TEST 8: sync-from-live when the live session has self-refreshed ────────
+
+  await test('syncs backup FROM live credentials when active session rotated its token', async () => {
+    const account = 'tate'
+    // Backup shares refreshToken with live (same lineage) but live has a NEWER
+    // accessToken - i.e. Claude Code self-refreshed .credentials.json.
+    const liveFile = path.join(CREDS_DIR, '_live.json')
+    fs.writeFileSync(liveFile, JSON.stringify({ claudeAiOauth: { accessToken: 'AT-live-NEW', refreshToken: 'RT-shared', expiresAt: Date.now() + 8 * 3600 * 1000, scopes: ['x'], subscriptionType: 'max', rateLimitTier: 'standard' } }))
+    writeAccountFile(account, { claudeAiOauth: { accessToken: 'AT-backup-OLD', refreshToken: 'RT-shared', expiresAt: Date.now() + 60 * 1000 } })
+    process.env.CLAUDE_CREDENTIALS_PATH = liveFile
+
+    let oauthHit = false
+    const { srv, port } = await startStubServer(async (req, res) => { oauthHit = true; res.writeHead(500); res.end('{}') })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port
+
+    const refresher = freshRequire()
+    await refresher.refresh_account(account)
+    await stopStubServer(srv)
+    delete process.env.CLAUDE_CREDENTIALS_PATH
+
+    if (oauthHit) throw new Error('OAuth endpoint was called - should have synced from live instead')
+    const saved = readAccountFile(account)
+    if (saved.claudeAiOauth.accessToken !== 'AT-live-NEW') throw new Error('backup was not synced from live (got ' + saved.claudeAiOauth.accessToken + ')')
+  })
+
+  // ── TEST 9: self-heal on 401 only for the last-confirmed active account ────
+
+  await test('self-heals on 401 only after positively confirming the account was the live session', async () => {
+    const account = 'tate'
+    const liveFile = path.join(CREDS_DIR, '_live.json')
+    process.env.CLAUDE_CREDENTIALS_PATH = liveFile
+
+    // Stub + OAUTH_REFRESH_URL must be set BEFORE freshRequire - the module
+    // captures OAUTH_REFRESH_URL as a const at require time.
+    let oauthHit = false
+    const { srv, port } = await startStubServer(async (req, res) => { oauthHit = true; res.writeHead(401); res.end(JSON.stringify({ error: 'invalid_grant' })) })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port
+
+    const refresher = freshRequire()
+
+    // Cycle 1: backup matches live -> records _lastActiveAccount='tate', skips
+    // (no OAuth call). Confirms the active-session positive evidence.
+    fs.writeFileSync(liveFile, JSON.stringify({ claudeAiOauth: { accessToken: 'AT-shared', refreshToken: 'RT-shared', expiresAt: Date.now() + 60 * 1000, scopes: ['x'], subscriptionType: 'max', rateLimitTier: 'standard' } }))
+    writeAccountFile(account, { claudeAiOauth: { accessToken: 'AT-shared', refreshToken: 'RT-shared', expiresAt: Date.now() + 60 * 1000 } })
+    await refresher.refresh_account(account)
+
+    // Claude Code self-refreshes the live file (diverges). Backup now stale,
+    // its spent refresh_token will 401.
+    fs.writeFileSync(liveFile, JSON.stringify({ claudeAiOauth: { accessToken: 'AT-AFTER-CC-REFRESH', refreshToken: 'RT-AFTER', expiresAt: Date.now() + 8 * 3600 * 1000, scopes: ['x'], subscriptionType: 'max', rateLimitTier: 'standard' } }))
+    // ensure other backups don't match the live file
+    writeAccountFile('code', { claudeAiOauth: { accessToken: 'AT-code', refreshToken: 'RT-code' } })
+    writeAccountFile('money', { claudeAiOauth: { accessToken: 'AT-money', refreshToken: 'RT-money' } })
+
+    // Cycle 2: backup no longer matches live -> OAuth -> 401 -> self-heal
+    // because account === _lastActiveAccount. Must NOT throw.
+    let threw = false
+    try { await refresher.refresh_account(account) } catch (_) { threw = true }
+    await stopStubServer(srv)
+    delete process.env.CLAUDE_CREDENTIALS_PATH
+
+    if (!oauthHit) throw new Error('expected an OAuth attempt after divergence')
+    if (threw) throw new Error('self-heal should have caught the 401 and synced, not thrown')
+    const saved = readAccountFile(account)
+    if (saved.claudeAiOauth.accessToken !== 'AT-AFTER-CC-REFRESH') throw new Error('backup not self-healed from live (got ' + saved.claudeAiOauth.accessToken + ')')
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
     console.error('\n' + failures + ' test(s) FAILED')
     process.exit(1)
   } else {
-    console.log('\nALL TESTS PASSED (' + 6 + ' tests)')
+    console.log('\nALL TESTS PASSED (' + 9 + ' tests)')
     process.exit(0)
   }
 

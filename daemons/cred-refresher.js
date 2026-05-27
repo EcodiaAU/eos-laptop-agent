@@ -6,10 +6,22 @@
 //
 // ============================================================
 // INVARIANT - DO NOT REMOVE THIS COMMENT:
-//   This daemon reads and writes ONLY to D:/PRIVATE/ecodia-creds/{account}.json.
-//   It MUST NEVER read, write, or watch ~/.claude/.credentials.json.
-//   That file is owned exclusively by tools/creds.js::rotate_to (Phase 1).
-//   Any change that causes this daemon to touch .credentials.json is a bug.
+//   This daemon WRITES ONLY to D:/PRIVATE/ecodia-creds/{account}.json.
+//   It MUST NEVER write to, and MUST NEVER register a filesystem watch on,
+//   the live credentials file at ~/.claude/.credentials.json. That file is
+//   written exclusively by tools/creds.js::rotate_to and by Claude Code's own
+//   in-place OAuth refresh.
+//
+//   2026-05-28 amendment: a ONE-SHOT READ of the live credentials file is now
+//   permitted (readLiveCredentials), for the SOLE purpose of identifying which
+//   account is the live interactive session so we DO NOT consume its single-use
+//   refresh_token. This is the OPPOSITE of the clobber pattern (which watched +
+//   wrote-back). Read-to-skip is protective. The watch + write-back ban is what
+//   is load-bearing; a read-only snapshot to avoid a token-lineage collision
+//   is safe. Root cause it fixes: overnight the refresher refreshed the backup
+//   of the account Tate's live session was on, rotating the single-use
+//   refresh_token out from under Claude Code, so Claude Code's own refresh
+//   failed and Tate had to re-login (2026-05-28 cred-collision diagnosis).
 // ============================================================
 //
 // Per-account file shape (claudeAiOauth wrapper):
@@ -73,6 +85,15 @@ const FAILURE_ESCALATION_COUNT = 3
 // ── failure counter (per-account, resets on success) ─────────────────────────
 
 const failureCount = { tate: 0, code: 0, money: 0 }
+
+// Tracks which account most recently matched the live interactive session.
+// Used to gate the 401 self-heal: we only sync a backup from live credentials
+// after a 401 when we have POSITIVE prior evidence that account WAS the live
+// session (and the live session has since rotated its single-use refresh_token,
+// spending the one in our backup). Without this gate, an account whose backup
+// happens not to match any other backup would falsely self-heal. null until
+// a cycle observes a live match.
+let _lastActiveAccount = null
 
 // ── kv_store writer (dependency-injected seam for tests) ─────────────────────
 
@@ -169,6 +190,37 @@ function readAccountFile(account) {
   return JSON.parse(fs.readFileSync(p, 'utf8'))
 }
 
+// Path to the live credentials file Claude Code uses. ONE-SHOT READ ONLY -
+// never write, never watch (see the INVARIANT block at the top of this file).
+const LIVE_CREDENTIALS_PATH =
+  process.env.CLAUDE_CREDENTIALS_PATH ||
+  path.join(require('os').homedir(), '.claude', '.credentials.json')
+
+// Read the live credentials once. Returns { accessToken, refreshToken } or null.
+// Used only to identify + protect the active interactive session's token
+// lineage. Read-only; tolerant of missing/corrupt file.
+function readLiveCredentials() {
+  try {
+    if (!fs.existsSync(LIVE_CREDENTIALS_PATH)) return null
+    const parsed = JSON.parse(fs.readFileSync(LIVE_CREDENTIALS_PATH, 'utf8'))
+    const o = parsed && parsed.claudeAiOauth
+    if (!o || !o.accessToken) return null
+    return { accessToken: o.accessToken, refreshToken: o.refreshToken, raw: parsed }
+  } catch (_) {
+    return null
+  }
+}
+
+// True when this account's backup shares the live session's token lineage
+// (same access token OR same refresh token). If so, Claude Code owns this
+// account's refresh - we must NOT consume its single-use refresh_token.
+function backupMatchesLive(oauth, live) {
+  if (!live) return false
+  if (oauth.accessToken && oauth.accessToken === live.accessToken) return true
+  if (oauth.refreshToken && live.refreshToken && oauth.refreshToken === live.refreshToken) return true
+  return false
+}
+
 // Atomic write: write to .tmp then rename over target.
 function writeAccountFileAtomic(account, data) {
   const target = accountFilePath(account)
@@ -183,9 +235,28 @@ function writeAccountFileAtomic(account, data) {
 // Throws if the HTTP call fails or returns a non-2xx status.
 // On success: resets failure counter, atomically writes new tokens.
 // On failure: increments failure counter; escalates to kv_store at threshold.
-async function refresh_account(account) {
+async function refresh_account(account, live) {
   const fileData = readAccountFile(account)
   const oauth    = fileData.claudeAiOauth
+
+  // ACTIVE-ACCOUNT PROTECTION (2026-05-28): if this backup shares the live
+  // interactive session's token lineage, Claude Code owns its refresh. OAuth-
+  // refreshing here would consume the single-use refresh_token out from under
+  // the live session and force a re-login. Skip - and sync the backup FROM the
+  // live file so the scheduler can still rotate to a valid token. (Sync is a
+  // no-op while they're identical; it matters after Claude Code self-refreshes.)
+  if (live === undefined) live = readLiveCredentials()
+  if (backupMatchesLive(oauth, live)) {
+    _lastActiveAccount = account  // positive evidence: this account IS the live session
+    if (live.raw && live.raw.claudeAiOauth && live.raw.claudeAiOauth.accessToken !== oauth.accessToken) {
+      writeAccountFileAtomic(account, { claudeAiOauth: live.raw.claudeAiOauth })
+      console.log('[cred-refresher] synced ' + account + ' backup from live credentials (active session)')
+    } else {
+      console.log('[cred-refresher] skipped ' + account + ' - active interactive session owns its refresh')
+    }
+    failureCount[account] = 0
+    return
+  }
 
   const now         = Date.now()
   const timeToExpiry = oauth.expiresAt - now
@@ -213,6 +284,35 @@ async function refresh_account(account) {
   }
 
   if (response.status < 200 || response.status >= 300) {
+    // SELF-HEAL (2026-05-28): a 401/invalid_grant here often means the live
+    // interactive session already rotated this account's single-use
+    // refresh_token (Claude Code self-refreshed .credentials.json after our
+    // last skip, so the backup's refresh_token is now spent). If the live file
+    // does NOT match any OTHER account's backup, the live file IS this
+    // account's session - sync the backup from it instead of escalating a
+    // false "refresh failing" alarm.
+    // Gate on POSITIVE prior evidence: only self-heal the account we last
+    // confirmed was the live session. This avoids a false self-heal for an
+    // account whose backup merely fails to match any other backup (e.g. in
+    // isolated tests where live credentials are unrelated to the mocks).
+    if (
+      (response.status === 401 || /invalid_grant/i.test(response.body || '')) &&
+      account === _lastActiveAccount
+    ) {
+      const liveNow = live || readLiveCredentials()
+      if (liveNow && liveNow.raw && liveNow.raw.claudeAiOauth) {
+        const others = ACCOUNTS.filter(a => a !== account)
+        const liveMatchesOther = others.some(a => {
+          try { return backupMatchesLive(readAccountFile(a).claudeAiOauth, liveNow) } catch { return false }
+        })
+        if (!liveMatchesOther) {
+          writeAccountFileAtomic(account, { claudeAiOauth: liveNow.raw.claudeAiOauth })
+          failureCount[account] = 0
+          console.log('[cred-refresher] self-healed ' + account + ' backup from live credentials after 401 (live session had rotated the token)')
+          return
+        }
+      }
+    }
     const errMsg = 'HTTP ' + response.status + ' from OAuth endpoint: ' + response.body
     await handleFailure(account, errMsg)
     throw new Error(errMsg)
@@ -270,11 +370,14 @@ async function handleFailure(account, reason) {
   }
 }
 
-// Run a single pass over all accounts.
+// Run a single pass over all accounts. Reads the live credentials ONCE
+// up-front and passes the snapshot to each account so the active-session
+// protection (skip + sync) is consistent across the pass.
 async function _runOnce() {
+  const live = readLiveCredentials()
   for (const account of ACCOUNTS) {
     try {
-      await refresh_account(account)
+      await refresh_account(account, live)
     } catch (e) {
       // Error already logged and counted in refresh_account/handleFailure.
       // Continue to next account.
