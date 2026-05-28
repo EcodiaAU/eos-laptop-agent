@@ -267,8 +267,25 @@ async function dispatch_worker(params) {
   const tab_id = 'tab_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex')
   const tab_credential = uuid()
 
-  // Decide inline vs file
-  const brief_size_bytes = Buffer.byteLength(brief_body, 'utf8')
+  // 2026-05-29 patch: SENTINEL-PREFIX label pinning.
+  // Prepend a deterministic sentinel as the first user message so the chat
+  // auto-titles include it. close_my_tab + kill_worker target via prefix-match
+  // (probe ide.tabs, find tab whose label startsWith sentinel, close by exact
+  // resolved label). Removes the diff-by-label-vs-existing-Claude-Code-tab
+  // ambiguity and the auto-retitle drift problem in one shot.
+  //
+  // worker_name (optional) lets the caller pin a human-readable label
+  // ("audit", "deploy") for visual coordination. Falls back to EOS-W-<short>.
+  // The sentinel is the literal text between [ and ] - close-time match is
+  // `label.startsWith('[' + sentinel_inner + ']')`.
+  const sentinel_inner = (params.worker_name && /^[A-Za-z0-9_\- ]{1,40}$/.test(String(params.worker_name)))
+    ? String(params.worker_name)
+    : ('EOS-W-' + tab_id.slice(-8))
+  const sentinel_prefix = '[' + sentinel_inner + ']'
+  const briefed_body = sentinel_prefix + ' ' + brief_body
+
+  // Decide inline vs file (use briefed body for size calc + paste)
+  const brief_size_bytes = Buffer.byteLength(briefed_body, 'utf8')
   let brief_storage = 'inline'
   let brief_file_path = null
   if (brief_size_bytes > BRIEF_INLINE_CAP_BYTES) {
@@ -276,9 +293,9 @@ async function dispatch_worker(params) {
     brief_file_path = path.join(BRIEFS_DIR, task_id + '.md').replace(/\\/g, '/')
   }
 
-  // Always write brief to file for audit + recovery, even if inline
+  // Always write brief to file for audit + recovery, even if inline (sentinel-prefixed)
   const auditFilePath = path.join(BRIEFS_DIR, task_id + '.md')
-  try { fs.writeFileSync(auditFilePath, brief_body, 'utf8') } catch (e) {}
+  try { fs.writeFileSync(auditFilePath, briefed_body, 'utf8') } catch (e) {}
 
   // Resolve account=current to the real account label (from active_account.json).
   // Lazy-load usage to avoid require-cycle; usage.js doesn't depend on cowork.js.
@@ -325,7 +342,10 @@ async function dispatch_worker(params) {
   // Compose brief (registration already done conductor-side, brief is identity + task only)
   const compose_brief_storage = brief_storage
   const compose_brief_file = brief_storage === 'file' ? brief_file_path : null
-  const composedBrief = composeBrief({
+  // Sentinel-prefix the brief so the chat auto-titles include it for prefix-match close.
+  // The sentinel needs to be the FIRST chars of the chat's first message - prepend it
+  // OUTSIDE the composedBrief so it sits before the <dispatched> header.
+  const composedBriefInner = composeBrief({
     tab_id: tab_id,
     task_id: task_id,
     tab_credential: tab_credential,
@@ -335,6 +355,7 @@ async function dispatch_worker(params) {
     brief_storage: compose_brief_storage,
     brief_file_path: compose_brief_file,
   })
+  const composedBrief = sentinel_prefix + '\n' + composedBriefInner
 
   // Spawn a new Claude Code chat tab via the IDE bridge command
   // claude-vscode.newConversation (2026-05-28 patch). Replaces the previous
@@ -395,38 +416,69 @@ async function dispatch_worker(params) {
   }
   await sleep(1500)  // let the new chat tab UI render
 
-  // Capture tab_handle by ide.tabs diff. Find the NEW CC chat tab(s).
+  // Capture tab_handle by COUNT-DELTA + ACTIVE (not label diff - label diff
+  // failed when a leaked "Claude Code" tab already existed). The freshly
+  // spawned tab is always active immediately after claude-vscode.newConversation.
+  // We capture {sentinel_prefix, viewColumn, viewType} so close-time prefix
+  // match works regardless of the chat's eventual auto-title.
   let tab_handle = null
   try {
+    const cc_count_before_per_vc = {}
+    for (const t of cc_tabs_before) {
+      cc_count_before_per_vc[t.viewColumn] = (cc_count_before_per_vc[t.viewColumn] || 0) + 1
+    }
     const tabsAfter = await ideRoutes.tabs({})
     const groupsAfter = (tabsAfter && (tabsAfter.groups || (tabsAfter.result && tabsAfter.result.groups))) || []
-    const before_keys = new Set(cc_tabs_before.map(t => t.viewColumn + '|' + t.label))
-    const new_cc_tabs = []
+    let captured_viewColumn = null
+    let captured_label_at_spawn = null
     for (const g of groupsAfter) {
-      for (const t of (g.tabs || [])) {
-        if (t.viewType !== 'mainThreadWebview-claudeVSCodePanel') continue
-        const key = t.viewColumn + '|' + t.label
-        if (!before_keys.has(key)) {
-          new_cc_tabs.push({ label: t.label, viewColumn: t.viewColumn, active: t.active })
+      const cc_after = (g.tabs || []).filter(t => t.viewType === 'mainThreadWebview-claudeVSCodePanel')
+      const before_count = cc_count_before_per_vc[g.viewColumn] || 0
+      if (cc_after.length > before_count) {
+        // count went up - the spawn landed here
+        const active = cc_after.find(t => t.active)
+        const target = active || cc_after[cc_after.length - 1]  // fall back to last in group
+        if (target) {
+          captured_viewColumn = g.viewColumn
+          captured_label_at_spawn = target.label
+          break
         }
       }
     }
-    if (new_cc_tabs.length === 1) {
+    if (captured_viewColumn != null) {
       tab_handle = {
-        label: new_cc_tabs[0].label,
-        viewColumn: new_cc_tabs[0].viewColumn,
+        sentinel_prefix: sentinel_prefix,
+        viewColumn: captured_viewColumn,
         viewType: 'mainThreadWebview-claudeVSCodePanel',
-        captured_via: 'ide_tabs_diff',
-        captured_label_is_provisional: true,  // chat auto-titles after first message
+        label_at_spawn: captured_label_at_spawn,
+        captured_via: 'count_delta_plus_active',
+        captured_label_is_provisional: true,  // chat auto-titles after first message; use sentinel_prefix to find current label
       }
-    } else if (new_cc_tabs.length > 1) {
-      const active = new_cc_tabs.find(t => t.active)
-      tab_handle = active ? {
-        label: active.label, viewColumn: active.viewColumn,
-        viewType: 'mainThreadWebview-claudeVSCodePanel',
-        captured_via: 'ide_tabs_diff_multi_active',
-        captured_label_is_provisional: true,
-      } : null
+    } else {
+      // count delta zero - spawn might not have landed or ide.tabs lagged
+      // KEEP legacy diff as last resort
+      const before_keys = new Set(cc_tabs_before.map(t => t.viewColumn + '|' + t.label))
+      const new_cc_tabs = []
+      for (const g of groupsAfter) {
+        for (const t of (g.tabs || [])) {
+          if (t.viewType !== 'mainThreadWebview-claudeVSCodePanel') continue
+          const key = t.viewColumn + '|' + t.label
+          if (!before_keys.has(key)) {
+            new_cc_tabs.push({ label: t.label, viewColumn: t.viewColumn, active: t.active })
+          }
+        }
+      }
+      const candidate = new_cc_tabs.length === 1 ? new_cc_tabs[0] : (new_cc_tabs.find(t => t.active) || null)
+      if (candidate) {
+        tab_handle = {
+          sentinel_prefix: sentinel_prefix,
+          viewColumn: candidate.viewColumn,
+          viewType: 'mainThreadWebview-claudeVSCodePanel',
+          label_at_spawn: candidate.label,
+          captured_via: 'legacy_label_diff_fallback',
+          captured_label_is_provisional: true,
+        }
+      }
     }
   } catch (e) {}
 
@@ -677,26 +729,32 @@ async function kill_worker(params) {
       : (coord.workers && coord.workers.get && coord.workers.get(tab_id))) || null
     const tab_handle = (stored && stored.tab_handle) || params.tab_handle || null
     const CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
-    if (!tab_handle || tab_handle.viewType !== CC_CHAT_VIEW_TYPE || tab_handle.viewColumn == null || !tab_handle.label) {
+    if (!tab_handle || tab_handle.viewType !== CC_CHAT_VIEW_TYPE || tab_handle.viewColumn == null) {
       refused = 'no_safe_tab_handle_or_incomplete'
     } else {
+      // Sentinel prefix-match (preferred) or exact-label fallback. Mirrors
+      // coord.close_my_tab v4 - find the tab whose current label starts with
+      // the stored sentinel_prefix, close by that exact resolved label.
       const ide = require('./ide')
       const tabsResult = await ide.tabs({})
       const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+      const sentinelPrefix = tab_handle.sentinel_prefix || null
+      const exactLabel = tab_handle.label || tab_handle.label_at_spawn || null
       let foundExact = null
       for (const g of groups) {
         if (g.viewColumn !== tab_handle.viewColumn) continue
         for (const t of (g.tabs || [])) {
           if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
-          if (t.label === tab_handle.label) { foundExact = t; break }
+          if (sentinelPrefix && t.label && t.label.startsWith(sentinelPrefix)) { foundExact = t; break }
+          if (!foundExact && exactLabel && t.label === exactLabel) { foundExact = t }
         }
         if (foundExact) break
       }
       if (!foundExact) {
-        refused = 'strict_no_exact_label_match:' + tab_handle.label + '|vc' + tab_handle.viewColumn
+        refused = 'no_match:sentinel=' + (sentinelPrefix || 'null') + '|exact=' + (exactLabel || 'null') + '|vc' + tab_handle.viewColumn
       } else {
         const closeResult = await ide.tabs_close({
-          label: tab_handle.label,
+          label: foundExact.label,
           viewColumn: tab_handle.viewColumn,
           viewType: CC_CHAT_VIEW_TYPE,
         })
