@@ -629,7 +629,7 @@ async function close_my_tab(params, ctx) {
       let targetLabel = stored.label
       try {
         const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
-        const groups = (tabsResult && tabsResult.result && tabsResult.result.groups) || []
+        const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
         // Look for the stored label first; if not found, fall back to active CC chat in stored viewColumn
         let foundExact = null
         let activeInColumn = null
@@ -668,7 +668,7 @@ async function close_my_tab(params, ctx) {
     } else {
       // Fallback: no stored tab_handle, use the active-cc-chat safety gate.
       const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
-      const groups = (tabsResult && tabsResult.result && tabsResult.result.groups) || []
+      const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
       let activeTab = null
       for (const g of groups) {
         for (const t of (g.tabs || [])) {

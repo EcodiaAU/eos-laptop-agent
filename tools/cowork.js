@@ -359,11 +359,14 @@ async function dispatch_worker(params) {
 
   const ideRoutes = require('./ide')
 
-  // Snapshot CC chat tabs BEFORE spawn
+  // Snapshot CC chat tabs BEFORE spawn.
+  // ide.tabs() called internally returns {ide, pid, port, ok, groups:[...]}
+  // with groups at the TOP level (no .result wrapper - that's only the
+  // /api/tool HTTP wrapper). Read groups directly.
   let cc_tabs_before = []
   try {
     const tabsBefore = await ideRoutes.tabs({})
-    const groups = (tabsBefore && tabsBefore.result && tabsBefore.result.groups) || []
+    const groups = (tabsBefore && (tabsBefore.groups || (tabsBefore.result && tabsBefore.result.groups))) || []
     for (const g of groups) {
       for (const t of (g.tabs || [])) {
         if (t.viewType === 'mainThreadWebview-claudeVSCodePanel') {
@@ -396,7 +399,7 @@ async function dispatch_worker(params) {
   let tab_handle = null
   try {
     const tabsAfter = await ideRoutes.tabs({})
-    const groupsAfter = (tabsAfter && tabsAfter.result && tabsAfter.result.groups) || []
+    const groupsAfter = (tabsAfter && (tabsAfter.groups || (tabsAfter.result && tabsAfter.result.groups))) || []
     const before_keys = new Set(cc_tabs_before.map(t => t.viewColumn + '|' + t.label))
     const new_cc_tabs = []
     for (const g of groupsAfter) {
