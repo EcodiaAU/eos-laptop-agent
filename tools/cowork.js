@@ -650,25 +650,68 @@ async function kill_worker(params) {
 
   const markerPath = path.join(STATE_DIR, tab_id + '.spawned')
 
-  // Focus the worker's IDE + close the active tab. Best-effort: we don't have
-  // hwnd-level tab targeting without UIA so this closes the CURRENTLY focused
-  // tab, which is fragile. Caller should focus the right tab first or pass
-  // tab_handle in.
-  if (params.tab_handle && params.tab_handle.hwnd) {
-    try {
-      await win.focus_window({ titleContains: params.tab_handle.title.slice(0, 30) })
-      await sleep(300)
-    } catch (e) {}
-  }
+  // 2026-05-28 EMERGENCY PATCH. Previous version sent blind Ctrl+W to whatever
+  // was foreground - mass-closed Tate's CC chats when the scheduler's
+  // completionPass triggered markComplete -> kill_worker for accumulated
+  // signal_done messages on agent restart. Same class of bug as the
+  // close_my_tab targeted_active_fallback_label incident.
+  //
+  // New behaviour: STRICT exact-label match via ide.tabs_close using the
+  // worker's stored tab_handle (label + viewColumn + viewType) from the
+  // worker registry. Refuses if no stored handle or no exact match. Better
+  // leak than wrong-close.
+  //
+  // The hwnd/title-prefix-focus path is dead: webview tab titles change
+  // (Claude Code chats auto-retitle from first message), and even when the
+  // prefix matches it could match Tate's own tab. Never blind keystroke.
+  //
+  // Doctrine: ~/ecodiaos/patterns/vs-code-webview-tabs-have-no-stable-id-pin-label-or-leak-2026-05-28.md
+  //           ~/ecodiaos/patterns/cowork-kill-worker-tab-handle-from-foreground-after-spawn-is-unsafe-2026-05-28.md
+  let closed = false
+  let refused = null
+  let error = null
   try {
-    await input.shortcut({ keys: ['ctrl', 'w'] })
-    await sleep(400)
-  } catch (e) {}
+    const coord = require('./coord')
+    const stored = (coord._loadWorkerRegistry
+      ? coord._loadWorkerRegistry(tab_id)
+      : (coord.workers && coord.workers.get && coord.workers.get(tab_id))) || null
+    const tab_handle = (stored && stored.tab_handle) || params.tab_handle || null
+    const CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
+    if (!tab_handle || tab_handle.viewType !== CC_CHAT_VIEW_TYPE || tab_handle.viewColumn == null || !tab_handle.label) {
+      refused = 'no_safe_tab_handle_or_incomplete'
+    } else {
+      const ide = require('./ide')
+      const tabsResult = await ide.tabs({})
+      const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+      let foundExact = null
+      for (const g of groups) {
+        if (g.viewColumn !== tab_handle.viewColumn) continue
+        for (const t of (g.tabs || [])) {
+          if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
+          if (t.label === tab_handle.label) { foundExact = t; break }
+        }
+        if (foundExact) break
+      }
+      if (!foundExact) {
+        refused = 'strict_no_exact_label_match:' + tab_handle.label + '|vc' + tab_handle.viewColumn
+      } else {
+        const closeResult = await ide.tabs_close({
+          label: tab_handle.label,
+          viewColumn: tab_handle.viewColumn,
+          viewType: CC_CHAT_VIEW_TYPE,
+        })
+        const inner = (closeResult && closeResult.result) || closeResult || {}
+        closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+      }
+    }
+  } catch (e) {
+    error = e.message || String(e)
+  }
 
-  // Cleanup state marker
+  // Cleanup state marker - always safe to do.
   try { fs.unlinkSync(markerPath) } catch (e) {}
 
-  return { ok: true, tab_id: tab_id, marker_removed: !fs.existsSync(markerPath) }
+  return { ok: true, tab_id: tab_id, closed: closed, refused: refused, error: error, marker_removed: !fs.existsSync(markerPath) }
 }
 
 // ── cowork.swap_creds ────────────────────────────────────────────────────
