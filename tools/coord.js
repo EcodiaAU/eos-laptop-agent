@@ -622,71 +622,53 @@ async function close_my_tab(params, ctx) {
 
   const stored = workers.has(ctx.tab_id) ? workers.get(ctx.tab_id).tab_handle : null
 
+  // 2026-05-28 patch v3 (STRICT). Earlier versions had an active-tab fallback
+  // that closed whatever Tate happened to be focused on at close time -
+  // because CC chats auto-retitle from first message content, the stored
+  // label rarely matched at close time, and the fallback path closed the
+  // user's active chat instead. Mass-close incident (4+ CC chats lost).
+  //
+  // New behavior: STRICT exact-label match only. If the stored label still
+  // matches a tab in the stored viewColumn + viewType, close it. Otherwise
+  // refuse and leak the orphan tab. Better leak than wrong-close.
+  //
+  // The label-pinning architectural fix (rename the spawned tab to a
+  // deterministic name via agentSession.rename or equivalent) failed at
+  // probe time (rename command is interactive, hung 30s waiting for user
+  // input). Position-based targeting and sentinel-first-message-auto-title
+  // are open research items. Until one lands, tab leakage is acceptable.
+  //
+  // Doctrine: cowork-kill-worker-tab-handle-from-foreground-after-spawn-
+  // is-unsafe-2026-05-28.md + this patch's new pattern (TODO).
   try {
-    if (stored && stored.viewType === CC_CHAT_VIEW_TYPE && stored.viewColumn != null) {
-      // Primary path: targeted close via ide.tabs_close
-      // Probe current tabs - confirm a CC chat still exists in stored viewColumn.
-      let targetLabel = stored.label
-      try {
-        const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
-        const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
-        // Look for the stored label first; if not found, fall back to active CC chat in stored viewColumn
-        let foundExact = null
-        let activeInColumn = null
-        for (const g of groups) {
-          if (g.viewColumn !== stored.viewColumn) continue
-          for (const t of (g.tabs || [])) {
-            if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
-            if (t.label === stored.label) foundExact = t
-            if (t.active) activeInColumn = t
-          }
+    if (!stored || stored.viewType !== CC_CHAT_VIEW_TYPE || stored.viewColumn == null || !stored.label) {
+      refused = 'no_stored_tab_handle_or_incomplete:' + JSON.stringify(stored || null).slice(0, 200)
+    } else {
+      // Probe current tabs - require exact label match in stored viewColumn.
+      const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
+      const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+      let foundExact = null
+      for (const g of groups) {
+        if (g.viewColumn !== stored.viewColumn) continue
+        for (const t of (g.tabs || [])) {
+          if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
+          if (t.label === stored.label) { foundExact = t; break }
         }
-        if (foundExact) {
-          targetLabel = foundExact.label
-          close_strategy = 'targeted_exact_label'
-        } else if (activeInColumn) {
-          targetLabel = activeInColumn.label
-          close_strategy = 'targeted_active_fallback_label'
-        } else {
-          refused = 'no_matching_cc_chat_in_stored_viewColumn:' + stored.viewColumn
-        }
-      } catch (probeErr) {
-        // tabs probe failed - try the targeted close blind with stored label
-        close_strategy = 'targeted_blind_no_probe'
+        if (foundExact) break
       }
-      if (!refused) {
+      if (!foundExact) {
+        refused = 'strict_no_exact_label_match:' + stored.label + '|vc' + stored.viewColumn + ' (chat probably auto-retitled - leaking orphan tab to avoid wrong-close)'
+      } else {
         const closeResult = await ide.tabs_close({
-          label: targetLabel,
+          label: stored.label,
           viewColumn: stored.viewColumn,
           viewType: CC_CHAT_VIEW_TYPE,
           ide_port: conductor.ide_bridge_port,
         })
         const inner = (closeResult && closeResult.result) || closeResult || {}
         closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
-        if (!closed && inner.matched === 0) refused = 'tabs_close_no_match:' + targetLabel + '|vc' + stored.viewColumn
-      }
-    } else {
-      // Fallback: no stored tab_handle, use the active-cc-chat safety gate.
-      const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
-      const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
-      let activeTab = null
-      for (const g of groups) {
-        for (const t of (g.tabs || [])) {
-          if (t.active) { activeTab = t; break }
-        }
-        if (activeTab) break
-      }
-      if (!activeTab) {
-        refused = 'fallback_no_active_tab_and_no_stored_handle'
-      } else if (activeTab.viewType !== CC_CHAT_VIEW_TYPE) {
-        refused = 'fallback_active_not_cc_chat:' + (activeTab.viewType || 'unknown') + '|label=' + (activeTab.label || '')
-      } else {
-        const cmdResult = await ide.command({
-          cmd: 'workbench.action.closeActiveEditor',
-          ide_port: conductor.ide_bridge_port,
-        })
-        closed = !!(cmdResult && (cmdResult.ok || cmdResult.result === null || cmdResult.result === undefined))
-        close_strategy = 'fallback_active_cc_chat_safety_gate'
+        close_strategy = closed ? 'strict_exact_label_match' : 'strict_match_close_failed'
+        if (!closed) refused = 'tabs_close_returned_no_close:matched=' + (inner.matched || 0)
       }
     }
   } catch (e) {
