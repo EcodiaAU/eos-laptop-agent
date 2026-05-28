@@ -317,12 +317,28 @@ function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conduc
     status: null,
     in_critical_section: false,
     terminated_at: null,
+    tab_handle: null,  // set later by setWorkerTabHandle once dispatch_worker captures it
   }
   workers.set(tab_id, row)
   atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), row)
   // Also write the .spawned marker so dispatch_worker's waitForSpawnedAt sees it
   try { fs.writeFileSync(path.join(STATE_DIR, tab_id + '.spawned'), now, 'utf8') } catch (e) {}
   return row
+}
+
+// setWorkerTabHandle - persist the spawned tab's identity (label, viewColumn,
+// viewType) into the worker registry row. Called from cowork.dispatch_worker
+// after the ide.tabs diff identifies the new tab. Read by close_my_tab to
+// target the exact tab via ide.tabs_close instead of focus-dependent
+// closeActiveEditor. Both the in-memory Map AND the on-disk JSON are updated.
+function setWorkerTabHandle(tab_id, tab_handle) {
+  if (!tab_id || !tab_handle) return { ok: false, error: 'tab_id and tab_handle required' }
+  if (!workers.has(tab_id)) return { ok: false, error: 'unknown_tab_id' }
+  const w = workers.get(tab_id)
+  w.tab_handle = tab_handle
+  w.tab_handle_set_at = new Date().toISOString()
+  try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+  return { ok: true, tab_id: tab_id, tab_handle: tab_handle }
 }
 
 function persistMessage(msg) {
@@ -580,30 +596,121 @@ async function close_my_tab(params, ctx) {
   // Lazy-require ide to avoid circular deps.
   let ide
   try { ide = require('./ide') } catch (e) { return { ok: false, error: 'ide_module_unavailable' } }
+
+  // 2026-05-28 patch v2. Target the worker's specific tab via ide.tabs_close
+  // using the stored tab_handle ({label, viewColumn, viewType}) that
+  // cowork.dispatch_worker captured at spawn time via ide.tabs diff. This
+  // removes ALL focus dependencies from the close path - no matter what
+  // Tate is currently looking at, the right tab gets closed.
+  //
+  // Three execution paths:
+  //   Primary: stored tab_handle + match by (viewColumn, viewType) + label
+  //     (tries label match first; if chat has auto-retitled, falls back to
+  //     active-CC-chat-in-stored-viewColumn).
+  //   Fallback: no stored tab_handle (legacy workers spawned before this
+  //     patch landed). Use the safety gate: probe ide.tabs, only close if
+  //     the active editor is a CC chat. Same as v1 patch.
+  //   Refuse: nothing safely targetable. Mark refused, exit without closing.
+  //
+  // Doctrine:
+  //   ~/ecodiaos/patterns/cowork-kill-worker-tab-handle-from-foreground-after-spawn-is-unsafe-2026-05-28.md
+  const CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
   let closed = false
+  let refused = null
   let error = null
+  let close_strategy = null
+
+  const stored = workers.has(ctx.tab_id) ? workers.get(ctx.tab_id).tab_handle : null
+
   try {
-    // Dispatch the VS Code command that closes the focused editor. Workers
-    // calling this RIGHT AFTER signal_done from inside their own chat panel
-    // are still focused there, so this targets the worker's tab. The
-    // ide_port pin ensures we hit the right IDE instance (Stable vs Insiders).
-    const cmdResult = await ide.command({
-      cmd: 'workbench.action.closeActiveEditor',
-      ide_port: conductor.ide_bridge_port,
-    })
-    closed = !!(cmdResult && (cmdResult.ok || cmdResult.result === null || cmdResult.result === undefined))
+    if (stored && stored.viewType === CC_CHAT_VIEW_TYPE && stored.viewColumn != null) {
+      // Primary path: targeted close via ide.tabs_close
+      // Probe current tabs - confirm a CC chat still exists in stored viewColumn.
+      let targetLabel = stored.label
+      try {
+        const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
+        const groups = (tabsResult && tabsResult.result && tabsResult.result.groups) || []
+        // Look for the stored label first; if not found, fall back to active CC chat in stored viewColumn
+        let foundExact = null
+        let activeInColumn = null
+        for (const g of groups) {
+          if (g.viewColumn !== stored.viewColumn) continue
+          for (const t of (g.tabs || [])) {
+            if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
+            if (t.label === stored.label) foundExact = t
+            if (t.active) activeInColumn = t
+          }
+        }
+        if (foundExact) {
+          targetLabel = foundExact.label
+          close_strategy = 'targeted_exact_label'
+        } else if (activeInColumn) {
+          targetLabel = activeInColumn.label
+          close_strategy = 'targeted_active_fallback_label'
+        } else {
+          refused = 'no_matching_cc_chat_in_stored_viewColumn:' + stored.viewColumn
+        }
+      } catch (probeErr) {
+        // tabs probe failed - try the targeted close blind with stored label
+        close_strategy = 'targeted_blind_no_probe'
+      }
+      if (!refused) {
+        const closeResult = await ide.tabs_close({
+          label: targetLabel,
+          viewColumn: stored.viewColumn,
+          viewType: CC_CHAT_VIEW_TYPE,
+          ide_port: conductor.ide_bridge_port,
+        })
+        const inner = (closeResult && closeResult.result) || closeResult || {}
+        closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+        if (!closed && inner.matched === 0) refused = 'tabs_close_no_match:' + targetLabel + '|vc' + stored.viewColumn
+      }
+    } else {
+      // Fallback: no stored tab_handle, use the active-cc-chat safety gate.
+      const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
+      const groups = (tabsResult && tabsResult.result && tabsResult.result.groups) || []
+      let activeTab = null
+      for (const g of groups) {
+        for (const t of (g.tabs || [])) {
+          if (t.active) { activeTab = t; break }
+        }
+        if (activeTab) break
+      }
+      if (!activeTab) {
+        refused = 'fallback_no_active_tab_and_no_stored_handle'
+      } else if (activeTab.viewType !== CC_CHAT_VIEW_TYPE) {
+        refused = 'fallback_active_not_cc_chat:' + (activeTab.viewType || 'unknown') + '|label=' + (activeTab.label || '')
+      } else {
+        const cmdResult = await ide.command({
+          cmd: 'workbench.action.closeActiveEditor',
+          ide_port: conductor.ide_bridge_port,
+        })
+        closed = !!(cmdResult && (cmdResult.ok || cmdResult.result === null || cmdResult.result === undefined))
+        close_strategy = 'fallback_active_cc_chat_safety_gate'
+      }
+    }
   } catch (e) {
     error = e.message || String(e)
   }
-  // Even if the IDE call failed, the worker is done - mark the registry record
-  // closed_tab so corazonWatchdog/sweep can tell tabs-leaked from clean exits.
+  // Worker is done either way - mark closed_tab_at so the sweep can tell
+  // tabs-leaked from clean-exits-that-refused-to-close.
   if (workers.has(ctx.tab_id)) {
     const w = workers.get(ctx.tab_id)
     w.closed_tab_at = new Date().toISOString()
     w.closed_tab_ok = closed
+    w.closed_tab_strategy = close_strategy
+    if (refused) w.closed_tab_refused_reason = refused
     try { atomicWriteJson(path.join(WORKERS_DIR, ctx.tab_id + '.json'), w) } catch (e) {}
   }
-  return { ok: true, tab_id: ctx.tab_id, closed: closed, error: error }
+  return {
+    ok: true,
+    tab_id: ctx.tab_id,
+    closed: closed,
+    strategy: close_strategy,
+    refused: refused,
+    error: error,
+    used_stored_handle: !!stored,
+  }
 }
 
 // signal_bound - sent by a spawned worker on first turn to confirm it launched
@@ -938,6 +1045,7 @@ module.exports = {
   signal_done: signal_done,
   signal_bound: signal_bound,
   close_my_tab: close_my_tab,
+  setWorkerTabHandle: setWorkerTabHandle,
   verify_paste: verify_paste,
   register_conductor: register_conductor,
   unregister_conductor: unregister_conductor,

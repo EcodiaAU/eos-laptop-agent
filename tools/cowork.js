@@ -4,7 +4,7 @@
 //   1. Generates tab_id + tab_credential UUIDs
 //   2. Snapshots windows (for tab_handle capture)
 //   3. (v1) Acquires swap_lock if account != current; swaps creds (TODO when PG lock + creds-swap path ships)
-//   4. Spawns a new Cursor chat tab via cursor.new_chat_tab
+//   4. Spawns a new Claude Code chat tab in VS Code Stable via vscode.new_claude_code_chat
 //   5. Diffs windows to capture the new tab's hwnd/title
 //   6. Composes brief: <dispatched .../> + mandatory FIRST ACTION (curl
 //      bootstrap to register-worker) + brief body (inline or file pointer)
@@ -27,7 +27,6 @@ const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
 
-const cursor = require('./cursor')
 const vscode = require('./vscode')
 const input = require('./input')
 const clipboard = require('./clipboard')
@@ -109,11 +108,11 @@ async function snapshotWindowSet() {
   return set
 }
 
-function diffNewWindows(pre, post, ideFilter) {
+function diffNewWindows(pre, post, exeFilter) {
   const added = []
   for (const [hwnd, w] of post.entries()) {
     if (pre.has(hwnd)) continue
-    if (ideFilter && w.exe !== ideFilter) continue
+    if (exeFilter && w.exe !== exeFilter) continue
     added.push(w)
   }
   return added
@@ -219,7 +218,7 @@ async function recoveryRepasteBrief(brief, tab_handle) {
     } catch (e) {}
   } else {
     try {
-      await cursor.focus()
+      await vscode.focus({ ide: 'stable' })
       await sleep(400)
     } catch (e) {}
   }
@@ -260,7 +259,6 @@ async function dispatch_worker(params) {
   // coord_url default points at the laptop-agent's own coord substrate (port 7456).
   // Earlier prototype used a separate stub on 7457; that path is deprecated.
   const coord_url = params.coord_url || 'http://localhost:7456'
-  const ide_target = params.ide || 'cursor'
 
   if (!brief_body) throw new Error('brief required')
 
@@ -338,21 +336,52 @@ async function dispatch_worker(params) {
     brief_file_path: compose_brief_file,
   })
 
-  // Spawn a new CLAUDE CODE chat tab via Ctrl+Shift+P -> "Claude Code: New Chat".
-  // Critical: cursor.new_chat_tab() (Ctrl+Shift+L) opens Cursor's NATIVE agent
-  // panel (Composer / Sonnet), NOT a Claude Code extension chat. Workers must
-  // land in a Claude Code chat tab to inherit the MCP surface + extension tools.
+  // Spawn a new Claude Code chat tab via the IDE bridge command
+  // claude-vscode.newConversation (2026-05-28 patch). Replaces the previous
+  // Ctrl+Alt+Shift+C keystroke path because:
+  //  1. Keystroke landed in whatever window was foreground when input.shortcut
+  //     fired - if VS Code wasn't focused, the spawn went to the wrong app
+  //     entirely or nowhere visible.
+  //  2. CC extension's findUnusedColumn() routes the new panel to a NEW
+  //     editor group (viewColumn 2+) when no CC chat exists in viewColumn 1.
+  //     With Tate working in viewColumn 1 (text/code files), every worker
+  //     spawned in a split view - bad UX.
+  //
+  // The IDE-bridge command runs in-process inside the extension host,
+  // bypasses focus, and the CC extension still uses findUnusedColumn but
+  // generally lands the chat in viewColumn 1 when there's at least one
+  // existing CC chat there (the common case while Tate works).
+  //
+  // We also snapshot ide.tabs before/after to identify the spawned tab
+  // deterministically by (label, viewColumn) - that pair gets stored in the
+  // worker registry and used by coord.close_my_tab to target the close via
+  // ide.tabs_close without any focus dependency.
+
+  const ideRoutes = require('./ide')
+
+  // Snapshot CC chat tabs BEFORE spawn
+  let cc_tabs_before = []
+  try {
+    const tabsBefore = await ideRoutes.tabs({})
+    const groups = (tabsBefore && tabsBefore.result && tabsBefore.result.groups) || []
+    for (const g of groups) {
+      for (const t of (g.tabs || [])) {
+        if (t.viewType === 'mainThreadWebview-claudeVSCodePanel') {
+          cc_tabs_before.push({ label: t.label, viewColumn: t.viewColumn })
+        }
+      }
+    }
+  } catch (e) {}
+
   let spawned = false
   let spawn_error = null
   try {
-    await vscode.new_claude_code_chat({ ide: ide_target })
+    await ideRoutes.command({ cmd: 'claude-vscode.newConversation' })
     spawned = true
   } catch (e) {
     spawn_error = e.message
   }
   if (!spawned) {
-    // Spawn failure on this account -> mark account flaky for FLAKY_TTL_MS.
-    // pick_account will exclude it on the next call. Self-heals on TTL.
     try {
       if (account_active_when_spawned && account_active_when_spawned !== 'current-process') {
         const usage = require('./usage')
@@ -363,23 +392,49 @@ async function dispatch_worker(params) {
   }
   await sleep(1500)  // let the new chat tab UI render
 
-  // Capture tab_handle by window diff
-  const postWindows = await snapshotWindowSet()
-  const ideExeMap = { cursor: 'Cursor', insiders: 'Code - Insiders', stable: 'Code' }
-  const ideExe = ideExeMap[ide_target] || 'Cursor'
-  const newWindows = diffNewWindows(preWindows, postWindows, ideExe)
-  // Tab spawning often doesn't create a NEW top-level window (just a new tab in
-  // the existing window). Falls back to focused window of correct exe.
+  // Capture tab_handle by ide.tabs diff. Find the NEW CC chat tab(s).
   let tab_handle = null
-  if (newWindows.length > 0) {
-    tab_handle = { ide: ide_target, hwnd: newWindows[0].hwnd, title: newWindows[0].title }
-  } else {
-    // Best-effort: foreground window after spawn. Failures here are non-fatal -
-    // the brief still gets pasted, tab_handle is just metadata.
+  try {
+    const tabsAfter = await ideRoutes.tabs({})
+    const groupsAfter = (tabsAfter && tabsAfter.result && tabsAfter.result.groups) || []
+    const before_keys = new Set(cc_tabs_before.map(t => t.viewColumn + '|' + t.label))
+    const new_cc_tabs = []
+    for (const g of groupsAfter) {
+      for (const t of (g.tabs || [])) {
+        if (t.viewType !== 'mainThreadWebview-claudeVSCodePanel') continue
+        const key = t.viewColumn + '|' + t.label
+        if (!before_keys.has(key)) {
+          new_cc_tabs.push({ label: t.label, viewColumn: t.viewColumn, active: t.active })
+        }
+      }
+    }
+    if (new_cc_tabs.length === 1) {
+      tab_handle = {
+        label: new_cc_tabs[0].label,
+        viewColumn: new_cc_tabs[0].viewColumn,
+        viewType: 'mainThreadWebview-claudeVSCodePanel',
+        captured_via: 'ide_tabs_diff',
+        captured_label_is_provisional: true,  // chat auto-titles after first message
+      }
+    } else if (new_cc_tabs.length > 1) {
+      const active = new_cc_tabs.find(t => t.active)
+      tab_handle = active ? {
+        label: active.label, viewColumn: active.viewColumn,
+        viewType: 'mainThreadWebview-claudeVSCodePanel',
+        captured_via: 'ide_tabs_diff_multi_active',
+        captured_label_is_provisional: true,
+      } : null
+    }
+  } catch (e) {}
+
+  // Persist tab_handle into the worker registry row so coord.close_my_tab can
+  // target this exact tab via ide.tabs_close({label, viewColumn, viewType}).
+  // Falls through to in-memory Map AND the on-disk JSON row.
+  if (tab_handle) {
     try {
-      const fg = await win.foreground()
-      if (fg && fg.exe === ideExe) {
-        tab_handle = { ide: ide_target, hwnd: fg.hwnd, title: fg.title, captured_via: 'foreground_after_spawn' }
+      const coord = require('./coord')
+      if (typeof coord.setWorkerTabHandle === 'function') {
+        coord.setWorkerTabHandle(tab_id, tab_handle)
       }
     } catch (e) {}
   }
