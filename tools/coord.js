@@ -738,10 +738,14 @@ async function close_my_tab(params, ctx) {
       }
 
       if (!foundExact) {
+        // 2026-05-29 Fix C: echo the candidate set inline so a no_match is
+        // debuggable in ONE round-trip (was just a count, which forced a
+        // separate ide.tabs probe to see what was actually there).
+        const candLabels = candidates.map((t, i) => (typeof t.index === 'number' ? t.index : i) + ':"' + (t.label || '') + '"').join(', ')
         refused = 'no_match:tabIndex=' + (storedTabIndex == null ? 'null' : storedTabIndex)
           + '|sentinel=' + (sentinelPrefix || 'null')
           + '|exact=' + (exactLabel || 'null')
-          + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ')'
+          + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ': [' + candLabels + '])'
       } else {
         // Compose close request. If we matched via tabIndex use the deterministic
         // index path on bridge v2; otherwise use exact-label.
