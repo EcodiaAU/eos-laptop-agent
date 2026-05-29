@@ -157,15 +157,56 @@ async function newTerminal(params) {
   return { ok: true, ide: params.ide || 'cursor', action: 'new_terminal' }
 }
 
-// vscode.close_tab - Ctrl+W (closes editor tab; in Cursor / VS Code it also closes the side-panel item if focused there)
+// vscode.close_tab - close the active editor/webview tab via the IDE bridge.
+//
+// 2026-05-29 patch. Previous version did ahkActivate(VS Code) + blind Ctrl+W.
+// Two failure modes from real incidents:
+//   (a) ahkActivate fails on Windows when MainWindowTitle is blank (intermittent)
+//       -> Ctrl+W still fires + lands in whatever was foreground (Chrome incident
+//       2026-05-29 - closed Chrome's tab instead of the worker's CC chat).
+//   (b) Race window between ahkActivate completing and the keystroke firing -
+//       Chrome navigating in the meantime can grab the keystroke (same Chrome
+//       incident, even when ahkActivate succeeded).
+//
+// New behaviour: identify the active tab in the active group via the ide bridge
+// (focusless REST probe), close it via /window/tabs/close using its viewColumn +
+// tabIndex (bridge v2 stable handle, never label-substring). NO keystroke, no
+// focus dependency, no Chrome collision. Workers that accidentally call this
+// instead of coord.close_my_tab end up doing the safe thing instead of the
+// dangerous thing.
+//
+// Doctrine: ~/ecodiaos/patterns/vs-code-webview-tabs-have-no-stable-id-pin-label-or-leak-2026-05-28.md
+// Race origin: 2026-05-29 evening - worker's blind Ctrl+W ate Chrome's tab.
 async function closeTab(params) {
   params = params || {}
-  const meta = resolveIde(params.ide)
-  if (!ahkActivate(meta.exe)) throw new Error(meta.friendly + ' not running')
-  await sleep(150)
-  await input.shortcut({ keys: ['ctrl', 'w'] })
-  await sleep(250)
-  return { ok: true, ide: params.ide || 'cursor', action: 'close_tab' }
+  const ide = require('./ide')
+  const tabsResult = await ide.tabs(params)
+  const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+  // Pick the active group, fall back to first group
+  const activeGroup = groups.find(g => g.isActive) || groups[0]
+  if (!activeGroup) return { ok: false, error: 'no_tab_groups' }
+  const allTabs = activeGroup.tabs || []
+  const activeIdx = allTabs.findIndex(t => t.active)
+  if (activeIdx < 0) return { ok: false, error: 'no_active_tab_in_group', viewColumn: activeGroup.viewColumn }
+  const activeTab = allTabs[activeIdx]
+  // exactLabel as sanity belt-and-braces - bridge v2 supports it.
+  const cr = await ide.tabs_close({
+    viewColumn: activeGroup.viewColumn,
+    tabIndex: activeIdx,
+    exactLabel: activeTab.label,
+    ide: params.ide,
+  })
+  const inner = (cr && cr.result) || cr || {}
+  const closedOk = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+  return {
+    ok: !!closedOk,
+    ide: params.ide || 'cursor',
+    action: 'close_tab',
+    closed_viewColumn: activeGroup.viewColumn,
+    closed_tabIndex: activeIdx,
+    closed_label: activeTab.label,
+    refused: inner.refused || null,
+  }
 }
 
 // vscode.toggle_sidebar - Ctrl+B

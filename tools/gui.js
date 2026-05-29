@@ -471,13 +471,47 @@ async function openUrl(params) {
   return { ok: true, navigated: url, mode: mode }
 }
 
-// Close the current tab (Ctrl+W).
-async function closeTab(_params) {
-  await focusChrome()
-  await sleep(150)
-  await input.shortcut({ keys: ['ctrl', 'w'] })
-  await sleep(200)
-  return { ok: true, closed: 'current_tab' }
+// Close a Chrome tab via the DevTools Protocol (Target.closeTarget).
+//
+// 2026-05-29 patch. Previous version did focusChrome() + blind Ctrl+W. Failure
+// mode: a parallel chat's focusChrome between our focus + our Ctrl+W moved
+// focus elsewhere; Ctrl+W then closed the wrong tab. Worst case: when a
+// dispatched CC worker mistakenly called gui.close_tab thinking it'd close
+// its own VS Code chat tab, the keystroke landed in Chrome and ate a
+// completely unrelated browser tab.
+//
+// New behaviour: route through CDP. Optional params:
+//   - alias: CDP alias to use (default: try active alias)
+//   - tabId: explicit Target ID
+//   - url_substring: close the first tab whose URL contains this string
+// Default (no params): close the currently focused Chrome tab via the alias's
+// active target. No keystrokes, no focus dependency, no possibility of closing
+// a non-Chrome window.
+async function closeTab(params) {
+  params = params || {}
+  const cdp = require('./cdp')
+  const alias = params.alias || null
+  if (params.tabId) {
+    const res = await cdp.send({ alias: alias, method: 'Target.closeTarget', params: { targetId: params.tabId } })
+    return { ok: true, closed: 'by_tabId:' + params.tabId, result: res }
+  }
+  if (params.url_substring) {
+    const list = await cdp.listTabs({ alias: alias })
+    const tabs = (list && list.tabs) || (list && list.result && list.result.tabs) || []
+    const match = tabs.find(t => t.url && t.url.includes(params.url_substring))
+    if (!match) return { ok: false, error: 'no_tab_matches_url_substring', candidates: tabs.map(t => t.url) }
+    const res = await cdp.send({ alias: alias, method: 'Target.closeTarget', params: { targetId: match.targetId || match.id } })
+    return { ok: true, closed: 'by_url_substring:' + params.url_substring, url: match.url, result: res }
+  }
+  // No explicit target -> close whatever tab the alias is currently attached to.
+  const url = await cdp.url({ alias: alias })
+  const list = await cdp.listTabs({ alias: alias })
+  const tabs = (list && list.tabs) || (list && list.result && list.result.tabs) || []
+  const currentUrl = (url && url.url) || (url && url.result && url.result.url) || null
+  const match = currentUrl ? tabs.find(t => t.url === currentUrl) : null
+  if (!match) return { ok: false, error: 'cdp_active_tab_not_in_list', currentUrl: currentUrl, candidates: tabs.length }
+  const res = await cdp.send({ alias: alias, method: 'Target.closeTarget', params: { targetId: match.targetId || match.id } })
+  return { ok: true, closed: 'active_cdp_tab', url: currentUrl, result: res }
 }
 
 // Switch to next tab (Ctrl+Tab) or previous (Ctrl+Shift+Tab).
@@ -528,19 +562,28 @@ async function installCdpToChrome(params) {
 
   // PowerShell one-shot script that updates each .lnk via WScript.Shell COM API.
   // Pass paths as a single string arg to avoid quoting headaches.
+  // Build the flag INSIDE PowerShell from typed variables - inlining the
+  // JS-side `flag` string was broken: it contains literal `"` chars
+  // (--user-data-dir="..."), which collide with the surrounding PS string
+  // and silently kill the iteration (no UPDATED, no ALREADY_HAS_FLAG, no
+  // ERROR output). (fix 2026-05-28)
   const psPaths = found.map(p => "'" + p.replace(/'/g, "''") + "'").join(',')
+  const psUserData = "'" + userData.replace(/'/g, "''") + "'"
   const psScript = [
     '$paths = @(' + psPaths + ')',
+    '$port = ' + port,
+    '$userData = ' + psUserData,
+    '$flag = "--remote-debugging-port=$port --user-data-dir=`"$userData`" --profile-directory=Default --restore-last-session"',
     '$shell = New-Object -ComObject WScript.Shell',
     '$results = @()',
     'foreach ($p in $paths) {',
     '  try {',
     '    $lnk = $shell.CreateShortcut($p)',
-    '    $args = if ($lnk.Arguments) { $lnk.Arguments } else { "" }',
-    '    if ($args -match "--remote-debugging-port=") {',
+    '    $argString = if ($lnk.Arguments) { $lnk.Arguments } else { "" }',
+    '    if ($argString -match "--remote-debugging-port=") {',
     '      $results += "ALREADY_HAS_FLAG|$p"',
     '    } else {',
-    '      $lnk.Arguments = ($args + " ' + flag + '").Trim()',
+    '      $lnk.Arguments = ($argString + " " + $flag).Trim()',
     '      $lnk.Save()',
     '      $results += "UPDATED|$p"',
     '    }',
@@ -548,7 +591,7 @@ async function installCdpToChrome(params) {
     '    $results += "ERROR|$p|" + $_.Exception.Message',
     '  }',
     '}',
-    '$results -join "`n"',
+    '$results -join [Environment]::NewLine',
   ].join('\n')
 
   const r = spawnSync('powershell', ['-NoProfile', '-Command', psScript], {
@@ -583,22 +626,63 @@ async function installCdpToChrome(params) {
 
 // LEGACY (kept for explicit force-relaunch): kills Chrome + relaunches with CDP.
 // Prefer gui.install_cdp_to_chrome which avoids tab loss.
+//
+// Params:
+//   port         (default 9222)
+//   userDataDir  explicit profile dir; otherwise auto-detect from running
+//                Chrome's crashpad-handler subprocess, fallback to LOCALAPPDATA
+//   force        (default false) ignore the "already up" short-circuit and
+//                force kill+relaunch. Use when the running CDP Chrome is on
+//                the wrong profile, has the wrong cookies, or otherwise
+//                needs to be swapped without freeing port 9222 first.
 async function enableChromeCdp(params) {
   params = params || {}
   const port = params.port || 9222
+  const force = !!params.force
 
-  const pre = await probeChromeCdp(port, 500)
-  if (pre.ok) return { ok: true, already_up: true, port: port, version: pre.version.Browser }
+  if (!force) {
+    const pre = await probeChromeCdp(port, 500)
+    if (pre.ok) return { ok: true, already_up: true, port: port, version: pre.version.Browser }
+  }
 
-  // Kill all chrome.exe instances. spawnSync separates args (no shell interp).
-  spawnSync('powershell', [
-    '-NoProfile',
-    '-Command',
-    'Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force'
-  ], { stdio: 'ignore', windowsHide: true, creationFlags: 0x08000000 })
-  await sleep(2000)
+  // Detect the user-data-dir of the RUNNING Chrome before killing it. Tate's
+  // real logged-in profile is D:\SSD_Turbo\ChromeUserData, NOT the default
+  // LOCALAPPDATA path - launching the wrong dir gives a blank, logged-out
+  // profile. This is why CDP "never worked" before (2026-05-21). Detect, then
+  // fall back to the known real dir, then the OS default.
+  let detectedDir = null
+  try {
+    const out = (spawnSync('powershell', ['-NoProfile', '-Command',
+      "(Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { $_.CommandLine -match '--user-data-dir=' } | Select-Object -First 1).CommandLine"
+    ], { encoding: 'utf8', windowsHide: true, creationFlags: 0x08000000 }).stdout) || ''
+    const m = out.match(/--user-data-dir=("([^"]+)"|(\S+))/)
+    if (m) detectedDir = (m[2] || m[3] || '').trim()
+  } catch (e) {}
+  // Profile-dir resolution order (Tate verbatim 2026-05-21: real profile lives at
+  // LOCALAPPDATA on his Corazon, NOT D:\SSD_Turbo\ChromeUserData - that was a stale
+  // claim from an earlier session). Auto-detect from running Chrome's command line
+  // (crashpad-handler subprocess always has --user-data-dir even when the main
+  // process omits it). Fall back to LOCALAPPDATA. SSD_Turbo retained only as a
+  // last-resort because some past artefacts live there.
+  const defaultProfile = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+  const userData = params.userDataDir || detectedDir ||
+    (fs.existsSync(defaultProfile)
+      ? defaultProfile
+      : (fs.existsSync('D:\\SSD_Turbo\\ChromeUserData') ? 'D:\\SSD_Turbo\\ChromeUserData' : defaultProfile))
 
-  const userData = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data')
+  // Kill all chrome.exe, verify zero. A single kill misses background processes
+  // that keep the profile's singleton lock, so the relaunch with the debug flag
+  // hands off to the survivor and drops the port. Loop until zero. (fix 2026-05-21)
+  for (let i = 0; i < 4; i++) {
+    spawnSync('powershell', ['-NoProfile', '-Command',
+      'Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue'
+    ], { stdio: 'ignore', windowsHide: true, creationFlags: 0x08000000 })
+    await sleep(1200)
+    const left = (spawnSync('powershell', ['-NoProfile', '-Command',
+      '(Get-Process chrome -ErrorAction SilentlyContinue | Measure-Object).Count'
+    ], { encoding: 'utf8', windowsHide: true, creationFlags: 0x08000000 }).stdout || '').trim()
+    if (left === '0') break
+  }
   for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
     const lock = path.join(userData, lockName)
     try { if (fs.existsSync(lock)) fs.unlinkSync(lock) } catch (e) {}
@@ -612,7 +696,20 @@ async function enableChromeCdp(params) {
     '--no-first-run',
     '--no-default-browser-check',
   ]
-  const child = spawn('chrome.exe', args, { detached: true, stdio: 'ignore', windowsHide: false })
+  // Resolve full chrome.exe path. spawn('chrome.exe') relies on PATH, which is
+  // absent for the pm2-launched agent -> unhandled ENOENT 'error' event crashes
+  // the whole agent (and Chrome is already killed, leaving the user stranded).
+  // Resolve explicit install paths + guard the spawn error. (fix 2026-05-21)
+  const chromeCandidates = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ]
+  let chromeExe = null
+  for (const c of chromeCandidates) { try { if (fs.statSync(c).isFile()) { chromeExe = c; break } } catch (e) {} }
+  if (!chromeExe) throw new Error('chrome.exe not found in standard install paths')
+  const child = spawn(chromeExe, args, { detached: true, stdio: 'ignore', windowsHide: false })
+  child.on('error', () => {}) // never let a spawn failure crash the agent
   child.unref()
 
   const start = Date.now()
