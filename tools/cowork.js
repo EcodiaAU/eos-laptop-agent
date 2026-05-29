@@ -772,6 +772,154 @@ async function kill_worker(params) {
   return { ok: true, tab_id: tab_id, closed: closed, refused: refused, error: error, marker_removed: !fs.existsSync(markerPath) }
 }
 
+// cowork.cleanup_orphan_workers - sweep recent orphan worker tabs.
+//
+// Every dispatched worker registers a file at coordination/workers/<tab_id>.json.
+// On signal_done -> coord.close_my_tab, the close may refuse when the tab label
+// has auto-retitled away from the sentinel prefix (CC summarises long briefs
+// into a title-case headline that does not preserve the literal prefix).
+// Refuse-and-leak is the right safety call at close-time but tabs accumulate.
+//
+// This sweep periodically (or on-demand) cross-references the worker registry
+// against current ide.tabs() state and closes orphan tabs the strict close
+// path could not match. SAFETY: sentinel-prefix match only by default. The
+// untitled "Claude Code" match is gated behind force_untitled because Tate's
+// own fresh chat tabs also carry that label.
+//
+// Params:
+//   dry_run        : (bool, default false) report what WOULD close, do nothing
+//   max_age_days   : (number, default 7)   only consider orphans terminated within window
+//   force_untitled : (bool, default false) ALSO match exact "Claude Code" tabs
+//                                          (RISK: may match Tate's own fresh chats)
+//
+// Returns: { ok, dry_run, max_age_days, force_untitled, candidates, closed, results: [...] }
+async function cleanup_orphan_workers(params) {
+  params = params || {}
+  const dry_run = !!params.dry_run
+  const max_age_days = Number.isFinite(params.max_age_days) ? params.max_age_days : 7
+  const force_untitled = !!params.force_untitled
+
+  ensureDirs()
+  const CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
+  const cutoffMs = Date.now() - max_age_days * 86_400_000
+
+  // Load candidate orphans from registry
+  let files = []
+  try { files = fs.readdirSync(WORKERS_DIR).filter(f => f.endsWith('.json')) } catch (e) {}
+  const orphans = []
+  for (const f of files) {
+    const filePath = path.join(WORKERS_DIR, f)
+    try {
+      const w = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+      if (!w.terminated_at) continue
+      if (w.closed_tab_ok === true) continue
+      const ts = Date.parse(w.terminated_at)
+      if (!Number.isFinite(ts) || ts < cutoffMs) continue
+      const th = w.tab_handle
+      if (!th || th.viewColumn == null) continue
+      orphans.push({ filePath: filePath, worker: w })
+    } catch (e) {}
+  }
+
+  if (orphans.length === 0) {
+    return { ok: true, dry_run: dry_run, max_age_days: max_age_days, force_untitled: force_untitled,
+             candidates: 0, closed: 0, results: [], message: 'no recent orphans with viewColumn-bearing tab_handle' }
+  }
+
+  // Snapshot current tab state (single ide.tabs probe)
+  let groups = []
+  try {
+    const tabsResult = await ide.tabs({})
+    groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+  } catch (e) {
+    return { ok: false, error: 'ide.tabs probe failed: ' + (e.message || String(e)) }
+  }
+
+  // viewColumn -> mutable list of CC chat tab labels
+  const tabsByCol = {}
+  for (const g of groups) {
+    const col = g.viewColumn
+    if (!tabsByCol[col]) tabsByCol[col] = []
+    for (const t of (g.tabs || [])) {
+      if (t.viewType === CC_CHAT_VIEW_TYPE) tabsByCol[col].push({ label: t.label, active: !!t.active })
+    }
+  }
+
+  const results = []
+  let closedCount = 0
+
+  for (const { filePath, worker } of orphans) {
+    const th = worker.tab_handle
+    const sp = th.sentinel_prefix || null
+    const vc = th.viewColumn
+    const cands = tabsByCol[vc] || []
+
+    let match = null
+    let strategy = null
+
+    // Pass 1: sentinel-prefix exact match (SAFE - never matches Tate's tabs)
+    if (sp) {
+      const hit = cands.find(t => t.label && t.label.startsWith(sp))
+      if (hit) { match = hit; strategy = 'sentinel_prefix' }
+    }
+
+    // Pass 2 (opt-in): exact "Claude Code" untitled match - RISKY
+    if (!match && force_untitled) {
+      const hit = cands.find(t => t.label === 'Claude Code' && !t.active)
+      if (hit) { match = hit; strategy = 'untitled_claude_code_force' }
+    }
+
+    if (!match) {
+      results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'no_match',
+                     sentinel: sp, viewColumn: vc, candidates_in_col: cands.length })
+      continue
+    }
+
+    if (dry_run) {
+      results.push({ tab_id: worker.tab_id, action: 'would_close', label: match.label, strategy: strategy, viewColumn: vc })
+      // Reserve so a second orphan does not also propose the same label
+      tabsByCol[vc] = cands.filter(t => t.label !== match.label || t !== match)
+      continue
+    }
+
+    // Close
+    try {
+      const cr = await ide.tabs_close({ label: match.label, viewColumn: vc, viewType: CC_CHAT_VIEW_TYPE })
+      const inner = (cr && cr.result) || cr || {}
+      const closedOk = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+      if (closedOk) {
+        try {
+          const cur = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+          cur.closed_tab_at = new Date().toISOString()
+          cur.closed_tab_ok = true
+          cur.closed_tab_strategy = 'cleanup_orphan:' + strategy
+          cur.closed_tab_label = match.label
+          fs.writeFileSync(filePath, JSON.stringify(cur, null, 2))
+        } catch (e) {}
+        // Remove from local map so next candidate does not double-match
+        tabsByCol[vc] = cands.filter(t => t.label !== match.label || t !== match)
+        closedCount++
+        results.push({ tab_id: worker.tab_id, action: 'closed', label: match.label, strategy: strategy, viewColumn: vc })
+      } else {
+        results.push({ tab_id: worker.tab_id, action: 'close_failed', label: match.label, strategy: strategy, raw: inner })
+      }
+    } catch (e) {
+      results.push({ tab_id: worker.tab_id, action: 'close_error', label: match.label, strategy: strategy, error: e.message })
+    }
+  }
+
+  return {
+    ok: true,
+    dry_run: dry_run,
+    max_age_days: max_age_days,
+    force_untitled: force_untitled,
+    candidates: orphans.length,
+    closed: closedCount,
+    leaked: results.filter(r => r.action === 'leak').length,
+    results: results,
+  }
+}
+
 // ── cowork.swap_creds ────────────────────────────────────────────────────
 //
 // Swap ~/.claude/.credentials.json to a different account's snapshot.
@@ -1063,6 +1211,7 @@ module.exports = {
   dispatch_worker: dispatch_worker,
   list_workers: list_workers,
   kill_worker: kill_worker,
+  cleanup_orphan_workers: cleanup_orphan_workers,
   swap_creds: swap_creds,
   swap_history: swap_history,
 }
