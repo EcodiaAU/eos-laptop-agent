@@ -380,10 +380,8 @@ async function dispatch_worker(params) {
 
   const ideRoutes = require('./ide')
 
-  // Snapshot CC chat tabs BEFORE spawn.
-  // ide.tabs() called internally returns {ide, pid, port, ok, groups:[...]}
-  // with groups at the TOP level (no .result wrapper - that's only the
-  // /api/tool HTTP wrapper). Read groups directly.
+  // Snapshot CC chat tabs BEFORE spawn so we can identify the freshly-opened
+  // tab via diff against this baseline after newConversation fires.
   let cc_tabs_before = []
   try {
     const tabsBefore = await ideRoutes.tabs({})
@@ -397,6 +395,17 @@ async function dispatch_worker(params) {
     }
   } catch (e) {}
 
+  // 2026-05-29 FOCUS-WORKING path. We tried the ide.chat_send_message bridge
+  // route (claude-vscode.editor.open + workbench.action.chat.submit) to
+  // eliminate the clipboard race, but editor.open does NOT focus the chat
+  // input textbox the same way newConversation does - even with explicit
+  // claude-vscode.focus (which actually fires an @-mention event, not an
+  // input-focus event), the Enter keystroke landed nowhere and the worker
+  // never received the brief. Reverted to newConversation + clipboard+Ctrl+V
+  // + Enter, the only path that reliably focuses the input + submits.
+  //
+  // The bridge route (ide.chat_send_message) is kept as a tool for future use
+  // when CC exposes a real chat-input-focus command or a programmatic submit.
   let spawned = false
   let spawn_error = null
   try {
@@ -416,11 +425,8 @@ async function dispatch_worker(params) {
   }
   await sleep(1500)  // let the new chat tab UI render
 
-  // Capture tab_handle by COUNT-DELTA + ACTIVE (not label diff - label diff
-  // failed when a leaked "Claude Code" tab already existed). The freshly
-  // spawned tab is always active immediately after claude-vscode.newConversation.
-  // We capture {sentinel_prefix, viewColumn, viewType} so close-time prefix
-  // match works regardless of the chat's eventual auto-title.
+  // Capture tab_handle by COUNT-DELTA + ACTIVE diff against cc_tabs_before.
+  // The freshly spawned tab is always active immediately after newConversation.
   let tab_handle = null
   try {
     const cc_count_before_per_vc = {}
@@ -429,67 +435,30 @@ async function dispatch_worker(params) {
     }
     const tabsAfter = await ideRoutes.tabs({})
     const groupsAfter = (tabsAfter && (tabsAfter.groups || (tabsAfter.result && tabsAfter.result.groups))) || []
-    let captured_viewColumn = null
-    let captured_label_at_spawn = null
-    let captured_tabIndex = null  // bridge-v2: tab position within its group, stable spawn-and-close handle
     for (const g of groupsAfter) {
-      // Iterate ALL tabs in group (need index across all tabs, not just CC chats)
       const allTabs = g.tabs || []
       const cc_after = allTabs.filter(t => t.viewType === 'mainThreadWebview-claudeVSCodePanel')
       const before_count = cc_count_before_per_vc[g.viewColumn] || 0
       if (cc_after.length > before_count) {
-        // count went up - the spawn landed here
         const active = cc_after.find(t => t.active)
-        const target = active || cc_after[cc_after.length - 1]  // fall back to last in group
+        const target = active || cc_after[cc_after.length - 1]
         if (target) {
-          captured_viewColumn = g.viewColumn
-          captured_label_at_spawn = target.label
-          // Bridge v2 returns tab.index in serializeTab. Capture it as the
-          // stable handle for close-time targeting. Fallback null = pre-v2 bridge.
-          if (typeof target.index === 'number') {
-            captured_tabIndex = target.index
-          } else {
-            // Compute position ourselves if bridge hasn't been upgraded yet
+          let tabIndex = null
+          if (typeof target.index === 'number') tabIndex = target.index
+          else {
             const pos = allTabs.indexOf(target)
-            if (pos >= 0) captured_tabIndex = pos
+            if (pos >= 0) tabIndex = pos
+          }
+          tab_handle = {
+            sentinel_prefix: sentinel_prefix,
+            viewColumn: g.viewColumn,
+            viewType: 'mainThreadWebview-claudeVSCodePanel',
+            label_at_spawn: target.label,
+            tabIndex: tabIndex,
+            captured_via: 'count_delta_plus_active',
+            captured_label_is_provisional: true,
           }
           break
-        }
-      }
-    }
-    if (captured_viewColumn != null) {
-      tab_handle = {
-        sentinel_prefix: sentinel_prefix,
-        viewColumn: captured_viewColumn,
-        viewType: 'mainThreadWebview-claudeVSCodePanel',
-        label_at_spawn: captured_label_at_spawn,
-        tabIndex: captured_tabIndex,  // bridge-v2 stable handle (null if bridge pre-v2)
-        captured_via: 'count_delta_plus_active',
-        captured_label_is_provisional: true,  // chat auto-titles after first message; tabIndex survives autotitle
-      }
-    } else {
-      // count delta zero - spawn might not have landed or ide.tabs lagged
-      // KEEP legacy diff as last resort
-      const before_keys = new Set(cc_tabs_before.map(t => t.viewColumn + '|' + t.label))
-      const new_cc_tabs = []
-      for (const g of groupsAfter) {
-        for (const t of (g.tabs || [])) {
-          if (t.viewType !== 'mainThreadWebview-claudeVSCodePanel') continue
-          const key = t.viewColumn + '|' + t.label
-          if (!before_keys.has(key)) {
-            new_cc_tabs.push({ label: t.label, viewColumn: t.viewColumn, active: t.active })
-          }
-        }
-      }
-      const candidate = new_cc_tabs.length === 1 ? new_cc_tabs[0] : (new_cc_tabs.find(t => t.active) || null)
-      if (candidate) {
-        tab_handle = {
-          sentinel_prefix: sentinel_prefix,
-          viewColumn: candidate.viewColumn,
-          viewType: 'mainThreadWebview-claudeVSCodePanel',
-          label_at_spawn: candidate.label,
-          captured_via: 'legacy_label_diff_fallback',
-          captured_label_is_provisional: true,
         }
       }
     }
@@ -507,30 +476,21 @@ async function dispatch_worker(params) {
     } catch (e) {}
   }
 
-  // Paste brief into the new tab. clipboard.write is the most-common failure
-  // surface (tonight: empty-stderr hang under memory pressure). Wrapping in
-  // try/catch with a single retry-after-pause prevents the orphan-tab failure
-  // class - dispatch already succeeded at register-worker + spawn-tab, so a
-  // late clipboard fail used to leave a brief-less worker.
-  //
-  // CRITICAL: vscode.new_claude_code_chat sends Ctrl+Alt+Shift+C which opens
-  // a fresh CC chat tab but does NOT reliably focus the input box - focus
-  // often lands on the sidebar tree, editor pane, or stays on the previous
-  // editor. Without an explicit focus call, the Ctrl+V paste below lands
-  // somewhere weird and the brief never reaches the chat. Symptom: tabs open
-  // but stay empty. Fix: call claude-vscode.focus before each paste attempt.
+  // Paste brief into the new tab via clipboard + Ctrl+V + Enter. This is the
+  // path that works reliably - newConversation focuses the chat input,
+  // claude-vscode.focus reaffirms it (in case the focus drifted to the
+  // sidebar or editor pane), then clipboard.write + Ctrl+V + Enter submit
+  // the brief. The 2.5s focus-dependent window is the known cost; the
+  // ide.chat_send_message bridge experiment didn't eliminate it because
+  // editor.open doesn't focus the chat INPUT box the same way.
   let pasted = false
   let paste_error = null
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      // Explicit focus the Claude Code chat input. Best-effort - failures here
-      // (older CC ext, command not registered in target IDE) fall through to
-      // the original paste flow which sometimes works on its own.
       try {
         await ide.command({ cmd: 'claude-vscode.focus' })
         await sleep(150)
       } catch (focusErr) {
-        // Try the older command name as a fallback (claude-dev extension lineage)
         try {
           await ide.command({ cmd: 'claude-dev.SidebarProvider.focus' })
           await sleep(150)
@@ -548,12 +508,10 @@ async function dispatch_worker(params) {
       break
     } catch (e) {
       paste_error = e.message
-      if (attempt < 2) await sleep(500)  // brief settle before retry
+      if (attempt < 2) await sleep(500)
     }
   }
   if (!pasted) {
-    // Worker registered + tab spawned, but we couldn't get the brief into it.
-    // Surface the orphan so the conductor can kill_worker + redispatch.
     return {
       ok: false,
       tab_id: tab_id,
@@ -562,8 +520,8 @@ async function dispatch_worker(params) {
       task_id: task_id,
       tab_handle: tab_handle,
       orphan: true,
-      error: 'brief paste failed after 2 attempts: ' + paste_error,
-      note: 'Worker tab is open but has no brief. Call cowork.kill_worker({tab_id}) to clean up, then retry dispatch.',
+      error: 'brief enter-submit failed after 2 attempts: ' + paste_error,
+      note: 'Worker tab is open + brief in input box, but Enter keystroke failed. Manual: focus the tab and press Enter to submit, OR call cowork.kill_worker({tab_id}) + retry.',
     }
   }
 

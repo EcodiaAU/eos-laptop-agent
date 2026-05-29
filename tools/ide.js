@@ -276,6 +276,25 @@ async function tabsClose(params) {
   return call(params, 'POST', '/ide/window/tabs/close', params || {});
 }
 
+// ide.chat_send_message {prompt, session?, submit?, ...filters}
+//
+// Focusless single-call replacement for the dispatch_worker keystroke chain.
+// The bridge runs the open + populate + submit + tab-diff sequence on a single
+// extension-host tick. Returns the new chat tab's {label, viewColumn, index,
+// viewType} which the caller can store as a tab_handle for the close path.
+//
+// 2026-05-29: replaces clipboard.write + input.shortcut[ctrl,v] + input.key[enter]
+// in cowork.dispatch_worker. Collapses the 2.5s focus-dependent paste window
+// to ~0ms. See ide-bridge.js /ide/chat/send_message route for full details.
+async function chatSendMessage(params) {
+  if (!params || !params.prompt) throw new Error('prompt required');
+  return call(params, 'POST', '/ide/chat/send_message', {
+    prompt: params.prompt,
+    session: params.session,
+    submit: params.submit,
+  });
+}
+
 // ----- terminals --------------------------------------------------------
 
 async function terminalsList(params) {
@@ -375,6 +394,7 @@ module.exports = {
   selection,
   tabs,
   tabs_close: tabsClose,
+  chat_send_message: chatSendMessage,
   terminals_list: terminalsList,
   terminal_create: terminalCreate,
   terminal_send: terminalSend,
