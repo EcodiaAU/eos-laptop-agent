@@ -380,135 +380,83 @@ async function dispatch_worker(params) {
 
   const ideRoutes = require('./ide')
 
-  // Snapshot CC chat tabs BEFORE spawn so we can identify the freshly-opened
-  // tab via diff against this baseline after newConversation fires.
-  let cc_tabs_before = []
-  try {
-    const tabsBefore = await ideRoutes.tabs({})
-    const groups = (tabsBefore && (tabsBefore.groups || (tabsBefore.result && tabsBefore.result.groups))) || []
-    for (const g of groups) {
-      for (const t of (g.tabs || [])) {
-        if (t.viewType === 'mainThreadWebview-claudeVSCodePanel') {
-          cc_tabs_before.push({ label: t.label, viewColumn: t.viewColumn })
-        }
-      }
-    }
-  } catch (e) {}
-
-  // 2026-05-29 FOCUS-WORKING path. We tried the ide.chat_send_message bridge
-  // route (claude-vscode.editor.open + workbench.action.chat.submit) to
-  // eliminate the clipboard race, but editor.open does NOT focus the chat
-  // input textbox the same way newConversation does - even with explicit
-  // claude-vscode.focus (which actually fires an @-mention event, not an
-  // input-focus event), the Enter keystroke landed nowhere and the worker
-  // never received the brief. Reverted to newConversation + clipboard+Ctrl+V
-  // + Enter, the only path that reliably focuses the input + submits.
+  // 2026-05-29 v6: FOCUSLESS POPULATE via the IDE bridge (claude-vscode.editor.open).
   //
-  // The bridge route (ide.chat_send_message) is kept as a tool for future use
-  // when CC exposes a real chat-input-focus command or a programmatic submit.
-  let spawned = false
+  // Supersedes the newConversation + clipboard.write + Ctrl+V chain. That chain
+  // had a ~2.5s focus-dependent window between the tab opening and the Ctrl+V
+  // keystroke; a foreground console-flash (a separate, unresolved bash-level
+  // issue on this host) could steal that window, sending the paste to the wrong
+  // window -> EMPTY worker tabs with no brief (the 3-empty-tabs symptom seen on
+  // the 2026-05-29 wave-killer scheduler dispatch).
+  //
+  // ide.chat_send_message runs claude-vscode.editor.open(session, prompt) entirely
+  // inside the extension host, prefilling the chat input REGARDLESS of OS focus,
+  // and returns the new tab's identity ({label, viewColumn, viewType, index}) for
+  // the close handle. Verified live 2026-05-29: editor.open opens the tab and the
+  // tabs_close({viewColumn, tabIndex}) handle round-trips cleanly. The ONLY
+  // residual focus-dependent step is the single Enter to submit; if it lands
+  // nowhere the brief still sits in the input (recoverable), never in the wrong
+  // window. Recovery re-Enters the SAME tab and NEVER re-spawns (the old
+  // re-spawn-on-orphan path is what produced 3 empty tabs per failed dispatch).
+  let tab_handle = null
   let spawn_error = null
   try {
-    await ideRoutes.command({ cmd: 'claude-vscode.newConversation' })
-    spawned = true
+    const sendRes = await ideRoutes.chat_send_message({ prompt: composedBrief, submit: false })
+    const inner = (sendRes && (sendRes.result || sendRes)) || {}
+    if (inner.open_command_ok === false) {
+      spawn_error = 'editor.open failed: ' + (inner.open_error || 'unknown')
+    }
+    const ot = inner.opened_tab
+    if (ot && ot.viewColumn != null) {
+      tab_handle = {
+        sentinel_prefix: sentinel_prefix,
+        viewColumn: ot.viewColumn,
+        viewType: ot.viewType || 'mainThreadWebview-claudeVSCodePanel',
+        label_at_spawn: ot.label,
+        tabIndex: (typeof ot.index === 'number') ? ot.index : null,
+        captured_via: 'bridge_chat_send_message',
+        captured_label_is_provisional: true,
+      }
+    }
   } catch (e) {
     spawn_error = e.message
   }
-  if (!spawned) {
+  if (!tab_handle) {
     try {
       if (account_active_when_spawned && account_active_when_spawned !== 'current-process') {
         const usage = require('./usage')
-        usage._markFlaky(account_active_when_spawned, 'dispatch_spawn_failed: ' + (spawn_error || 'unknown'))
+        usage._markFlaky(account_active_when_spawned, 'dispatch_populate_failed: ' + (spawn_error || 'unknown'))
       }
     } catch (e) {}
-    return { ok: false, tab_id: tab_id, error: 'spawn failed: ' + spawn_error, account_marked_flaky: account_active_when_spawned }
+    return { ok: false, tab_id: tab_id, error: 'populate failed (editor.open): ' + (spawn_error || 'no opened_tab returned'), account_marked_flaky: account_active_when_spawned }
   }
-  await sleep(1500)  // let the new chat tab UI render
 
-  // Capture tab_handle by COUNT-DELTA + ACTIVE diff against cc_tabs_before.
-  // The freshly spawned tab is always active immediately after newConversation.
-  let tab_handle = null
+  // Persist tab_handle into the worker registry row so coord.close_my_tab can
+  // target this exact tab via ide.tabs_close({viewColumn, tabIndex, viewType}).
   try {
-    const cc_count_before_per_vc = {}
-    for (const t of cc_tabs_before) {
-      cc_count_before_per_vc[t.viewColumn] = (cc_count_before_per_vc[t.viewColumn] || 0) + 1
-    }
-    const tabsAfter = await ideRoutes.tabs({})
-    const groupsAfter = (tabsAfter && (tabsAfter.groups || (tabsAfter.result && tabsAfter.result.groups))) || []
-    for (const g of groupsAfter) {
-      const allTabs = g.tabs || []
-      const cc_after = allTabs.filter(t => t.viewType === 'mainThreadWebview-claudeVSCodePanel')
-      const before_count = cc_count_before_per_vc[g.viewColumn] || 0
-      if (cc_after.length > before_count) {
-        const active = cc_after.find(t => t.active)
-        const target = active || cc_after[cc_after.length - 1]
-        if (target) {
-          let tabIndex = null
-          if (typeof target.index === 'number') tabIndex = target.index
-          else {
-            const pos = allTabs.indexOf(target)
-            if (pos >= 0) tabIndex = pos
-          }
-          tab_handle = {
-            sentinel_prefix: sentinel_prefix,
-            viewColumn: g.viewColumn,
-            viewType: 'mainThreadWebview-claudeVSCodePanel',
-            label_at_spawn: target.label,
-            tabIndex: tabIndex,
-            captured_via: 'count_delta_plus_active',
-            captured_label_is_provisional: true,
-          }
-          break
-        }
-      }
+    const coord = require('./coord')
+    if (typeof coord.setWorkerTabHandle === 'function') {
+      coord.setWorkerTabHandle(tab_id, tab_handle)
     }
   } catch (e) {}
 
-  // Persist tab_handle into the worker registry row so coord.close_my_tab can
-  // target this exact tab via ide.tabs_close({label, viewColumn, viewType}).
-  // Falls through to in-memory Map AND the on-disk JSON row.
-  if (tab_handle) {
-    try {
-      const coord = require('./coord')
-      if (typeof coord.setWorkerTabHandle === 'function') {
-        coord.setWorkerTabHandle(tab_id, tab_handle)
-      }
-    } catch (e) {}
-  }
-
-  // Paste brief into the new tab via clipboard + Ctrl+V + Enter. This is the
-  // path that works reliably - newConversation focuses the chat input,
-  // claude-vscode.focus reaffirms it (in case the focus drifted to the
-  // sidebar or editor pane), then clipboard.write + Ctrl+V + Enter submit
-  // the brief. The 2.5s focus-dependent window is the known cost; the
-  // ide.chat_send_message bridge experiment didn't eliminate it because
-  // editor.open doesn't focus the chat INPUT box the same way.
+  // Submit: the input is already prefilled by editor.open and the new tab is the
+  // active editor. A single Enter submits it. Best-effort focus reaffirm first.
+  // Retry the ENTER ONLY (never re-spawn) - the tab + brief already exist, so a
+  // re-spawn would just leak an empty tab. If all attempts fail, the brief is
+  // still prefilled and recoverable.
   let pasted = false
   let paste_error = null
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      try {
-        await ide.command({ cmd: 'claude-vscode.focus' })
-        await sleep(150)
-      } catch (focusErr) {
-        try {
-          await ide.command({ cmd: 'claude-dev.SidebarProvider.focus' })
-          await sleep(150)
-        } catch (_e2) {
-          // Best-effort - proceed to paste anyway
-        }
-      }
-      await clipboard.write({ text: composedBrief })
-      await sleep(250)
-      await input.shortcut({ keys: ['ctrl', 'v'] })
-      await sleep(400)
+      try { await ideRoutes.command({ cmd: 'claude-vscode.focus' }); await sleep(150) } catch (_e) {}
       await input.key({ key: 'enter' })
       await sleep(600)
       pasted = true
       break
     } catch (e) {
       paste_error = e.message
-      if (attempt < 2) await sleep(500)
+      if (attempt < 3) await sleep(500)
     }
   }
   if (!pasted) {
@@ -520,8 +468,8 @@ async function dispatch_worker(params) {
       task_id: task_id,
       tab_handle: tab_handle,
       orphan: true,
-      error: 'brief enter-submit failed after 2 attempts: ' + paste_error,
-      note: 'Worker tab is open + brief in input box, but Enter keystroke failed. Manual: focus the tab and press Enter to submit, OR call cowork.kill_worker({tab_id}) + retry.',
+      error: 'brief enter-submit failed after 3 attempts: ' + paste_error,
+      note: 'Worker tab is open + brief PREFILLED in the input box (editor.open succeeded), but the Enter keystroke failed. Recoverable: focus the tab and press Enter. No re-spawn performed (avoids empty-tab leak).',
     }
   }
 
