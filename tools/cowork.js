@@ -431,8 +431,11 @@ async function dispatch_worker(params) {
     const groupsAfter = (tabsAfter && (tabsAfter.groups || (tabsAfter.result && tabsAfter.result.groups))) || []
     let captured_viewColumn = null
     let captured_label_at_spawn = null
+    let captured_tabIndex = null  // bridge-v2: tab position within its group, stable spawn-and-close handle
     for (const g of groupsAfter) {
-      const cc_after = (g.tabs || []).filter(t => t.viewType === 'mainThreadWebview-claudeVSCodePanel')
+      // Iterate ALL tabs in group (need index across all tabs, not just CC chats)
+      const allTabs = g.tabs || []
+      const cc_after = allTabs.filter(t => t.viewType === 'mainThreadWebview-claudeVSCodePanel')
       const before_count = cc_count_before_per_vc[g.viewColumn] || 0
       if (cc_after.length > before_count) {
         // count went up - the spawn landed here
@@ -441,6 +444,15 @@ async function dispatch_worker(params) {
         if (target) {
           captured_viewColumn = g.viewColumn
           captured_label_at_spawn = target.label
+          // Bridge v2 returns tab.index in serializeTab. Capture it as the
+          // stable handle for close-time targeting. Fallback null = pre-v2 bridge.
+          if (typeof target.index === 'number') {
+            captured_tabIndex = target.index
+          } else {
+            // Compute position ourselves if bridge hasn't been upgraded yet
+            const pos = allTabs.indexOf(target)
+            if (pos >= 0) captured_tabIndex = pos
+          }
           break
         }
       }
@@ -451,8 +463,9 @@ async function dispatch_worker(params) {
         viewColumn: captured_viewColumn,
         viewType: 'mainThreadWebview-claudeVSCodePanel',
         label_at_spawn: captured_label_at_spawn,
+        tabIndex: captured_tabIndex,  // bridge-v2 stable handle (null if bridge pre-v2)
         captured_via: 'count_delta_plus_active',
-        captured_label_is_provisional: true,  // chat auto-titles after first message; use sentinel_prefix to find current label
+        captured_label_is_provisional: true,  // chat auto-titles after first message; tabIndex survives autotitle
       }
     } else {
       // count delta zero - spawn might not have landed or ide.tabs lagged
@@ -732,32 +745,57 @@ async function kill_worker(params) {
     if (!tab_handle || tab_handle.viewType !== CC_CHAT_VIEW_TYPE || tab_handle.viewColumn == null) {
       refused = 'no_safe_tab_handle_or_incomplete'
     } else {
-      // Sentinel prefix-match (preferred) or exact-label fallback. Mirrors
-      // coord.close_my_tab v4 - find the tab whose current label starts with
-      // the stored sentinel_prefix, close by that exact resolved label.
+      // Mirrors coord.close_my_tab v5 precedence:
+      //   (a) tabIndex from bridge v2 (stable handle, survives autotitle)
+      //   (b) sentinel_prefix match
+      //   (c) exact_label match (legacy fallback)
       const ide = require('./ide')
       const tabsResult = await ide.tabs({})
       const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+      const storedTabIndex = (typeof tab_handle.tabIndex === 'number') ? tab_handle.tabIndex : null
       const sentinelPrefix = tab_handle.sentinel_prefix || null
       const exactLabel = tab_handle.label || tab_handle.label_at_spawn || null
-      let foundExact = null
+      let group = null
+      const candidates = []
       for (const g of groups) {
         if (g.viewColumn !== tab_handle.viewColumn) continue
+        group = g
         for (const t of (g.tabs || [])) {
-          if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
-          if (sentinelPrefix && t.label && t.label.startsWith(sentinelPrefix)) { foundExact = t; break }
-          if (!foundExact && exactLabel && t.label === exactLabel) { foundExact = t }
+          if (t.viewType === CC_CHAT_VIEW_TYPE) candidates.push(t)
         }
-        if (foundExact) break
+        break
+      }
+      let foundExact = null
+      let matchedBy = null
+      if (group && storedTabIndex != null) {
+        const tabAtIndex = (group.tabs || [])[storedTabIndex]
+        if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
+          foundExact = tabAtIndex; matchedBy = 'tabIndex:' + storedTabIndex
+        }
+      }
+      if (!foundExact && sentinelPrefix) {
+        const hit = candidates.find(t => t.label && t.label.startsWith(sentinelPrefix))
+        if (hit) { foundExact = hit; matchedBy = 'sentinel_prefix:' + sentinelPrefix }
+      }
+      if (!foundExact && exactLabel) {
+        const hit = candidates.find(t => t.label === exactLabel)
+        if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
       }
       if (!foundExact) {
-        refused = 'no_match:sentinel=' + (sentinelPrefix || 'null') + '|exact=' + (exactLabel || 'null') + '|vc' + tab_handle.viewColumn
+        refused = 'no_match:tabIndex=' + (storedTabIndex == null ? 'null' : storedTabIndex)
+          + '|sentinel=' + (sentinelPrefix || 'null')
+          + '|exact=' + (exactLabel || 'null')
+          + '|vc' + tab_handle.viewColumn
       } else {
-        const closeResult = await ide.tabs_close({
-          label: foundExact.label,
-          viewColumn: tab_handle.viewColumn,
-          viewType: CC_CHAT_VIEW_TYPE,
-        })
+        const closeReq = { viewColumn: tab_handle.viewColumn, viewType: CC_CHAT_VIEW_TYPE }
+        if (matchedBy && matchedBy.startsWith('tabIndex:')) {
+          closeReq.tabIndex = storedTabIndex
+          closeReq.exactLabel = foundExact.label
+        } else {
+          closeReq.exactLabel = foundExact.label
+          closeReq.label = foundExact.label  // legacy substring fallback
+        }
+        const closeResult = await ide.tabs_close(closeReq)
         const inner = (closeResult && closeResult.result) || closeResult || {}
         closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
       }
@@ -835,13 +873,13 @@ async function cleanup_orphan_workers(params) {
     return { ok: false, error: 'ide.tabs probe failed: ' + (e.message || String(e)) }
   }
 
-  // viewColumn -> mutable list of CC chat tab labels
-  const tabsByCol = {}
+  // viewColumn -> { allTabs (ordered, preserves index), ccTabs (mutable, dedup tracking) }
+  const groupByCol = {}
   for (const g of groups) {
-    const col = g.viewColumn
-    if (!tabsByCol[col]) tabsByCol[col] = []
-    for (const t of (g.tabs || [])) {
-      if (t.viewType === CC_CHAT_VIEW_TYPE) tabsByCol[col].push({ label: t.label, active: !!t.active })
+    groupByCol[g.viewColumn] = {
+      allTabs: (g.tabs || []).slice(),
+      ccTabs: (g.tabs || []).filter(t => t.viewType === CC_CHAT_VIEW_TYPE),
+      claimed: new Set(),  // labels already claimed by a previous orphan this sweep
     }
   }
 
@@ -851,40 +889,59 @@ async function cleanup_orphan_workers(params) {
   for (const { filePath, worker } of orphans) {
     const th = worker.tab_handle
     const sp = th.sentinel_prefix || null
+    const ti = (typeof th.tabIndex === 'number') ? th.tabIndex : null
     const vc = th.viewColumn
-    const cands = tabsByCol[vc] || []
+    const ctx = groupByCol[vc]
+    const cands = ctx ? ctx.ccTabs : []
 
     let match = null
     let strategy = null
+    let usedTabIndex = null
 
-    // Pass 1: sentinel-prefix exact match (SAFE - never matches Tate's tabs)
-    if (sp) {
-      const hit = cands.find(t => t.label && t.label.startsWith(sp))
+    // Pass 1: tabIndex direct lookup (bridge v2, stable handle).
+    if (ctx && ti != null) {
+      const tabAtIndex = ctx.allTabs[ti]
+      if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE && !ctx.claimed.has(tabAtIndex.label + '#' + ti)) {
+        match = tabAtIndex; strategy = 'tabIndex'; usedTabIndex = ti
+      }
+    }
+
+    // Pass 2: sentinel-prefix exact match (SAFE - never matches Tate's tabs).
+    if (!match && sp) {
+      const hit = cands.find(t => t.label && t.label.startsWith(sp) && !ctx.claimed.has(t.label + '#sp'))
       if (hit) { match = hit; strategy = 'sentinel_prefix' }
     }
 
-    // Pass 2 (opt-in): exact "Claude Code" untitled match - RISKY
-    if (!match && force_untitled) {
-      const hit = cands.find(t => t.label === 'Claude Code' && !t.active)
+    // Pass 3 (opt-in): exact "Claude Code" untitled match - RISKY.
+    if (!match && force_untitled && ctx) {
+      const hit = cands.find(t => t.label === 'Claude Code' && !t.active && !ctx.claimed.has('Claude Code#' + cands.indexOf(t)))
       if (hit) { match = hit; strategy = 'untitled_claude_code_force' }
     }
 
     if (!match) {
       results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'no_match',
-                     sentinel: sp, viewColumn: vc, candidates_in_col: cands.length })
+                     tabIndex: ti, sentinel: sp, viewColumn: vc,
+                     candidates_in_col: cands.length })
       continue
     }
 
     if (dry_run) {
-      results.push({ tab_id: worker.tab_id, action: 'would_close', label: match.label, strategy: strategy, viewColumn: vc })
-      // Reserve so a second orphan does not also propose the same label
-      tabsByCol[vc] = cands.filter(t => t.label !== match.label || t !== match)
+      results.push({ tab_id: worker.tab_id, action: 'would_close', label: match.label, strategy: strategy, viewColumn: vc, tabIndex: usedTabIndex })
+      if (ctx) ctx.claimed.add(match.label + '#' + (strategy === 'tabIndex' ? usedTabIndex : (strategy === 'sentinel_prefix' ? 'sp' : cands.indexOf(match))))
       continue
     }
 
     // Close
     try {
-      const cr = await ide.tabs_close({ label: match.label, viewColumn: vc, viewType: CC_CHAT_VIEW_TYPE })
+      const closeReq = { viewColumn: vc, viewType: CC_CHAT_VIEW_TYPE }
+      if (strategy === 'tabIndex') {
+        closeReq.tabIndex = usedTabIndex
+        closeReq.exactLabel = match.label  // sanity check on bridge v2
+      } else {
+        closeReq.exactLabel = match.label
+        closeReq.label = match.label  // legacy substring fallback
+      }
+      const cr = await ide.tabs_close(closeReq)
       const inner = (cr && cr.result) || cr || {}
       const closedOk = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
       if (closedOk) {
@@ -894,14 +951,14 @@ async function cleanup_orphan_workers(params) {
           cur.closed_tab_ok = true
           cur.closed_tab_strategy = 'cleanup_orphan:' + strategy
           cur.closed_tab_label = match.label
+          if (usedTabIndex != null) cur.closed_tab_index = usedTabIndex
           fs.writeFileSync(filePath, JSON.stringify(cur, null, 2))
         } catch (e) {}
-        // Remove from local map so next candidate does not double-match
-        tabsByCol[vc] = cands.filter(t => t.label !== match.label || t !== match)
+        if (ctx) ctx.claimed.add(match.label + '#' + (strategy === 'tabIndex' ? usedTabIndex : (strategy === 'sentinel_prefix' ? 'sp' : cands.indexOf(match))))
         closedCount++
-        results.push({ tab_id: worker.tab_id, action: 'closed', label: match.label, strategy: strategy, viewColumn: vc })
+        results.push({ tab_id: worker.tab_id, action: 'closed', label: match.label, strategy: strategy, viewColumn: vc, tabIndex: usedTabIndex })
       } else {
-        results.push({ tab_id: worker.tab_id, action: 'close_failed', label: match.label, strategy: strategy, raw: inner })
+        results.push({ tab_id: worker.tab_id, action: 'close_failed', label: match.label, strategy: strategy, refused: inner.refused, raw: inner })
       }
     } catch (e) {
       results.push({ tab_id: worker.tab_id, action: 'close_error', label: match.label, strategy: strategy, error: e.message })

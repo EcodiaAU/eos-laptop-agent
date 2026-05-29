@@ -644,50 +644,84 @@ async function close_my_tab(params, ctx) {
     if (!stored || stored.viewType !== CC_CHAT_VIEW_TYPE || stored.viewColumn == null) {
       refused = 'no_stored_tab_handle_or_incomplete:' + JSON.stringify(stored || null).slice(0, 200)
     } else {
-      // 2026-05-29 patch v4: SENTINEL PREFIX MATCH.
-      // The brief was prefixed with stored.sentinel_prefix (e.g., "[EOS-W-abc12345]")
-      // at dispatch time, so the chat's auto-title should start with it. Probe
-      // ide.tabs, find the EXACT label that startsWith sentinel_prefix in the
-      // stored viewColumn, close by that resolved exact label. Tab gets renamed
-      // by Claude after first response but the prefix is preserved in the user
-      // message preview that VS Code uses for the auto-title.
+      // 2026-05-29 patch v5: POSITION HANDLE FIRST.
       //
-      // Fallback: if no stored.sentinel_prefix (legacy worker), use the
-      // strict exact-label match against stored.label_at_spawn or stored.label.
+      // Closure precedence:
+      //   (a) tabIndex (bridge v2): direct close of tabGroups[vc].tabs[index],
+      //       gated by viewType match. Stable spawn-and-close handle that
+      //       SURVIVES auto-title summarisation. Primary path.
+      //   (b) sentinel_prefix: chat label still startsWith stored prefix.
+      //       Works when brief was short enough that auto-title preserved it.
+      //   (c) exact_label fallback: chat label still matches stored
+      //       label_at_spawn exactly (very rare post-autotitle).
+      //
+      // If none match -> REFUSE and leak. Better leak than wrong-close.
+      // (v3 mass-close incident: 4+ CC chats lost.)
       const tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port })
       const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+
       let foundExact = null
       let matchedBy = null
+      const storedTabIndex = (typeof stored.tabIndex === 'number') ? stored.tabIndex : null
       const sentinelPrefix = stored.sentinel_prefix || null
       const exactLabel = stored.label || stored.label_at_spawn || null
       const candidates = []
+      let group = null
       for (const g of groups) {
         if (g.viewColumn !== stored.viewColumn) continue
+        group = g
         for (const t of (g.tabs || [])) {
-          if (t.viewType !== CC_CHAT_VIEW_TYPE) continue
-          candidates.push(t)
-          if (sentinelPrefix && t.label && t.label.startsWith(sentinelPrefix)) {
-            foundExact = t; matchedBy = 'sentinel_prefix:' + sentinelPrefix; break
-          }
-          if (!foundExact && exactLabel && t.label === exactLabel) {
-            foundExact = t; matchedBy = 'exact_label:' + exactLabel
-          }
+          if (t.viewType === CC_CHAT_VIEW_TYPE) candidates.push(t)
         }
-        if (foundExact && matchedBy && matchedBy.startsWith('sentinel_prefix:')) break
+        break
       }
+
+      // (a) tabIndex match
+      if (group && storedTabIndex != null) {
+        const tabAtIndex = (group.tabs || [])[storedTabIndex]
+        if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
+          foundExact = tabAtIndex
+          matchedBy = 'tabIndex:' + storedTabIndex
+        }
+      }
+
+      // (b) sentinel_prefix match
+      if (!foundExact && sentinelPrefix) {
+        const hit = candidates.find(t => t.label && t.label.startsWith(sentinelPrefix))
+        if (hit) { foundExact = hit; matchedBy = 'sentinel_prefix:' + sentinelPrefix }
+      }
+
+      // (c) exact_label match (legacy fallback)
+      if (!foundExact && exactLabel) {
+        const hit = candidates.find(t => t.label === exactLabel)
+        if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
+      }
+
       if (!foundExact) {
-        refused = 'no_match:sentinel=' + (sentinelPrefix || 'null') + '|exact=' + (exactLabel || 'null') + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ')'
+        refused = 'no_match:tabIndex=' + (storedTabIndex == null ? 'null' : storedTabIndex)
+          + '|sentinel=' + (sentinelPrefix || 'null')
+          + '|exact=' + (exactLabel || 'null')
+          + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ')'
       } else {
-        const closeResult = await ide.tabs_close({
-          label: foundExact.label,
+        // Compose close request. If we matched via tabIndex use the deterministic
+        // index path on bridge v2; otherwise use exact-label.
+        const closeReq = {
           viewColumn: stored.viewColumn,
           viewType: CC_CHAT_VIEW_TYPE,
           ide_port: conductor.ide_bridge_port,
-        })
+        }
+        if (matchedBy && matchedBy.startsWith('tabIndex:')) {
+          closeReq.tabIndex = storedTabIndex
+          closeReq.exactLabel = foundExact.label  // belt-and-braces sanity check
+        } else {
+          closeReq.exactLabel = foundExact.label  // new bridge v2 exact-match field
+          closeReq.label = foundExact.label       // legacy substring fallback for pre-v2 bridges
+        }
+        const closeResult = await ide.tabs_close(closeReq)
         const inner = (closeResult && closeResult.result) || closeResult || {}
         closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
-        close_strategy = closed ? matchedBy : 'match_found_but_close_failed:' + matchedBy
-        if (!closed) refused = 'tabs_close_returned_no_close:matched=' + (inner.matched || 0)
+        close_strategy = closed ? matchedBy : 'match_found_but_close_failed:' + matchedBy + ':' + (inner.refused || 'closed=0')
+        if (!closed) refused = 'tabs_close_returned_no_close:matched=' + (inner.matched || 0) + ' refused=' + (inner.refused || 'none')
       }
     }
   } catch (e) {
