@@ -400,9 +400,13 @@ async function dispatch_worker(params) {
   // re-spawn-on-orphan path is what produced 3 empty tabs per failed dispatch).
   let tab_handle = null
   let spawn_error = null
+  let ide_exe = 'Code.exe'  // VS Code Stable (the worker host); refined from the bridge's ide name below
   try {
     const sendRes = await ideRoutes.chat_send_message({ prompt: composedBrief, submit: false })
     const inner = (sendRes && (sendRes.result || sendRes)) || {}
+    const ideName = String(inner.ide || '').toLowerCase()
+    if (ideName.includes('insiders')) ide_exe = 'Code - Insiders.exe'
+    else if (ideName.includes('cursor')) ide_exe = 'Cursor.exe'
     if (inner.open_command_ok === false) {
       spawn_error = 'editor.open failed: ' + (inner.open_error || 'unknown')
     }
@@ -440,16 +444,19 @@ async function dispatch_worker(params) {
     }
   } catch (e) {}
 
-  // Submit: the input is already prefilled by editor.open and the new tab is the
-  // active editor. A single Enter submits it. Best-effort focus reaffirm first.
-  // Retry the ENTER ONLY (never re-spawn) - the tab + brief already exist, so a
-  // re-spawn would just leak an empty tab. If all attempts fail, the brief is
-  // still prefilled and recoverable.
+  // Submit: bring the IDE OS-window to the foreground via a real AHK WinActivate
+  // (window.focus_window), THEN Enter. The earlier claude-vscode.focus only fired
+  // an in-IDE @-mention event and did NOT foreground the OS window, so the SendKeys
+  // Enter landed in whatever window happened to be foreground - the 2026-05-29
+  // "didnt press enter" failure (editor.open had correctly prefilled the input).
+  // editor.open already focused the chat input within the IDE, so once the window
+  // is foreground a single Enter submits. Never re-spawn; the brief is prefilled.
+  const windowRoutes = require('./window')
   let pasted = false
   let paste_error = null
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      try { await ideRoutes.command({ cmd: 'claude-vscode.focus' }); await sleep(150) } catch (_e) {}
+      try { await windowRoutes.focus_window({ exe: ide_exe }); await sleep(300) } catch (_e) {}
       await input.key({ key: 'enter' })
       await sleep(600)
       pasted = true
