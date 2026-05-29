@@ -736,10 +736,16 @@ async function kill_worker(params) {
   let refused = null
   let error = null
   try {
+    // 2026-05-29 ultracode audit C1 fix. Previous lookup tried
+    // coord._loadWorkerRegistry || coord.workers.get(tab_id) - NEITHER
+    // existed on the coord exports. Every scheduler-spawned worker hit the
+    // refuse-and-leak branch. Now uses coord.loadWorkerRegistry which checks
+    // in-memory cache first, then falls back to disk-read of the registry
+    // file (canonical substrate that setWorkerTabHandle writes).
     const coord = require('./coord')
-    const stored = (coord._loadWorkerRegistry
-      ? coord._loadWorkerRegistry(tab_id)
-      : (coord.workers && coord.workers.get && coord.workers.get(tab_id))) || null
+    const stored = (typeof coord.loadWorkerRegistry === 'function')
+      ? coord.loadWorkerRegistry(tab_id)
+      : null
     const tab_handle = (stored && stored.tab_handle) || params.tab_handle || null
     const CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
     if (!tab_handle || tab_handle.viewType !== CC_CHAT_VIEW_TYPE || tab_handle.viewColumn == null) {
@@ -765,12 +771,20 @@ async function kill_worker(params) {
         }
         break
       }
+      // Mirrors coord.close_my_tab post-2026-05-29 C2-audit precedence:
+      // tabIndex is a fast-path tiebreaker WITHIN the identity-confirmed set,
+      // never a standalone key. Position drifts on any sibling tab churn.
       let foundExact = null
       let matchedBy = null
       if (group && storedTabIndex != null) {
         const tabAtIndex = (group.tabs || [])[storedTabIndex]
         if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
-          foundExact = tabAtIndex; matchedBy = 'tabIndex:' + storedTabIndex
+          const labelMatch = exactLabel && tabAtIndex.label === exactLabel
+          const sentinelMatch = sentinelPrefix && tabAtIndex.label && tabAtIndex.label.startsWith(sentinelPrefix)
+          if (labelMatch || sentinelMatch) {
+            foundExact = tabAtIndex
+            matchedBy = 'tabIndex+' + (sentinelMatch ? 'sentinel' : 'label') + ':' + storedTabIndex
+          }
         }
       }
       if (!foundExact && sentinelPrefix) {
@@ -788,7 +802,7 @@ async function kill_worker(params) {
           + '|vc' + tab_handle.viewColumn
       } else {
         const closeReq = { viewColumn: tab_handle.viewColumn, viewType: CC_CHAT_VIEW_TYPE }
-        if (matchedBy && matchedBy.startsWith('tabIndex:')) {
+        if (matchedBy && matchedBy.startsWith('tabIndex')) {
           closeReq.tabIndex = storedTabIndex
           closeReq.exactLabel = foundExact.label
         } else {
@@ -889,6 +903,7 @@ async function cleanup_orphan_workers(params) {
   for (const { filePath, worker } of orphans) {
     const th = worker.tab_handle
     const sp = th.sentinel_prefix || null
+    const labelAtSpawn = th.label || th.label_at_spawn || null
     const ti = (typeof th.tabIndex === 'number') ? th.tabIndex : null
     const vc = th.viewColumn
     const ctx = groupByCol[vc]
@@ -898,11 +913,19 @@ async function cleanup_orphan_workers(params) {
     let strategy = null
     let usedTabIndex = null
 
-    // Pass 1: tabIndex direct lookup (bridge v2, stable handle).
+    // Pass 1: tabIndex direct lookup, REQUIRES label OR sentinel confirmation.
+    // 2026-05-29 audit C2 fix - tabIndex alone is identity-blind under tab
+    // churn. Require label_at_spawn match OR sentinel_prefix match.
     if (ctx && ti != null) {
       const tabAtIndex = ctx.allTabs[ti]
       if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE && !ctx.claimed.has(tabAtIndex.label + '#' + ti)) {
-        match = tabAtIndex; strategy = 'tabIndex'; usedTabIndex = ti
+        const labelMatch = labelAtSpawn && tabAtIndex.label === labelAtSpawn
+        const sentinelMatch = sp && tabAtIndex.label && tabAtIndex.label.startsWith(sp)
+        if (labelMatch || sentinelMatch) {
+          match = tabAtIndex
+          strategy = 'tabIndex+' + (sentinelMatch ? 'sentinel' : 'label')
+          usedTabIndex = ti
+        }
       }
     }
 

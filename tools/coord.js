@@ -22,7 +22,9 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 
-const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
+// 2026-05-29: env-overridable so test harnesses can sandbox to a tmp dir
+// without polluting the production registry. Defaults to the canonical path.
+const COORD_ROOT = process.env.COORD_ROOT || 'D:\\.code\\EcodiaOS\\coordination'
 const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
 const MESSAGES_DIR = path.join(COORD_ROOT, 'messages')
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
@@ -339,6 +341,29 @@ function setWorkerTabHandle(tab_id, tab_handle) {
   w.tab_handle_set_at = new Date().toISOString()
   try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
   return { ok: true, tab_id: tab_id, tab_handle: tab_handle }
+}
+
+// loadWorkerRegistry - read a worker row from disk by tab_id.
+//
+// 2026-05-29 ultracode audit C1 fix. cowork.kill_worker runs in the same
+// process as coord but had no way to load a stored tab_handle:
+//   - the in-memory `workers` Map is module-private and not exported
+//   - even if exported, dispatch_worker writes the row across an HTTP
+//     boundary, so the cowork process reads an empty Map
+// Disk is the canonical substrate written by setWorkerTabHandle, so a
+// disk-read fallback gives every caller (cowork.kill_worker, scheduler
+// cleanup, manual operator) a single source of truth for stored handles.
+// Returns null if the file does not exist or is unreadable.
+function loadWorkerRegistry(tab_id) {
+  if (!tab_id) return null
+  if (workers.has(tab_id)) return workers.get(tab_id)  // hot path - same-process callers
+  try {
+    const filePath = path.join(WORKERS_DIR, tab_id + '.json')
+    if (!fs.existsSync(filePath)) return null
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'))
+  } catch (e) {
+    return null
+  }
 }
 
 function persistMessage(msg) {
@@ -676,12 +701,27 @@ async function close_my_tab(params, ctx) {
         break
       }
 
-      // (a) tabIndex match
+      // (a) tabIndex match - REQUIRES label OR sentinel-prefix confirmation.
+      //
+      // 2026-05-29 ultracode audit C2 fix. Previous version accepted tier (a)
+      // on viewType match alone. storedTabIndex is captured once at spawn and
+      // never refreshed; any tab insert/close/reorder at a LOWER index before
+      // close shifts our worker's position. The index then resolves to a
+      // DIFFERENT live CC chat - wrong-close reintroduced (Woodford-murder).
+      //
+      // Fix: require the tab AT storedTabIndex to ALSO match label_at_spawn
+      // OR startsWith(sentinel_prefix). If both stale, fall through to (b)/(c).
+      // tabIndex becomes a fast-path tiebreaker WITHIN the identity-confirmed
+      // set, never a standalone key.
       if (group && storedTabIndex != null) {
         const tabAtIndex = (group.tabs || [])[storedTabIndex]
         if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
-          foundExact = tabAtIndex
-          matchedBy = 'tabIndex:' + storedTabIndex
+          const labelMatch = exactLabel && tabAtIndex.label === exactLabel
+          const sentinelMatch = sentinelPrefix && tabAtIndex.label && tabAtIndex.label.startsWith(sentinelPrefix)
+          if (labelMatch || sentinelMatch) {
+            foundExact = tabAtIndex
+            matchedBy = 'tabIndex+' + (sentinelMatch ? 'sentinel' : 'label') + ':' + storedTabIndex
+          }
         }
       }
 
@@ -710,7 +750,7 @@ async function close_my_tab(params, ctx) {
           viewType: CC_CHAT_VIEW_TYPE,
           ide_port: conductor.ide_bridge_port,
         }
-        if (matchedBy && matchedBy.startsWith('tabIndex:')) {
+        if (matchedBy && matchedBy.startsWith('tabIndex')) {
           closeReq.tabIndex = storedTabIndex
           closeReq.exactLabel = foundExact.label  // belt-and-braces sanity check
         } else {
@@ -1081,6 +1121,7 @@ module.exports = {
   signal_bound: signal_bound,
   close_my_tab: close_my_tab,
   setWorkerTabHandle: setWorkerTabHandle,
+  loadWorkerRegistry: loadWorkerRegistry,
   verify_paste: verify_paste,
   register_conductor: register_conductor,
   unregister_conductor: unregister_conductor,

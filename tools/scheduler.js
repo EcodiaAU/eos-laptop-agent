@@ -32,11 +32,19 @@ const coord = require('./coord')
 const POLL_INTERVAL_MS = 30_000
 const STALE_LEASE_INTERVAL_MS = 60_000
 const DISPATCH_LIMIT = 5
-const SIGNAL_BOUND_TIMEOUT_MS = 30_000
+// 2026-05-29 ultracode audit H5 fix. Was 30000, below the 84.5s cold-MCP
+// observed floor + spike margin per worker-ack-timeout doctrine. On timeout
+// the launch-lock released, defeating the cred-rotation serialisation.
+const SIGNAL_BOUND_TIMEOUT_MS = 180_000
 const ORPHAN_TIMEOUT_MS = 6 * 60 * 60 * 1000
 const COMPLETION_POLL_INTERVAL_MS = 5_000
 const STALE_DISPATCHING_MS = 10 * 60 * 1000   // 10 min -> retry
 const MAX_RETRY_COUNT = 3
+// 2026-05-29 ultracode audit C3 fix. cleanup_orphan_workers is the only
+// backstop the chain's refuse-and-leak posture relies on; the audit caught
+// it wired to no cron at all. 7 min picks up leaked tabs within a worker
+// lifetime, doesn't thrash ide.tabs.
+const CLEANUP_ORPHAN_INTERVAL_MS = 7 * 60 * 1000
 
 // ── Postgres pool (injection seam for tests) ─────────────────────────────────
 
@@ -235,6 +243,19 @@ exports.dispatchOne = async function dispatchOne(row) {
     })
 
     if (!result || !result.ok) {
+      // 2026-05-29 ultracode audit H6 fix. When dispatch_worker spawns the
+      // tab but fails to paste the brief, it returns {ok:false, orphan:true,
+      // tab_id, tab_handle}. The tab is open + un-briefed + uncovered by any
+      // sweep because dispatched_tab_id was never persisted. Clean it up
+      // here before throwing so the next dispatch tick doesn't compound the
+      // leak with a brand-new tab.
+      if (result && result.orphan && result.tab_id) {
+        try {
+          await dispatcher.kill_worker({ tab_id: result.tab_id, tab_handle: result.tab_handle })
+        } catch (e) {
+          process.stderr.write('[scheduler] dispatchOne: orphan kill_worker error: ' + e.message + '\n')
+        }
+      }
       throw new Error('dispatch_worker failed: ' + (result && result.error || 'unknown'))
     }
 
@@ -252,8 +273,13 @@ exports.dispatchOne = async function dispatchOne(row) {
           const body = msg.body
           if (body && body.type === 'bound' && String(body.task_id) === taskIdStr) {
             bound = true
-            // Mark the message seen so it doesn't linger.
-            try { await coord.read_inbox({ topic: 'chat.conductor.inbox', limit: 1 }) } catch (e) {}
+            // 2026-05-29 ultracode audit H4 fix. Was read_inbox({limit:1})
+            // which marks the OLDEST unread seen (not the matched bound -
+            // bound arrives late, sorts last). Under back-to-back dispatch
+            // the oldest unread is often a DIFFERENT task's done signal that
+            // gets silently consumed, orphaning that task for 6h. Use
+            // ack_message by id - addresses exactly the matched message.
+            try { await coord.ack_message({ message_id: msg.id }) } catch (e) {}
             break
           }
         }
@@ -324,16 +350,24 @@ exports.markComplete = async function markComplete(row, signal) {
   const pool = getPool()
   const dispatcher = getDispatcher()
 
-  // Try to close the tab (v1: noop - kill_worker is focus-dependent).
+  // 2026-05-29 ultracode audit H2 fix. Was: kill_worker in try/catch then
+  // unconditional dispatched_tab_id = NULL. kill_worker returns ok:true even
+  // when it refuses, so the NULL hid the leak and discarded the only handle
+  // for a later sweep. Now: only NULL the column when the kill actually
+  // closed the tab. Retained handles are reconcilable by
+  // cleanup_orphan_workers (which runs every CLEANUP_ORPHAN_INTERVAL_MS).
+  let closeOk = false
   if (row.dispatched_tab_id) {
     try {
       if (dispatcher.kill_worker) {
-        await dispatcher.kill_worker({ tab_id: row.dispatched_tab_id })
+        const killRes = await dispatcher.kill_worker({ tab_id: row.dispatched_tab_id })
+        closeOk = !!(killRes && killRes.closed)
       }
     } catch (e) {
-      process.stderr.write('[scheduler] close_tab tolerated error: ' + e.message + '\n')
+      process.stderr.write('[scheduler] kill_worker tolerated error: ' + e.message + '\n')
     }
   }
+  const dispatchedTabIdSqlFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
 
   const isSuccess = signal && signal.status === 'success'
 
@@ -362,7 +396,7 @@ exports.markComplete = async function markComplete(row, signal) {
        SET status = 'active', last_run_at = NOW(), next_run_at = $1,
            run_count = run_count + 1, last_result = $2,
            retry_count = 0, leased_by = NULL, leased_at = NULL,
-           dispatched_tab_id = NULL, updated_at = NOW()
+           ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $3`,
       [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
@@ -372,7 +406,7 @@ exports.markComplete = async function markComplete(row, signal) {
       `UPDATE os_scheduled_tasks
        SET status = 'completed', last_run_at = NOW(), last_result = $1,
            run_count = run_count + 1, leased_by = NULL, leased_at = NULL,
-           dispatched_tab_id = NULL, updated_at = NOW()
+           ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $2`,
       [String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
@@ -458,13 +492,40 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   )
 
   // 3. Running too long -> orphaned.
-  await pool.query(
-    `UPDATE os_scheduled_tasks
-     SET status = 'orphaned', updated_at = NOW()
+  //
+  // 2026-05-29 ultracode audit H3 fix. Was: status='orphaned' only. The
+  // orphan row's dispatched_tab_id was never cleaned, and startupCleanup
+  // filters on last_run_at > NOW() - 24h - orphan rows have stale/null
+  // last_run_at so they were permanently excluded. Tab leaked forever.
+  // Now: identify orphans, kill_worker on each (best-effort), gate the
+  // tab_id NULL on closed:true (mirrors markComplete), and set last_run_at
+  // so a future startupCleanup or cleanup_orphan_workers sweep can still
+  // target the stored tab_handle on disk.
+  const orphans = await pool.query(
+    `SELECT id, dispatched_tab_id FROM os_scheduled_tasks
      WHERE status = 'running'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval`,
     [ORPHAN_TIMEOUT_MS]
   )
+  const dispatcher = getDispatcher()
+  for (const row of orphans.rows) {
+    let closeOk = false
+    if (row.dispatched_tab_id && dispatcher.kill_worker) {
+      try {
+        const r = await dispatcher.kill_worker({ tab_id: row.dispatched_tab_id })
+        closeOk = !!(r && r.closed)
+      } catch (e) {
+        process.stderr.write('[scheduler] orphan kill_worker tolerated error for ' + row.id + ': ' + e.message + '\n')
+      }
+    }
+    const tabFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET status = 'orphaned', last_run_at = NOW(), ${tabFrag} updated_at = NOW()
+       WHERE id = $1`,
+      [row.id]
+    )
+  }
 }
 
 // ── startupCleanup ───────────────────────────────────────────────────────────
@@ -492,13 +553,16 @@ exports.startupCleanup = async function startupCleanup() {
 
   const dispatcher = getDispatcher()
   for (const row of rows) {
+    let closeOk = false
     try {
       if (dispatcher.kill_worker) {
-        await dispatcher.kill_worker({ tab_id: row.dispatched_tab_id })
+        const r = await dispatcher.kill_worker({ tab_id: row.dispatched_tab_id })
+        closeOk = !!(r && r.closed)
       }
     } catch (e) {
       // Tolerate - tab may already be closed.
     }
+    if (!closeOk) continue  // 2026-05-29 H2: retain handle so the cleanup sweep can target it
     try {
       const pool = getPool()
       await pool.query(
@@ -653,11 +717,31 @@ exports.start = function start() {
     }
   }, CAP_OBSERVER_INTERVAL_MS)
 
+  // 2026-05-29 ultracode audit C3 fix. cleanup_orphan_workers reconciles
+  // the worker registry against live ide.tabs and closes orphans the strict
+  // close path could not match. The audit caught this wired to zero cron -
+  // the entire 'better leak than wrong-close' posture assumed this ran on a
+  // schedule. Now does, every CLEANUP_ORPHAN_INTERVAL_MS.
+  const cleanupOrphanInterval = setInterval(async () => {
+    try {
+      const dispatcher = getDispatcher()
+      if (dispatcher.cleanup_orphan_workers) {
+        const r = await dispatcher.cleanup_orphan_workers({ max_age_days: 7, force_untitled: false })
+        if (r && (r.closed > 0 || r.candidates > 0)) {
+          process.stderr.write('[scheduler] cleanup_orphan_workers: closed=' + r.closed + ' of ' + r.candidates + ' candidates (leaked=' + (r.leaked || 0) + ')\n')
+        }
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] cleanup_orphan_workers error: ' + e.message + '\n')
+    }
+  }, CLEANUP_ORPHAN_INTERVAL_MS)
+
   // Unref so the intervals don't prevent process exit in test environments.
   if (dispatchInterval.unref) dispatchInterval.unref()
   if (completionInterval.unref) completionInterval.unref()
   if (staleInterval.unref) staleInterval.unref()
   if (capObserverInterval.unref) capObserverInterval.unref()
+  if (cleanupOrphanInterval.unref) cleanupOrphanInterval.unref()
 
-  return { dispatchInterval, completionInterval, staleInterval, capObserverInterval }
+  return { dispatchInterval, completionInterval, staleInterval, capObserverInterval, cleanupOrphanInterval }
 }
