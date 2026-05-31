@@ -11,7 +11,7 @@ function runAHKScript(script, timeout) {
   const tmp = path.join(os.tmpdir(), 'macro_' + Date.now() + '.ahk')
   fs.writeFileSync(tmp, '#Requires AutoHotkey v2.0\n' + script + '\nExitApp(0)', 'utf8')
   try {
-    const r = spawnSync(AHK, [tmp], { timeout: timeout, encoding: 'utf8', windowsHide: true })
+    const r = spawnSync(AHK, [tmp], { timeout: timeout, encoding: 'utf8', windowsHide: true, creationFlags: 0x08000000 /* CREATE_NO_WINDOW */ })
     if (r.error) throw r.error
     return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr }
   } finally {

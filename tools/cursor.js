@@ -43,7 +43,7 @@ function ahkActivate() {
     '}\n'
   fs.writeFileSync(tmp, script, 'utf8')
   try {
-    const r = spawnSync(AHK, [tmp], { timeout: 4000, encoding: 'utf8', windowsHide: true })
+    const r = spawnSync(AHK, [tmp], { timeout: 4000, encoding: 'utf8', windowsHide: true, creationFlags: 0x08000000 /* CREATE_NO_WINDOW */ })
     return r.status === 0
   } finally {
     try { fs.unlinkSync(tmp) } catch (e) {}

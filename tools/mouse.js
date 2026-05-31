@@ -10,7 +10,7 @@ function runAHK(script, timeout) {
   const tmp = path.join(os.tmpdir(), 'ahk_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.ahk')
   fs.writeFileSync(tmp, '#Requires AutoHotkey v2.0\n' + script + '\nExitApp(0)', 'utf8')
   try {
-    const r = spawnSync(AHK, [tmp], { timeout: timeout, encoding: 'utf8', windowsHide: true })
+    const r = spawnSync(AHK, [tmp], { timeout: timeout, encoding: 'utf8', windowsHide: true, creationFlags: 0x08000000 /* CREATE_NO_WINDOW */ })
     if (r.error) throw r.error
     return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr }
   } finally {

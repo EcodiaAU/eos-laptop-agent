@@ -47,7 +47,12 @@ const MAX_RECOVERY_ATTEMPTS = 3
 // after dispatch are orphans (model never started, clipboard race under memory
 // pressure, OOM, or stuck on auth gate). Default-on detection at 90s; callers
 // can opt out via worker_acknowledgment_timeout_ms=0 for fire-and-forget.
-const DEFAULT_WORKER_ACK_TIMEOUT_MS = 90000
+// 2026-05-31: bumped default 90s -> 180s. CC worker boot (skills + auto-memory +
+// MCP servers + first model call) routinely takes 60-90s on Opus 4.7; the prior
+// 90s default produced false-orphan reports for dispatches that actually
+// submitted cleanly. Callers can still override per-call. See
+// [[worker-ack-timeout-default-90s-too-tight-for-cold-mcp-load-2026-05-28]].
+const DEFAULT_WORKER_ACK_TIMEOUT_MS = 180000
 const WORKER_ACK_POLL_INTERVAL_MS = 2000
 
 // HTTP helper for synchronous worker registration (no external deps; use node's http module)
@@ -444,26 +449,75 @@ async function dispatch_worker(params) {
     }
   } catch (e) {}
 
-  // Submit: bring the IDE OS-window to the foreground via a real AHK WinActivate
-  // (window.focus_window), THEN Enter. The earlier claude-vscode.focus only fired
-  // an in-IDE @-mention event and did NOT foreground the OS window, so the SendKeys
-  // Enter landed in whatever window happened to be foreground - the 2026-05-29
-  // "didnt press enter" failure (editor.open had correctly prefilled the input).
-  // editor.open already focused the chat input within the IDE, so once the window
-  // is foreground a single Enter submits. Never re-spawn; the brief is prefilled.
+  // Submit: bring the IDE OS-window to the foreground AND send Enter in a SINGLE
+  // atomic AHK script (window.focus_and_send). Replaces the prior two-call dance
+  // (window.focus_window -> sleep 300 -> input.key) which had a 300ms+ Node-side
+  // window between activation and keystroke during which focus drifted off the
+  // CC chat textarea ~70% of the time, leaving the brief prefilled but never
+  // submitted - the empirical "scheduler-spawned tabs not hitting enter" failure
+  // mode observed in the workers/ ack rates 2026-05-29 → 2026-05-31.
+  //
+  // BEFORE the AHK call we also re-activate the just-opened chat tab via a
+  // VS Code command. editor.open made the tab active inside the bridge, but
+  // between bridge-return and AHK-fire (~100-500ms) Tate's interactive actions
+  // (clicking another file in the file tree, switching tabs) can shift the
+  // active editor in VS Code's internal state - WinActivate then foregrounds
+  // the Code.exe OS window but Enter lands in whatever editor is now active
+  // (often a code/HTML file, where it just inserts a newline). Re-asserting
+  // tab focus via workbench.action.openEditorAtIndex<N> (1-9) right before
+  // the AHK call closes that race. The CC extension also accepts
+  // workbench.action.focusMostRecentlyUsedEditor as a fallback when the
+  // tab index is >= 9.
   const windowRoutes = require('./window')
   let pasted = false
   let paste_error = null
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  let paste_attempts = []
+  let refocus_result = null
+  // Diagnostic: capture what window was foreground at the moment we tried
+  // the AHK activation. When activate_failed_within_1500ms fires, this tells
+  // us what stole the foreground (a terminal, an antivirus toast, another
+  // VS Code window, the Bash tool's PowerShell child, etc).
+  let foreground_at_paste = null
+  try {
+    foreground_at_paste = await windowRoutes.foreground()
+  } catch (e) {
+    foreground_at_paste = { error: e.message }
+  }
+
+  // V8 path: no bridge-side refocus call. The previous focusActiveEditor name
+  // turned out to be invalid (HTTP 500 "command not found") - and dispatches
+  // worked anyway because the AHK script's AttachThreadInput fallback
+  // recovers when the terminal-flash or another window steals foreground.
+  // editor.open + 1200ms bridge wait leaves the new tab as VS Code's active
+  // editor and CC's React useEffect focuses the textarea inside the webview.
+  // The atomic AHK (WinActivate → AttachThreadInput → Alt-as-last-resort →
+  // SendInput Enter) is sufficient when the new tab is still active.
+  // Anti-pattern: positional openEditorAtIndex<N> - the tab index returned
+  // by the bridge's tab-diff is unreliable when multiple "Claude Code"-
+  // labeled tabs exist (the diff matches by viewColumn|label, which is
+  // identical for default-empty CC chats; falls back to active-tab which
+  // is Tate's working tab, not the just-opened dispatch tab).
+  try {
+    const r = await windowRoutes.focus_and_send({ exe: ide_exe, key: 'ctrl+enter', settleMs: 250 })
+    paste_attempts.push({ attempt: 1, settleMs: 250, ok: r && r.ok, reason: r && r.reason })
+    if (r && r.ok) pasted = true
+    else paste_error = 'focus_and_send: ' + (r && r.reason || 'unknown')
+  } catch (e) {
+    paste_attempts.push({ attempt: 1, error: e.message })
+    paste_error = e.message
+  }
+  // If activation failed (window not found in 1.5s), second try with a longer
+  // settle. The tab refocus is already done; just retry the AHK keystroke.
+  if (!pasted) {
+    await sleep(400)
     try {
-      try { await windowRoutes.focus_window({ exe: ide_exe }); await sleep(300) } catch (_e) {}
-      await input.key({ key: 'enter' })
-      await sleep(600)
-      pasted = true
-      break
+      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, key: 'ctrl+enter', settleMs: 600 })
+      paste_attempts.push({ attempt: 2, settleMs: 600, ok: r2 && r2.ok, reason: r2 && r2.reason })
+      if (r2 && r2.ok) pasted = true
+      else paste_error = (paste_error || '') + '; retry: ' + (r2 && r2.reason || 'unknown')
     } catch (e) {
-      paste_error = e.message
-      if (attempt < 3) await sleep(500)
+      paste_attempts.push({ attempt: 2, error: e.message })
+      paste_error = (paste_error || '') + '; retry threw: ' + e.message
     }
   }
   if (!pasted) {
@@ -475,8 +529,11 @@ async function dispatch_worker(params) {
       task_id: task_id,
       tab_handle: tab_handle,
       orphan: true,
-      error: 'brief enter-submit failed after 3 attempts: ' + paste_error,
-      note: 'Worker tab is open + brief PREFILLED in the input box (editor.open succeeded), but the Enter keystroke failed. Recoverable: focus the tab and press Enter. No re-spawn performed (avoids empty-tab leak).',
+      error: 'brief enter-submit failed (atomic focus_and_send): ' + paste_error,
+      paste_attempts: paste_attempts,
+      refocus_result: refocus_result,
+      foreground_at_paste: foreground_at_paste,
+      note: 'Worker tab is open + brief PREFILLED in the input box (editor.open succeeded), but the WinActivate / SendInput AHK script could not bring Code.exe to foreground within 1.5s. foreground_at_paste shows what stole the foreground. Recoverable: focus the tab and press Enter. No re-spawn performed (avoids empty-tab leak).',
     }
   }
 
@@ -508,6 +565,8 @@ async function dispatch_worker(params) {
   let acknowledged = false
   let ack_via = null
   let ack_elapsed_ms = 0
+  let re_enter_fired = false
+  let re_enter_result = null
   if (ackTimeoutMs > 0) {
     const workerFile = path.join(WORKERS_DIR, tab_id + '.json')
     const start = Date.now()
@@ -516,6 +575,14 @@ async function dispatch_worker(params) {
       const data = JSON.parse(fs.readFileSync(workerFile, 'utf8'))
       baseline_heartbeat = data.last_heartbeat_at
     } catch (e) {}
+    // Recovery re-Enter threshold: if no ack at this elapsed point, the most
+    // likely cause is the first Enter landed in the wrong target (focus drift
+    // between bridge return and SendInput). The brief is still in the chat
+    // input box, so re-issuing focus_and_send is idempotent: if submit already
+    // happened, Enter on the now-empty CC chat is a no-op; if it didn't, this
+    // catches it. We fire this ONCE at ~half the timeout - waiting until
+    // expiry would mean the scheduler row times out before recovery completes.
+    const reEnterAtMs = Math.max(15000, Math.floor(ackTimeoutMs * 0.5))
     while (Date.now() - start < ackTimeoutMs) {
       // Check 1: heartbeat advanced past baseline
       try {
@@ -546,6 +613,22 @@ async function dispatch_worker(params) {
         }
       } catch (e) {}
       if (acknowledged) break
+      // Mid-wait recovery: one (refocus-tab + focus_and_send) re-fire if we
+      // cross the threshold without an ack. Idempotent on the brief side -
+      // Enter on a now-empty CC chat is a no-op. The refocus step matters
+      // more here than on the first attempt: at this point ~30-90s have
+      // elapsed, Tate has likely touched another editor, so the chat tab is
+      // definitely not active any more.
+      if (!re_enter_fired && (Date.now() - start) >= reEnterAtMs) {
+        re_enter_fired = true
+        // V8 recovery: just the atomic AHK. No bridge-side refocus.
+        try {
+          const windowRoutes = require('./window')
+          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, key: 'ctrl+enter', settleMs: 500 })
+        } catch (e) {
+          re_enter_result = { ok: false, error: e.message }
+        }
+      }
       await sleep(WORKER_ACK_POLL_INTERVAL_MS)
     }
     ack_elapsed_ms = Date.now() - start
@@ -575,6 +658,11 @@ async function dispatch_worker(params) {
       orphan: true,
       orphan_reason: 'no coord.* call from spawned worker within ' + ackTimeoutMs + 'ms',
       ack_elapsed_ms: ack_elapsed_ms,
+      paste_attempts: paste_attempts,
+      refocus_result: refocus_result,
+      foreground_at_paste: foreground_at_paste,
+      re_enter_fired: re_enter_fired,
+      re_enter_result: re_enter_result,
       brief_file_audit: auditFilePath.replace(/\\/g, '/'),
       redispatched: redispatched,
       note: 'Worker tab spawned + brief pasted but model never sent a coord.* call (heartbeat/progress/done). Causes: model never started, clipboard race under memory pressure, OOM, or auth gate. Call cowork.kill_worker({tab_id}) and retry, or pass redispatch_on_orphan=true to auto-retry once.',
@@ -598,8 +686,11 @@ async function dispatch_worker(params) {
     acknowledged: acknowledged,
     ack_via: ack_via,
     ack_elapsed_ms: ack_elapsed_ms,
+    paste_attempts: paste_attempts,
+    re_enter_fired: re_enter_fired,
+    re_enter_result: re_enter_result,
     note: ackTimeoutMs > 0
-      ? ('Worker acknowledged in ' + ack_elapsed_ms + 'ms via ' + ack_via + '. Task execution from here is the worker model\'s responsibility.')
+      ? ('Worker acknowledged in ' + ack_elapsed_ms + 'ms via ' + ack_via + (re_enter_fired ? ' (recovery re-Enter fired)' : '') + '. Task execution from here is the worker model\'s responsibility.')
       : 'Fire-and-forget mode (ack timeout=0). Worker registered + brief pasted; no acknowledgment wait performed.',
   }
 }
