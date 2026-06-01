@@ -383,10 +383,13 @@ exports.markComplete = async function markComplete(row, signal) {
   const rowType = row.type || 'one_shot'
 
   if (rowType === 'cron' && row.cron_expression) {
-    // Compute next_run_at via cron-parser.
+    // Compute next_run_at via cron-parser using the row's tz (default Brisbane).
+    // Pre-2026-05-31 this was hardcoded {utc:true}, which mis-fired AEST schedules
+    // by 10h. Phase A1 unification: every cron carries its own tz column.
     let nextRunAt = null
     try {
-      const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { utc: true })
+      const tz = row.tz || 'Australia/Brisbane'
+      const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { tz })
       nextRunAt = interval.next().toDate().toISOString()
     } catch (cronErr) {
       process.stderr.write('[scheduler] cron-parser error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
@@ -653,6 +656,245 @@ exports.checkCapWarning = async function checkCapWarning() {
 }
 
 exports._resetCapWarningLast = function () { _capWarningLast.account = null; _capWarningLast.at = 0 }
+
+// ── CRUD MCP handlers (Phase A1: scheduler unification) ─────────────────────
+//
+// Three tools exposed as scheduler.schedule_delayed / scheduler.schedule_cron /
+// scheduler.schedule_list. They write to os_scheduled_tasks and the existing
+// dispatch engine (leaseDueRows -> dispatchOne) picks them up untouched.
+//
+// All times returned as both _utc (ISO) and _aest (AEST ISO) per the
+// UTC-for-machines, AEST-for-Tate doctrine.
+
+const AEST_OFFSET_HOURS = 10  // UTC+10, no DST in Brisbane
+
+function toAestIso(dateLike) {
+  if (!dateLike) return null
+  const d = (dateLike instanceof Date) ? dateLike : new Date(dateLike)
+  if (isNaN(d.getTime())) return null
+  const shifted = new Date(d.getTime() + AEST_OFFSET_HOURS * 60 * 60 * 1000)
+  return shifted.toISOString().replace('Z', '+10:00')
+}
+
+// Parse a delay string into an absolute Date.
+//   'in 30m' / 'in 2h' / 'in 3d' / 'in 45s'
+//   raw ISO 8601: '2026-06-01T15:00:00Z'
+//   numeric ms-from-now: number (seconds-as-number rejected to force unit)
+function parseDelay(delay) {
+  if (delay == null) throw new Error('delay required')
+  if (delay instanceof Date) return delay
+  if (typeof delay === 'string') {
+    const m = delay.match(/^\s*in\s+(\d+)\s*([smhd])\s*$/i)
+    if (m) {
+      const n = parseInt(m[1], 10)
+      const unit = m[2].toLowerCase()
+      const mult = unit === 's' ? 1000
+        : unit === 'm' ? 60 * 1000
+        : unit === 'h' ? 60 * 60 * 1000
+        : 24 * 60 * 60 * 1000
+      return new Date(Date.now() + n * mult)
+    }
+    // Try as ISO 8601.
+    const iso = new Date(delay)
+    if (!isNaN(iso.getTime())) return iso
+    throw new Error('delay must be "in <N>[smhd]" or ISO 8601, got: ' + delay)
+  }
+  throw new Error('delay must be string, got: ' + typeof delay)
+}
+
+// Translate friendly schedule strings to raw cron-expressions.
+//   'every 1h' / 'every 30m' / 'every 10s' (every <N>[smh])
+//   'daily 09:00' / 'daily 23:30'
+//   already-raw 5- or 6-field cron: passes through
+function parseSchedule(schedule) {
+  if (!schedule || typeof schedule !== 'string') {
+    throw new Error('schedule required (string)')
+  }
+  const s = schedule.trim()
+  const every = s.match(/^every\s+(\d+)\s*([mh])\s*$/i)
+  if (every) {
+    const n = parseInt(every[1], 10)
+    const unit = every[2].toLowerCase()
+    if (unit === 'h') return `0 */${n} * * *`
+    return `*/${n} * * * *`
+  }
+  const daily = s.match(/^daily\s+(\d{1,2}):(\d{2})\s*$/i)
+  if (daily) {
+    return `${parseInt(daily[2], 10)} ${parseInt(daily[1], 10)} * * *`
+  }
+  // Assume already cron. Validate via cron-parser at the call site.
+  return s
+}
+
+const VALID_PRIORITY_CLASSES = new Set(['normal', 'high', 'low'])
+function normalisePriorityClass(pc) {
+  if (pc == null || pc === '') return 'normal'
+  const v = String(pc).toLowerCase()
+  if (v === 'high_fork' || v === 'low_fork') {
+    throw new Error('priority_class ' + pc + ' references dead fork substrate; use "normal", "high", or "low"')
+  }
+  if (!VALID_PRIORITY_CLASSES.has(v)) {
+    throw new Error('priority_class must be one of normal|high|low, got: ' + pc)
+  }
+  return v
+}
+
+// Map priority_class -> priority int (1=highest .. 5=lowest).
+function priorityForClass(pc) {
+  if (pc === 'high') return 1
+  if (pc === 'low') return 5
+  return 3
+}
+
+exports.schedule_delayed = async function schedule_delayed(params) {
+  const p = params || {}
+  if (!p.name || typeof p.name !== 'string') throw new Error('name required (string)')
+  if (!p.prompt || typeof p.prompt !== 'string') throw new Error('prompt required (string)')
+  const runAt = parseDelay(p.delay)
+  const priorityClass = normalisePriorityClass(p.priority_class)
+  const priority = priorityForClass(priorityClass)
+  const tz = p.tz || 'Australia/Brisbane'
+
+  const pool = getPool()
+  const sql = `
+    INSERT INTO os_scheduled_tasks
+      (type, name, prompt, run_at, next_run_at, preferred_account, priority, tz, status)
+    VALUES ('delayed', $1, $2, $3, $3, $4, $5, $6, 'active')
+    RETURNING id, run_at, next_run_at, tz
+  `
+  const result = await pool.query(sql, [
+    p.name,
+    p.prompt,
+    runAt.toISOString(),
+    p.preferred_account || null,
+    priority,
+    tz,
+  ])
+  const row = result.rows[0]
+  return {
+    ok: true,
+    id: row.id,
+    type: 'delayed',
+    priority_class: priorityClass,
+    next_fire_at_utc: new Date(row.next_run_at).toISOString(),
+    next_fire_at_aest: toAestIso(row.next_run_at),
+  }
+}
+
+exports.schedule_cron = async function schedule_cron(params) {
+  const p = params || {}
+  if (!p.name || typeof p.name !== 'string') throw new Error('name required (string)')
+  if (!p.prompt || typeof p.prompt !== 'string') throw new Error('prompt required (string)')
+  const cronExpr = parseSchedule(p.schedule)
+  const tz = p.tz || 'Australia/Brisbane'
+  const priorityClass = normalisePriorityClass(p.priority_class)
+  const priority = priorityForClass(priorityClass)
+
+  // Compute first next_run_at via cron-parser with the row's tz.
+  let firstRun
+  try {
+    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date() })
+    firstRun = interval.next().toDate()
+  } catch (e) {
+    throw new Error('invalid cron expression "' + cronExpr + '": ' + e.message)
+  }
+
+  const pool = getPool()
+  const sql = `
+    INSERT INTO os_scheduled_tasks
+      (type, name, prompt, cron_expression, next_run_at, preferred_account, priority, tz, status)
+    VALUES ('cron', $1, $2, $3, $4, $5, $6, $7, 'active')
+    RETURNING id, cron_expression, next_run_at, tz
+  `
+  const result = await pool.query(sql, [
+    p.name,
+    p.prompt,
+    cronExpr,
+    firstRun.toISOString(),
+    p.preferred_account || null,
+    priority,
+    tz,
+  ])
+  const row = result.rows[0]
+  return {
+    ok: true,
+    id: row.id,
+    type: 'cron',
+    schedule_expression: row.cron_expression,
+    tz: row.tz,
+    priority_class: priorityClass,
+    next_fire_at_utc: new Date(row.next_run_at).toISOString(),
+    next_fire_at_aest: toAestIso(row.next_run_at),
+  }
+}
+
+const ACTIVE_STATUSES = new Set(['active', 'dispatching', 'running'])
+const ARCHIVED_STATUSES = new Set(['completed', 'failed', 'orphaned'])
+
+exports.schedule_list = async function schedule_list(params) {
+  const p = params || {}
+  const limit = Math.min(Math.max(parseInt(p.limit, 10) || 100, 1), 100)
+  const archived = p.archived === true
+
+  const clauses = []
+  const vals = []
+  if (archived) {
+    vals.push(Array.from(ARCHIVED_STATUSES))
+    clauses.push('status = ANY($' + vals.length + ')')
+  } else {
+    vals.push(Array.from(ACTIVE_STATUSES))
+    clauses.push('status = ANY($' + vals.length + ')')
+  }
+  if (p.type) {
+    vals.push(p.type)
+    clauses.push('type = $' + vals.length)
+  }
+  if (p.name_like) {
+    vals.push('%' + p.name_like + '%')
+    clauses.push('name ILIKE $' + vals.length)
+  }
+  vals.push(limit)
+
+  const sql = `
+    SELECT id, type, name, prompt, cron_expression, run_at, next_run_at, last_run_at,
+           status, run_count, priority, preferred_account, actual_account, tz,
+           last_error, last_result, created_at, updated_at
+    FROM os_scheduled_tasks
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY next_run_at ASC NULLS LAST, created_at DESC
+    LIMIT $${vals.length}
+  `
+  const pool = getPool()
+  const result = await pool.query(sql, vals)
+  const rows = result.rows.map(r => ({
+    id: r.id,
+    type: r.type,
+    name: r.name,
+    prompt: (r.prompt || '').slice(0, 200),
+    cron_expression: r.cron_expression,
+    run_at_utc: r.run_at ? new Date(r.run_at).toISOString() : null,
+    run_at_aest: toAestIso(r.run_at),
+    next_run_at_utc: r.next_run_at ? new Date(r.next_run_at).toISOString() : null,
+    next_run_at_aest: toAestIso(r.next_run_at),
+    last_run_at_utc: r.last_run_at ? new Date(r.last_run_at).toISOString() : null,
+    status: r.status,
+    run_count: r.run_count,
+    priority: r.priority,
+    preferred_account: r.preferred_account,
+    actual_account: r.actual_account,
+    tz: r.tz,
+    last_error: r.last_error,
+    last_result: r.last_result ? r.last_result.slice(0, 200) : null,
+  }))
+  return { ok: true, count: rows.length, limit, archived, rows }
+}
+
+// Internals exposed for inline unit testing.
+exports._parseDelay = parseDelay
+exports._parseSchedule = parseSchedule
+exports._normalisePriorityClass = normalisePriorityClass
+exports._priorityForClass = priorityForClass
+exports._toAestIso = toAestIso
 
 // ── start ────────────────────────────────────────────────────────────────────
 //
