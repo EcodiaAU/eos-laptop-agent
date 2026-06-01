@@ -156,11 +156,21 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
   const n = (typeof limit === 'number' && limit > 0) ? limit : DISPATCH_LIMIT
   const pool = getPool()
   const leaseId = 'scheduler-' + process.pid + '-' + Date.now()
+  // 2026-06-01 Phase A2: exclude paused (last_status='paused') and cancelled
+  // (archived_at IS NOT NULL OR last_status='cancelled') rows. User-control
+  // surface for the new CRUD tools (schedule_pause/cancel/resume).
+  //
+  // Chain rows with chain_after set sit parked at next_run_at=NULL until the
+  // parent completes (markComplete wakes them). Without the NULL-guard, the
+  // existing "next_run_at IS NULL" branch would lease them immediately.
   const sql = `
     WITH due AS (
       SELECT id FROM os_scheduled_tasks
       WHERE status = 'active'
+        AND archived_at IS NULL
+        AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))
         AND (next_run_at IS NULL OR next_run_at <= NOW())
+        AND (chain_after IS NULL OR next_run_at IS NOT NULL)
       ORDER BY priority ASC, next_run_at ASC NULLS FIRST
       LIMIT $1
       FOR UPDATE SKIP LOCKED
@@ -413,6 +423,25 @@ exports.markComplete = async function markComplete(row, signal) {
        WHERE id = $2`,
       [String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
+  }
+
+  // 2026-06-01 Phase A2: chain wake-up. Any child row with chain_after = parent.id
+  // gets next_run_at=NOW() so the dispatch loop picks it up on the next 30s poll.
+  // Only fires on success - chain children stay parked if the parent failed.
+  if (isSuccess) {
+    try {
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET next_run_at = NOW(), updated_at = NOW()
+         WHERE chain_after = $1
+           AND status = 'active'
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+        [row.id]
+      )
+    } catch (chainErr) {
+      process.stderr.write('[scheduler] chain wake-up error for parent ' + row.id + ': ' + chainErr.message + '\n')
+    }
   }
 }
 
@@ -889,12 +918,211 @@ exports.schedule_list = async function schedule_list(params) {
   return { ok: true, count: rows.length, limit, archived, rows }
 }
 
+// ── A2 CRUD: cancel / pause / resume / run_now / chain ──────────────────────
+
+// Resolve a row by id (uuid) or name. Returns the row or null.
+async function _resolveRow(p) {
+  const pool = getPool()
+  if (p.id) {
+    const r = await pool.query(`SELECT * FROM os_scheduled_tasks WHERE id = $1`, [p.id])
+    return r.rows[0] || null
+  }
+  if (p.name) {
+    // Prefer active, fall back to most-recent if multiple matches exist.
+    const r = await pool.query(
+      `SELECT * FROM os_scheduled_tasks
+       WHERE name = $1
+       ORDER BY (archived_at IS NULL) DESC, created_at DESC
+       LIMIT 1`,
+      [p.name]
+    )
+    return r.rows[0] || null
+  }
+  throw new Error('id or name required')
+}
+
+exports.schedule_cancel = async function schedule_cancel(params) {
+  const p = params || {}
+  const row = await _resolveRow(p)
+  if (!row) return { ok: false, error: 'task not found', id: p.id || null, name: p.name || null }
+  const pool = getPool()
+  const result = await pool.query(
+    `UPDATE os_scheduled_tasks
+     SET archived_at = NOW(), last_status = 'cancelled', updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, name, archived_at`,
+    [row.id]
+  )
+  const r = result.rows[0]
+  return {
+    ok: true,
+    id: r.id,
+    name: r.name,
+    cancelled_at_utc: new Date(r.archived_at).toISOString(),
+    cancelled_at_aest: toAestIso(r.archived_at),
+  }
+}
+
+exports.schedule_pause = async function schedule_pause(params) {
+  const p = params || {}
+  const row = await _resolveRow(p)
+  if (!row) return { ok: false, error: 'task not found', id: p.id || null, name: p.name || null }
+  if (row.archived_at) {
+    return { ok: false, error: 'task is cancelled (archived); cannot pause', id: row.id, name: row.name }
+  }
+  const pool = getPool()
+  const result = await pool.query(
+    `UPDATE os_scheduled_tasks
+     SET last_status = 'paused', updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, name, updated_at`,
+    [row.id]
+  )
+  const r = result.rows[0]
+  return {
+    ok: true,
+    id: r.id,
+    name: r.name,
+    paused_at_utc: new Date(r.updated_at).toISOString(),
+    paused_at_aest: toAestIso(r.updated_at),
+  }
+}
+
+exports.schedule_resume = async function schedule_resume(params) {
+  const p = params || {}
+  const row = await _resolveRow(p)
+  if (!row) return { ok: false, error: 'task not found', id: p.id || null, name: p.name || null }
+  if (row.archived_at) {
+    return { ok: false, error: 'task is cancelled (archived); cannot resume', id: row.id, name: row.name }
+  }
+  if (row.last_status !== 'paused') {
+    return { ok: false, error: 'task is not paused (last_status=' + (row.last_status || 'null') + ')', id: row.id, name: row.name }
+  }
+
+  // Recompute next_run_at:
+  //  - cron rows: next interval from now using row.tz
+  //  - delayed rows: NOW() (the original delay window has passed during pause)
+  //  - other types: NOW()
+  let nextRunAt = new Date()
+  if (row.type === 'cron' && row.cron_expression) {
+    try {
+      const tz = row.tz || 'Australia/Brisbane'
+      const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { tz, currentDate: new Date() })
+      nextRunAt = interval.next().toDate()
+    } catch (cronErr) {
+      process.stderr.write('[scheduler] schedule_resume cron-parse error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
+    }
+  }
+
+  const pool = getPool()
+  const result = await pool.query(
+    `UPDATE os_scheduled_tasks
+     SET last_status = NULL, next_run_at = $2, updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, name, next_run_at, updated_at`,
+    [row.id, nextRunAt.toISOString()]
+  )
+  const r = result.rows[0]
+  return {
+    ok: true,
+    id: r.id,
+    name: r.name,
+    resumed_at_utc: new Date(r.updated_at).toISOString(),
+    resumed_at_aest: toAestIso(r.updated_at),
+    next_fire_at_utc: new Date(r.next_run_at).toISOString(),
+    next_fire_at_aest: toAestIso(r.next_run_at),
+  }
+}
+
+exports.schedule_run_now = async function schedule_run_now(params) {
+  const p = params || {}
+  const row = await _resolveRow(p)
+  if (!row) return { ok: false, error: 'task not found', id: p.id || null, name: p.name || null }
+  if (row.archived_at) {
+    return { ok: false, error: 'task is cancelled (archived); cannot run', id: row.id, name: row.name }
+  }
+  if (row.last_status === 'paused') {
+    return { ok: false, error: 'task is paused; resume first', id: row.id, name: row.name }
+  }
+  const pool = getPool()
+  const result = await pool.query(
+    `UPDATE os_scheduled_tasks
+     SET next_run_at = NOW(), updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, name, next_run_at`,
+    [row.id]
+  )
+  const r = result.rows[0]
+  return {
+    ok: true,
+    id: r.id,
+    name: r.name,
+    next_fire_at_utc: new Date(r.next_run_at).toISOString(),
+    next_fire_at_aest: toAestIso(r.next_run_at),
+  }
+}
+
+exports.schedule_chain = async function schedule_chain(params) {
+  const p = params || {}
+  if (!p.after_task_id || typeof p.after_task_id !== 'string') {
+    throw new Error('after_task_id required (string uuid)')
+  }
+  if (!p.name || typeof p.name !== 'string') throw new Error('name required (string)')
+  if (!p.prompt || typeof p.prompt !== 'string') throw new Error('prompt required (string)')
+
+  const pool = getPool()
+  // Verify parent exists - chain target must be resolvable.
+  const parent = await pool.query(
+    `SELECT id, name, status, archived_at FROM os_scheduled_tasks WHERE id = $1`,
+    [p.after_task_id]
+  )
+  if (!parent.rows.length) {
+    return { ok: false, error: 'after_task_id not found', after_task_id: p.after_task_id }
+  }
+
+  const priorityClass = normalisePriorityClass(p.priority_class)
+  const priority = priorityForClass(priorityClass)
+
+  // Chain rows insert with status='active', next_run_at=NULL. markComplete on
+  // the parent wakes them via the chain wake-up hook (sets next_run_at=NOW()).
+  // type='chained' is one of the allowed values in os_scheduled_tasks_type_check
+  // (cron|delayed|chained). leaseDueRows skips parked chain rows by requiring
+  // next_run_at IS NOT NULL when chain_after is set.
+  const sql = `
+    INSERT INTO os_scheduled_tasks
+      (type, name, prompt, chain_after, next_run_at, preferred_account, priority, status)
+    VALUES ('chained', $1, $2, $3, NULL, $4, $5, 'active')
+    RETURNING id, name, chain_after, status, created_at
+  `
+  const result = await pool.query(sql, [
+    p.name,
+    p.prompt,
+    p.after_task_id,
+    p.preferred_account || null,
+    priority,
+  ])
+  const r = result.rows[0]
+  return {
+    ok: true,
+    id: r.id,
+    name: r.name,
+    type: 'chain',
+    chain_after: r.chain_after,
+    parent_name: parent.rows[0].name,
+    parent_status: parent.rows[0].status,
+    priority_class: priorityClass,
+    created_at_utc: new Date(r.created_at).toISOString(),
+    created_at_aest: toAestIso(r.created_at),
+  }
+}
+
 // Internals exposed for inline unit testing.
 exports._parseDelay = parseDelay
 exports._parseSchedule = parseSchedule
 exports._normalisePriorityClass = normalisePriorityClass
 exports._priorityForClass = priorityForClass
 exports._toAestIso = toAestIso
+exports._resolveRow = _resolveRow
 
 // ── start ────────────────────────────────────────────────────────────────────
 //
