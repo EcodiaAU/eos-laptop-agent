@@ -854,7 +854,12 @@ async function signal_bound(params, ctx) {
 // so the sweep only catches genuinely-dead tabs.
 
 const SWEEP_INTERVAL_MS = 60 * 1000
-const SWEEP_STALE_THRESHOLD_MS = 10 * 60 * 1000  // 10 min (was 180s, too aggressive)
+// 2026-06-01: bumped 10min -> 60min after Phase A2 incident. The auto-heartbeat
+// middleware in /api/tool only catches MCP tool calls hitting the laptop-agent;
+// Claude Code's built-in Bash/Read/Grep/Edit bypass it entirely. So a worker
+// can be doing real coding work for >10min using only built-ins and get swept.
+// 60min gives substantial coding tasks room without masking genuine deaths.
+const SWEEP_STALE_THRESHOLD_MS = 60 * 60 * 1000  // 60 min
 
 function sweepStaleWorkers() {
   const now = Date.now()
