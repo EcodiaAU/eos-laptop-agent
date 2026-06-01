@@ -1,3 +1,12 @@
+// Load .env early so SCHEDULER_ENABLED + DATABASE_URL + AGENT_TOKEN are
+// available before any tool is required. Tolerant fallback when dotenv or
+// the file is missing - env may still be set by the launch shell or PM2.
+try {
+  require('dotenv').config({ path: require('path').join(__dirname, '.env') })
+} catch (_e) {
+  // dotenv missing or file absent - env still functional via parent env
+}
+
 const express = require('express')
 const cors = require('cors')
 const os = require('os')
@@ -87,6 +96,20 @@ app.post('/api/tool', auth, async (req, res) => {
 
   try {
     const result = await fn(params, ctx)
+    // 2026-06-01: ANY successful tool call from a registered worker tab
+    // bumps that worker's last_heartbeat_at. This stops the sweep loop from
+    // killing workers mid-task during long-running tool calls (Read, Bash,
+    // db_execute) where the model wouldn't naturally call coord.heartbeat
+    // between every step. Non-worker tabs are a no-op. Skip the coord.*
+    // family to avoid double-write on the explicit heartbeat path.
+    if (ctx.tab_id && !String(tool).startsWith('coord.')) {
+      try {
+        const coord = require('./tools/coord')
+        if (typeof coord._touchHeartbeatForTab === 'function') {
+          coord._touchHeartbeatForTab(ctx.tab_id)
+        }
+      } catch (e) {}
+    }
     res.json({ ok: true, result })
   } catch (err) {
     res.status(500).json({ error: err.message, tool })

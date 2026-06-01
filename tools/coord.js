@@ -554,6 +554,22 @@ async function heartbeat(params, ctx) {
   return { ok: true, last_heartbeat_at: w.last_heartbeat_at }
 }
 
+// 2026-06-01: side-channel heartbeat touch for the /api/tool middleware.
+// ANY successful tool call from a registered worker tab counts as a liveness
+// signal - models doing real coding work make many non-coord tool calls
+// (Read, Bash, db_execute, etc) and shouldn't have to explicitly heartbeat
+// between them. Non-throwing. Returns false silently for non-worker tabs
+// (conductors, ad-hoc calls) so the middleware can call it unconditionally.
+function _touchHeartbeatForTab(tab_id) {
+  if (!tab_id) return false
+  const w = workers.get(tab_id)
+  if (!w) return false
+  if (w.terminated_at) return false
+  w.last_heartbeat_at = new Date().toISOString()
+  try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+  return true
+}
+
 async function report_progress(params, ctx) {
   params = params || {}
   ctx = ctx || {}
@@ -828,10 +844,17 @@ async function signal_bound(params, ctx) {
 // markers. Per pattern worker-registry-truth-is-on-disk-not-mtime-2026-05-18.
 // Workers that crash or have their tab closed never call signal_done; their
 // registry rows would stay ALIVE forever without this sweep.
-// Cadence: every 60s. Threshold: 2x DEAD_HEARTBEAT_MS = 180s with no beat.
+// Cadence: every 60s. Threshold bumped 2026-06-01: workers doing real coding
+// work (reading large files, planning, running tests, multi-step refactors)
+// routinely go 3-8min between explicit coord.heartbeat calls. The previous
+// 180s threshold was killing ~40% of workers mid-task ("heartbeat-then-die"
+// failure mode observed during Phase A1 scheduler-unification dispatches).
+// Combined with the touch_heartbeat_for_tab middleware in index.js, ANY
+// successful tool call from a registered worker now bumps last_heartbeat_at,
+// so the sweep only catches genuinely-dead tabs.
 
 const SWEEP_INTERVAL_MS = 60 * 1000
-const SWEEP_STALE_THRESHOLD_MS = DEAD_HEARTBEAT_MS * 2  // 180s
+const SWEEP_STALE_THRESHOLD_MS = 10 * 60 * 1000  // 10 min (was 180s, too aggressive)
 
 function sweepStaleWorkers() {
   const now = Date.now()
@@ -1141,4 +1164,7 @@ module.exports = {
   _sweepStaleWorkers: sweepStaleWorkers,
   _startSweepLoop: startSweepLoop,
   _stopSweepLoop: stopSweepLoop,
+  // Side-channel heartbeat touch for the /api/tool middleware (any tool
+  // call from a registered worker tab = liveness signal).
+  _touchHeartbeatForTab: _touchHeartbeatForTab,
 }
