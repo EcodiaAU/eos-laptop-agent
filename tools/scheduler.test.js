@@ -235,6 +235,110 @@ test('dispatchOne AllAccountsCappedError: defers row, does not mark failed', asy
   credsModule.pick_healthiest_account = origPick
 })
 
+// ── 2026-06-02 P0: dispatchOne "no IDE instances registered" defers ─────────
+
+test('dispatchOne no-IDE error: defers row 5min, does not mark failed, does not touch retry_count', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'tate'
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'tate' })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async () => ({
+      ok: false,
+      tab_id: null,
+      error: 'populate failed (editor.open): no IDE instances registered. The ecodia-preview extension must be installed and the IDE running.'
+    }),
+    kill_worker: async () => {},
+  })
+
+  const row = makeRow({ id: 'task-no-ide-defer', retry_count: 2 })
+  let threw = false
+  try {
+    await scheduler.dispatchOne(row)
+  } catch (e) {
+    threw = true
+  }
+
+  // Find the defer UPDATE (status=active + next_run_at + last_error mentioning IDE bridge).
+  const deferUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") &&
+    q.sql.includes('next_run_at') &&
+    q.params.some(p => typeof p === 'string' && p.includes('no IDE bridge registered'))
+  )
+  assert(!!deferUpdate, 'dispatchOne no-IDE: defer UPDATE landed with next_run_at + IDE bridge marker')
+  assert(threw, 'dispatchOne no-IDE: still re-throws so dispatch loop logs')
+
+  // CRITICAL: retry_count must NOT be incremented (no $1 = retry_count in defer UPDATE).
+  const markFailedUpdate = pool._queries.find(q =>
+    q.sql.includes('retry_count = $1') && q.sql.includes("status = 'failed'")
+  )
+  assert(!markFailedUpdate, 'dispatchOne no-IDE: row was NOT marked failed (cron survives IDE gap)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+})
+
+// ── 2026-06-02 P0: markFailed cron at MAX_RETRY_COUNT defers to next interval ─
+
+test('markFailed cron at MAX_RETRY_COUNT: defers to next cron interval, resets retry_count', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  const row = makeRow({
+    id: 'task-cron-maxed',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    retry_count: 2,  // newRetryCount = 3 = MAX_RETRY_COUNT
+  })
+  await scheduler.markFailed(row, new Error('some transient failure'))
+
+  const deferUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") &&
+    q.sql.includes('retry_count = 0') &&
+    q.sql.includes('next_run_at = $2')
+  )
+  assert(!!deferUpdate, 'markFailed cron-maxed: status=active, retry_count reset to 0, next_run_at set')
+
+  // The other branch (status=failed) must NOT have fired.
+  const failedUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'failed'")
+  )
+  assert(!failedUpdate, 'markFailed cron-maxed: did NOT permanently fail the cron row')
+
+  // next_run_at must be a valid future ISO.
+  if (deferUpdate && deferUpdate.params[1]) {
+    const nextRun = new Date(deferUpdate.params[1])
+    assert(!isNaN(nextRun.getTime()), 'markFailed cron-maxed: next_run_at parses to valid date')
+    assert(nextRun.getTime() > Date.now(), 'markFailed cron-maxed: next_run_at is in the future')
+  } else {
+    assert(false, 'markFailed cron-maxed: next_run_at param missing')
+  }
+})
+
+// ── 2026-06-02 P0: markFailed non-cron at MAX_RETRY_COUNT still permanently fails
+
+test('markFailed delayed at MAX_RETRY_COUNT: still marks failed (one-shot semantics preserved)', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  const row = makeRow({
+    id: 'task-delayed-maxed',
+    type: 'delayed',
+    cron_expression: null,
+    retry_count: 2,  // newRetryCount = 3 = MAX_RETRY_COUNT
+  })
+  await scheduler.markFailed(row, new Error('genuine permanent failure'))
+
+  const failedUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'failed'")
+  )
+  assert(!!failedUpdate, 'markFailed delayed-maxed: row marked failed (one-shot work IS done)')
+})
+
 // ── Task 3.2: launchLock released on dispatch_worker error ───────────────────
 
 test('launchLock: released in finally even when dispatch_worker throws', async () => {

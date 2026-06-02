@@ -197,21 +197,44 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
 exports.markFailed = async function markFailed(row, err) {
   const pool = getPool()
   const newRetryCount = (row.retry_count || 0) + 1
+  const errMsg = String(err && err.message || err).slice(0, 2000)
   if (newRetryCount >= MAX_RETRY_COUNT) {
-    await pool.query(
-      `UPDATE os_scheduled_tasks
-       SET status = 'failed', retry_count = $1, last_error = $2,
-           leased_by = NULL, leased_at = NULL, updated_at = NOW()
-       WHERE id = $3`,
-      [newRetryCount, String(err && err.message || err).slice(0, 2000), row.id]
-    )
+    // 2026-06-02 P0 fix. Cron rows MUST NOT permanently die after 3 retries -
+    // that loses every future interval of recurring work. Defer to the next
+    // cron interval and reset retry_count instead. Non-cron rows still
+    // permanently fail (one-shot work is genuinely done after 3 failed tries).
+    if (row.type === 'cron' && row.cron_expression) {
+      let nextRunAt = null
+      try {
+        const tz = row.tz || 'Australia/Brisbane'
+        const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { tz })
+        nextRunAt = interval.next().toDate().toISOString()
+      } catch (_e) {
+        nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+      }
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'active', retry_count = 0, last_error = $1, next_run_at = $2,
+             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+         WHERE id = $3`,
+        [errMsg + ' (cron: deferred to next interval, retry_count reset)', nextRunAt, row.id]
+      )
+    } else {
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'failed', retry_count = $1, last_error = $2,
+             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+         WHERE id = $3`,
+        [newRetryCount, errMsg, row.id]
+      )
+    }
   } else {
     await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'active', retry_count = $1, last_error = $2,
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
        WHERE id = $3`,
-      [newRetryCount, String(err && err.message || err).slice(0, 2000), row.id]
+      [newRetryCount, errMsg, row.id]
     )
   }
 }
@@ -311,6 +334,7 @@ exports.dispatchOne = async function dispatchOne(row) {
       process.stderr.write('[scheduler] dispatchOne: signal_bound timeout for task ' + row.id + ' (tab ' + tabId + ')\n')
     }
   } catch (err) {
+    const errMsg = err && err.message || ''
     if (err && err.name === 'AllAccountsCappedError') {
       // Defer: find earliest reset + 1min, release lease, keep status=active.
       let deferMs = 60 * 60 * 1000  // default 1h
@@ -335,6 +359,26 @@ exports.dispatchOne = async function dispatchOne(row) {
         )
       } catch (pgErr) {
         process.stderr.write('[scheduler] markFailed pg error: ' + pgErr.message + '\n')
+      }
+    } else if (errMsg.includes('no IDE instances registered')) {
+      // 2026-06-02 P0 fix. The dispatch_worker editor.open path throws this when
+      // no VS Code / Cursor / Insiders instance has registered the ecodia-preview
+      // extension with the laptop-agent bridge. This is TRANSIENT (Tate closes
+      // the IDE, machine reboots, extension reloads). Treat it the same way as
+      // AllAccountsCappedError: defer ~5min, do NOT increment retry_count, do
+      // NOT mark failed. The cron survives the gap window naturally.
+      const deferMs = 5 * 60 * 1000
+      const nextRun = new Date(Date.now() + deferMs)
+      try {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', leased_by = NULL, leased_at = NULL,
+               next_run_at = $1, last_error = $2, updated_at = NOW()
+           WHERE id = $3`,
+          [nextRun.toISOString(), 'no IDE bridge registered - deferred 5min', row.id]
+        )
+      } catch (pgErr) {
+        process.stderr.write('[scheduler] no-IDE defer pg error: ' + pgErr.message + '\n')
       }
     } else {
       try {
