@@ -37,6 +37,41 @@ const ide = require('./ide')
 const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
 const STATE_DIR = path.join(COORD_ROOT, 'state')
+
+// 2026-06-02: read the user's effective CC submit key from VS Code settings.
+// The CC chat extension exposes `claudeCode.useCtrlEnterToSend` (default false):
+//   false (default) -> Enter submits, Shift+Enter newline
+//   true            -> Ctrl+Enter submits, Enter newline
+// Pre-this-fix dispatch_worker hardcoded ctrl+enter, which silently failed
+// on default-config installs (today's two scheduler dispatches landed in
+// prefilled input boxes that never submitted - workers' last_heartbeat_at
+// never advanced past registered_at). Reading the setting per-dispatch makes
+// the path robust to either user config without requiring settings mutation.
+function readCcSubmitKey() {
+  // VS Code Stable user settings on Windows
+  const candidatePaths = [
+    path.join(os.homedir(), 'AppData', 'Roaming', 'Code', 'User', 'settings.json'),
+    path.join(os.homedir(), 'AppData', 'Roaming', 'Code - Insiders', 'User', 'settings.json'),
+    path.join(os.homedir(), 'AppData', 'Roaming', 'Cursor', 'User', 'settings.json'),
+  ]
+  for (const p of candidatePaths) {
+    try {
+      if (!fs.existsSync(p)) continue
+      const raw = fs.readFileSync(p, 'utf8')
+      // VS Code settings.json allows JSONC (// and /* */ comments + trailing commas).
+      // Cheap, lossy strip - just enough to JSON.parse the common case.
+      const stripped = raw
+        .replace(/\/\/[^\n]*/g, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/,(\s*[\]}])/g, '$1')
+      const cfg = JSON.parse(stripped)
+      if (cfg && cfg['claudeCode.useCtrlEnterToSend'] === true) return 'ctrl+enter'
+    } catch (e) {
+      // ignore - try next file or fall through to default
+    }
+  }
+  return 'enter'  // CC extension default
+}
 const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
 const MESSAGES_DIR = path.join(COORD_ROOT, 'messages')
 const BRIEF_INLINE_CAP_BYTES = 100 * 1024  // 100KB - over this, paste pointer instead
@@ -497,13 +532,18 @@ async function dispatch_worker(params) {
   // labeled tabs exist (the diff matches by viewColumn|label, which is
   // identical for default-empty CC chats; falls back to active-tab which
   // is Tate's working tab, not the just-opened dispatch tab).
+  // 2026-06-02: read the submit key from CC's `useCtrlEnterToSend` setting
+  // (default false -> Enter; opt-in true -> Ctrl+Enter). Hardcoded ctrl+enter
+  // was silently no-op'ing on the default-config install and orphaning every
+  // scheduler dispatch (workers' heartbeat never advanced past registration).
+  const submitKey = readCcSubmitKey()
   try {
-    const r = await windowRoutes.focus_and_send({ exe: ide_exe, key: 'ctrl+enter', settleMs: 250 })
-    paste_attempts.push({ attempt: 1, settleMs: 250, ok: r && r.ok, reason: r && r.reason })
+    const r = await windowRoutes.focus_and_send({ exe: ide_exe, key: submitKey, settleMs: 250 })
+    paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, ok: r && r.ok, reason: r && r.reason })
     if (r && r.ok) pasted = true
     else paste_error = 'focus_and_send: ' + (r && r.reason || 'unknown')
   } catch (e) {
-    paste_attempts.push({ attempt: 1, error: e.message })
+    paste_attempts.push({ attempt: 1, key: submitKey, error: e.message })
     paste_error = e.message
   }
   // If activation failed (window not found in 1.5s), second try with a longer
@@ -511,8 +551,8 @@ async function dispatch_worker(params) {
   if (!pasted) {
     await sleep(400)
     try {
-      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, key: 'ctrl+enter', settleMs: 600 })
-      paste_attempts.push({ attempt: 2, settleMs: 600, ok: r2 && r2.ok, reason: r2 && r2.reason })
+      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, key: submitKey, settleMs: 600 })
+      paste_attempts.push({ attempt: 2, settleMs: 600, key: submitKey, ok: r2 && r2.ok, reason: r2 && r2.reason })
       if (r2 && r2.ok) pasted = true
       else paste_error = (paste_error || '') + '; retry: ' + (r2 && r2.reason || 'unknown')
     } catch (e) {
@@ -624,7 +664,8 @@ async function dispatch_worker(params) {
         // V8 recovery: just the atomic AHK. No bridge-side refocus.
         try {
           const windowRoutes = require('./window')
-          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, key: 'ctrl+enter', settleMs: 500 })
+          // 2026-06-02: setting-aware submit key (see readCcSubmitKey above).
+          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, key: submitKey, settleMs: 500 })
         } catch (e) {
           re_enter_result = { ok: false, error: e.message }
         }
