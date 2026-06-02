@@ -441,20 +441,43 @@ async function dispatch_worker(params) {
   let tab_handle = null
   let spawn_error = null
   let ide_exe = 'Code.exe'  // VS Code Stable (the worker host); refined from the bridge's ide name below
-  // 2026-06-02: capture the bridge's pid so focus_and_send can target the
-  // EXACT VS Code window hosting the new chat tab via ahk_pid, not just
-  // ahk_exe Code.exe (which matches any Code.exe window). Multi-window
-  // installs were dispatching Enter into Tate's working window instead of
-  // the new chat tab.
-  let bridge_pid = null
+  // 2026-06-02: resolve the bridge's OS window hwnd so focus_and_send targets
+  // the exact window via ahk_id, not ahk_exe Code.exe. ahk_exe matches any
+  // VS Code window non-deterministically. ahk_pid does NOT work for the
+  // bridge's reported pid because the bridge runs in the extension host -
+  // a child process that owns no OS window. We use window.windows() to find
+  // a Code.exe window whose title contains the workspace folder name (which
+  // VS Code appends to every window title).
+  let bridge_hwnd = null
+  let bridge_workspace = null
   try {
     const sendRes = await ideRoutes.chat_send_message({ prompt: composedBrief, submit: false })
     const inner = (sendRes && (sendRes.result || sendRes)) || {}
     const ideName = String(inner.ide || '').toLowerCase()
     if (ideName.includes('insiders')) ide_exe = 'Code - Insiders.exe'
     else if (ideName.includes('cursor')) ide_exe = 'Cursor.exe'
-    // pid comes from ide.js call() wrapper: { ide, pid, port, ...result }
-    if (sendRes && Number.isInteger(Number(sendRes.pid))) bridge_pid = Number(sendRes.pid)
+    // Look up the bridge's workspace (set at IDE-extension registration time)
+    // so we can hwnd-disambiguate when multiple VS Code windows are open.
+    try {
+      const reg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.ecodia-preview', 'instances.json'), 'utf8'))
+      const bridgePid = sendRes && Number.isInteger(Number(sendRes.pid)) ? Number(sendRes.pid) : null
+      const inst = bridgePid && reg[bridgePid]
+      if (inst && Array.isArray(inst.workspaceRoots) && inst.workspaceRoots.length) {
+        // e.g. "d:\\.code\\ecodiaos\\backend" -> last folder name "backend"
+        const root = String(inst.workspaceRoots[0])
+        bridge_workspace = root.split(/[\\/]/).filter(Boolean).pop() || null
+      }
+      if (bridge_workspace) {
+        const wins = await win.windows({})
+        const candidates = (wins.windows || []).filter(w =>
+          w.exe && /Code\.exe$/i.test(w.exe) &&
+          w.title && w.title.toLowerCase().includes(bridge_workspace.toLowerCase())
+        )
+        if (candidates.length) bridge_hwnd = Number(candidates[0].hwnd)
+      }
+    } catch (_e) {
+      // bridge_hwnd stays null -> focus_and_send falls back to ahk_exe Code.exe
+    }
     if (inner.open_command_ok === false) {
       spawn_error = 'editor.open failed: ' + (inner.open_error || 'unknown')
     }
@@ -546,8 +569,8 @@ async function dispatch_worker(params) {
   // scheduler dispatch (workers' heartbeat never advanced past registration).
   const submitKey = readCcSubmitKey()
   try {
-    const r = await windowRoutes.focus_and_send({ exe: ide_exe, pid: bridge_pid, key: submitKey, settleMs: 250 })
-    paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, pid: bridge_pid, ok: r && r.ok, reason: r && r.reason })
+    const r = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 250 })
+    paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, hwnd: bridge_hwnd, ok: r && r.ok, reason: r && r.reason })
     if (r && r.ok) pasted = true
     else paste_error = 'focus_and_send: ' + (r && r.reason || 'unknown')
   } catch (e) {
@@ -559,8 +582,8 @@ async function dispatch_worker(params) {
   if (!pasted) {
     await sleep(400)
     try {
-      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, pid: bridge_pid, key: submitKey, settleMs: 600 })
-      paste_attempts.push({ attempt: 2, settleMs: 600, key: submitKey, pid: bridge_pid, ok: r2 && r2.ok, reason: r2 && r2.reason })
+      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 600 })
+      paste_attempts.push({ attempt: 2, settleMs: 600, key: submitKey, hwnd: bridge_hwnd, ok: r2 && r2.ok, reason: r2 && r2.reason })
       if (r2 && r2.ok) pasted = true
       else paste_error = (paste_error || '') + '; retry: ' + (r2 && r2.reason || 'unknown')
     } catch (e) {
@@ -672,8 +695,8 @@ async function dispatch_worker(params) {
         // V8 recovery: just the atomic AHK. No bridge-side refocus.
         try {
           const windowRoutes = require('./window')
-          // 2026-06-02: setting-aware submit key + bridge_pid target.
-          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, pid: bridge_pid, key: submitKey, settleMs: 500 })
+          // 2026-06-02: setting-aware submit key + bridge_hwnd target.
+          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 500 })
         } catch (e) {
           re_enter_result = { ok: false, error: e.message }
         }

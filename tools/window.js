@@ -163,14 +163,13 @@ async function focusWindow(params) {
 async function focusAndSend(params) {
   params = params || {}
   const exe = params.exe || 'Code.exe'
-  // 2026-06-02: caller may pass a specific pid to disambiguate when multiple
-  // windows of the same exe are alive. Without pid we use `ahk_exe <Code.exe>`,
-  // which matches ANY VS Code window - the AHK WinActivate non-deterministically
-  // picks the most-recently-active one, which is often NOT the window hosting
-  // the just-opened CC chat tab. Result: Enter lands in Tate's working window,
-  // not the chat tab, and the worker never starts. With pid we use `ahk_pid <N>`
-  // to target the exact bridge-registered window.
-  const pid = params.pid && Number.isInteger(Number(params.pid)) ? Number(params.pid) : null
+  // 2026-06-02: caller may pass an OS hwnd (uint) to disambiguate when multiple
+  // windows of the same exe are alive. Prefer hwnd over pid because VS Code's
+  // ide-bridge runs in the extension host - a child process that owns NO OS
+  // window. ahk_pid <extension_host_pid> returns no_matching_window. The hwnd
+  // must come from window.windows() filtering on the main Code.exe instance
+  // that hosts the bridge (matched by workspaceRoots in the title).
+  const hwnd = params.hwnd && Number.isInteger(Number(params.hwnd)) ? Number(params.hwnd) : null
   const key = String(params.key || 'enter').toLowerCase()
   const settleMs = Math.max(0, Math.min(2000, params.settleMs == null ? 250 : Number(params.settleMs)))
   const KEY_MAP = {
@@ -202,9 +201,9 @@ async function focusAndSend(params) {
   //      point VS Code is NOT yet foreground, so Alt activating the menu is
   //      on some OTHER window, not VS Code - the subsequent WinActivate
   //      drops VS Code foreground and Enter lands in the chat textarea.
-  // Target spec: prefer pid for exact-window match, fall back to exe for
+  // Target spec: prefer hwnd for exact-window match, fall back to exe for
   // single-window installs.
-  const winSpec = pid ? 'ahk_pid ' + pid : 'ahk_exe ' + safeExe
+  const winSpec = hwnd ? 'ahk_id ' + hwnd : 'ahk_exe ' + safeExe
   const script =
     '#Requires AutoHotkey v2.0\n' +
     'SetTitleMatchMode 2\n' +
