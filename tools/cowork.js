@@ -594,7 +594,13 @@ async function dispatch_worker(params) {
   const focusCmd = focusGroupCmd(tab_handle && tab_handle.viewColumn)
   if (focusCmd) {
     try {
-      await ideRoutes.command({ cmd: focusCmd })
+      // Hard 3s ceiling - we MUST NOT let ide.command hang and hold the
+      // dispatch launch-lock. If the bridge is busy/dead, fall through to
+      // focus_and_send's AHK ladder.
+      await Promise.race([
+        ideRoutes.command({ cmd: focusCmd }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('focus_cmd_timeout_3s')), 3000)),
+      ])
       await sleep(200)
     } catch (_e) { /* tolerate; focus_and_send is still a safety net */ }
   }
