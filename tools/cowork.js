@@ -441,12 +441,20 @@ async function dispatch_worker(params) {
   let tab_handle = null
   let spawn_error = null
   let ide_exe = 'Code.exe'  // VS Code Stable (the worker host); refined from the bridge's ide name below
+  // 2026-06-02: capture the bridge's pid so focus_and_send can target the
+  // EXACT VS Code window hosting the new chat tab via ahk_pid, not just
+  // ahk_exe Code.exe (which matches any Code.exe window). Multi-window
+  // installs were dispatching Enter into Tate's working window instead of
+  // the new chat tab.
+  let bridge_pid = null
   try {
     const sendRes = await ideRoutes.chat_send_message({ prompt: composedBrief, submit: false })
     const inner = (sendRes && (sendRes.result || sendRes)) || {}
     const ideName = String(inner.ide || '').toLowerCase()
     if (ideName.includes('insiders')) ide_exe = 'Code - Insiders.exe'
     else if (ideName.includes('cursor')) ide_exe = 'Cursor.exe'
+    // pid comes from ide.js call() wrapper: { ide, pid, port, ...result }
+    if (sendRes && Number.isInteger(Number(sendRes.pid))) bridge_pid = Number(sendRes.pid)
     if (inner.open_command_ok === false) {
       spawn_error = 'editor.open failed: ' + (inner.open_error || 'unknown')
     }
@@ -538,8 +546,8 @@ async function dispatch_worker(params) {
   // scheduler dispatch (workers' heartbeat never advanced past registration).
   const submitKey = readCcSubmitKey()
   try {
-    const r = await windowRoutes.focus_and_send({ exe: ide_exe, key: submitKey, settleMs: 250 })
-    paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, ok: r && r.ok, reason: r && r.reason })
+    const r = await windowRoutes.focus_and_send({ exe: ide_exe, pid: bridge_pid, key: submitKey, settleMs: 250 })
+    paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, pid: bridge_pid, ok: r && r.ok, reason: r && r.reason })
     if (r && r.ok) pasted = true
     else paste_error = 'focus_and_send: ' + (r && r.reason || 'unknown')
   } catch (e) {
@@ -551,8 +559,8 @@ async function dispatch_worker(params) {
   if (!pasted) {
     await sleep(400)
     try {
-      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, key: submitKey, settleMs: 600 })
-      paste_attempts.push({ attempt: 2, settleMs: 600, key: submitKey, ok: r2 && r2.ok, reason: r2 && r2.reason })
+      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, pid: bridge_pid, key: submitKey, settleMs: 600 })
+      paste_attempts.push({ attempt: 2, settleMs: 600, key: submitKey, pid: bridge_pid, ok: r2 && r2.ok, reason: r2 && r2.reason })
       if (r2 && r2.ok) pasted = true
       else paste_error = (paste_error || '') + '; retry: ' + (r2 && r2.reason || 'unknown')
     } catch (e) {
@@ -664,8 +672,8 @@ async function dispatch_worker(params) {
         // V8 recovery: just the atomic AHK. No bridge-side refocus.
         try {
           const windowRoutes = require('./window')
-          // 2026-06-02: setting-aware submit key (see readCcSubmitKey above).
-          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, key: submitKey, settleMs: 500 })
+          // 2026-06-02: setting-aware submit key + bridge_pid target.
+          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, pid: bridge_pid, key: submitKey, settleMs: 500 })
         } catch (e) {
           re_enter_result = { ok: false, error: e.message }
         }
