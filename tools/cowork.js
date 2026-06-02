@@ -568,6 +568,36 @@ async function dispatch_worker(params) {
   // was silently no-op'ing on the default-config install and orphaning every
   // scheduler dispatch (workers' heartbeat never advanced past registration).
   const submitKey = readCcSubmitKey()
+
+  // 2026-06-03: explicitly focus the editor group that hosts the new chat tab
+  // BEFORE the AHK Enter. The bridge's editor.open opens a tab in a viewColumn
+  // and makes it the active tab of that column, but does NOT necessarily move
+  // KEYBOARD FOCUS to that column. If Tate's keyboard focus is in a different
+  // editor group (working on a code file in column 2 while the chat opens in
+  // column 1), AHK Enter lands in the code file and the chat input never gets
+  // the keystroke. e2e tests passed because Tate was on the conductor chat
+  // (column 1, same column as new tab) at test time. Real crons fail because
+  // Tate's focus is wherever he last worked.
+  //
+  // workbench.action.focusFirstEditorGroup / focusSecondEditorGroup / etc are
+  // VS Code's standard column-focus commands. The new chat is the active tab
+  // in its column, so focusing that column lands keyboard focus on the
+  // chat webview, whose React layer autofocuses the textarea.
+  const focusGroupCmd = (vc) => {
+    if (vc === 1) return 'workbench.action.focusFirstEditorGroup'
+    if (vc === 2) return 'workbench.action.focusSecondEditorGroup'
+    if (vc === 3) return 'workbench.action.focusThirdEditorGroup'
+    if (vc === 4) return 'workbench.action.focusFourthEditorGroup'
+    if (vc === 5) return 'workbench.action.focusFifthEditorGroup'
+    return null
+  }
+  const focusCmd = focusGroupCmd(tab_handle && tab_handle.viewColumn)
+  if (focusCmd) {
+    try {
+      await ideRoutes.command({ cmd: focusCmd })
+      await sleep(200)
+    } catch (_e) { /* tolerate; focus_and_send is still a safety net */ }
+  }
   try {
     const r = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 250 })
     paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, hwnd: bridge_hwnd, ok: r && r.ok, reason: r && r.reason })
