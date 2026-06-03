@@ -207,7 +207,13 @@ exports.markFailed = async function markFailed(row, err) {
       let nextRunAt = null
       try {
         const tz = row.tz || 'Australia/Brisbane'
-        const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { tz })
+        // 2026-06-03: translate friendly aliases ("every 4h", "daily 20:00")
+        // via parseSchedule before handing to cron-parser. Rows inserted
+        // before the parseSchedule INSERT-side translation landed (or via
+        // direct SQL) store the raw alias; cron-parser cannot parse those
+        // and silently leaves nextRunAt=null.
+        const cronExpr = parseSchedule(row.cron_expression)
+        const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
         nextRunAt = interval.next().toDate().toISOString()
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
@@ -443,7 +449,9 @@ exports.markComplete = async function markComplete(row, signal) {
     let nextRunAt = null
     try {
       const tz = row.tz || 'Australia/Brisbane'
-      const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { tz })
+      // 2026-06-03: friendly-alias translation (see markFailed for rationale).
+      const cronExpr = parseSchedule(row.cron_expression)
+      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
       nextRunAt = interval.next().toDate().toISOString()
     } catch (cronErr) {
       process.stderr.write('[scheduler] cron-parser error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
@@ -1051,7 +1059,9 @@ exports.schedule_resume = async function schedule_resume(params) {
   if (row.type === 'cron' && row.cron_expression) {
     try {
       const tz = row.tz || 'Australia/Brisbane'
-      const interval = cronParser.CronExpressionParser.parse(row.cron_expression, { tz, currentDate: new Date() })
+      // 2026-06-03: friendly-alias translation (see markFailed for rationale).
+      const cronExpr = parseSchedule(row.cron_expression)
+      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date() })
       nextRunAt = interval.next().toDate()
     } catch (cronErr) {
       process.stderr.write('[scheduler] schedule_resume cron-parse error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
