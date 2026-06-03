@@ -171,7 +171,17 @@ async function focusAndSend(params) {
   // that hosts the bridge (matched by workspaceRoots in the title).
   const hwnd = params.hwnd && Number.isInteger(Number(params.hwnd)) ? Number(params.hwnd) : null
   const key = String(params.key || 'enter').toLowerCase()
-  const settleMs = Math.max(0, Math.min(2000, params.settleMs == null ? 250 : Number(params.settleMs)))
+  const settleMs = Math.max(0, Math.min(4000, params.settleMs == null ? 250 : Number(params.settleMs)))
+  // 2026-06-03: repeats and repeatGapMs. Send the same key N times spaced by
+  // repeatGapMs. Compensates for the race between the bridge's editor.open
+  // populate (which can take >1.5s for multi-KB briefs) and Enter. If the
+  // first Enter fires before the textarea is populated, it lands on empty
+  // input - CC's submit handler returns without submitting. A second/third
+  // Enter spaced a few hundred ms later catches the now-populated textarea.
+  // Post-submit, additional Enters land on an empty input again - no-op.
+  // Max 5 repeats, max 2000ms gap.
+  const repeats = Math.max(1, Math.min(5, Number(params.repeats) || 1))
+  const repeatGapMs = Math.max(50, Math.min(2000, Number(params.repeatGapMs) || 700))
   const KEY_MAP = {
     enter: '{Enter}', return: '{Enter}',
     'ctrl+enter': '^{Enter}', 'ctrl-enter': '^{Enter}', ctrl_enter: '^{Enter}',
@@ -234,13 +244,38 @@ async function focusAndSend(params) {
     '}\n' +
     'if WinActive("' + winSpec + '") {\n' +
     '  Sleep ' + settleMs + '\n' +
-    '  SendInput "' + ahkKey + '"\n' +
+    '  ; 2026-06-03: physical click at window center to FORCE focus into the\n' +
+    '  ; webview / active tab content. AHK SetForegroundWindow brings the OS\n' +
+    '  ; window forward but Windows restores focus to the last-focused CHILD\n' +
+    '  ; element (= whatever Tate last touched in this window), NOT the\n' +
+    '  ; just-opened tab. A real click into the editor area focuses the\n' +
+    '  ; webview which auto-focuses its textarea via React useEffect.\n' +
+    '  WinGetPos(&winX, &winY, &winW, &winH)\n' +
+    '  clickX := winX + (winW // 2)\n' +
+    '  clickY := winY + (winH // 2)\n' +
+    '  ; Save mouse position to restore after (avoid stealing Tate cursor).\n' +
+    '  CoordMode "Mouse", "Screen"\n' +
+    '  MouseGetPos &origMouseX, &origMouseY\n' +
+    '  Click clickX, clickY\n' +
+    '  Sleep 150\n' +
+    '  MouseMove origMouseX, origMouseY, 0\n' +
+    '  Sleep 100\n' +
+    '  Loop ' + repeats + ' {\n' +
+    '    SendInput "' + ahkKey + '"\n' +
+    '    if (A_Index < ' + repeats + ') {\n' +
+    '      Sleep ' + repeatGapMs + '\n' +
+    '    }\n' +
+    '  }\n' +
     '  ExitApp 0\n' +
     '}\n' +
     'ExitApp 2\n'
   fs.writeFileSync(tmp, script, 'utf8')
   try {
-    const r = spawnSync(AHK, [tmp], { timeout: 6000, windowsHide: true, encoding: 'utf8', creationFlags: 0x08000000 /* CREATE_NO_WINDOW - prevents console flash that steals focus mid-keystroke */ })
+    // Timeout sized to accommodate WinActivate ladder (~2s worst case) +
+    // settleMs (up to 4s) + repeats * repeatGapMs (up to 5 * 2000 = 10s).
+    // Headroom of +3s for spawn jitter.
+    const ahkTimeoutMs = Math.max(6000, 3000 + settleMs + (repeats - 1) * repeatGapMs + 3000)
+    const r = spawnSync(AHK, [tmp], { timeout: ahkTimeoutMs, windowsHide: true, encoding: 'utf8', creationFlags: 0x08000000 /* CREATE_NO_WINDOW - prevents console flash that steals focus mid-keystroke */ })
     return {
       ok: r.status === 0,
       status: r.status,

@@ -605,8 +605,13 @@ async function dispatch_worker(params) {
     } catch (_e) { /* tolerate; focus_and_send is still a safety net */ }
   }
   try {
-    const r = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 250 })
-    paste_attempts.push({ attempt: 1, settleMs: 250, key: submitKey, hwnd: bridge_hwnd, ok: r && r.ok, reason: r && r.reason })
+    // 2026-06-03: longer settle + 4 repeats. The bridge's editor.open does
+    // an internal 1.2s sleep then returns; but the textarea populate for
+    // multi-KB briefs can still be incomplete at AHK fire time. The first
+    // Enter on an empty textarea is a no-op; subsequent Enters catch the
+    // textarea once populate completes. Post-submit Enters are no-ops.
+    const r = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 1200, repeats: 4, repeatGapMs: 800 })
+    paste_attempts.push({ attempt: 1, settleMs: 1200, repeats: 4, key: submitKey, hwnd: bridge_hwnd, ok: r && r.ok, reason: r && r.reason })
     if (r && r.ok) pasted = true
     else paste_error = 'focus_and_send: ' + (r && r.reason || 'unknown')
   } catch (e) {
@@ -618,8 +623,8 @@ async function dispatch_worker(params) {
   if (!pasted) {
     await sleep(400)
     try {
-      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 600 })
-      paste_attempts.push({ attempt: 2, settleMs: 600, key: submitKey, hwnd: bridge_hwnd, ok: r2 && r2.ok, reason: r2 && r2.reason })
+      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 1500, repeats: 4, repeatGapMs: 800 })
+      paste_attempts.push({ attempt: 2, settleMs: 1500, repeats: 4, key: submitKey, hwnd: bridge_hwnd, ok: r2 && r2.ok, reason: r2 && r2.reason })
       if (r2 && r2.ok) pasted = true
       else paste_error = (paste_error || '') + '; retry: ' + (r2 && r2.reason || 'unknown')
     } catch (e) {
