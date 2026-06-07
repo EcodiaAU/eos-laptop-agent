@@ -100,6 +100,21 @@ exports.pick_healthiest_account = async function ({
   preferred = null,
   required_headroom_minutes = 15,
 } = {}) {
+  // 2026-06-08 Mac-day: when CREDS_DIR doesn't exist or has zero per-account
+  // files, cred-rotation is impossible. Return 'current-process' so the
+  // scheduler dispatches on whatever account is already loaded in
+  // ~/.claude/.credentials.json. The scheduler's rotate_to() also handles
+  // 'current-process' as a no-op. This is the no-rotation Mac-bootstrap mode
+  // until D:/PRIVATE/ecodia-creds gets transferred and CREDS_DIR is pointed
+  // at it.
+  if (!fs.existsSync(CREDS_DIR)) {
+    return 'current-process'
+  }
+  const haveAny = ACCOUNTS.some(a => fs.existsSync(path.join(CREDS_DIR, a + '.json')))
+  if (!haveAny) {
+    return 'current-process'
+  }
+
   const usage = getUsageSource()
   const states = {}
   for (const acct of ACCOUNTS) {
@@ -173,6 +188,12 @@ exports.current_account = function () {
 //   Error('per-account cred file not found: <path>') if the source file is absent
 
 exports.rotate_to = async function (account) {
+  // 2026-06-08 Mac-day: when pick_healthiest_account returned 'current-process'
+  // (no cred files available), rotate_to is a no-op.
+  if (account === 'current-process') {
+    return { previous: exports.current_account(), current: 'current-process', no_rotation: true }
+  }
+
   if (!ACCOUNTS.includes(account)) {
     throw new Error('unknown account: ' + account)
   }

@@ -178,6 +178,13 @@ app.listen(PORT, () => {
   if (process.env.SCHEDULER_ENABLED === 'true') {
     try {
       const scheduler = require('./tools/scheduler')
+      // 2026-06-08 Mac-day-1: scheduler.js default dispatcher is cowork.js,
+      // which is Windows-AHK-coupled. Inject mac-dispatcher when platform=darwin.
+      if (process.platform === 'darwin') {
+        const macDispatcher = require('./tools/mac-dispatcher')
+        scheduler._setDispatcher(macDispatcher)
+        console.log('Scheduler dispatcher: mac-dispatcher (darwin)')
+      }
       scheduler.start()
       console.log('Scheduler started (autonomy substrate Phase 3)')
     } catch (e) {
