@@ -23,7 +23,11 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 
-const CREDS_DIR = process.env.CREDS_DIR || 'D:/PRIVATE/ecodia-creds'
+const CREDS_DIR = process.env.CREDS_DIR || (
+  process.platform === 'win32'
+    ? 'D:/PRIVATE/ecodia-creds'
+    : path.join(os.homedir(), 'PRIVATE', 'ecodia-creds')
+)
 const CLAUDE_CREDENTIALS_PATH =
   process.env.CLAUDE_CREDENTIALS_PATH ||
   path.join(os.homedir(), '.claude', '.credentials.json')
@@ -187,7 +191,14 @@ exports.current_account = function () {
 //   Error('unknown account: <name>') if account is not in ['tate','code','money']
 //   Error('per-account cred file not found: <path>') if the source file is absent
 
-exports.rotate_to = async function (account) {
+exports.rotate_to = async function (accountOrParams) {
+  // Agent dispatcher passes the full params object as the first argument; CLI/test
+  // callers historically pass a bare string. Accept either to avoid a dispatcher
+  // shape mismatch ([object Object] errors).
+  const account = (accountOrParams && typeof accountOrParams === 'object')
+    ? accountOrParams.account
+    : accountOrParams
+
   // 2026-06-08 Mac-day: when pick_healthiest_account returned 'current-process'
   // (no cred files available), rotate_to is a no-op.
   if (account === 'current-process') {

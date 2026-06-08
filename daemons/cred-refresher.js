@@ -59,22 +59,27 @@
 
 // Load supabase creds from the canonical local file if present. Must happen
 // before any code reads SUPABASE_URL / SUPABASE_SERVICE_KEY from process.env.
+const fs   = require('fs')
+const path = require('path')
+const os   = require('os')
+const http  = require('http')
+const https = require('https')
+
+const _DEFAULT_CREDS_DIR = process.platform === 'win32'
+  ? 'D:/PRIVATE/ecodia-creds'
+  : path.join(os.homedir(), 'PRIVATE', 'ecodia-creds')
+
 try {
-  require('dotenv').config({ path: 'D:/PRIVATE/ecodia-creds/supabase.env' })
+  require('dotenv').config({ path: path.join(_DEFAULT_CREDS_DIR, 'supabase.env') })
 } catch (_) {
   // dotenv missing or file absent - env vars may still be set by PM2
 }
-
-const fs   = require('fs')
-const path = require('path')
-const http  = require('http')
-const https = require('https')
 
 // ── config ────────────────────────────────────────────────────────────────────
 
 const ACCOUNTS = ['tate', 'code', 'money']
 
-const CREDS_DIR          = process.env.CREDS_DIR          || 'D:/PRIVATE/ecodia-creds'
+const CREDS_DIR          = process.env.CREDS_DIR          || _DEFAULT_CREDS_DIR
 const OAUTH_REFRESH_URL  = process.env.OAUTH_REFRESH_URL  || 'https://platform.claude.com/v1/oauth/token'
 const OAUTH_CLIENT_ID    = process.env.OAUTH_CLIENT_ID    || '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const OAUTH_USER_AGENT   = process.env.OAUTH_USER_AGENT   || 'claude-cli-refresher/1.0 (eos-laptop-agent)'

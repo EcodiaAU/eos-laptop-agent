@@ -1,3 +1,10 @@
+const os = require('os')
+const path = require('path')
+
+const _CREDS_DIR = process.platform === 'win32'
+  ? 'D:/PRIVATE/ecodia-creds'
+  : path.join(os.homedir(), 'PRIVATE', 'ecodia-creds')
+
 module.exports = {
   apps: [
     {
@@ -37,8 +44,8 @@ module.exports = {
       restart_delay: 5000,
       env: {
         NODE_ENV: 'production',
-        CREDS_DIR: 'D:/PRIVATE/ecodia-creds',
-        REFRESH_LOG_PATH: 'D:/PRIVATE/ecodia-creds/refresh.log',
+        CREDS_DIR: _CREDS_DIR,
+        REFRESH_LOG_PATH: path.join(_CREDS_DIR, 'refresh.log'),
         OAUTH_REFRESH_URL: 'https://platform.claude.com/v1/oauth/token',
         OAUTH_CLIENT_ID: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
         OAUTH_USER_AGENT: 'claude-cli-refresher/1.0 (eos-laptop-agent)',
