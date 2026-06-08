@@ -260,11 +260,25 @@ exports.dispatchOne = async function dispatchOne(row) {
   let tabId = null
   try {
     // 1. Pick + rotate to healthiest account.
-    account = await getCreds().pick_healthiest_account({
+    const picked = await getCreds().pick_healthiest_account({
       preferred: row.preferred_account || null,
       required_headroom_minutes: 15,
     })
-    await getCreds().rotate_to(account)
+    const rotateResult = await getCreds().rotate_to(picked)
+    // 2026-06-08 (safety gate): rotate_to returns {deferred:true} on Mac when
+    // other workers are active (Keychain is a shared resource - rotating
+    // while other-account workers are mid-flight would 401 them on next refresh).
+    // When deferred, dispatch on whatever account is currently authenticated;
+    // the next cron fire will retry rotation when the registry is idle.
+    if (rotateResult && rotateResult.deferred) {
+      const liveAccount = getCreds().current_account()
+      process.stderr.write('[scheduler] dispatchOne: rotation to ' + picked +
+        ' deferred (active_workers=' + rotateResult.active_count + '), dispatching on ' +
+        liveAccount + ' instead\n')
+      account = liveAccount
+    } else {
+      account = picked
+    }
 
     // 2. Build brief with actual_account filled in.
     const rowWithAccount = Object.assign({}, row, { actual_account: account })
