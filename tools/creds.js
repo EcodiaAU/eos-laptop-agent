@@ -260,13 +260,47 @@ exports.current_account = function () {
 //   Error('unknown account: <name>') if account is not in ['tate','code','money']
 //   Error('per-account cred file not found: <path>') if the source file is absent
 
+// Count active worker rows. On Mac, the Keychain entry is shared across every
+// Claude Code process on the machine; rotating it while OTHER workers have
+// in-flight tokens kicks them out with a 401 the moment their access token
+// expires. The safety gate: only rotate when no other workers are active.
+// The caller can pass {force: true} or {caller_tab_id: <id>} to bypass /
+// exclude themselves from the count.
+function countActiveWorkers(excludeTabId) {
+  const COORD_ROOT = process.env.COORD_ROOT || (
+    process.platform === 'win32'
+      ? 'D:\\.code\\EcodiaOS\\coordination'
+      : path.join(os.homedir(), '.ecodiaos', 'coordination')
+  )
+  const workersDir = path.join(COORD_ROOT, 'workers')
+  if (!fs.existsSync(workersDir)) return { count: 0, tabs: [] }
+  let count = 0
+  const tabs = []
+  for (const file of fs.readdirSync(workersDir)) {
+    if (!file.endsWith('.json')) continue
+    try {
+      const w = JSON.parse(fs.readFileSync(path.join(workersDir, file), 'utf8'))
+      if (excludeTabId && w.tab_id === excludeTabId) continue
+      if (w.terminated_at) continue
+      count++
+      tabs.push({ tab_id: w.tab_id, account: w.account_active_when_spawned })
+    } catch (_) {}
+  }
+  return { count, tabs }
+}
+
+exports._countActiveWorkers = countActiveWorkers
+
 exports.rotate_to = async function (accountOrParams) {
   // Agent dispatcher passes the full params object as the first argument; CLI/test
   // callers historically pass a bare string. Accept either to avoid a dispatcher
   // shape mismatch ([object Object] errors).
-  const account = (accountOrParams && typeof accountOrParams === 'object')
-    ? accountOrParams.account
-    : accountOrParams
+  const params = (accountOrParams && typeof accountOrParams === 'object')
+    ? accountOrParams
+    : { account: accountOrParams }
+  const account = params.account
+  const force = !!params.force
+  const callerTabId = params.caller_tab_id || null
 
   // 2026-06-08 Mac-day: when pick_healthiest_account returned 'current-process'
   // (no cred files available), rotate_to is a no-op.
@@ -284,6 +318,25 @@ exports.rotate_to = async function (accountOrParams) {
   }
 
   const previous = exports.current_account()
+
+  // Safety gate: never rotate while other workers are mid-flight (Mac Keychain
+  // is a single shared resource; rotation kicks any other-account session out
+  // with a 401 on its next refresh). Skip the gate when target == current,
+  // when force is set, or when there are zero other workers.
+  if (previous !== account) {
+    const { count, tabs } = countActiveWorkers(callerTabId)
+    if (count > 0 && !force) {
+      return {
+        previous,
+        current: previous,
+        deferred: true,
+        reason: 'active_workers_present',
+        active_count: count,
+        active_tabs: tabs.slice(0, 10),
+        hint: 'pass {force: true} to bypass, or wait for these workers to terminate before rotating',
+      }
+    }
+  }
 
   const content = fs.readFileSync(source, 'utf8')
 
