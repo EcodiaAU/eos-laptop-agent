@@ -129,6 +129,30 @@ function getCaps() {
 
 function getActiveAccount() {
   ensureDirs()
+  // 2026-06-08 (attribution fix): defer to creds.current_account first. The
+  // live ~/.claude/.credentials.json is the truth about which Anthropic
+  // account every API call hits, regardless of what active_account.json
+  // remembers. Without this deferral the dispatcher tagged every worker as
+  // money@ecodia.au (the DEFAULT_ACTIVE bootstrap value) even though the live
+  // creds were tate's, so ccusage attribution inverted the rate-limit picture.
+  try {
+    const creds = require('./creds')
+    const short = creds.current_account && creds.current_account()
+    if (short && short !== 'unknown') {
+      const canonical = normalizeAccount(short)
+      if (canonical) {
+        const row = readJsonSafe(ACTIVE_ACCOUNT_FILE, null)
+        if (!row || row.account !== canonical) {
+          // Lazy-sync active_account.json to match live creds so
+          // downstream readers (mac-dispatcher, swap_history) stay aligned.
+          try { setActiveAccount(canonical, 'live-creds-sync') } catch (e) {}
+        }
+        return canonical
+      }
+    }
+  } catch (e) {
+    // creds module unavailable or threw - fall through to file-based read
+  }
   const row = readJsonSafe(ACTIVE_ACCOUNT_FILE, null)
   if (row && row.account) return row.account
   // First run - seed the default and return.
