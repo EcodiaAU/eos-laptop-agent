@@ -161,6 +161,9 @@ async function focusWindow(params) {
 // the keystroke - reliability is verified downstream via the worker ack
 // (coord heartbeat advance) in cowork.dispatch_worker's orphan-detect loop.
 async function focusAndSend(params) {
+  if (process.platform === 'darwin') {
+    return focusAndSendMac(params)
+  }
   params = params || {}
   const exe = params.exe || 'Code.exe'
   // 2026-06-02: caller may pass an OS hwnd (uint) to disambiguate when multiple
@@ -286,6 +289,65 @@ async function focusAndSend(params) {
             : r.status === 2 ? 'activate_failed_within_1500ms'
             : 'ahk_error',
     }
+  } finally {
+    try { fs.unlinkSync(tmp) } catch (e) {}
+  }
+}
+
+// Mac-native equivalent of focusAndSend. Replaces the AHK WinActivate + SendInput
+// chain with AppleScript: `tell application X to activate` brings the IDE
+// forward, then System Events `keystroke return` submits the prefilled chat.
+// Same atomic intent as the AHK version (one osascript invocation = one race-free
+// activate + keystroke) but uses Cocoa frontmost + System Events instead of
+// Win32 ForegroundLock + SendInput. Requires Accessibility permission for
+// osascript (granted at user level; probed via `UI elements enabled` in tests).
+// Origin: 2026-06-08, scheduler dispatch path broken on Mac because the AHK
+// binary at C:/Users/.../AutoHotkey64.exe does not exist; spawned tabs had
+// briefs prefilled but never submitted, so workers never called signal_bound
+// and every dispatch hit the 180s stale-lease timeout.
+async function focusAndSendMac(params) {
+  params = params || {}
+  const appName = params.app_name || 'Visual Studio Code'
+  const key = String(params.key || 'enter').toLowerCase()
+  const settleMs = Math.max(0, Math.min(4000, params.settleMs == null ? 250 : Number(params.settleMs)))
+  const repeats = Math.max(1, Math.min(5, Number(params.repeats) || 1))
+  const repeatGapMs = Math.max(50, Math.min(2000, Number(params.repeatGapMs) || 700))
+
+  let keystrokeLine
+  if (key === 'enter' || key === 'return') {
+    keystrokeLine = 'keystroke return'
+  } else if (key === 'ctrl+enter' || key === 'ctrl-enter' || key === 'ctrl_enter') {
+    keystrokeLine = 'keystroke return using control down'
+  } else if (key === 'shift+enter' || key === 'shift-enter' || key === 'shift_enter') {
+    keystrokeLine = 'keystroke return using shift down'
+  } else {
+    return { ok: false, platform: 'darwin', reason: 'unsupported key on darwin: ' + key }
+  }
+
+  const safeApp = appName.replace(/"/g, '\\"')
+  const lines = [
+    'tell application "' + safeApp + '" to activate',
+    'delay ' + (settleMs / 1000).toFixed(3),
+    'tell application "System Events"',
+  ]
+  for (let i = 0; i < repeats; i++) {
+    if (i > 0) lines.push('  delay ' + (repeatGapMs / 1000).toFixed(3))
+    lines.push('  ' + keystrokeLine)
+  }
+  lines.push('end tell')
+
+  const script = lines.join('\n')
+  const tmp = path.join(os.tmpdir(), 'eos-fas-mac-' + Date.now() + '-' + process.pid + '.scpt')
+  try {
+    fs.writeFileSync(tmp, script, 'utf8')
+    const totalMs = settleMs + (repeats - 1) * repeatGapMs + 1500
+    const r = spawnSync('osascript', [tmp], { encoding: 'utf-8', timeout: Math.max(5000, totalMs) })
+    if (r.status === 0) {
+      return { ok: true, platform: 'darwin', app: appName, key: key, repeats: repeats }
+    }
+    return { ok: false, platform: 'darwin', reason: 'osascript exit ' + r.status + ': ' + ((r.stderr || '').trim() || '(no stderr)') }
+  } catch (e) {
+    return { ok: false, platform: 'darwin', reason: 'spawn failed: ' + e.message }
   } finally {
     try { fs.unlinkSync(tmp) } catch (e) {}
   }

@@ -441,6 +441,11 @@ async function dispatch_worker(params) {
   let tab_handle = null
   let spawn_error = null
   let ide_exe = 'Code.exe'  // VS Code Stable (the worker host); refined from the bridge's ide name below
+  // 2026-06-08: on Mac, focus_and_send routes to AppleScript-via-osascript and
+  // needs the macOS app name (not the .exe binary). Derived from the bridge's
+  // ide name in the chat_send_message reply below. Windows path still uses
+  // ide_exe + bridge_hwnd; Mac path uses app_name only (hwnd has no analogue).
+  let app_name = 'Visual Studio Code'
   // 2026-06-02: resolve the bridge's OS window hwnd so focus_and_send targets
   // the exact window via ahk_id, not ahk_exe Code.exe. ahk_exe matches any
   // VS Code window non-deterministically. ahk_pid does NOT work for the
@@ -454,8 +459,8 @@ async function dispatch_worker(params) {
     const sendRes = await ideRoutes.chat_send_message({ prompt: composedBrief, submit: false })
     const inner = (sendRes && (sendRes.result || sendRes)) || {}
     const ideName = String(inner.ide || '').toLowerCase()
-    if (ideName.includes('insiders')) ide_exe = 'Code - Insiders.exe'
-    else if (ideName.includes('cursor')) ide_exe = 'Cursor.exe'
+    if (ideName.includes('insiders')) { ide_exe = 'Code - Insiders.exe'; app_name = 'Visual Studio Code - Insiders' }
+    else if (ideName.includes('cursor')) { ide_exe = 'Cursor.exe'; app_name = 'Cursor' }
     // Look up the bridge's workspace (set at IDE-extension registration time)
     // so we can hwnd-disambiguate when multiple VS Code windows are open.
     try {
@@ -610,8 +615,8 @@ async function dispatch_worker(params) {
     // multi-KB briefs can still be incomplete at AHK fire time. The first
     // Enter on an empty textarea is a no-op; subsequent Enters catch the
     // textarea once populate completes. Post-submit Enters are no-ops.
-    const r = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 1200, repeats: 4, repeatGapMs: 800 })
-    paste_attempts.push({ attempt: 1, settleMs: 1200, repeats: 4, key: submitKey, hwnd: bridge_hwnd, ok: r && r.ok, reason: r && r.reason })
+    const r = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, app_name: app_name, key: submitKey, settleMs: 1200, repeats: 4, repeatGapMs: 800 })
+    paste_attempts.push({ attempt: 1, settleMs: 1200, repeats: 4, key: submitKey, hwnd: bridge_hwnd, app_name: app_name, ok: r && r.ok, reason: r && r.reason })
     if (r && r.ok) pasted = true
     else paste_error = 'focus_and_send: ' + (r && r.reason || 'unknown')
   } catch (e) {
@@ -623,8 +628,8 @@ async function dispatch_worker(params) {
   if (!pasted) {
     await sleep(400)
     try {
-      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 1500, repeats: 4, repeatGapMs: 800 })
-      paste_attempts.push({ attempt: 2, settleMs: 1500, repeats: 4, key: submitKey, hwnd: bridge_hwnd, ok: r2 && r2.ok, reason: r2 && r2.reason })
+      const r2 = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, app_name: app_name, key: submitKey, settleMs: 1500, repeats: 4, repeatGapMs: 800 })
+      paste_attempts.push({ attempt: 2, settleMs: 1500, repeats: 4, key: submitKey, hwnd: bridge_hwnd, app_name: app_name, ok: r2 && r2.ok, reason: r2 && r2.reason })
       if (r2 && r2.ok) pasted = true
       else paste_error = (paste_error || '') + '; retry: ' + (r2 && r2.reason || 'unknown')
     } catch (e) {
@@ -737,7 +742,7 @@ async function dispatch_worker(params) {
         try {
           const windowRoutes = require('./window')
           // 2026-06-02: setting-aware submit key + bridge_hwnd target.
-          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, key: submitKey, settleMs: 500 })
+          re_enter_result = await windowRoutes.focus_and_send({ exe: ide_exe, hwnd: bridge_hwnd, app_name: app_name, key: submitKey, settleMs: 500 })
         } catch (e) {
           re_enter_result = { ok: false, error: e.message }
         }
