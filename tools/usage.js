@@ -50,11 +50,18 @@ const CREATE_NO_WINDOW = 0x08000000
 // (libuv seems to re-allocate a console for the npm-wrapper child). Falling
 // back to bare-node invocation eliminates the wrappers entirely.
 // Override via CCUSAGE_CLI_JS env if the global install lives elsewhere.
-const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS
-  || 'D:\\SSD_Turbo\\node-global\\node_modules\\ccusage\\dist\\cli.js'
+const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS || (
+  process.platform === 'win32'
+    ? 'D:\\SSD_Turbo\\node-global\\node_modules\\ccusage\\dist\\cli.js'
+    : '/opt/homebrew/lib/node_modules/ccusage/dist/cli.js'
+)
 const NODE_EXE = process.execPath  // current node binary, always valid
 
-const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
+const COORD_ROOT = process.env.COORD_ROOT || (
+  process.platform === 'win32'
+    ? 'D:\\.code\\EcodiaOS\\coordination'
+    : '/Users/ecodia/.code/ecodiaos/coordination'
+)
 const USAGE_DIR = path.join(COORD_ROOT, 'usage')
 const AUDIT_DIR = path.join(USAGE_DIR, 'audit')
 const ACCOUNTS_FILE = path.join(USAGE_DIR, 'accounts.json')

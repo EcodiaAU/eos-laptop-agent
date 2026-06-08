@@ -24,7 +24,12 @@ const usage = require(path.join(AGENT_ROOT, 'tools', 'usage'))
 
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 5 * 60 * 1000
 const POLL_INITIAL_DELAY_MS = Number(process.env.POLL_INITIAL_DELAY_MS) || 5_000
-const HEARTBEAT_FILE = path.join('D:\\.code\\EcodiaOS\\coordination\\usage', 'poller.heartbeat')
+const _COORD_ROOT = process.env.COORD_ROOT || (
+  process.platform === 'win32'
+    ? 'D:\\.code\\EcodiaOS\\coordination'
+    : '/Users/ecodia/.code/ecodiaos/coordination'
+)
+const HEARTBEAT_FILE = path.join(_COORD_ROOT, 'usage', 'poller.heartbeat')
 
 function nowIso() { return new Date().toISOString() }
 
