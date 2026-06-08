@@ -563,7 +563,43 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
 
-  // 2. Stale dispatching, max retries exhausted.
+  // 2a. Stale dispatching, max retries exhausted, CRON row: defer to next
+  // scheduled interval and reset retry_count per
+  // [[scheduler-no-ide-defer-and-cron-rows-never-permanently-fail-2026-06-02]].
+  // Marking a cron row permanently failed loses every future interval of
+  // recurring work. markFailed already handles this for the dispatchOne path;
+  // this branch fixes the parallel path through the stale-lease sweep.
+  const staleCronRows = await pool.query(
+    `SELECT id, cron_expression, tz FROM os_scheduled_tasks
+     WHERE status = 'dispatching'
+       AND leased_at < NOW() - ($1 || ' milliseconds')::interval
+       AND retry_count >= $2
+       AND type = 'cron'
+       AND cron_expression IS NOT NULL`,
+    [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
+  )
+  for (const row of staleCronRows.rows) {
+    let nextRunAt = null
+    try {
+      const tz = row.tz || 'Australia/Brisbane'
+      const cronExpr = parseSchedule(row.cron_expression)
+      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
+      nextRunAt = interval.next().toDate().toISOString()
+    } catch (_e) {
+      nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    }
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET status = 'active', retry_count = 0,
+           last_error = 'stale lease - max retries exhausted (cron: deferred to next interval per doctrine)',
+           next_run_at = $1, leased_by = NULL, leased_at = NULL, updated_at = NOW()
+       WHERE id = $2`,
+      [nextRunAt, row.id]
+    )
+  }
+
+  // 2b. Stale dispatching, max retries exhausted, NON-CRON row: permanently
+  // fail. One-shot delayed work is genuinely done after 3 stale leases.
   await pool.query(
     `UPDATE os_scheduled_tasks
      SET status = 'failed', retry_count = retry_count + 1,
@@ -571,7 +607,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
          leased_by = NULL, leased_at = NULL, updated_at = NOW()
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
-       AND retry_count >= $2`,
+       AND retry_count >= $2
+       AND (type != 'cron' OR cron_expression IS NULL)`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
 
