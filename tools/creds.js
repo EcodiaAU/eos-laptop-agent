@@ -22,6 +22,63 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const { spawnSync } = require('child_process')
+
+// On Mac, Claude Code stores its live OAuth credentials in the macOS Keychain
+// (service "Claude Code-credentials", account "ecodia"). The ~/.claude/.credentials.json
+// file is vestigial and is NOT read by the Mac binary, so file-swap rotation
+// does not change which account Anthropic sees. Confirmed empirically 2026-06-08
+// after Tate's money@ login updated the Keychain (mdat changed) but left
+// .credentials.json unchanged. We use `security` CLI for Keychain read/write.
+const USE_KEYCHAIN = process.platform === 'darwin'
+const KEYCHAIN_SERVICE = 'Claude Code-credentials'
+const KEYCHAIN_ACCOUNT = 'ecodia'
+
+function readKeychain() {
+  if (!USE_KEYCHAIN) return null
+  const res = spawnSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w'], {
+    encoding: 'utf8',
+    timeout: 5000,
+  })
+  if (res.status !== 0) return null
+  return res.stdout.trim()
+}
+
+function writeKeychain(jsonContent) {
+  if (!USE_KEYCHAIN) throw new Error('writeKeychain called on non-Mac platform')
+  // CRITICAL: `security -w` hex-encodes the entire stored blob when the
+  // input contains embedded newlines or non-printable bytes (verified
+  // empirically 2026-06-08: pretty-printed tate.json with internal \n's
+  // round-tripped as hex; minified money.json round-tripped clean).
+  // The hex-encoded blob breaks Claude Code's OAuth read because the
+  // hex-string text does not parse as JSON.
+  //
+  // Fix: minify the JSON (single-line, no whitespace) before writing.
+  // Falls back to trimmed raw string if the input is not valid JSON,
+  // which keeps the path safe for diagnostic uses.
+  let payload
+  try {
+    payload = JSON.stringify(JSON.parse(jsonContent))
+  } catch (_) {
+    payload = String(jsonContent).replace(/\s+$/, '')
+  }
+  // -U updates the entry in place if it exists; without -U a duplicate error fires.
+  const res = spawnSync('security', [
+    'add-generic-password',
+    '-U',
+    '-s', KEYCHAIN_SERVICE,
+    '-a', KEYCHAIN_ACCOUNT,
+    '-w', payload,
+  ], { encoding: 'utf8', timeout: 5000 })
+  if (res.status !== 0) {
+    throw new Error('keychain write failed: status=' + res.status + ' stderr=' + (res.stderr || '').slice(0, 300))
+  }
+  return true
+}
+
+exports._readKeychain = readKeychain
+exports._writeKeychain = writeKeychain
+exports.USE_KEYCHAIN = USE_KEYCHAIN
 
 const CREDS_DIR = process.env.CREDS_DIR || (
   process.platform === 'win32'
@@ -155,13 +212,25 @@ exports.pick_healthiest_account = async function ({
 // This function only READS .credentials.json; it never writes or watches it.
 
 exports.current_account = function () {
-  if (!fs.existsSync(CLAUDE_CREDENTIALS_PATH)) return 'unknown'
-  let parsed
-  try {
-    parsed = JSON.parse(fs.readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf8'))
-  } catch (_) {
-    return 'unknown'
+  // On Mac, the live OAuth blob lives in the Keychain (Claude Code does NOT
+  // read .credentials.json on darwin). Read the Keychain blob and hash-match
+  // its accessToken against the per-account files. Fall back to the file path
+  // on non-Mac platforms (existing Windows behaviour).
+  let liveJsonText
+  if (USE_KEYCHAIN) {
+    liveJsonText = readKeychain()
+    if (!liveJsonText) return 'unknown'
+  } else {
+    if (!fs.existsSync(CLAUDE_CREDENTIALS_PATH)) return 'unknown'
+    try {
+      liveJsonText = fs.readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf8')
+    } catch (_) {
+      return 'unknown'
+    }
   }
+
+  let parsed
+  try { parsed = JSON.parse(liveJsonText) } catch (_) { return 'unknown' }
   const activeToken = parsed && parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken
   if (!activeToken) return 'unknown'
 
@@ -216,16 +285,33 @@ exports.rotate_to = async function (accountOrParams) {
 
   const previous = exports.current_account()
 
-  const content = fs.readFileSync(source)
+  const content = fs.readFileSync(source, 'utf8')
 
-  // Ensure target directory exists
+  if (USE_KEYCHAIN) {
+    // Mac: write the per-account JSON blob into the Keychain entry that the
+    // Claude Code Mac binary actually reads. Atomic by virtue of
+    // `security add-generic-password -U` overwriting in place.
+    writeKeychain(content)
+    // Also mirror to .credentials.json for legacy diagnostics + the cred-refresher's
+    // live-session detection (it reads the file to identify which account is live).
+    try {
+      const dir = path.dirname(CLAUDE_CREDENTIALS_PATH)
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      const tmp = CLAUDE_CREDENTIALS_PATH + '.tmp'
+      fs.writeFileSync(tmp, content)
+      fs.renameSync(tmp, CLAUDE_CREDENTIALS_PATH)
+    } catch (_) {
+      // best-effort mirror; Keychain is the source of truth on Mac
+    }
+    return { previous, current: account, target: 'keychain' }
+  }
+
+  // Windows / Linux: file-swap rotation. .credentials.json IS the source of truth.
   const dir = path.dirname(CLAUDE_CREDENTIALS_PATH)
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-
-  // Atomic write: write to .tmp then rename into place
   const tmp = CLAUDE_CREDENTIALS_PATH + '.tmp'
   fs.writeFileSync(tmp, content)
   fs.renameSync(tmp, CLAUDE_CREDENTIALS_PATH)
 
-  return { previous, current: account }
+  return { previous, current: account, target: 'file' }
 }
