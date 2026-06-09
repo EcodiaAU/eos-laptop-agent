@@ -589,11 +589,18 @@ async function signal_done(params, ctx) {
   if (ctx.tab_id && workers.has(ctx.tab_id)) {
     parent_conductor_tab_id = workers.get(ctx.tab_id).parent_conductor_tab_id || null
   }
+  // 2026-06-09: status MUST be persisted in the body. The scheduler's
+  // markComplete reads signal.status to decide success vs failure; dropping
+  // it routed every signal_done through markFailed and stamped result_summary
+  // into last_error. Audit found 48/48 rows with last_error set, 0 clean
+  // successes - every cron looked like a failure since this field was lost.
+  // See [[scheduler-signal-done-status-must-survive-coord-to-inbox-2026-06-09]].
   const r = await send_message({
     to: 'chat.conductor.inbox',
     body: {
       type: 'done',
       task_id: params.task_id,
+      status: params.status || 'success',
       result_summary: params.result_summary,
       result_pointer: params.result_pointer || null,
       terminate: !!params.terminate,

@@ -35,7 +35,15 @@ const DISPATCH_LIMIT = 5
 // 2026-05-29 ultracode audit H5 fix. Was 30000, below the 84.5s cold-MCP
 // observed floor + spike margin per worker-ack-timeout doctrine. On timeout
 // the launch-lock released, defeating the cred-rotation serialisation.
-const SIGNAL_BOUND_TIMEOUT_MS = 180_000
+// 2026-06-08 self-evolution bump: empirical Mac cold-MCP signal_bound
+// latency (n=60 across last 4h on this agent) p50=24s p75=32s p90=77s
+// p95=402s max=1283s. The 180s cap was missing the entire p90-p99 tail and
+// most dispatches were logging signal_bound timeout despite the worker
+// having successfully paste'd + read its brief; the rows still ran but
+// recovery + cleanup-orphan churn was real. 600s catches p95 cleanly while
+// keeping launch-lock throughput acceptable (next dispatch can still proceed
+// every 10min worst-case). Tunable via env without code change.
+const SIGNAL_BOUND_TIMEOUT_MS = parseInt(process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS, 10) || 600_000
 const ORPHAN_TIMEOUT_MS = 6 * 60 * 60 * 1000
 const COMPLETION_POLL_INTERVAL_MS = 5_000
 const STALE_DISPATCHING_MS = 10 * 60 * 1000   // 10 min -> retry
@@ -443,9 +451,16 @@ exports.markComplete = async function markComplete(row, signal) {
   }
   const dispatchedTabIdSqlFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
 
-  const isSuccess = signal && signal.status === 'success'
+  // 2026-06-09: missing status === success. Pre-fix, coord.signal_done was
+  // dropping params.status on the way to the inbox, so signal.status came
+  // through as undefined and every signal_done was misclassified as failure.
+  // Defensive default: a worker calling signal_done at all is the affirmative
+  // "I finished" signal; only an EXPLICIT signal.status === 'failed' (or any
+  // non-success value) should route through markFailed. See
+  // [[scheduler-signal-done-status-must-survive-coord-to-inbox-2026-06-09]].
+  const explicitFailure = signal && signal.status && signal.status !== 'success'
 
-  if (!isSuccess) {
+  if (explicitFailure) {
     // Treat as failure: delegate to markFailed with a synthetic error.
     const syntheticErr = new Error(
       (signal && signal.result_summary) || 'task signaled non-success'
@@ -626,7 +641,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
 
-  // 3. Running too long -> orphaned.
+  // 3. Running too long -> orphaned (non-cron) OR deferred to next interval (cron).
   //
   // 2026-05-29 ultracode audit H3 fix. Was: status='orphaned' only. The
   // orphan row's dispatched_tab_id was never cleaned, and startupCleanup
@@ -636,8 +651,15 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // tab_id NULL on closed:true (mirrors markComplete), and set last_run_at
   // so a future startupCleanup or cleanup_orphan_workers sweep can still
   // target the stored tab_handle on disk.
+  //
+  // 2026-06-09 fix: cron rows in this branch were also being permanently
+  // terminated as 'orphaned', stranding 23 corpus rows after the 24h
+  // signal_bound regression window (08-09 June). Per
+  // [[scheduler-no-ide-defer-and-cron-rows-never-permanently-fail-2026-06-02]],
+  // cron rows must defer to their next scheduled interval; only one-shot
+  // (delayed/chained) rows go to terminal status='orphaned'.
   const orphans = await pool.query(
-    `SELECT id, dispatched_tab_id FROM os_scheduled_tasks
+    `SELECT id, dispatched_tab_id, type, cron_expression, tz FROM os_scheduled_tasks
      WHERE status = 'running'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval`,
     [ORPHAN_TIMEOUT_MS]
@@ -654,12 +676,33 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
       }
     }
     const tabFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
-    await pool.query(
-      `UPDATE os_scheduled_tasks
-       SET status = 'orphaned', last_run_at = NOW(), ${tabFrag} updated_at = NOW()
-       WHERE id = $1`,
-      [row.id]
-    )
+    if (row.type === 'cron' && row.cron_expression) {
+      let nextRunAt = null
+      try {
+        const tz = row.tz || 'Australia/Brisbane'
+        const cronExpr = parseSchedule(row.cron_expression)
+        const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
+        nextRunAt = interval.next().toDate().toISOString()
+      } catch (_e) {
+        nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+      }
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'active', retry_count = 0, last_run_at = NOW(),
+             next_run_at = $1,
+             last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
+             leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
+         WHERE id = $2`,
+        [nextRunAt, row.id]
+      )
+    } else {
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'orphaned', last_run_at = NOW(), ${tabFrag} updated_at = NOW()
+         WHERE id = $1`,
+        [row.id]
+      )
+    }
   }
 }
 
