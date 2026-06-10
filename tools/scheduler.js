@@ -119,9 +119,12 @@ exports._setDispatcher = function (d) { _dispatcher = d }
 //
 // Path scheme: WORKTREE_ROOT/<row.id> - predictable across retries so
 // allocate+prune is idempotent. allocateWorktreeForRow first force-prunes any
-// stale entry at that path, then `git worktree add -B worker/<short>` off
-// origin/main. pruneWorktreeForRow is callable on completion, failure, orphan,
-// and stale-lease paths without state-tracking.
+// stale entry at that path, then `git worktree add -B worker/<row.id>` off
+// origin/main. The branch name uses the FULL row.id (not a truncated prefix)
+// so two concurrent dispatches with similar id prefixes do not collide on the
+// branch ref - a 2026-06-10 verify-gate failure caught this exact case.
+// pruneWorktreeForRow is callable on completion, failure, orphan, and
+// stale-lease paths without state-tracking.
 
 const fs = require('fs')
 const path = require('path')
@@ -137,7 +140,7 @@ async function defaultAllocateWorktreeForRow(row) {
   // Refresh origin/main so the worktree branches off recent base.
   await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
 
-  const branchName = 'worker/' + String(row.id).slice(0, 8)
+  const branchName = 'worker/' + String(row.id)
   await runGit(['worktree', 'add', '-B', branchName, wtPath, 'origin/main'])
   return wtPath
 }
