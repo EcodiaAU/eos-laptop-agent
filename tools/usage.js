@@ -72,7 +72,13 @@ const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
 
 // Defaults; override via env CAPS_5H_TOKENS / CAPS_WEEKLY_TOKENS.
 const DEFAULT_CAP_5H = 220_000_000
-const DEFAULT_CAP_WEEKLY = 1_000_000_000
+// 2026-06-10: was 1_000_000_000, which is provably below the real ceiling -
+// money@ ran at 2.49B weekly while serving live interactive sessions fine,
+// yet headroom_score pinned 0 (min of the two fractions) and the dispatcher
+// deferred EVERY cron on AllAccountsCappedError for the rest of the week.
+// 6.6B = the 20B/week org budget split across 3 accounts. The 5h window is
+// the real throttle; weekly is a budget rail, not a hard vendor cap.
+const DEFAULT_CAP_WEEKLY = 6_600_000_000
 const BUFFER_FACTOR = 0.85  // 15% conservative buffer
 const HEADROOM_WARNING_FRACTION = 0.20  // <20% remaining = warn
 const FLAKY_TTL_MS = 10 * 60 * 1000  // 10min cooldown after a dispatch failure
