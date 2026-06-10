@@ -102,6 +102,34 @@ test('buildBrief: actual_account appears in brief when set', async () => {
   assert(brief.includes('code'), 'buildBrief: actual_account in brief')
 })
 
+// ── 2026-06-10 branch-thrash guard: buildBrief worktree directive ───────────
+
+test('buildBrief: worktree_path injects WORKTREE block at top + shared-tree warning', async () => {
+  const row = makeRow({
+    id: 'wt-test-1',
+    worktree_path: '/Users/ecodia/.code/ecodiaos/_worktrees/dispatched/wt-test-1',
+  })
+  const brief = scheduler.buildBrief(row)
+  assert(brief.includes('WORKTREE: /Users/ecodia/.code/ecodiaos/_worktrees/dispatched/wt-test-1'),
+    'buildBrief: WORKTREE: header present with full path')
+  assert(brief.includes('git -C /Users/ecodia/.code/ecodiaos/_worktrees/dispatched/wt-test-1'),
+    'buildBrief: git -C <worktree> directive present')
+  assert(brief.includes('Do NOT operate on /Users/ecodia/.code/ecodiaos/backend'),
+    'buildBrief: shared-tree warning present')
+  assert(brief.indexOf('WORKTREE:') < brief.indexOf('FIRST ACTION'),
+    'buildBrief: WORKTREE block appears BEFORE FIRST ACTION (worker sees it first)')
+})
+
+test('buildBrief: omits WORKTREE block when worktree_path is unset', async () => {
+  const row = makeRow({ id: 'no-wt-test' })
+  const brief = scheduler.buildBrief(row)
+  assert(!brief.includes('WORKTREE:'),
+    'buildBrief: no WORKTREE block when worktree_path is null/undefined (back-compat)')
+  // Without a worktree path the brief still functions: signal_bound + TASK + signal_done.
+  assert(brief.includes('signal_bound'), 'buildBrief: signal_bound still present in legacy mode')
+  assert(brief.includes('signal_done'), 'buildBrief: signal_done still present in legacy mode')
+})
+
 // ── Task 3.1: launchLock ──────────────────────────────────────────────────────
 
 test('launchLock: serializes 2 concurrent acquires in order', async () => {
@@ -143,9 +171,20 @@ test('leaseDueRows: SQL contains FOR UPDATE SKIP LOCKED and limit param', async 
 
 // ── Task 3.2: dispatchOne happy path ─────────────────────────────────────────
 
+// 2026-06-10 branch-thrash guard: stub worktree fns so dispatchOne tests do not
+// touch the real shared tree's git state. Tests that exercise the allocator
+// path explicitly override with their own capture stubs.
+function stubNoopWorktreeFns() {
+  scheduler._setWorktreeFns({
+    allocate: async () => '/tmp/test-worktree',
+    prune: async () => {},
+  })
+}
+
 test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
+  stubNoopWorktreeFns()
 
   // Stub creds module exports in-place (same cached object scheduler uses).
   const origPick = credsModule.pick_healthiest_account
@@ -203,11 +242,140 @@ test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', 
   coordModule.read_inbox = origReadInbox
 })
 
+// ── 2026-06-10 branch-thrash guard: dispatchOne worktree wiring + cleanup ───
+
+test('dispatchOne: allocates worktree, passes path into brief, dispatches with worker_acknowledgment_timeout_ms=0', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  let allocateCalledWith = null
+  let pruneCalledWith = null
+  scheduler._setWorktreeFns({
+    allocate: async (row) => {
+      allocateCalledWith = row
+      return '/tmp/test/wt-' + row.id
+    },
+    prune: async (row) => { pruneCalledWith = row },
+  })
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'tate'
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'tate' })
+
+  let dispatched = null
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => {
+      dispatched = params
+      return { ok: true, tab_id: 'tab_wt_test', task_id: params.task_id }
+    },
+    kill_worker: async () => {},
+  })
+
+  const origPeekInbox = coordModule.peek_inbox
+  const origReadInbox = coordModule.read_inbox
+  coordModule.peek_inbox = async () => ({
+    messages: [{ body: { type: 'bound', task_id: 'wt-alloc-test' } }]
+  })
+  coordModule.read_inbox = async () => ({ messages: [] })
+
+  const row = makeRow({ id: 'wt-alloc-test' })
+  await scheduler.dispatchOne(row)
+
+  assert(allocateCalledWith && allocateCalledWith.id === 'wt-alloc-test',
+    'dispatchOne: allocateWorktreeForRow called with the row')
+  assert(dispatched && dispatched.brief && dispatched.brief.includes('WORKTREE: /tmp/test/wt-wt-alloc-test'),
+    'dispatchOne: brief contains the allocated WORKTREE path')
+  // markComplete owns prune, not dispatchOne happy-path - so prune should NOT have fired yet.
+  assert(pruneCalledWith === null, 'dispatchOne happy path: prune NOT called (markComplete owns it)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+  coordModule.peek_inbox = origPeekInbox
+  coordModule.read_inbox = origReadInbox
+  scheduler._resetWorktreeFns()
+})
+
+test('dispatchOne: tolerates worktree allocate failure (proceeds without isolated tree, logs)', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  scheduler._setWorktreeFns({
+    allocate: async () => { throw new Error('synthetic git worktree add failure') },
+    prune: async () => {},
+  })
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'tate'
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'tate' })
+
+  let dispatched = null
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => {
+      dispatched = params
+      return { ok: true, tab_id: 'tab_wt_fail', task_id: params.task_id }
+    },
+    kill_worker: async () => {},
+  })
+
+  const origPeekInbox = coordModule.peek_inbox
+  const origReadInbox = coordModule.read_inbox
+  coordModule.peek_inbox = async () => ({
+    messages: [{ body: { type: 'bound', task_id: 'wt-fail-test' } }]
+  })
+  coordModule.read_inbox = async () => ({ messages: [] })
+
+  const row = makeRow({ id: 'wt-fail-test' })
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true }
+  assert(!threw, 'dispatchOne: allocate failure does NOT crash the dispatch')
+  assert(dispatched !== null, 'dispatchOne: dispatched anyway, hook is the runtime backstop')
+  assert(dispatched && dispatched.brief && !dispatched.brief.includes('WORKTREE:'),
+    'dispatchOne: brief omits WORKTREE block when allocate failed')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+  coordModule.peek_inbox = origPeekInbox
+  coordModule.read_inbox = origReadInbox
+  scheduler._resetWorktreeFns()
+})
+
+test('markComplete: calls pruneWorktreeForRow', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  let pruneCalledWith = null
+  scheduler._setWorktreeFns({
+    allocate: async () => '/tmp/x',
+    prune: async (row) => { pruneCalledWith = row },
+  })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async () => ({ ok: true }),
+    kill_worker: async () => ({ closed: true }),
+  })
+
+  const row = makeRow({
+    id: 'mc-prune-test',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    dispatched_tab_id: 'tab_x',
+  })
+  await scheduler.markComplete(row, { type: 'done', task_id: 'mc-prune-test', status: 'success' })
+
+  assert(pruneCalledWith && pruneCalledWith.id === 'mc-prune-test',
+    'markComplete: pruneWorktreeForRow called with the row')
+
+  scheduler._resetWorktreeFns()
+})
+
 // ── Task 3.2: dispatchOne AllAccountsCappedError defers ──────────────────────
 
 test('dispatchOne AllAccountsCappedError: defers row, does not mark failed', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
+  stubNoopWorktreeFns()
 
   const origPick = credsModule.pick_healthiest_account
   const { AllAccountsCappedError } = credsModule
@@ -240,6 +408,7 @@ test('dispatchOne AllAccountsCappedError: defers row, does not mark failed', asy
 test('dispatchOne no-IDE error: defers row 5min, does not mark failed, does not touch retry_count', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
+  stubNoopWorktreeFns()
 
   const origPick = credsModule.pick_healthiest_account
   const origRotate = credsModule.rotate_to
