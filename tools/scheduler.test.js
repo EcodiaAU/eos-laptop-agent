@@ -436,14 +436,21 @@ test('markComplete one_shot: sets status=completed', async () => {
 })
 
 // ── Task 3.3: staleLeaseRecovery SQL shapes ───────────────────────────────────
+//
+// 2026-06-10: shape changed after the per-row coord-liveness gate landed.
+// Branch 2b (non-cron max-retry) converted from a bulk UPDATE to SELECT +
+// per-row UPDATE so each row can be skipped if a live worker tab is still
+// heartbeating. With empty stub rows, the new shape emits 4 queries
+// (1 bulk UPDATE + 3 SELECTs), not 3.
 
-test('staleLeaseRecovery: issues 3 SQL queries with correct shapes', async () => {
+test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
+  scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
 
   await scheduler.staleLeaseRecovery()
 
-  assert(pool._queries.length === 3, 'staleLeaseRecovery: exactly 3 queries issued')
+  assert(pool._queries.length === 4, 'staleLeaseRecovery: exactly 4 queries issued (got ' + pool._queries.length + ')')
 
   const retryable = pool._queries.find(q =>
     q.sql.includes("status = 'active'") &&
@@ -453,18 +460,188 @@ test('staleLeaseRecovery: issues 3 SQL queries with correct shapes', async () =>
   )
   assert(!!retryable, 'staleLeaseRecovery: retryable stale-dispatch query correct shape')
 
-  const maxRetryFailed = pool._queries.find(q =>
-    q.sql.includes("status = 'failed'") &&
+  const cronStaleSelect = pool._queries.find(q =>
+    q.sql.includes('SELECT') &&
     q.sql.includes("status = 'dispatching'") &&
-    q.sql.includes('>= $2')
+    q.sql.includes('>= $2') &&
+    q.sql.includes("type = 'cron'")
   )
-  assert(!!maxRetryFailed, 'staleLeaseRecovery: max-retry exhausted -> failed query correct shape')
+  assert(!!cronStaleSelect, 'staleLeaseRecovery: cron stale-lease SELECT correct shape')
 
-  const orphaned = pool._queries.find(q =>
-    q.sql.includes("status = 'orphaned'") &&
-    q.sql.includes("status = 'running'")
+  const nonCronStaleSelect = pool._queries.find(q =>
+    q.sql.includes('SELECT') &&
+    q.sql.includes("status = 'dispatching'") &&
+    q.sql.includes('>= $2') &&
+    q.sql.includes("type != 'cron' OR cron_expression IS NULL")
   )
-  assert(!!orphaned, 'staleLeaseRecovery: running too long -> orphaned query correct shape')
+  assert(!!nonCronStaleSelect, 'staleLeaseRecovery: non-cron stale-lease SELECT correct shape')
+
+  scheduler._setCoord(null)
+})
+
+// ── 2026-06-10: coord-liveness gate on stale-lease recovery ──────────────────
+//
+// Origin: telemetry-batch fire 2026-06-10T04:23Z spawned 4 sibling workers in
+// 4 min because cold-start binds breached STALE_DISPATCHING_MS. The bulk
+// UPDATE freed the lease and the next poll re-dispatched mid-flight. Per
+// [[scheduler-stale-lease-must-check-coord-worker-liveness-before-redispatch-2026-06-10]],
+// each stale-lease branch now consults coord.list_workers and skips the
+// re-dispatch if a non-dead heartbeating worker exists on the same task_id.
+
+function makeSplitStubPool(opts) {
+  // Returns different rows for the cron-stale SELECT vs the non-cron-stale
+  // SELECT so focused liveness tests can exercise one branch at a time.
+  const cronRows = opts.cronRows || []
+  const nonCronRows = opts.nonCronRows || []
+  const orphanRows = opts.orphanRows || []
+  const queries = []
+  return {
+    _queries: queries,
+    query(sql, params) {
+      queries.push({ sql, params: params || [] })
+      if (sql.includes('SELECT') && sql.includes("type = 'cron'")) {
+        return Promise.resolve({ rows: cronRows, rowCount: cronRows.length })
+      }
+      if (sql.includes('SELECT') && sql.includes("type != 'cron'")) {
+        return Promise.resolve({ rows: nonCronRows, rowCount: nonCronRows.length })
+      }
+      if (sql.includes('SELECT') && sql.includes("status = 'running'")) {
+        return Promise.resolve({ rows: orphanRows, rowCount: orphanRows.length })
+      }
+      return Promise.resolve({ rows: [], rowCount: 0 })
+    }
+  }
+}
+
+test('staleLeaseRecovery cron branch: live worker -> skip UPDATE, lease intact', async () => {
+  const pool = makeSplitStubPool({
+    cronRows: [{ id: 'task-cron-1', cron_expression: '0 9 * * *', tz: 'Australia/Brisbane' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_alive_1',
+        task_id: 'task-cron-1',
+        last_heartbeat_at: new Date().toISOString(),
+        stale_ms: 4_000,
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const perRowUpdate = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('deferred to next interval per doctrine')
+  )
+  assert(!perRowUpdate, 'cron branch: no per-row UPDATE emitted when a live worker holds the task')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery non-cron branch: live worker -> skip UPDATE, lease intact', async () => {
+  const pool = makeSplitStubPool({
+    nonCronRows: [{ id: 'task-delayed-1' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_alive_2',
+        task_id: 'task-delayed-1',
+        last_heartbeat_at: new Date().toISOString(),
+        stale_ms: 12_000,
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const perRowFail = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes("status = 'failed'") &&
+    q.sql.includes('stale lease - max retries exhausted')
+  )
+  assert(!perRowFail, 'non-cron branch: no per-row failure UPDATE when a live worker holds the task')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery non-cron branch: no live worker -> per-row UPDATE fires', async () => {
+  const pool = makeSplitStubPool({
+    nonCronRows: [{ id: 'task-delayed-2' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
+
+  await scheduler.staleLeaseRecovery()
+
+  const perRowFail = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes("status = 'failed'") &&
+    q.sql.includes('stale lease - max retries exhausted')
+  )
+  assert(!!perRowFail, 'non-cron branch: per-row failure UPDATE fires when no live worker exists')
+  assert(perRowFail && perRowFail.params[0] === 'task-delayed-2', 'non-cron branch: UPDATE targets the stale row by id')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery: stale worker (stale_ms >= 180s) does not count as live', async () => {
+  const pool = makeSplitStubPool({
+    nonCronRows: [{ id: 'task-delayed-3' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_zombie',
+        task_id: 'task-delayed-3',
+        last_heartbeat_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+        stale_ms: 300_000,
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const perRowFail = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes("status = 'failed'")
+  )
+  assert(!!perRowFail, 'non-cron branch: zombie worker past liveness window does not block UPDATE')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery: coord error fails open (UPDATE still fires)', async () => {
+  const pool = makeSplitStubPool({
+    nonCronRows: [{ id: 'task-delayed-4' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => { throw new Error('coord unreachable') }
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const perRowFail = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes("status = 'failed'")
+  )
+  assert(!!perRowFail, 'fail-open: coord unreachable does not block stale-lease recovery')
+
+  scheduler._setCoord(null)
 })
 
 // ── Task 3.4: start() schedules 4 intervals (3 core + Phase 7 cap observer) ──

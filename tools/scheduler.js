@@ -26,6 +26,13 @@ let _credsModule = require('./creds')
 function getCreds() { return _credsModule }
 exports._setCredsModule = function (m) { _credsModule = m }
 const coord = require('./coord')
+// Injection seam: tests pass a stub coord implementing { list_workers }.
+// Only the stale-lease liveness check routes through getCoord(); the other
+// coord call sites (completionPass) read coord directly to avoid behaviour
+// drift in well-tested paths.
+let _coordOverride = null
+function getCoord() { return _coordOverride || coord }
+exports._setCoord = function (c) { _coordOverride = c }
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -509,7 +516,11 @@ exports.markComplete = async function markComplete(row, signal) {
   // 2026-06-01 Phase A2: chain wake-up. Any child row with chain_after = parent.id
   // gets next_run_at=NOW() so the dispatch loop picks it up on the next 30s poll.
   // Only fires on success - chain children stay parked if the parent failed.
-  if (isSuccess) {
+  // 2026-06-10: ReferenceError fix. Was `if (isSuccess)` referencing an undeclared
+  // variable, throwing on every completionPass markComplete and caught by the outer
+  // try/catch. !explicitFailure is the correct success predicate at this point
+  // (explicitFailure path already returned early via markFailed above).
+  if (!explicitFailure) {
     try {
       await pool.query(
         `UPDATE os_scheduled_tasks
@@ -577,6 +588,34 @@ exports.completionPass = async function completionPass() {
 //   2. dispatching > STALE_DISPATCHING_MS and retry_count >= MAX_RETRY_COUNT -> failed
 //   3. running > ORPHAN_TIMEOUT_MS -> orphaned
 
+// Liveness staleness window: a worker whose last heartbeat was within
+// STALE_WORKER_LIVENESS_MS counts as alive for the stale-lease skip path.
+// 180s matches the existing scheduler.SIGNAL_BOUND_TIMEOUT_MS cold-start
+// p90 floor and the cowork heartbeat cadence. Hardcoding lower than the
+// observed cold-start floor is an anti-pattern: a slow bind would look
+// dead and let the scheduler thunder-herd the same row.
+const STALE_WORKER_LIVENESS_MS = 180_000
+
+async function hasLiveWorkerForTask(taskId) {
+  try {
+    const r = await getCoord().list_workers({})
+    const ws = (r && r.workers) || []
+    for (const w of ws) {
+      if (w.task_id !== taskId) continue
+      if (w.terminated_at) continue
+      if (w.dead) continue
+      if (typeof w.stale_ms === 'number' && w.stale_ms >= STALE_WORKER_LIVENESS_MS) continue
+      return w
+    }
+    return null
+  } catch (e) {
+    // Fail-open: if coord is unreachable, do not block stale-lease recovery.
+    // A stuck recovery loop is worse than a single thundering-herd re-dispatch.
+    process.stderr.write('[scheduler] hasLiveWorkerForTask coord error for ' + taskId + ': ' + e.message + '\n')
+    return null
+  }
+}
+
 exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   const pool = getPool()
 
@@ -608,6 +647,21 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
   for (const row of staleCronRows.rows) {
+    // Liveness gate per
+    // [[scheduler-stale-lease-must-check-coord-worker-liveness-before-redispatch-2026-06-10]].
+    // If a worker tab is still heartbeating against this task, skip the
+    // re-dispatch and leave leased_by + leased_at intact so the lease keeps
+    // holding. Freeing the lease here is the thundering-herd anti-pattern
+    // (origin: 2026-06-10T04:23Z, telemetry-batch fired 4 sibling workers
+    // inside 4 min because cold-start binds breached STALE_DISPATCHING_MS).
+    const liveWorker = await hasLiveWorkerForTask(row.id)
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping stale-lease cron-defer\n'
+      )
+      continue
+    }
     let nextRunAt = null
     try {
       const tz = row.tz || 'Australia/Brisbane'
@@ -629,17 +683,36 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
 
   // 2b. Stale dispatching, max retries exhausted, NON-CRON row: permanently
   // fail. One-shot delayed work is genuinely done after 3 stale leases.
-  await pool.query(
-    `UPDATE os_scheduled_tasks
-     SET status = 'failed', retry_count = retry_count + 1,
-         last_error = 'stale lease - max retries exhausted',
-         leased_by = NULL, leased_at = NULL, updated_at = NOW()
+  // Converted from a single bulk UPDATE to SELECT + per-row UPDATE on
+  // 2026-06-10 so the coord-liveness gate can consult per task_id. The
+  // bulk UPDATE could not consult coord per row and re-dispatched mid-flight
+  // workers (incident 2026-06-10T04:23Z, telemetry-batch).
+  const staleNonCronRows = await pool.query(
+    `SELECT id FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
        AND retry_count >= $2
        AND (type != 'cron' OR cron_expression IS NULL)`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
+  for (const row of staleNonCronRows.rows) {
+    const liveWorker = await hasLiveWorkerForTask(row.id)
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping stale-lease fail\n'
+      )
+      continue
+    }
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET status = 'failed', retry_count = retry_count + 1,
+           last_error = 'stale lease - max retries exhausted',
+           leased_by = NULL, leased_at = NULL, updated_at = NOW()
+       WHERE id = $1`,
+      [row.id]
+    )
+  }
 
   // 3. Running too long -> orphaned (non-cron) OR deferred to next interval (cron).
   //
