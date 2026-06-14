@@ -212,6 +212,15 @@ exports.pick_healthiest_account = async function ({
 
   if (eligible.length > 0) return eligible[0]
 
+  // 2026-06-14 sole-enabled fallback. If exactly one account is enabled, return
+  // it even when it is below the headroom threshold. With one usable account
+  // there is nothing to fail over TO, so running it degraded beats throwing
+  // AllAccountsCapped and freezing ALL dispatch (the original "everything stuck"
+  // symptom). Dispatch eligibility must not hard-block the only account; the cap
+  // WARNING (checkCapWarning + the poller cap-alert) is the signal to switch.
+  const enabledAll = ACCOUNTS.filter(a => !DISABLED_ACCOUNTS.has(a))
+  if (enabledAll.length === 1) return enabledAll[0]
+
   // All capped - build reset map and throw
   const resets = {}
   for (const a of ACCOUNTS) resets[a] = (states[a] && states[a].reset_at) || null
