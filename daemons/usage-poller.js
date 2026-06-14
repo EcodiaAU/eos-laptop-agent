@@ -109,14 +109,30 @@ function capAutoSwitch() {
       return
     }
 
-    // A healthy alternate exists. Raise a switch-request for the switch executor
-    // (CDP sign-in to `best`). Dedupe per block so we raise once per window.
+    // A healthy alternate exists. Fire the EXISTING switch procedure: schedule a
+    // fresh CC chat (scheduler.schedule_delayed = "open a chat via scheduler")
+    // whose prompt drives the Claude VS Code OAuth sign-in flow to `best` (which
+    // mints a FRESH token, unlike the clobber-prone file-swap). Dedupe per block.
     const st = readJsonSafe(SWITCH_REQUEST_FILE, {})
     if (st.block === b.endTime && st.target === best) return
+
+    const switchPrompt = [
+      'You are EcodiaOS. AUTONOMOUS ACCOUNT SWITCH (fired by the usage-poller cap trigger at ' + Math.round(pct * 100) + '% of the 5h block on ' + live + ').',
+      'GOAL: switch the active Claude Code account from ' + live + ' to ' + best + ' via the VS Code OAuth sign-in flow (this mints a FRESH token; do NOT use the file-swap rotate_to, which clobbers with a stale snapshot).',
+      'STEPS: (1) trigger Claude Code sign-out/sign-in (command palette "Claude Code: Sign In" / the /login link). (2) gui.enable_chrome_cdp and CDP-drive the claude.ai OAuth page: pick the ' + best + '@ecodia.au Google account and approve. (3) verify the new live token: creds.current_account should report ' + best + ' (or the Keychain accessToken changed). (4) confirm the IDE quota bar reflects ' + best + '.',
+      'Reference doctrine: claude-max-account-routing-is-vscode-extension-driven, cc-webview-chat-input-and-submit-unreachable, scheduler-cred-rotation-clobbered-live-keychain-2026-06-14. End with coord.signal_done + coord.close_my_tab.',
+    ].join('\n\n')
+
+    const sched = agentTool('scheduler.schedule_delayed', {
+      name: 'autonomous-account-switch-' + best + '-' + Date.now(),
+      delay: 'in 1m',
+      prompt: switchPrompt,
+    })
     fs.writeFileSync(SWITCH_REQUEST_FILE, JSON.stringify({
-      block: b.endTime, target: best, from: live, pct: Math.round(pct * 100), raised_at: nowIso(), status: 'pending',
+      block: b.endTime, target: best, from: live, pct: Math.round(pct * 100),
+      raised_at: nowIso(), scheduled: !!sched, status: sched ? 'scheduled' : 'schedule_failed',
     }), 'utf8')
-    console.log('[' + nowIso() + '] cap-auto-switch: ' + Math.round(pct * 100) + '% - SWITCH-REQUEST raised ' + live + ' -> ' + best)
+    console.log('[' + nowIso() + '] cap-auto-switch: ' + Math.round(pct * 100) + '% - scheduled OAuth switch ' + live + ' -> ' + best + ' (sched=' + !!sched + ')')
   } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
 }
 
