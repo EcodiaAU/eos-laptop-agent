@@ -91,6 +91,18 @@ const CLAUDE_CREDENTIALS_PATH =
 
 const ACCOUNTS = ['tate', 'code', 'money']
 
+// Accounts the operator has flagged as paused/unaffordable. pick_healthiest_account
+// will never select them; rotate_to refuses to rotate to them. Set via env var
+// ACCOUNTS_DISABLED as a comma-separated short-name list. Origin: 2026-06-11
+// code@ plan paused.
+const DISABLED_ACCOUNTS = new Set(
+  (process.env.ACCOUNTS_DISABLED || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+)
+exports._DISABLED_ACCOUNTS = DISABLED_ACCOUNTS
+
 // ── AllAccountsCappedError ────────────────────────────────────────────────────
 
 class AllAccountsCappedError extends Error {
@@ -182,17 +194,19 @@ exports.pick_healthiest_account = async function ({
     states[acct] = usage.get_usage_state(acct)
   }
 
-  // Honour preferred if it clears the threshold
+  // Honour preferred only if it clears the threshold AND is not disabled.
   if (
     preferred &&
+    !DISABLED_ACCOUNTS.has(preferred) &&
     states[preferred] &&
     states[preferred].headroom_minutes > required_headroom_minutes
   ) {
     return preferred
   }
 
-  // Pick highest-headroom account above threshold
+  // Pick highest-headroom account above threshold, excluding disabled accounts.
   const eligible = ACCOUNTS
+    .filter(a => !DISABLED_ACCOUNTS.has(a))
     .filter(a => states[a] && states[a].headroom_minutes > required_headroom_minutes)
     .sort((a, b) => states[b].headroom_minutes - states[a].headroom_minutes)
 
@@ -312,12 +326,51 @@ exports.rotate_to = async function (accountOrParams) {
     throw new Error('unknown account: ' + account)
   }
 
+  // Disabled-account guard: operator-paused accounts must never become the
+  // live Keychain identity, regardless of force. The interactive conductor
+  // would re-login to find itself routed to a paused plan. Origin: 2026-06-11
+  // code@ plan paused.
+  if (DISABLED_ACCOUNTS.has(account)) {
+    return {
+      previous: exports.current_account(),
+      current: exports.current_account(),
+      deferred: true,
+      reason: 'account_disabled',
+      account,
+      hint: 'account is in ACCOUNTS_DISABLED env var (operator-paused plan); remove from list to re-enable',
+    }
+  }
+
+  // 2026-06-14 relogin-loop root-cause fix (Guard A: sole-enabled account).
+  // The Mac Keychain holds the LIVE, continuously-refreshed OAuth token for the
+  // logged-in account. The per-account files are point-in-time SNAPSHOTS whose
+  // access+refresh tokens go stale within ~1h. current_account() matches by
+  // accessToken, so once the live token refreshes past the snapshot it returns
+  // 'unknown', which made rotate_to believe it had to rotate and CLOBBER the
+  // live token with the older snapshot. The snapshot's refreshToken is already
+  // server-rotated, so the next refresh 401s and the account is signed out -
+  // every cron fire. When `account` is the ONLY non-disabled account, the live
+  // session must already BE it (there is nothing else to dispatch on), so there
+  // is nothing to rotate: use the live Keychain as-is and never touch it.
+  const _enabled = ACCOUNTS.filter(a => !DISABLED_ACCOUNTS.has(a))
+  if (_enabled.length === 1 && _enabled[0] === account && !force) {
+    return { previous: account, current: account, no_rotation: true, reason: 'sole_enabled_account_use_live' }
+  }
+
   const source = path.join(CREDS_DIR, account + '.json')
   if (!fs.existsSync(source)) {
     throw new Error('per-account cred file not found: ' + source)
   }
 
   const previous = exports.current_account()
+
+  // Guard B: already on the target account per current_account(). Skip the
+  // Keychain write entirely - rewriting the snapshot over the live token is the
+  // same clobber as a cross-account rotation. Belt-and-suspenders alongside the
+  // sole-enabled fast-path above, for any future multi-account config.
+  if (previous === account && !force) {
+    return { previous, current: account, no_rotation: true, reason: 'already_on_target' }
+  }
 
   // Safety gate: never rotate while other workers are mid-flight (Mac Keychain
   // is a single shared resource; rotation kicks any other-account session out
@@ -339,6 +392,36 @@ exports.rotate_to = async function (accountOrParams) {
   }
 
   const content = fs.readFileSync(source, 'utf8')
+
+  // 2026-06-11 stale-source guard. Mac Keychain rotation with a stale blob
+  // silently kicks every Claude Code session on the machine into a 401 the
+  // moment the next API call fires - INCLUDING the interactive conductor
+  // session, which is NOT in ~/.ecodiaos/coordination/workers/ and therefore
+  // is invisible to the Layer 9 safety gate above. Without this guard the
+  // scheduler repeatedly clobbers Tate's live token every cron fire whenever
+  // no dispatched workers happen to be active (the gate's only protection).
+  // Refuse the rotation when the source per-account file is past or near
+  // expiry; the scheduler's deferred-handling branch will dispatch on the
+  // currently-authenticated account instead. Origin: 2026-06-11 30-min
+  // relogin loop diagnosis (all three per-account files were stale fossils
+  // because cred-refresher was reading the .credentials.json mirror instead
+  // of the Keychain - see daemons/cred-refresher.js readLiveCredentials).
+  const STALE_THRESHOLD_MS = 5 * 60 * 1000
+  let _parsedSource
+  try { _parsedSource = JSON.parse(content) } catch (_) {}
+  const _sourceExpiry = _parsedSource && _parsedSource.claudeAiOauth && _parsedSource.claudeAiOauth.expiresAt
+  if (!_sourceExpiry || (_sourceExpiry - Date.now()) < STALE_THRESHOLD_MS) {
+    return {
+      previous,
+      current: previous,
+      deferred: true,
+      reason: 'source_token_stale',
+      source: source,
+      source_expires_at: _sourceExpiry || null,
+      source_age_min: _sourceExpiry ? Math.round((Date.now() - _sourceExpiry) / 60000) : null,
+      hint: 'per-account file is stale; cred-refresher must sync it from the live Keychain before this rotation is safe',
+    }
+  }
 
   if (USE_KEYCHAIN) {
     // Mac: write the per-account JSON blob into the Keychain entry that the
@@ -367,4 +450,63 @@ exports.rotate_to = async function (accountOrParams) {
   fs.renameSync(tmp, CLAUDE_CREDENTIALS_PATH)
 
   return { previous, current: account, target: 'file' }
+}
+
+// ── seed_from_live ────────────────────────────────────────────────────────────
+//
+// Captures the current live OAuth blob (Mac Keychain on darwin, .credentials.json
+// elsewhere) into the per-account backup file for `account`. Use after Tate logs
+// into Claude Code as that account to re-arm rotation. The Keychain blob is the
+// canonical fresh token pair; the per-account file is the rotation target.
+//
+// Returns { account, source, dest, expiresAt, expires_in_min }.
+exports.seed_from_live = function (accountOrParams) {
+  const params = (accountOrParams && typeof accountOrParams === 'object')
+    ? accountOrParams
+    : { account: accountOrParams }
+  const account = params.account
+  if (!ACCOUNTS.includes(account)) {
+    throw new Error('unknown account: ' + account + ' (expected one of ' + ACCOUNTS.join(',') + ')')
+  }
+
+  let liveText = null
+  let liveSource = null
+  if (USE_KEYCHAIN) {
+    liveText = readKeychain()
+    liveSource = 'keychain:' + KEYCHAIN_SERVICE + '/' + KEYCHAIN_ACCOUNT
+  }
+  if (!liveText) {
+    if (!fs.existsSync(CLAUDE_CREDENTIALS_PATH)) {
+      throw new Error('no live credentials source available (Keychain empty AND ' + CLAUDE_CREDENTIALS_PATH + ' missing)')
+    }
+    liveText = fs.readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf8')
+    liveSource = CLAUDE_CREDENTIALS_PATH
+  }
+
+  let parsed
+  try { parsed = JSON.parse(liveText) } catch (_) {
+    throw new Error('live credentials are not valid JSON (source: ' + liveSource + ')')
+  }
+  const o = parsed && parsed.claudeAiOauth
+  if (!o || !o.accessToken) {
+    throw new Error('live credentials lack claudeAiOauth.accessToken (source: ' + liveSource + ')')
+  }
+  if (!o.expiresAt || (o.expiresAt - Date.now()) < 5 * 60 * 1000) {
+    throw new Error('refusing to seed ' + account + ' from stale live blob (expiresAt=' + o.expiresAt + ', age=' + Math.round((Date.now() - (o.expiresAt || 0)) / 60000) + 'min). Log in as ' + account + ' in Claude Code first.')
+  }
+
+  const dest = path.join(CREDS_DIR, account + '.json')
+  const tmp = dest + '.tmp'
+  if (!fs.existsSync(CREDS_DIR)) fs.mkdirSync(CREDS_DIR, { recursive: true })
+  // Write minified to match the Keychain canonical form
+  fs.writeFileSync(tmp, JSON.stringify(parsed), 'utf8')
+  fs.renameSync(tmp, dest)
+
+  return {
+    account,
+    source: liveSource,
+    dest,
+    expiresAt: o.expiresAt,
+    expires_in_min: Math.round((o.expiresAt - Date.now()) / 60000),
+  }
 }

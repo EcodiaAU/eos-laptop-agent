@@ -21,6 +21,9 @@
 'use strict'
 
 const { Pool } = require('pg')
+const { execFile } = require('child_process')
+const { promisify } = require('util')
+const execFileP = promisify(execFile)
 const cronParser = require('cron-parser')
 let _credsModule = require('./creds')
 function getCreds() { return _credsModule }
@@ -35,6 +38,21 @@ function getCoord() { return _coordOverride || coord }
 exports._setCoord = function (c) { _coordOverride = c }
 
 // ── constants ────────────────────────────────────────────────────────────────
+
+// 2026-06-10 branch-thrash guard: each dispatched worker gets its own git
+// worktree off origin/main so its branch flips and commits cannot reach the
+// conductor's shared tree. Paired with the reference-transaction hook in
+// backend/scripts/branch-thrash-guard.sh which is the runtime backstop.
+//
+// SHARED_TREE: the conductor's working tree. We invoke `git worktree add` from
+// here so the worktree is registered against the shared .git directory.
+// WORKTREE_ROOT: parent path for per-task linked worktrees. Predictable per
+// row.id so allocate+prune is idempotent across retries and crashes.
+//
+// Doctrine: backend/patterns/branch-thrash-guard-on-shared-tree-2026-06-10.md
+const SHARED_TREE = process.env.SCHEDULER_SHARED_TREE || '/Users/ecodia/.code/ecodiaos/backend'
+const WORKTREE_ROOT = process.env.SCHEDULER_WORKTREE_ROOT || '/Users/ecodia/.code/ecodiaos/_worktrees/dispatched'
+const WORKTREE_GIT_TIMEOUT_MS = 30_000
 
 const POLL_INTERVAL_MS = 30_000
 const STALE_LEASE_INTERVAL_MS = 60_000
@@ -69,7 +87,24 @@ function getPool() {
   if (!_pool) {
     const connStr = process.env.DATABASE_URL
     if (!connStr) throw new Error('scheduler: DATABASE_URL env var is required')
-    _pool = new Pool({ connectionString: connStr })
+    _pool = new Pool({
+      connectionString: connStr,
+      keepAlive: true,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 10_000,
+    })
+    // 2026-06-14 restart-loop root-cause fix. node-postgres emits an 'error'
+    // event on the Pool when an IDLE pooled client's TCP connection dies. The
+    // Supabase transaction/session pooler drops idle connections routinely,
+    // surfacing as "Connection terminated unexpectedly". With NO listener on
+    // this event, Node treats it as an uncaughtException and KILLS THE PROCESS;
+    // launchd respawns the agent, the next idle connection drops again, and the
+    // whole laptop-agent restart-loops (42 boots observed in one log). A
+    // no-op-but-present listener makes the drop non-fatal - node-postgres
+    // transparently opens a fresh connection on the next query.
+    _pool.on('error', (err) => {
+      process.stderr.write('[scheduler] pg pool idle-client error (non-fatal, pool reconnects): ' + (err && err.message || err) + '\n')
+    })
   }
   return _pool
 }
@@ -90,6 +125,76 @@ function getDispatcher() {
 
 // Injection seam: tests pass a stub dispatcher implementing { dispatch_worker }
 exports._setDispatcher = function (d) { _dispatcher = d }
+
+// ── worktree allocator (injection seam for tests) ────────────────────────────
+//
+// 2026-06-10 branch-thrash guard. Per-row isolated worktree off origin/main so
+// the dispatched worker tab can `git checkout -b`, commit, even `git reset
+// --hard` without touching the conductor's shared tree. The shared tree's
+// .git/hooks/reference-transaction is the backstop when a worker still tries
+// the shared path despite the brief.
+//
+// Path scheme: WORKTREE_ROOT/<row.id> - predictable across retries so
+// allocate+prune is idempotent. allocateWorktreeForRow first force-prunes any
+// stale entry at that path, then `git worktree add -B worker/<row.id>` off
+// origin/main. The branch name uses the FULL row.id (not a truncated prefix)
+// so two concurrent dispatches with similar id prefixes do not collide on the
+// branch ref - a 2026-06-10 verify-gate failure caught this exact case.
+// pruneWorktreeForRow is callable on completion, failure, orphan, and
+// stale-lease paths without state-tracking.
+
+const fs = require('fs')
+const path = require('path')
+
+async function defaultAllocateWorktreeForRow(row) {
+  const wtPath = path.join(WORKTREE_ROOT, String(row.id))
+  fs.mkdirSync(path.dirname(wtPath), { recursive: true })
+
+  // Idempotent cleanup: forget any stale worktree at that path first.
+  await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
+  await runGit(['worktree', 'prune']).catch(() => {})
+
+  // Refresh origin/main so the worktree branches off recent base.
+  await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
+
+  const branchName = 'worker/' + String(row.id)
+  await runGit(['worktree', 'add', '-B', branchName, wtPath, 'origin/main'])
+  return wtPath
+}
+
+async function defaultPruneWorktreeForRow(row) {
+  const wtPath = path.join(WORKTREE_ROOT, String(row.id))
+  await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
+  await runGit(['worktree', 'prune']).catch(() => {})
+}
+
+async function runGit(args) {
+  // ECODIAOS_BRANCH_OK=1 lets the dispatcher's own worktree add survive even
+  // when the shared-tree hook tightens. The hook today only blocks HEAD updates
+  // on the shared tree; worktree add does not move HEAD there. The env var is
+  // a future-proof for hook tightening.
+  const env = Object.assign({}, process.env, { ECODIAOS_BRANCH_OK: '1' })
+  return execFileP('git', ['-C', SHARED_TREE].concat(args), {
+    timeout: WORKTREE_GIT_TIMEOUT_MS,
+    env,
+  })
+}
+
+let _allocateWorktreeForRow = defaultAllocateWorktreeForRow
+let _pruneWorktreeForRow = defaultPruneWorktreeForRow
+
+exports.allocateWorktreeForRow = function (row) { return _allocateWorktreeForRow(row) }
+exports.pruneWorktreeForRow = function (row) { return _pruneWorktreeForRow(row) }
+
+// Injection seam: tests pass {allocate, prune} stubs to skip subprocess git.
+exports._setWorktreeFns = function (fns) {
+  if (fns && typeof fns.allocate === 'function') _allocateWorktreeForRow = fns.allocate
+  if (fns && typeof fns.prune === 'function') _pruneWorktreeForRow = fns.prune
+}
+exports._resetWorktreeFns = function () {
+  _allocateWorktreeForRow = defaultAllocateWorktreeForRow
+  _pruneWorktreeForRow = defaultPruneWorktreeForRow
+}
 
 // ── launch-lock (in-memory async mutex) ──────────────────────────────────────
 //
@@ -134,7 +239,32 @@ exports.buildBrief = function buildBrief(row) {
     : 'Account: current (no rotation performed).'
   const orphanHours = Math.round(ORPHAN_TIMEOUT_MS / (60 * 60 * 1000))
 
-  const lines = [
+  const lines = []
+
+  // 2026-06-10 branch-thrash guard. When the dispatcher allocated an isolated
+  // worktree for this row, the brief carries the path so the worker operates
+  // there and never touches the conductor's shared tree. The hook in the
+  // shared tree's .git/hooks/reference-transaction is the backstop if the
+  // worker still tries.
+  if (row.worktree_path) {
+    lines.push(
+      'WORKTREE: ' + row.worktree_path,
+      '',
+      'Your isolated working tree is at the path above. Use ABSOLUTE paths under',
+      'it for every file operation. Run all git commands with',
+      '  git -C ' + row.worktree_path + ' ...',
+      'or by first changing into that directory.',
+      '',
+      'Do NOT operate on /Users/ecodia/.code/ecodiaos/backend - that is the',
+      "conductor's shared working tree and its reference-transaction hook will",
+      'reject branch flips there (see backend/patterns/branch-thrash-guard-on-',
+      'shared-tree-2026-06-10.md). The dispatcher prunes this worktree on your',
+      'signal_done.',
+      '',
+    )
+  }
+
+  lines.push(
     // FIRST instruction: signal_bound with task_id so scheduler release launch-lock.
     'FIRST ACTION (mandatory, before any task work):',
     'Call coord.signal_bound now with { task_id: "' + taskId + '" } to confirm you received this brief.',
@@ -153,7 +283,7 @@ exports.buildBrief = function buildBrief(row) {
     // Context line.
     accountLine,
     'If this task has not called signal_done within ' + orphanHours + 'h it will be marked orphaned.',
-  ]
+  )
 
   return lines.join('\n')
 }
@@ -213,6 +343,12 @@ exports.markFailed = async function markFailed(row, err) {
   const pool = getPool()
   const newRetryCount = (row.retry_count || 0) + 1
   const errMsg = String(err && err.message || err).slice(0, 2000)
+
+  // 2026-06-10 branch-thrash guard cleanup: drop the per-row isolated worktree.
+  // Even on cron-defer-to-next-interval the worktree should be cleaned: the
+  // next fire will allocate a fresh one off origin/main (the FF history may
+  // have advanced) and idempotent allocate would tolerate either path.
+  try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   if (newRetryCount >= MAX_RETRY_COUNT) {
     // 2026-06-02 P0 fix. Cron rows MUST NOT permanently die after 3 retries -
     // that loses every future interval of recurring work. Defer to the next
@@ -295,8 +431,20 @@ exports.dispatchOne = async function dispatchOne(row) {
       account = picked
     }
 
-    // 2. Build brief with actual_account filled in.
-    const rowWithAccount = Object.assign({}, row, { actual_account: account })
+    // 2026-06-10 branch-thrash guard: allocate isolated worktree off origin/main
+    // so the worker tab cannot flip the conductor's shared tree. Allocation
+    // failure is non-fatal - we log it and proceed without a worktree path,
+    // and the reference-transaction hook on the shared tree is the runtime
+    // backstop in that case.
+    let worktreePath = null
+    try {
+      worktreePath = await exports.allocateWorktreeForRow(row)
+    } catch (e) {
+      process.stderr.write('[scheduler] dispatchOne: worktree allocation failed for ' + row.id + ': ' + (e && e.message || e) + ' (dispatching without isolated worktree; branch-thrash guard now relies on the reference-transaction hook)\n')
+    }
+
+    // 2. Build brief with actual_account + worktree_path filled in.
+    const rowWithAccount = Object.assign({}, row, { actual_account: account, worktree_path: worktreePath })
     const brief = exports.buildBrief(rowWithAccount)
 
     // 3. Dispatch worker.
@@ -438,6 +586,12 @@ exports.dispatchOne = async function dispatchOne(row) {
 exports.markComplete = async function markComplete(row, signal) {
   const pool = getPool()
   const dispatcher = getDispatcher()
+
+  // 2026-06-10 branch-thrash guard cleanup: drop the per-row isolated worktree
+  // allocated at dispatchOne. Idempotent + tolerant so a missing worktree
+  // (legacy row from before the guard shipped, or one already pruned by a
+  // recovery sweep) does not block completion.
+  try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
 
   // 2026-05-29 ultracode audit H2 fix. Was: kill_worker in try/catch then
   // unconditional dispatched_tab_id = NULL. kill_worker returns ok:true even
@@ -679,6 +833,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
        WHERE id = $2`,
       [nextRunAt, row.id]
     )
+    // 2026-06-10 branch-thrash guard cleanup on cron-defer recovery.
+    try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   }
 
   // 2b. Stale dispatching, max retries exhausted, NON-CRON row: permanently
@@ -712,6 +868,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
        WHERE id = $1`,
       [row.id]
     )
+    // 2026-06-10 branch-thrash guard cleanup on permanent fail.
+    try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   }
 
   // 3. Running too long -> orphaned (non-cron) OR deferred to next interval (cron).
@@ -776,6 +934,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
         [row.id]
       )
     }
+    // 2026-06-10 branch-thrash guard cleanup on orphan + cron-defer paths.
+    try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   }
 }
 
