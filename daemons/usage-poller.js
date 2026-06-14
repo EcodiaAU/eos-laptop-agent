@@ -40,36 +40,26 @@ function writeHeartbeat(payload) {
   } catch (e) {}
 }
 
-// ── proactive 5h-cap alert ───────────────────────────────────────────────────
-// 2026-06-14. The chronic "we hit the cap and got stuck" problem: account
-// switching works (CDP sign-in to the next account), but nothing warns BEFORE
-// the live account caps. This reads the active ccusage 5h block (the same fixed
-// window Claude Code's UI shows) and iMessages Tate when it crosses 80% / 92% of
-// the calibrated limit, so he can switch with runway. Defensive: never throws,
-// never blocks the poll. Calibrated from Tate's live reading 2026-06-14 (54% at
-// ~397M tokens -> ~735M real 5h limit).
+// ── 5h-cap auto-switch trigger ───────────────────────────────────────────────
+// 2026-06-14. The chronic "hit the cap and get stuck" problem. Tate's rule
+// (verbatim): "idc when your thing is near capped, it needs to trigger you to do
+// the gui switch if other accounts are available". So the cap-approaching signal
+// must TRIGGER an autonomous CDP sign-in switch to a healthy account, NOT text
+// Tate. This reads the active ccusage 5h block (the same window Claude Code's UI
+// shows). When it crosses the threshold, it asks the laptop-agent for the
+// healthiest OTHER account; if one with real headroom exists, it raises a
+// switch-request that the switch executor consumes (CDP sign-in to that account,
+// which mints a FRESH token - unlike the file-swap which clobbers with a stale
+// snapshot). If no alternate account is enabled+healthy (the current single-
+// account reality), it holds silently. It NEVER texts Tate. Defensive: never
+// throws, never blocks the poll. Calibrated from Tate's live reading 2026-06-14
+// (54% at ~397M tokens -> ~735M real 5h limit).
 const CAP_5H_TOKENS = Number(process.env.CAPS_5H_TOKENS) || 735_000_000
 const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS || '/opt/homebrew/lib/node_modules/ccusage/dist/cli.js'
-const CAP_ALERT_STATE = path.join(_COORD_ROOT, 'usage', 'cap-alert-state.json')
-const TATE_PHONE_FILE = '/Users/ecodia/PRIVATE/ecodia-creds/kv-mirror/tate_phone.json'
-const WARN_PCT = 0.80
-const CRIT_PCT = 0.92
+const SWITCH_REQUEST_FILE = path.join(_COORD_ROOT, 'usage', 'switch-request.json')
+const SWITCH_TRIGGER_PCT = 0.80   // raise the switch request at 80% of the 5h block
 
 function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
-
-function tatePhone() {
-  const d = readJsonSafe(TATE_PHONE_FILE, null)
-  if (!d) return null
-  if (typeof d === 'string') return d.trim()
-  // canonical E.164 first, then formatted display, then explicit phone fields.
-  // NOT Object.values()[0] - that grabbed apple_id_on_phone (an email) before.
-  const cand = d.e164 || d.display || d.phone || d.number || d.mobile || d.value
-  if (typeof cand === 'string' && cand.trim()) return cand.trim()
-  for (const v of Object.values(d)) {
-    if (typeof v === 'string' && /^[+]?[\d\s()-]{8,}$/.test(v)) return v.trim()
-  }
-  return null
-}
 
 function agentToken() {
   try {
@@ -79,17 +69,22 @@ function agentToken() {
   return process.env.AGENT_TOKEN || ''
 }
 
-function sendIMessage(to, text) {
-  const payload = JSON.stringify({ tool: 'applescript.message_send', params: { to, service: 'iMessage', text } })
-  const r = spawnSync('curl', [
-    '-sS', '-m', '15', 'http://127.0.0.1:' + (process.env.AGENT_PORT || 7456) + '/api/tool',
-    '-X', 'POST', '-H', 'content-type: application/json',
-    '-H', 'authorization: Bearer ' + agentToken(), '--data-binary', payload,
-  ], { encoding: 'utf8', timeout: 20000 })
-  return r.status === 0
+// Call a laptop-agent tool over localhost. Returns parsed result or null.
+function agentTool(tool, params) {
+  try {
+    const payload = JSON.stringify({ tool, params: params || {} })
+    const r = spawnSync('curl', [
+      '-sS', '-m', '12', 'http://127.0.0.1:' + (process.env.AGENT_PORT || 7456) + '/api/tool',
+      '-X', 'POST', '-H', 'content-type: application/json',
+      '-H', 'authorization: Bearer ' + agentToken(), '--data-binary', payload,
+    ], { encoding: 'utf8', timeout: 15000 })
+    if (r.status !== 0 || !r.stdout) return null
+    const j = JSON.parse(r.stdout)
+    return j && j.ok ? j.result : null
+  } catch (_) { return null }
 }
 
-function capAlert() {
+function capAutoSwitch() {
   try {
     const r = spawnSync(process.execPath, [CCUSAGE_CLI_JS, 'blocks', '--active', '--json'], { encoding: 'utf8', timeout: 30000 })
     if (r.status !== 0 || !r.stdout) return
@@ -97,26 +92,32 @@ function capAlert() {
     const b = blocks.find(x => x.isActive) || blocks[0]
     if (!b || !b.endTime) return
     const cur = b.totalTokens || 0
-    const proj = (b.projection && b.projection.totalTokens) || cur
     const pct = cur / CAP_5H_TOKENS
-    const projPct = proj / CAP_5H_TOKENS
-    const level = pct >= CRIT_PCT ? 'crit' : ((pct >= WARN_PCT || projPct >= 1.0) ? 'warn' : 'ok')
-    if (level === 'ok') return
-    const st = readJsonSafe(CAP_ALERT_STATE, {})
-    // one alert per block per level; crit supersedes warn; never repeat
-    if (st.block === b.endTime && (st.level === level || st.level === 'crit')) return
-    const phone = tatePhone()
-    if (!phone) { console.error('[cap-alert] no Tate phone resolved'); return }
-    const aest = new Date(new Date(b.endTime).getTime() + 10 * 3600 * 1000)
-    const hh = String(aest.getUTCHours()).padStart(2, '0')
-    const mm = String(aest.getUTCMinutes()).padStart(2, '0')
-    const msg = 'EcodiaOS 5h cap ' + Math.round(pct * 100) + '% used (proj ' + Math.round(projPct * 100) +
-      '% by reset ' + hh + ':' + mm + ' AEST) on the live account. Switch accounts (CDP sign-in) before it caps.'
-    if (sendIMessage(phone, msg)) {
-      fs.writeFileSync(CAP_ALERT_STATE, JSON.stringify({ block: b.endTime, level, pct: Math.round(pct * 100), sent_at: nowIso() }), 'utf8')
-      console.log('[' + nowIso() + '] cap-alert ' + level + ' sent: ' + Math.round(pct * 100) + '%')
+    if (pct < SWITCH_TRIGGER_PCT) return  // plenty of headroom, nothing to do
+
+    // Cap approaching. Ask the agent for the healthiest account and the live one.
+    // pick_healthiest_account honours ACCOUNTS_DISABLED + headroom; current_account
+    // is the live Keychain identity. A switch is only worthwhile if the healthiest
+    // is a DIFFERENT, enabled account (i.e. a real alternate exists).
+    const best = agentTool('creds.pick_healthiest_account', { required_headroom_minutes: 15 })
+    const live = agentTool('creds.current_account', {})
+    const haveAlternate = best && live && best !== live && best !== 'unknown' && best !== 'current-process'
+
+    if (!haveAlternate) {
+      // Single-account reality: nowhere to switch. Hold silently. NO text to Tate.
+      console.log('[' + nowIso() + '] cap-auto-switch: ' + Math.round(pct * 100) + '% of 5h block, no alternate account available (best=' + best + ' live=' + live + ') - holding')
+      return
     }
-  } catch (e) { console.error('[cap-alert] ' + (e && e.message || e)) }
+
+    // A healthy alternate exists. Raise a switch-request for the switch executor
+    // (CDP sign-in to `best`). Dedupe per block so we raise once per window.
+    const st = readJsonSafe(SWITCH_REQUEST_FILE, {})
+    if (st.block === b.endTime && st.target === best) return
+    fs.writeFileSync(SWITCH_REQUEST_FILE, JSON.stringify({
+      block: b.endTime, target: best, from: live, pct: Math.round(pct * 100), raised_at: nowIso(), status: 'pending',
+    }), 'utf8')
+    console.log('[' + nowIso() + '] cap-auto-switch: ' + Math.round(pct * 100) + '% - SWITCH-REQUEST raised ' + live + ' -> ' + best)
+  } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
 }
 
 async function runOnePoll() {
@@ -137,7 +138,7 @@ async function runOnePoll() {
     }
     console.log('[' + nowIso() + '] poll OK in ' + elapsed + 'ms', JSON.stringify(summary))
     writeHeartbeat({ ok: true, elapsed_ms: elapsed, summary: summary })
-    capAlert()
+    capAutoSwitch()
   } catch (e) {
     const elapsed = Date.now() - t0
     console.error('[' + nowIso() + '] poll FAILED in ' + elapsed + 'ms: ' + e.message)
