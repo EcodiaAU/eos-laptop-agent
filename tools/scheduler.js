@@ -314,6 +314,7 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
       WHERE status = 'active'
         AND archived_at IS NULL
         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))
+        AND austerity_paused IS NOT TRUE
         AND (next_run_at IS NULL OR next_run_at <= NOW())
         AND (chain_after IS NULL OR next_run_at IS NOT NULL)
       ORDER BY priority ASC, next_run_at ASC NULLS FIRST
