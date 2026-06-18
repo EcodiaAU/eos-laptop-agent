@@ -604,6 +604,80 @@ test('markComplete one_shot: sets status=completed', async () => {
   assert(!!completedUpdate, 'markComplete one_shot: status set to completed')
 })
 
+// ── 2026-06-18: completionPass scans seen+unseen, freshness-gated ─────────────
+//
+// Root-cause of the scheduler completion gap: completionPass used peek_inbox,
+// which only returns UNSEEN messages. The interactive conductor drains the same
+// chat.conductor.inbox via read_inbox and marks done signals seen within ~1s, so
+// completionPass lost the race and rows rotted in status=running. The fix scans
+// the full index (seen or unseen) via coord.scanTopicByType, gated on
+// created_at >= leased_at so a prior cron fire's stale done cannot complete a
+// fresh dispatch.
+
+test('completionPass: fresh done (created_at >= leased_at) completes a running cron row', async () => {
+  const leasedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString()  // 1h ago
+  const doneAt = new Date(Date.now() - 30 * 1000).toISOString()         // 30s ago (after lease)
+  const runningRow = makeRow({
+    id: 'task-comp-fresh',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    status: 'running',
+    leased_at: leasedAt,
+    dispatched_tab_id: null,
+  })
+  const pool = makeStubPool([runningRow])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
+  scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+  const origScan = coordModule.scanTopicByType
+  coordModule.scanTopicByType = () => new Map([
+    ['task-comp-fresh', { created_at: doneAt, body: { type: 'done', task_id: 'task-comp-fresh', status: 'success', result_summary: 'ok' } }],
+  ])
+
+  await scheduler.completionPass()
+
+  const rescheduled = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  )
+  assert(!!rescheduled, 'completionPass fresh: running cron row rescheduled to active (loop closed)')
+
+  coordModule.scanTopicByType = origScan
+  scheduler._resetWorktreeFns()
+})
+
+test('completionPass: stale done (created_at < leased_at) does NOT complete (freshness gate)', async () => {
+  const leasedAt = new Date(Date.now() - 60 * 1000).toISOString()        // leased 60s ago
+  const staleDoneAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()  // 3h-old done from a prior fire
+  const runningRow = makeRow({
+    id: 'task-comp-stale',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    status: 'running',
+    leased_at: leasedAt,
+    dispatched_tab_id: null,
+  })
+  const pool = makeStubPool([runningRow])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
+  scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+  const origScan = coordModule.scanTopicByType
+  coordModule.scanTopicByType = () => new Map([
+    ['task-comp-stale', { created_at: staleDoneAt, body: { type: 'done', task_id: 'task-comp-stale', status: 'success' } }],
+  ])
+
+  await scheduler.completionPass()
+
+  const rescheduled = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  )
+  assert(!rescheduled, 'completionPass stale: prior-fire done ignored, row left running for its own worker')
+
+  coordModule.scanTopicByType = origScan
+  scheduler._resetWorktreeFns()
+})
+
 // ── Task 3.3: staleLeaseRecovery SQL shapes ───────────────────────────────────
 //
 // 2026-06-10: shape changed after the per-row coord-liveness gate landed.

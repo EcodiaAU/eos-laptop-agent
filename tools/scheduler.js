@@ -71,7 +71,14 @@ const DISPATCH_LIMIT = 5
 const SIGNAL_BOUND_TIMEOUT_MS = parseInt(process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS, 10) || 600_000
 const ORPHAN_TIMEOUT_MS = 6 * 60 * 60 * 1000
 const COMPLETION_POLL_INTERVAL_MS = 5_000
-const STALE_DISPATCHING_MS = 10 * 60 * 1000   // 10 min -> retry
+// 2026-06-18 half-state race fix. Must stay ABOVE SIGNAL_BOUND_TIMEOUT_MS (600s)
+// so staleLeaseRecovery branch-1 cannot reap a row that dispatchOne is still
+// legitimately waiting on for signal_bound. When the two windows were equal
+// (both 10min) a slow-but-live cold-MCP bind got reclaimed mid-wait, and the
+// running-flip then produced a status=running + leased_by=NULL zombie. 15min
+// gives 5min of headroom over the bind timeout; the p99 bind tail (~21min) is
+// covered by the dispatchOne running-flip lease guard, not by this window.
+const STALE_DISPATCHING_MS = 15 * 60 * 1000   // 15 min -> retry (> 600s bind timeout)
 const MAX_RETRY_COUNT = 3
 // 2026-05-29 ultracode audit C3 fix. cleanup_orphan_workers is the only
 // backstop the chain's refuse-and-leak posture relies on; the audit caught
@@ -505,14 +512,41 @@ exports.dispatchOne = async function dispatchOne(row) {
       await new Promise(r => setTimeout(r, 1000))
     }
 
-    // 5. Update row to running.
-    await pool.query(
+    // 5. Update row to running - GUARDED on still owning the lease.
+    //
+    // 2026-06-18 half-state race fix. The signal_bound wait above can run up to
+    // SIGNAL_BOUND_TIMEOUT_MS (600s). If it overruns STALE_DISPATCHING_MS,
+    // staleLeaseRecovery branch-1 fires on this still-'dispatching' row, sets
+    // status='active', leased_by=NULL, retry_count++. The OLD unconditional
+    // UPDATE then blindly overwrote status back to 'running' WITHOUT reclaiming
+    // leased_by, producing the observed zombie half-state (status=running AND
+    // leased_by IS NULL - a running row with no lease owner) and risking a
+    // double-dispatch of the same task. Guarding on (status='dispatching' AND
+    // leased_by unchanged) makes the flip a no-op when recovery already reclaimed
+    // the row; we then bail and let the recovered row re-dispatch cleanly. Live
+    // evidence 2026-06-18: external-blocker / client-app-health /
+    // monthly-architectural-review all sat status=running, leased_by NULL,
+    // leased_at SET, last_error='stale lease recovered'.
+    const runRes = await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'running', actual_account = $1, dispatched_tab_id = $2,
            leased_at = NOW(), updated_at = NOW()
-       WHERE id = $3`,
-      [account, tabId, row.id]
+       WHERE id = $3
+         AND status = 'dispatching'
+         AND leased_by IS NOT DISTINCT FROM $4`,
+      [account, tabId, row.id, row.leased_by || null]
     )
+
+    if (runRes && runRes.rowCount === 0) {
+      // Lease reclaimed mid-bind (or already advanced). Do NOT resurrect to
+      // running - that is exactly the zombie half-state. The just-spawned tab,
+      // if live, is reconciled by cleanup_orphan_workers; if the worker signals
+      // done, the row is already back in the active->dispatch cycle.
+      process.stderr.write('[scheduler] dispatchOne: lease for task ' + row.id +
+        ' was reclaimed during signal_bound wait (tab ' + tabId +
+        '); skipping running-flip to avoid zombie half-state\n')
+      return
+    }
 
     if (!bound) {
       process.stderr.write('[scheduler] dispatchOne: signal_bound timeout for task ' + row.id + ' (tab ' + tabId + ')\n')
@@ -700,36 +734,54 @@ exports.markComplete = async function markComplete(row, signal) {
 exports.completionPass = async function completionPass() {
   const pool = getPool()
 
-  // Fetch all running rows.
+  // Fetch all running rows (need leased_at for the freshness gate below).
   const result = await pool.query(
     `SELECT * FROM os_scheduled_tasks WHERE status = 'running' LIMIT 50`
   )
   if (!result.rows.length) return
 
-  // Peek at conductor inbox for done signals.
-  const inbox = await coord.peek_inbox({ topic: 'chat.conductor.inbox', limit: 100 })
-  if (!inbox || !inbox.messages || !inbox.messages.length) return
-
-  // Build a map: task_id -> signal
-  const doneSignals = new Map()
-  for (const msg of inbox.messages) {
-    const body = msg.body
-    if (body && body.type === 'done' && body.task_id) {
-      // keep first (oldest) signal per task
-      if (!doneSignals.has(String(body.task_id))) {
-        doneSignals.set(String(body.task_id), body)
-      }
-    }
+  // 2026-06-18 scheduler-completion-race fix. Was: coord.peek_inbox on
+  // chat.conductor.inbox, which only returns UNSEEN messages. The interactive
+  // conductor reads the SAME inbox via coord.read_inbox (its wake /
+  // UserPromptSubmit hook), which marks a worker's `done` signal seen within
+  // ~1s of arrival. completionPass (every 5s) then lost the race: the done was
+  // already seen, and peek_inbox can never return a seen message, so
+  // markComplete never fired and the row rotted in status=running until the 6h
+  // orphan timer. Live evidence 2026-06-18: external-blocker-freshness-probe
+  // done created 06:23:38.505Z, marked seen 06:23:39.117Z (0.6s later), row
+  // still running 4h on. Fix: scan the FULL inbox index (seen or unseen) for the
+  // newest done per running task_id - completion detection is now independent of
+  // whoever else drains the inbox. See
+  // [[scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18]].
+  const runningIds = result.rows.map(r => String(r.id))
+  let doneByTask
+  try {
+    doneByTask = coord.scanTopicByType('chat.conductor.inbox', 'done', runningIds)
+  } catch (e) {
+    process.stderr.write('[scheduler] completionPass scan error: ' + e.message + '\n')
+    return
   }
-
-  if (!doneSignals.size) return
+  if (!doneByTask || !doneByTask.size) return
 
   for (const row of result.rows) {
-    const taskIdStr = String(row.id)
-    const signal = doneSignals.get(taskIdStr)
-    if (!signal) continue
+    const msg = doneByTask.get(String(row.id))
+    if (!msg) continue
+    // Freshness gate. task_id == row.id is STABLE across cron fires, so the
+    // inbox accumulates many done signals with the same task_id over a row's
+    // lifetime. Only THIS dispatch's done counts: leased_at is set to NOW() when
+    // dispatchOne flips the row to running, so a prior fire's done has
+    // created_at < leased_at and must be ignored (else a fresh dispatch would be
+    // completed instantly by a days-old signal, before its worker even runs).
+    // 30s back-margin tolerates a fast worker that signals done microseconds
+    // before the running-flip timestamp; cron intervals are >= minutes and
+    // one-shot task_ids are unique, so no cross-fire collision fits that margin.
+    if (row.leased_at) {
+      const doneMs = new Date(msg.created_at).getTime()
+      const leasedMs = new Date(row.leased_at).getTime()
+      if (!isNaN(doneMs) && !isNaN(leasedMs) && doneMs < leasedMs - 30_000) continue
+    }
     try {
-      await exports.markComplete(row, signal)
+      await exports.markComplete(row, msg.body)
     } catch (e) {
       process.stderr.write('[scheduler] completionPass markComplete error for ' + row.id + ': ' + e.message + '\n')
     }
