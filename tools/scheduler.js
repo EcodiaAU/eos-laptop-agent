@@ -950,6 +950,32 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   )
   const dispatcher = getDispatcher()
   for (const row of orphans.rows) {
+    // Liveness gate per
+    // [[scheduler-stale-lease-must-check-coord-worker-liveness-before-redispatch-2026-06-10]].
+    // 2026-06-18: the 2026-06-10 fix wired this gate into branches 1 + 2a + 2b
+    // (the status='dispatching' sweeps) but MISSED this branch 3 (the
+    // status='running' orphan-timeout sweep). A cron worker still heartbeating
+    // but running past ORPHAN_TIMEOUT_MS (6h) had its row flipped back to
+    // 'active' with a fresh next_run_at WITHOUT a liveness check, so the next
+    // poll re-leased (re-dispatched) the task while the prior tab was still
+    // finishing. That is the exact double-fire path behind the morning dup
+    // bursts (climate-pm-chain + orphan-next-action-audit) and the
+    // partnership-watering double-dispatch on 2026-06-14. When a worker tab is
+    // still alive for this task, SKIP the reclaim and leave status='running' +
+    // leased_by + leased_at intact so the lease keeps holding (mirrors the
+    // skip in branches 2a + 2b). Once heartbeats stop, hasLiveWorkerForTask
+    // returns null within STALE_WORKER_LIVENESS_MS and the next sweep reclaims.
+    // Doctrine: [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]] -
+    // a guard wired into N parallel branches must cover ALL branches of the
+    // same routine.
+    const liveWorker = await hasLiveWorkerForTask(row.id)
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping running orphan-timeout reclaim\n'
+      )
+      continue
+    }
     let closeOk = false
     if (row.dispatched_tab_id && dispatcher.kill_worker) {
       try {
