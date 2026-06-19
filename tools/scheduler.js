@@ -381,7 +381,7 @@ exports.markFailed = async function markFailed(row, err) {
         `UPDATE os_scheduled_tasks
          SET status = 'active', retry_count = 0, last_error = $1, next_run_at = $2,
              leased_by = NULL, leased_at = NULL, updated_at = NOW()
-         WHERE id = $3`,
+         WHERE id = $3 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [errMsg + ' (cron: deferred to next interval, retry_count reset)', nextRunAt, row.id]
       )
     } else {
@@ -398,7 +398,7 @@ exports.markFailed = async function markFailed(row, err) {
       `UPDATE os_scheduled_tasks
        SET status = 'active', retry_count = $1, last_error = $2,
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
-       WHERE id = $3`,
+       WHERE id = $3 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [newRetryCount, errMsg, row.id]
     )
   }
@@ -572,7 +572,7 @@ exports.dispatchOne = async function dispatchOne(row) {
           `UPDATE os_scheduled_tasks
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3`,
+           WHERE id = $3 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
           [nextRun.toISOString(), 'AllAccountsCappedError - deferred ' + Math.round(deferMs / 60000) + 'min', row.id]
         )
       } catch (pgErr) {
@@ -592,7 +592,7 @@ exports.dispatchOne = async function dispatchOne(row) {
           `UPDATE os_scheduled_tasks
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3`,
+           WHERE id = $3 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
           [nextRun.toISOString(), 'no IDE bridge registered - deferred 5min', row.id]
         )
       } catch (pgErr) {
@@ -687,7 +687,7 @@ exports.markComplete = async function markComplete(row, signal) {
            run_count = run_count + 1, last_result = $2,
            retry_count = 0, leased_by = NULL, leased_at = NULL,
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
-       WHERE id = $3`,
+       WHERE id = $3 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
   } else {
@@ -834,7 +834,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
          leased_by = NULL, leased_at = NULL, updated_at = NOW()
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
-       AND retry_count < $2`,
+       AND retry_count < $2 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
 
@@ -883,7 +883,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
        SET status = 'active', retry_count = 0,
            last_error = 'stale lease - max retries exhausted (cron: deferred to next interval per doctrine)',
            next_run_at = $1, leased_by = NULL, leased_at = NULL, updated_at = NOW()
-       WHERE id = $2`,
+       WHERE id = $2 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, row.id]
     )
     // 2026-06-10 branch-thrash guard cleanup on cron-defer recovery.
@@ -1002,7 +1002,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
              next_run_at = $1,
              last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
              leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
-         WHERE id = $2`,
+         WHERE id = $2 AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [nextRunAt, row.id]
       )
     } else {
@@ -1406,7 +1406,7 @@ exports.schedule_cancel = async function schedule_cancel(params) {
   const pool = getPool()
   const result = await pool.query(
     `UPDATE os_scheduled_tasks
-     SET archived_at = NOW(), last_status = 'cancelled', updated_at = NOW()
+     SET archived_at = NOW(), last_status = 'cancelled', status = 'cancelled', updated_at = NOW()
      WHERE id = $1
      RETURNING id, name, archived_at`,
     [row.id]
