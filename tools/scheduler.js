@@ -418,6 +418,49 @@ exports.dispatchOne = async function dispatchOne(row) {
   let account = null
   let tabId = null
   try {
+    // 0. Defense-in-depth austerity gate. leaseDueRows already excludes
+    // austerity_paused rows, but a 2026-06-19 incident showed ~8 paused crons
+    // (calendar-watch, opportunity-triage, neo4j-maintenance, monthly-financial-close,
+    // github-push-ci-watch ...) reaching dispatchOne in a 3-min burst and spawning
+    // worker tabs despite the gate (unreproducible race between lease + stale-lease
+    // recovery under the signal_bound hold). The harm is a spawned CC session burning
+    // tokens while austerity is meant to suppress it. Re-read the marker here, under
+    // the launch-lock (fresh read), BEFORE any cred rotation / worktree / tab spawn.
+    // If the row is now paused (or gone/cancelled), release the lease and skip - NOT
+    // markFailed: this is a suppression, not a failure, so it must not burn a retry or
+    // defer the cron off its cadence. next_run_at is left intact so the row rejoins
+    // its schedule the moment austerity lifts.
+    {
+      const guard = await pool.query(
+        `SELECT austerity_paused, status, archived_at, last_status, name
+         FROM os_scheduled_tasks WHERE id = $1`,
+        [row.id]
+      )
+      const g = guard.rows[0]
+      // Fire ONLY on the explicit suppression markers. A missing read (g
+      // undefined) is left to proceed - the guard targets the austerity marker,
+      // not row existence, and a genuinely-deleted row fails downstream anyway.
+      const suppressed = !!g && (
+        g.austerity_paused === true ||
+        g.archived_at != null ||
+        g.last_status === 'cancelled'
+      )
+      if (suppressed) {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', leased_by = NULL, leased_at = NULL, updated_at = NOW()
+           WHERE id = $1
+             AND status = 'dispatching'
+             AND leased_by IS NOT DISTINCT FROM $2`,
+          [row.id, row.leased_by || null]
+        )
+        process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
+          (g && g.name || row.name || '?') + ') - austerity_paused gate ' +
+          '(defense-in-depth); upstream leaseDueRows leak, lease released without retry\n')
+        return
+      }
+    }
+
     // 1. Pick + rotate to healthiest account.
     const picked = await getCreds().pick_healthiest_account({
       preferred: row.preferred_account || null,

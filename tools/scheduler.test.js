@@ -242,6 +242,54 @@ test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', 
   coordModule.read_inbox = origReadInbox
 })
 
+// ── 2026-06-19 defense-in-depth austerity gate inside dispatchOne ───────────
+// leaseDueRows excludes austerity_paused rows, but an incident showed paused
+// crons reaching dispatchOne in a burst and spawning worker tabs anyway. The
+// dispatchOne re-read must SKIP a now-paused row: no dispatch_worker, lease
+// released without a retry (no markFailed, next_run_at untouched).
+test('dispatchOne: SKIPs an austerity_paused row - no dispatch, lease released, no retry', async () => {
+  // Stub pool returns the guard SELECT row as paused.
+  const pool = makeStubPool([{
+    austerity_paused: true, status: 'dispatching', archived_at: null,
+    last_status: null, name: 'calendar-watch',
+  }])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  let pickCalled = false
+  credsModule.pick_healthiest_account = async () => { pickCalled = true; return 'code' }
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'code' })
+
+  let dispatched = false
+  scheduler._setDispatcher({
+    dispatch_worker: async () => { dispatched = true; return { ok: true, tab_id: 'should_not_spawn' } },
+    kill_worker: async () => {},
+  })
+
+  const row = makeRow({ id: 'paused-cron-guard', name: 'calendar-watch', leased_by: 'lease-x' })
+
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [guard test threw]:', e.message) }
+
+  assert(!threw, 'guard: no throw')
+  assert(dispatched === false, 'guard: dispatch_worker NOT called for paused row')
+  assert(pickCalled === false, 'guard: cred rotation skipped (guard fires before step 1)')
+
+  const releaseUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('leased_by = NULL') && q.sql.includes('dispatching'))
+  assert(!!releaseUpdate, 'guard: lease released back to active')
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!runningUpdate, 'guard: row NOT flipped to running')
+  // No markFailed (would set retry_count / status=failed or defer next_run_at).
+  const failedUpdate = pool._queries.find(q => q.sql.includes("status = 'failed'") || q.sql.includes('retry_count ='))
+  assert(!failedUpdate, 'guard: markFailed NOT invoked (suppression, not failure)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+})
+
 // ── 2026-06-10 branch-thrash guard: dispatchOne worktree wiring + cleanup ───
 
 test('dispatchOne: allocates worktree, passes path into brief, dispatches with worker_acknowledgment_timeout_ms=0', async () => {
