@@ -576,7 +576,9 @@ exports.dispatchOne = async function dispatchOne(row) {
           `UPDATE os_scheduled_tasks
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3`,
+           WHERE id = $3
+             AND archived_at IS NULL
+             AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
           [nextRun.toISOString(), 'AllAccountsCappedError - deferred ' + Math.round(deferMs / 60000) + 'min', row.id]
         )
       } catch (pgErr) {
@@ -596,7 +598,9 @@ exports.dispatchOne = async function dispatchOne(row) {
           `UPDATE os_scheduled_tasks
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3`,
+           WHERE id = $3
+             AND archived_at IS NULL
+             AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
           [nextRun.toISOString(), 'no IDE bridge registered - deferred 5min', row.id]
         )
       } catch (pgErr) {
