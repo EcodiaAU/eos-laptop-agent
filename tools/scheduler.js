@@ -98,6 +98,24 @@ const RETRY_BACKOFF_MS = 5 * 60 * 1000   // 5 min bounded retry delay
 // lifetime, doesn't thrash ide.tabs.
 const CLEANUP_ORPHAN_INTERVAL_MS = 7 * 60 * 1000
 
+// 2026-06-20 sleep-resilience. The agent runs on a Mac laptop with no caffeinate
+// wrapper; KeepAlive in the launchd plist only restarts the process on EXIT, not
+// when the OS freezes it during system sleep / hibernate. When the host sleeps,
+// the Node event loop stops and ALL setInterval loops below (dispatch, completion,
+// stale-lease recovery, cap observer, orphan cleanup) stop ticking. Crons leased
+// into status='dispatching'/'running' just before the freeze then sit stuck until
+// the agent next gets sustained runtime. Verified root cause of the 2026-06-18 and
+// 2026-06-19 fleet-wide stuck-running recurrences: pmset shows the host hibernated
+// on a 1% battery for ~9h ('Low Power Sleep' TCPKeepAlive=inactive), waking only on
+// acattach, and the named crons recovered only once the host was sustainedly awake.
+// We cannot stop the host sleeping from inside the process (critical-battery
+// hibernate ignores caffeinate), but we CAN make the first resumed tick reconcile
+// immediately and emit an OBSERVABLE wake-stall signal instead of a silent stall.
+// A gap between consecutive stale-lease ticks far exceeding STALE_LEASE_INTERVAL_MS
+// is the fingerprint of a frozen-then-resumed loop. Doctrine:
+// [[scheduler-must-survive-mac-sleep-2026-06-20]].
+const WAKE_STALL_FACTOR = 3
+
 // ── Postgres pool (injection seam for tests) ─────────────────────────────────
 
 let _pool = null
@@ -1831,6 +1849,68 @@ exports._priorityForClass = priorityForClass
 exports._toAestIso = toAestIso
 exports._resolveRow = _resolveRow
 
+// ── wake-stall detection (sleep-resilience) ──────────────────────────────────
+//
+// Pure + deterministic so the wake path is unit-testable with an injected clock
+// instead of fake timers. Returns whether the Node event loop was frozen between
+// two consecutive stale-lease ticks (the host slept). `frozenMs` is the observed
+// inter-tick gap; `stalled` is true when that gap exceeds intervalMs * factor.
+// Doctrine: [[scheduler-must-survive-mac-sleep-2026-06-20]].
+exports.detectWakeStall = function detectWakeStall(prevTickMs, nowMs, intervalMs, factor) {
+  const f = (typeof factor === 'number' && factor > 1) ? factor : WAKE_STALL_FACTOR
+  const frozenMs = nowMs - prevTickMs
+  return { stalled: frozenMs > intervalMs * f, frozenMs }
+}
+
+// Surface a wake-stall to the conductor / Tate via observer_signals so a silent
+// nightly sleep-stall becomes a visible signal on the next CC turn (mirrors the
+// usage-cap observer). Best-effort, app-level dedup to one signal per host-hour so
+// a single multi-hour freeze does not spam. Doctrine:
+// [[health-canary-must-alert-not-silently-accumulate]].
+const _wakeStallLast = { hourKey: null }
+exports._resetWakeStallLast = function () { _wakeStallLast.hourKey = null }
+exports.recordWakeStall = async function recordWakeStall(frozenMs) {
+  const mins = Math.round(frozenMs / 60000)
+  const hourKey = new Date().toISOString().slice(0, 13)   // dedup per host-hour
+  if (_wakeStallLast.hourKey === hourKey) return { skipped: 'cooldown', minutes: mins }
+  await getPool().query(
+    `INSERT INTO observer_signals (observer_name, signal_kind, message, fingerprint, priority, created_at)
+     VALUES ($1, $2, $3, $4, $5, now())`,
+    ['scheduler-wake-stall-observer', 'scheduler_wake_stall',
+     'Scheduler event loop was frozen ~' + mins + ' min (host sleep/hibernate). Crons leased before the freeze may have stalled in running/dispatching; staleLeaseRecovery ran a catch-up sweep on wake. If this recurs nightly, keep the Mac on AC power or wrap the laptop-agent in `caffeinate -s` (note: critical-battery hibernate ignores caffeinate).',
+     'scheduler_wake_stall:' + hourKey, 2]
+  )
+  _wakeStallLast.hourKey = hourKey
+  return { fired: true, minutes: mins }
+}
+
+// One stale-lease tick: detect a wake-from-sleep gap, surface it + run an
+// immediate catch-up recovery, then run the normal recovery sweep. Extracted from
+// the setInterval callback so the wake path is testable with an injected clock.
+// `_lastStaleTickMs` is module state seeded by start(); pass nowMs explicitly so
+// tests stay deterministic.
+let _lastStaleTickMs = null
+exports._resetStaleTickClock = function (ms) { _lastStaleTickMs = (typeof ms === 'number') ? ms : null }
+exports.staleTick = async function staleTick(nowMs) {
+  const now = (typeof nowMs === 'number') ? nowMs : Date.now()
+  if (_lastStaleTickMs !== null) {
+    const wake = exports.detectWakeStall(_lastStaleTickMs, now, STALE_LEASE_INTERVAL_MS)
+    if (wake.stalled) {
+      exports._wakeStallCount = (exports._wakeStallCount || 0) + 1
+      process.stderr.write(
+        '[scheduler] WAKE-STALL: event loop frozen ~' + Math.round(wake.frozenMs / 1000) +
+        's (likely host sleep/hibernate) - running immediate catch-up staleLeaseRecovery\n'
+      )
+      try { await exports.recordWakeStall(wake.frozenMs) } catch (e) {
+        process.stderr.write('[scheduler] recordWakeStall error: ' + e.message + '\n')
+      }
+    }
+  }
+  _lastStaleTickMs = now
+  await exports.staleLeaseRecovery()
+}
+exports._wakeStallCount = 0
+
 // ── start ────────────────────────────────────────────────────────────────────
 //
 // Starts all three intervals plus the usage-cap observer. Wraps each in
@@ -1842,6 +1922,16 @@ exports.start = function start() {
   // Non-blocking startup cleanup.
   exports.startupCleanup().catch(e => {
     process.stderr.write('[scheduler] startupCleanup error: ' + e.message + '\n')
+  })
+
+  // 2026-06-20 sleep-resilience: reconcile stuck dispatching/running leases
+  // IMMEDIATELY on start (boot / KeepAlive restart / first runtime after a host
+  // sleep), not only on the first 60s stale-lease tick. startupCleanup above only
+  // closes leaked tabs - it does NOT recover leases. Seeds the wake-stall clock so
+  // the first scheduled tick measures the gap from now.
+  exports._resetStaleTickClock(Date.now())
+  exports.staleLeaseRecovery().catch(e => {
+    process.stderr.write('[scheduler] startup staleLeaseRecovery error: ' + e.message + '\n')
   })
 
   // Dispatch loop.
@@ -1876,10 +1966,13 @@ exports.start = function start() {
     }
   }, COMPLETION_POLL_INTERVAL_MS)
 
-  // Stale-lease recovery.
+  // Stale-lease recovery. Routed through staleTick so a wake-from-sleep gap is
+  // detected, surfaced (observer_signals), and followed by an immediate catch-up
+  // recovery on the first resumed tick. Doctrine:
+  // [[scheduler-must-survive-mac-sleep-2026-06-20]].
   const staleInterval = setInterval(async () => {
     try {
-      await exports.staleLeaseRecovery()
+      await exports.staleTick(Date.now())
     } catch (e) {
       process.stderr.write('[scheduler] staleLeaseRecovery error: ' + e.message + '\n')
     }
