@@ -163,6 +163,60 @@ async function run() {
   assertEq('T3 refuse-and-leak: NO close request issued (leak-not-murder)', 0, closeCalls.length)
 
   // -----------------------------------------------------------------------
+  // T4: cleanup_orphan_workers READS the env-resolved COORD_ROOT registry
+  //     and CLOSES a matchable orphan.
+  //
+  // 2026-06-20 regression. cowork.js hardcoded COORD_ROOT to the dead Corazon
+  // Windows path with no env override, so on the Mac canonical host
+  // cleanup_orphan_workers scanned an empty literal "D:\\..." directory and
+  // returned candidates=0 / closed=0 every pass while the real registry at
+  // ~/.ecodiaos/coordination/workers (the path coord.js + mac-dispatcher.js
+  // resolve from env) accumulated 600+ orphans. This test seeds a terminated,
+  // not-yet-closed orphan into the env-pointed COORD_ROOT registry and proves
+  // the sweep (a) SEES it as a candidate and (b) actually closes it. Before
+  // the fix this asserts candidates=0 (function blind to the registry).
+  // -----------------------------------------------------------------------
+  const ORPHAN_TAB = 'tab_orphan_sweep_t4'
+  const orphanRow = {
+    tab_id: ORPHAN_TAB,
+    task_id: 'task-' + ORPHAN_TAB,
+    parent_conductor_tab_id: 'conductor',
+    registered_at: new Date(Date.now() - 3600_000).toISOString(),
+    // terminated (signal_done fired) but close never landed -> orphan tab leak.
+    terminated_at: new Date(Date.now() - 1800_000).toISOString(),
+    // closed_tab_ok absent -> still a candidate for the sweep.
+    status: 'completed',
+    tab_handle: {
+      sentinel_prefix: '[EOS-W-orphant4]',
+      viewColumn: 1,
+      viewType: CC,
+      label_at_spawn: '[EOS-W-orphant4] leaked worker',
+      tabIndex: 0,
+    },
+  }
+  fs.mkdirSync(path.join(TMP_COORD_ROOT, 'workers'), { recursive: true })
+  const orphanFile = path.join(TMP_COORD_ROOT, 'workers', ORPHAN_TAB + '.json')
+  fs.writeFileSync(orphanFile, JSON.stringify(orphanRow, null, 2))
+
+  // The leaked tab is still present in the IDE under its sentinel label.
+  mockTabsResponse = {
+    groups: [{
+      viewColumn: 1, isActive: true,
+      tabs: [{ label: '[EOS-W-orphant4] leaked worker', active: false, viewType: CC, index: 0 }],
+    }],
+  }
+  closeCalls.length = 0
+  const sweep = await cowork.cleanup_orphan_workers({ dry_run: false, max_age_days: 7 })
+  assertTruthy('T4 orphan-sweep: function saw the env-registry candidate', sweep.candidates >= 1)
+  assertEq('T4 orphan-sweep: closed exactly 1 orphan', 1, sweep.closed)
+  assertEq('T4 orphan-sweep: leaked count is 0', 0, sweep.leaked)
+  assertEq('T4 orphan-sweep: a close request was issued', 1, closeCalls.length)
+  // Registry row marked closed so the next sweep skips it (no re-close churn).
+  let updated = {}
+  try { updated = JSON.parse(fs.readFileSync(orphanFile, 'utf8')) } catch (e) {}
+  assertEq('T4 orphan-sweep: registry row stamped closed_tab_ok', true, updated.closed_tab_ok)
+
+  // -----------------------------------------------------------------------
   // Report
   // -----------------------------------------------------------------------
   let pass = 0, fail = 0

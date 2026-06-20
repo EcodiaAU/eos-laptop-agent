@@ -34,7 +34,24 @@ const screenshot = require('./screenshot')
 const win = require('./window')
 const ide = require('./ide')
 
-const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
+// 2026-06-20 orphan-cleanup root-cause fix. This was hardcoded to the dead
+// Corazon-era Windows path 'D:\\.code\\EcodiaOS\\coordination' with NO env
+// override. coord.js (line 27) and mac-dispatcher.js (line 35) BOTH resolve
+// COORD_ROOT from process.env.COORD_ROOT with a Mac default, so the live
+// dispatcher writes the worker registry to ~/.ecodiaos/coordination/workers
+// (2000+ rows). cowork.cleanup_orphan_workers reads WORKERS_DIR off THIS
+// constant, so on the Mac canonical host it scanned the literal directory
+// "D:\\.code\\EcodiaOS\\coordination\\workers" (created as a single oddly
+// named folder by ensureDirs' mkdirSync, always empty), found 0 candidates,
+// and closed 0 of N every pass while real orphans piled up. Aligning the
+// resolution with coord.js + mac-dispatcher.js makes the sweep read the same
+// registry the dispatcher writes. Doctrine:
+//   patterns/hook-substrate-must-track-canonical-host-not-corazon-ghosts-2026-06-10.md
+//   patterns/substrate-path-coupling-survives-host-swap-as-silent-no-op.md
+const COORD_ROOT = process.env.COORD_ROOT
+  || (process.platform === 'win32'
+        ? 'D:\\.code\\EcodiaOS\\coordination'
+        : path.join(os.homedir(), '.ecodiaos', 'coordination'))
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
 const STATE_DIR = path.join(COORD_ROOT, 'state')
 
@@ -1000,7 +1017,16 @@ async function cleanup_orphan_workers(params) {
              candidates: 0, closed: 0, results: [], message: 'no recent orphans with viewColumn-bearing tab_handle' }
   }
 
-  // Snapshot current tab state (single ide.tabs probe)
+  // Snapshot current tab state (single ide.tabs probe).
+  // 2026-06-20: resolve ide at call-time (require('./ide')) rather than the
+  // module-load top-level binding, mirroring kill_worker (which already does
+  // a local require). The top-level capture binds whatever was in the module
+  // cache when cowork.js first loaded; a stub installed AFTER that (the test
+  // harness patches require.cache post-require) never reaches the top-level
+  // ref, so the sweep silently probed the live IDE instead of the stub and
+  // was untestable in isolation. Call-time resolution makes the close path
+  // honour cache patches and keeps the two ide-touching close paths uniform.
+  const ide = require('./ide')
   let groups = []
   try {
     const tabsResult = await ide.tabs({})
