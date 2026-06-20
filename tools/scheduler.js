@@ -1449,9 +1449,20 @@ function parseSchedule(schedule) {
   if (daily) {
     return `${parseInt(daily[2], 10)} ${parseInt(daily[1], 10)} * * *`
   }
+  // "weekly mon 09:00" -> "MM HH * * DOW". The hour is LOCAL; cron-parser is
+  // handed { tz: 'Australia/Brisbane' } at the call site, so the local hour and
+  // local day-of-week are honoured directly (same pattern as "daily"). Stays in
+  // sync with the insert-side parsers in backend src/routes/mcp/cowork.js and
+  // mcp-servers/scheduler/index.js; all three resolve to the same instant.
+  const weekly = s.match(/^weekly\s+(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2}):(\d{2})\s*$/i)
+  if (weekly) {
+    const DOW = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 }
+    return `${parseInt(weekly[3], 10)} ${parseInt(weekly[2], 10)} * * ${DOW[weekly[1].toLowerCase()]}`
+  }
   // Assume already cron. Validate via cron-parser at the call site.
   return s
 }
+exports.parseSchedule = parseSchedule
 
 const VALID_PRIORITY_CLASSES = new Set(['normal', 'high', 'low'])
 function normalisePriorityClass(pc) {
