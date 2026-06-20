@@ -80,6 +80,18 @@ const COMPLETION_POLL_INTERVAL_MS = 5_000
 // covered by the dispatchOne running-flip lease guard, not by this window.
 const STALE_DISPATCHING_MS = 15 * 60 * 1000   // 15 min -> retry (> 600s bind timeout)
 const MAX_RETRY_COUNT = 3
+// 2026-06-19 next_run_at-recompute fix. staleLeaseRecovery branch 1 (retryable
+// stale-dispatch) used to free the row back to 'active' while leaving next_run_at
+// at its past-due value, so the row was due on the very next 30s poll and re-fired
+// off-cadence up to MAX_RETRY times. Per
+// [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]]
+// a retry must use a BOUNDED short delay, never an unbounded immediate re-due.
+// 5 min preserves up to MAX_RETRY quick re-attempts for a transient bind failure
+// (3 retries spread over ~15 min) without hammering every poll, and is short
+// enough that a genuinely-due cron loses no cadence. The leaseDueRows re-entry
+// guard is the second layer: a cron that already RAN this period is dropped from
+// dispatch regardless of how next_run_at got clobbered.
+const RETRY_BACKOFF_MS = 5 * 60 * 1000   // 5 min bounded retry delay
 // 2026-05-29 ultracode audit C3 fix. cleanup_orphan_workers is the only
 // backstop the chain's refuse-and-leak posture relies on; the audit caught
 // it wired to no cron at all. 7 min picks up leaked tabs within a worker
@@ -295,6 +307,96 @@ exports.buildBrief = function buildBrief(row) {
   return lines.join('\n')
 }
 
+// ── cron re-entry guard helpers ──────────────────────────────────────────────
+//
+// Root-cause defenses for
+// [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
+// All three are PURE and FAIL-OPEN: any parse error or missing field returns the
+// "dispatch normally" answer, so the guard can never make a row un-dispatchable.
+// Worst case a helper is a no-op; it can never stall the fleet.
+
+// True iff a cron row has already run for its current scheduled period. A row is
+// "due" in leaseDueRows when next_run_at <= NOW(); if any path clobbers next_run_at
+// into the past while last_run_at still points at the run that already happened this
+// period, the row would re-dispatch every poll. This compares last_run_at against
+// the most recent scheduled boundary at/before `now`: a legitimately-due row (boundary
+// just passed, not yet run) has last_run_at from the PRIOR period (strictly before the
+// boundary); a clobbered already-ran row has last_run_at at/after it.
+exports.cronAlreadyRanThisPeriod = function cronAlreadyRanThisPeriod(row, now) {
+  try {
+    if (!row || row.type !== 'cron' || !row.cron_expression) return false
+    if (!row.last_run_at) return false // never ran -> genuinely due
+    const ref = now instanceof Date ? now : new Date()
+    const tz = row.tz || 'Australia/Brisbane'
+    const cronExpr = parseSchedule(row.cron_expression)
+    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: ref })
+    const prevBoundary = interval.prev().toDate()
+    const lastRun = new Date(row.last_run_at)
+    if (isNaN(lastRun.getTime())) return false
+    return lastRun.getTime() >= prevBoundary.getTime()
+  } catch (_e) {
+    return false
+  }
+}
+
+// Next scheduled boundary for a cron row as an ISO string. Fails open to a 1h
+// fallback (mirrors the catch in staleLeaseRecovery branches 2a/3).
+exports.computeNextRunAt = function computeNextRunAt(row, now) {
+  const baseMs = now instanceof Date ? now.getTime() : Date.now()
+  try {
+    const tz = (row && row.tz) || 'Australia/Brisbane'
+    const cronExpr = parseSchedule(row.cron_expression)
+    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date(baseMs) })
+    return interval.next().toDate().toISOString()
+  } catch (_e) {
+    return new Date(baseMs + 60 * 60 * 1000).toISOString()
+  }
+}
+
+// Run-count anomaly detector (observability). A cron's run_count is a LIFETIME
+// counter; a value far above what the schedule could have produced since the row
+// was created is the fingerprint of off-cadence re-firing (an annual cron created
+// two weeks ago with run_count > 1 is impossible). Returns null for non-cron rows
+// or when the period can't be derived; otherwise {anomalous, runCount, expectedMax,
+// periodMs, ageMs, name, id}. Pure + fail-open.
+exports.runCountAnomalyForRow = function runCountAnomalyForRow(row, now) {
+  try {
+    if (!row || row.type !== 'cron' || !row.cron_expression) return null
+    if (!row.created_at) return null
+    const ref = now instanceof Date ? now : new Date()
+    const tz = row.tz || 'Australia/Brisbane'
+    const cronExpr = parseSchedule(row.cron_expression)
+    // Period = gap between two consecutive future occurrences. Two cheap iterations.
+    const it = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: ref })
+    const a = it.next().toDate().getTime()
+    const b = it.next().toDate().getTime()
+    const periodMs = b - a
+    if (!(periodMs > 0)) return null
+    const ageMs = ref.getTime() - new Date(row.created_at).getTime()
+    if (!(ageMs >= 0)) return null
+    // Physical maximum lifetime fires: whole periods elapsed since creation, +1
+    // for a possible fire on the creation boundary.
+    const expectedMax = Math.floor(ageMs / periodMs) + 1
+    const runCount = Number(row.run_count || 0)
+    // Alarm when run_count exceeds DOUBLE the physical maximum AND the row is
+    // still young (few periods elapsed). The young-row gate is deliberate: the
+    // bug signature is "a newly-created cron firing impossibly often" (an annual
+    // cron created two weeks ago has expectedMax=1, so run_count>=3 trips; the ten
+    // 2026-06-19 smoking guns were all <=22-day-old low-frequency crons with
+    // expectedMax=1). For a MATURE row the lifetime run_count is dominated by
+    // history and by any cron_expression edit made mid-life (live 2026-06-19:
+    // research-batch + self-evolution carry 220/153 lifetime fires against a now-
+    // weekly expression, a schedule edit, not a bug), so flagging it would be
+    // recurring noise. Capping at MAX_AUDIT_PERIODS keeps the canary to the
+    // first ~6 periods of a cron's life, where the off-cadence bug actually shows.
+    const MAX_AUDIT_PERIODS = 6
+    const anomalous = expectedMax <= MAX_AUDIT_PERIODS && runCount > expectedMax * 2
+    return { anomalous, runCount, expectedMax, periodMs, ageMs, name: row.name || null, id: row.id }
+  } catch (_e) {
+    return null
+  }
+}
+
 // ── leaseDueRows ─────────────────────────────────────────────────────────────
 //
 // Atomically transitions up to `limit` due active rows to status=dispatching
@@ -338,7 +440,41 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
     RETURNING t.*
   `
   const result = await pool.query(sql, [n, leaseId])
-  return result.rows
+
+  // Post-lease re-entry guard. The due-query above tests next_run_at <= NOW()
+  // only; a row whose next_run_at was clobbered into the past while it already
+  // ran this period (the staleLeaseRecovery branch-1 history, or any manual /
+  // script re-arm) would re-dispatch every poll. Catch it here: recompute
+  // next_run_at to the true next boundary, release the lease, and drop it from
+  // this batch. This is the clobber-source-independent layer that protects the
+  // fleet no matter HOW next_run_at got mangled. Only cron rows, only the few
+  // just leased, so the cost is negligible. The release UPDATE carries the same
+  // cancellation/pause guard as every other re-arm site, and is scoped to the
+  // row WE just leased (status='dispatching' AND leased_by=$leaseId) so a
+  // concurrent sweep cannot be clobbered.
+  // [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]]
+  const nowRef = new Date()
+  const dispatchable = []
+  for (const row of result.rows) {
+    if (exports.cronAlreadyRanThisPeriod(row, nowRef)) {
+      const nextRunAt = exports.computeNextRunAt(row, nowRef)
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'active', next_run_at = $1,
+             last_error = 'reentry-guard: already ran this period, next_run_at recomputed (clobber-safe)',
+             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+         WHERE id = $2 AND status = 'dispatching' AND leased_by = $3
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+        [nextRunAt, row.id, leaseId]
+      )
+      process.stderr.write('[scheduler] leaseDueRows: re-entry guard skipped ' + row.id +
+        ' (' + (row.name || '?') + ') - already ran this period; next_run_at -> ' + nextRunAt + '\n')
+      continue
+    }
+    dispatchable.push(row)
+  }
+  return dispatchable
 }
 
 // ── markFailed ───────────────────────────────────────────────────────────────
@@ -381,7 +517,9 @@ exports.markFailed = async function markFailed(row, err) {
         `UPDATE os_scheduled_tasks
          SET status = 'active', retry_count = 0, last_error = $1, next_run_at = $2,
              leased_by = NULL, leased_at = NULL, updated_at = NOW()
-         WHERE id = $3`,
+         WHERE id = $3
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [errMsg + ' (cron: deferred to next interval, retry_count reset)', nextRunAt, row.id]
       )
     } else {
@@ -398,7 +536,9 @@ exports.markFailed = async function markFailed(row, err) {
       `UPDATE os_scheduled_tasks
        SET status = 'active', retry_count = $1, last_error = $2,
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
-       WHERE id = $3`,
+       WHERE id = $3
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [newRetryCount, errMsg, row.id]
     )
   }
@@ -730,7 +870,9 @@ exports.markComplete = async function markComplete(row, signal) {
            run_count = run_count + 1, last_result = $2,
            retry_count = 0, leased_by = NULL, leased_at = NULL,
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
-       WHERE id = $3`,
+       WHERE id = $3
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
   } else {
@@ -869,16 +1011,24 @@ async function hasLiveWorkerForTask(taskId) {
 exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   const pool = getPool()
 
-  // 1. Stale dispatching, retryable.
+  // 1. Stale dispatching, retryable. 2026-06-19: re-arm next_run_at to a BOUNDED
+  // retry backoff (NOW + RETRY_BACKOFF_MS) instead of leaving it past-due. The old
+  // form left next_run_at untouched, so the row was due on the next 30s poll and
+  // re-fired off-cadence; this bounds the re-dispatch to once per backoff window
+  // while preserving up to MAX_RETRY quick re-attempts. See RETRY_BACKOFF_MS note
+  // and [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
   await pool.query(
     `UPDATE os_scheduled_tasks
      SET status = 'active', retry_count = retry_count + 1,
-         last_error = 'stale lease recovered',
+         last_error = 'stale lease recovered (next_run_at re-armed to bounded retry backoff)',
+         next_run_at = NOW() + ($3 || ' milliseconds')::interval,
          leased_by = NULL, leased_at = NULL, updated_at = NOW()
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
-       AND retry_count < $2`,
-    [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
+       AND retry_count < $2
+       AND archived_at IS NULL
+       AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+    [STALE_DISPATCHING_MS, MAX_RETRY_COUNT, RETRY_BACKOFF_MS]
   )
 
   // 2a. Stale dispatching, max retries exhausted, CRON row: defer to next
@@ -926,7 +1076,9 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
        SET status = 'active', retry_count = 0,
            last_error = 'stale lease - max retries exhausted (cron: deferred to next interval per doctrine)',
            next_run_at = $1, leased_by = NULL, leased_at = NULL, updated_at = NOW()
-       WHERE id = $2`,
+       WHERE id = $2
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, row.id]
     )
     // 2026-06-10 branch-thrash guard cleanup on cron-defer recovery.
@@ -1045,7 +1197,9 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
              next_run_at = $1,
              last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
              leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
-         WHERE id = $2`,
+         WHERE id = $2
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [nextRunAt, row.id]
       )
     } else {
@@ -1059,6 +1213,49 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     // 2026-06-10 branch-thrash guard cleanup on orphan + cron-defer paths.
     try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   }
+}
+
+// ── runCountAnomalyAudit ─────────────────────────────────────────────────────
+//
+// Dispatcher self-audit canary. Scans non-archived cron rows and flags any whose
+// lifetime run_count is implausibly high for the row's age given its schedule
+// (e.g. an annual cron created two weeks ago with run_count > 1). This is the
+// observability that turns the off-cadence re-fire bug from "found at the monthly
+// review" into "alarmed on day one". Read-only; returns the anomaly list and logs
+// each to stderr so the scheduler-health canary / log drain surfaces it. Per
+// [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]]
+// fix #3 and [[scheduler-health-canary-and-cron-dupe-guard-2026-06-10]].
+exports.runCountAnomalyAudit = async function runCountAnomalyAudit() {
+  const pool = getPool()
+  const ref = new Date()
+  let rows
+  try {
+    const r = await pool.query(
+      `SELECT id, name, type, cron_expression, tz, run_count, created_at
+         FROM os_scheduled_tasks
+        WHERE type = 'cron'
+          AND cron_expression IS NOT NULL
+          AND archived_at IS NULL
+          AND (last_status IS NULL OR last_status NOT IN ('cancelled'))`
+    )
+    rows = r.rows
+  } catch (e) {
+    process.stderr.write('[scheduler] runCountAnomalyAudit query error: ' + e.message + '\n')
+    return []
+  }
+  const anomalies = []
+  for (const row of rows) {
+    const a = exports.runCountAnomalyForRow(row, ref)
+    if (a && a.anomalous) {
+      anomalies.push(a)
+      process.stderr.write(
+        '[scheduler] RUN_COUNT ANOMALY ' + a.id + ' (' + (a.name || '?') + '): run_count=' +
+        a.runCount + ' expectedMax=' + a.expectedMax + ' periodMs=' + a.periodMs +
+        ' ageDays=' + (a.ageMs / 86400000).toFixed(1) + ' - off-cadence re-fire fingerprint\n'
+      )
+    }
+  }
+  return anomalies
 }
 
 // ── startupCleanup ───────────────────────────────────────────────────────────
@@ -1448,8 +1645,15 @@ exports.schedule_cancel = async function schedule_cancel(params) {
   if (!row) return { ok: false, error: 'task not found', id: p.id || null, name: p.name || null }
   const pool = getPool()
   const result = await pool.query(
+    // 2026-06-19 cancellation-durability fix: also set status='cancelled', not
+    // just last_status + archived_at. Pre-fix, a cancelled cron kept whatever
+    // status it had (often 'active'), and any re-arm UPDATE that matched BY ID
+    // without an archived_at/last_status guard would resurrect it. The guard is
+    // now applied at every status='active' re-arm site (markFailed, markComplete,
+    // staleLeaseRecovery), and status itself is made terminal here so the row is
+    // internally consistent (status agrees with last_status/archived_at).
     `UPDATE os_scheduled_tasks
-     SET archived_at = NOW(), last_status = 'cancelled', updated_at = NOW()
+     SET status = 'cancelled', archived_at = NOW(), last_status = 'cancelled', updated_at = NOW()
      WHERE id = $1
      RETURNING id, name, archived_at`,
     [row.id]
