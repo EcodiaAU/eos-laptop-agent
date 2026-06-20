@@ -24,7 +24,13 @@ const { Pool } = require('pg')
 const { execFile } = require('child_process')
 const { promisify } = require('util')
 const execFileP = promisify(execFile)
-const cronParser = require('cron-parser')
+// Single source of truth for schedule semantics (vendored byte-identical from
+// ecodiaos-backend/src/lib/schedule-core.js, pinned by schedule-core-identity.test.js).
+// Handles intervals of ANY size, daily, weekly, and raw cron. Replaced the
+// in-file parseSchedule + scattered cron-parser dances that mis-fired intervals
+// over 23h (every Nh was faked into "0 */N * * *" -> cron-parser collapsed it to
+// daily). Doctrine: scheduler-one-schedule-engine-2026-06-20.
+const scheduleCore = require('../lib/schedule-core')
 let _credsModule = require('./creds')
 function getCreds() { return _credsModule }
 exports._setCredsModule = function (m) { _credsModule = m }
@@ -172,6 +178,21 @@ async function defaultAllocateWorktreeForRow(row) {
   // Idempotent cleanup: forget any stale worktree at that path first.
   await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
   await runGit(['worktree', 'prune']).catch(() => {})
+
+  // 2026-06-20: `worktree remove --force` is a silent no-op when the path
+  // exists on disk but is no longer a REGISTERED worktree (crashed prior
+  // dispatch, or git metadata pruned out from under it). The swallowed error
+  // left the directory standing, so the `worktree add` below died with
+  // "<path> already exists" and the row fell back to an UNISOLATED shared-tree
+  // dispatch - a branch-thrash hazard that is acute when several conductor
+  // chats run concurrently. Force-clear any surviving directory so add always
+  // lands on a clean path. Same destroy-on-redispatch posture as the
+  // remove --force above (the path is keyed to THIS row.id, whose prior attempt
+  // is dead); scoped strictly under WORKTREE_ROOT as a safety bound.
+  if (fs.existsSync(wtPath) && wtPath.startsWith(WORKTREE_ROOT + path.sep)) {
+    fs.rmSync(wtPath, { recursive: true, force: true })
+    await runGit(['worktree', 'prune']).catch(() => {})
+  }
 
   // Refresh origin/main so the worktree branches off recent base.
   await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
@@ -328,9 +349,8 @@ exports.cronAlreadyRanThisPeriod = function cronAlreadyRanThisPeriod(row, now) {
     if (!row.last_run_at) return false // never ran -> genuinely due
     const ref = now instanceof Date ? now : new Date()
     const tz = row.tz || 'Australia/Brisbane'
-    const cronExpr = parseSchedule(row.cron_expression)
-    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: ref })
-    const prevBoundary = interval.prev().toDate()
+    const prevBoundary = scheduleCore.prevRun(row.cron_expression, ref, tz)
+    if (!prevBoundary) return false
     const lastRun = new Date(row.last_run_at)
     if (isNaN(lastRun.getTime())) return false
     return lastRun.getTime() >= prevBoundary.getTime()
@@ -343,14 +363,9 @@ exports.cronAlreadyRanThisPeriod = function cronAlreadyRanThisPeriod(row, now) {
 // fallback (mirrors the catch in staleLeaseRecovery branches 2a/3).
 exports.computeNextRunAt = function computeNextRunAt(row, now) {
   const baseMs = now instanceof Date ? now.getTime() : Date.now()
-  try {
-    const tz = (row && row.tz) || 'Australia/Brisbane'
-    const cronExpr = parseSchedule(row.cron_expression)
-    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date(baseMs) })
-    return interval.next().toDate().toISOString()
-  } catch (_e) {
-    return new Date(baseMs + 60 * 60 * 1000).toISOString()
-  }
+  const tz = (row && row.tz) || 'Australia/Brisbane'
+  const d = scheduleCore.nextRun(row && row.cron_expression, new Date(baseMs), tz)
+  return d ? d.toISOString() : new Date(baseMs + 60 * 60 * 1000).toISOString()
 }
 
 // Run-count anomaly detector (observability). A cron's run_count is a LIFETIME
@@ -365,12 +380,8 @@ exports.runCountAnomalyForRow = function runCountAnomalyForRow(row, now) {
     if (!row.created_at) return null
     const ref = now instanceof Date ? now : new Date()
     const tz = row.tz || 'Australia/Brisbane'
-    const cronExpr = parseSchedule(row.cron_expression)
-    // Period = gap between two consecutive future occurrences. Two cheap iterations.
-    const it = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: ref })
-    const a = it.next().toDate().getTime()
-    const b = it.next().toDate().getTime()
-    const periodMs = b - a
+    // Period = gap between two consecutive occurrences (interval ms, or two cron iterations).
+    const periodMs = scheduleCore.periodMs(row.cron_expression, tz)
     if (!(periodMs > 0)) return null
     const ageMs = ref.getTime() - new Date(row.created_at).getTime()
     if (!(ageMs >= 0)) return null
@@ -501,15 +512,7 @@ exports.markFailed = async function markFailed(row, err) {
     if (row.type === 'cron' && row.cron_expression) {
       let nextRunAt = null
       try {
-        const tz = row.tz || 'Australia/Brisbane'
-        // 2026-06-03: translate friendly aliases ("every 4h", "daily 20:00")
-        // via parseSchedule before handing to cron-parser. Rows inserted
-        // before the parseSchedule INSERT-side translation landed (or via
-        // direct SQL) store the raw alias; cron-parser cannot parse those
-        // and silently leaves nextRunAt=null.
-        const cronExpr = parseSchedule(row.cron_expression)
-        const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-        nextRunAt = interval.next().toDate().toISOString()
+        nextRunAt = exports.computeNextRunAt(row)
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }
@@ -856,11 +859,7 @@ exports.markComplete = async function markComplete(row, signal) {
     // by 10h. Phase A1 unification: every cron carries its own tz column.
     let nextRunAt = null
     try {
-      const tz = row.tz || 'Australia/Brisbane'
-      // 2026-06-03: friendly-alias translation (see markFailed for rationale).
-      const cronExpr = parseSchedule(row.cron_expression)
-      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-      nextRunAt = interval.next().toDate().toISOString()
+      nextRunAt = exports.computeNextRunAt(row)
     } catch (cronErr) {
       process.stderr.write('[scheduler] cron-parser error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
     }
@@ -1064,10 +1063,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     }
     let nextRunAt = null
     try {
-      const tz = row.tz || 'Australia/Brisbane'
-      const cronExpr = parseSchedule(row.cron_expression)
-      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-      nextRunAt = interval.next().toDate().toISOString()
+      nextRunAt = exports.computeNextRunAt(row)
     } catch (_e) {
       nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
     }
@@ -1184,10 +1180,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     if (row.type === 'cron' && row.cron_expression) {
       let nextRunAt = null
       try {
-        const tz = row.tz || 'Australia/Brisbane'
-        const cronExpr = parseSchedule(row.cron_expression)
-        const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-        nextRunAt = interval.next().toDate().toISOString()
+        nextRunAt = exports.computeNextRunAt(row)
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }
@@ -1433,34 +1426,18 @@ function parseDelay(delay) {
 //   'every 1h' / 'every 30m' / 'every 10s' (every <N>[smh])
 //   'daily 09:00' / 'daily 23:30'
 //   already-raw 5- or 6-field cron: passes through
+// Back-compat shim. The real schedule semantics live in scheduleCore now; this
+// only survives for external callers/tests that expect the cron STRING form of a
+// cron-kind schedule. Intervals ("every 72h") are NOT cron, so the shim returns
+// them unchanged rather than faking a (broken) "0 */N * * *". Internal next-run
+// computation no longer goes through here; it uses scheduleCore directly.
 function parseSchedule(schedule) {
   if (!schedule || typeof schedule !== 'string') {
     throw new Error('schedule required (string)')
   }
-  const s = schedule.trim()
-  const every = s.match(/^every\s+(\d+)\s*([mh])\s*$/i)
-  if (every) {
-    const n = parseInt(every[1], 10)
-    const unit = every[2].toLowerCase()
-    if (unit === 'h') return `0 */${n} * * *`
-    return `*/${n} * * * *`
-  }
-  const daily = s.match(/^daily\s+(\d{1,2}):(\d{2})\s*$/i)
-  if (daily) {
-    return `${parseInt(daily[2], 10)} ${parseInt(daily[1], 10)} * * *`
-  }
-  // "weekly mon 09:00" -> "MM HH * * DOW". The hour is LOCAL; cron-parser is
-  // handed { tz: 'Australia/Brisbane' } at the call site, so the local hour and
-  // local day-of-week are honoured directly (same pattern as "daily"). Stays in
-  // sync with the insert-side parsers in backend src/routes/mcp/cowork.js and
-  // mcp-servers/scheduler/index.js; all three resolve to the same instant.
-  const weekly = s.match(/^weekly\s+(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2}):(\d{2})\s*$/i)
-  if (weekly) {
-    const DOW = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 }
-    return `${parseInt(weekly[3], 10)} ${parseInt(weekly[2], 10)} * * ${DOW[weekly[1].toLowerCase()]}`
-  }
-  // Assume already cron. Validate via cron-parser at the call site.
-  return s
+  const c = scheduleCore.classify(schedule)
+  if (c && c.kind === 'cron') return c.cron
+  return schedule.trim()
 }
 exports.parseSchedule = parseSchedule
 
@@ -1523,19 +1500,19 @@ exports.schedule_cron = async function schedule_cron(params) {
   const p = params || {}
   if (!p.name || typeof p.name !== 'string') throw new Error('name required (string)')
   if (!p.prompt || typeof p.prompt !== 'string') throw new Error('prompt required (string)')
-  const cronExpr = parseSchedule(p.schedule)
+  if (!scheduleCore.isValid(p.schedule)) {
+    throw new Error('invalid schedule: "' + p.schedule + '" (use "every Xm|h", "daily HH:MM", "weekly <mon-sun> HH:MM", or a raw cron expression)')
+  }
   const tz = p.tz || 'Australia/Brisbane'
   const priorityClass = normalisePriorityClass(p.priority_class)
   const priority = priorityForClass(priorityClass)
 
-  // Compute first next_run_at via cron-parser with the row's tz.
-  let firstRun
-  try {
-    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date() })
-    firstRun = interval.next().toDate()
-  } catch (e) {
-    throw new Error('invalid cron expression "' + cronExpr + '": ' + e.message)
-  }
+  // Store the schedule AS GIVEN. The shared engine reads aliases and raw cron
+  // alike; intervals ("every 72h") cannot be expressed as cron so must not be
+  // normalised. Compute the first next_run_at via the same engine the rearm uses.
+  const cronExpr = String(p.schedule).trim()
+  const firstRun = scheduleCore.nextRun(p.schedule, new Date(), tz)
+  if (!firstRun) throw new Error('invalid schedule (could not compute next run): "' + p.schedule + '"')
 
   const pool = getPool()
   const sql = `
@@ -1722,11 +1699,7 @@ exports.schedule_resume = async function schedule_resume(params) {
   let nextRunAt = new Date()
   if (row.type === 'cron' && row.cron_expression) {
     try {
-      const tz = row.tz || 'Australia/Brisbane'
-      // 2026-06-03: friendly-alias translation (see markFailed for rationale).
-      const cronExpr = parseSchedule(row.cron_expression)
-      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date() })
-      nextRunAt = interval.next().toDate()
+      nextRunAt = new Date(exports.computeNextRunAt(row))
     } catch (cronErr) {
       process.stderr.write('[scheduler] schedule_resume cron-parse error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
     }
