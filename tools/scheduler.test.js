@@ -480,13 +480,13 @@ test('dispatchOne no-IDE error: defers row 5min, does not mark failed, does not 
     threw = true
   }
 
-  // Find the defer UPDATE (status=active + next_run_at + last_error mentioning IDE bridge).
+  // Find the defer UPDATE (status=active + next_run_at + last_error mentioning the transient bridge marker).
   const deferUpdate = pool._queries.find(q =>
     q.sql.includes("status = 'active'") &&
     q.sql.includes('next_run_at') &&
-    q.params.some(p => typeof p === 'string' && p.includes('no IDE bridge registered'))
+    q.params.some(p => typeof p === 'string' && p.includes('transient IDE-bridge error'))
   )
-  assert(!!deferUpdate, 'dispatchOne no-IDE: defer UPDATE landed with next_run_at + IDE bridge marker')
+  assert(!!deferUpdate, 'dispatchOne no-IDE: defer UPDATE landed with next_run_at + transient bridge marker')
   assert(threw, 'dispatchOne no-IDE: still re-throws so dispatch loop logs')
 
   // CRITICAL: retry_count must NOT be incremented (no $1 = retry_count in defer UPDATE).
@@ -494,6 +494,42 @@ test('dispatchOne no-IDE error: defers row 5min, does not mark failed, does not 
     q.sql.includes('retry_count = $1') && q.sql.includes("status = 'failed'")
   )
   assert(!markFailedUpdate, 'dispatchOne no-IDE: row was NOT marked failed (cron survives IDE gap)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+})
+
+test('dispatchOne transient SOCKET error: one-shot row at MAX retries defers, NOT permanent-fail (audit fix c)', async () => {
+  // The 2026-06-20 regression: a socket-class IDE-bridge blip ("populate failed
+  // (editor.open): socket hang up") on a ONE-SHOT/delayed row whose retry_count
+  // is already at MAX would fall through to markFailed -> status='failed',
+  // silently losing the scheduled work. With isTransientBridgeError it must
+  // defer instead (no retry burn, no fail).
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'tate'
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'tate' })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async () => ({ ok: false, tab_id: null, error: 'dispatch_worker failed: populate failed (editor.open): socket hang up' }),
+    kill_worker: async () => {},
+  })
+
+  // type=delayed (one-shot), retry_count already at MAX-1 so the next fail would be permanent under old code.
+  const row = makeRow({ id: 'task-socket-oneshot', type: 'delayed', cron_expression: null, retry_count: 2 })
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true }
+
+  const deferUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at') &&
+    q.params.some(p => typeof p === 'string' && p.includes('transient IDE-bridge error')))
+  assert(!!deferUpdate, 'socket-class error on one-shot row DEFERS (status=active + next_run_at)')
+  const failedUpdate = pool._queries.find(q => q.sql.includes("status = 'failed'"))
+  assert(!failedUpdate, 'socket-class error on one-shot row was NOT permanently failed (the bug)')
+  assert(threw, 're-throws so the dispatch loop logs')
 
   credsModule.pick_healthiest_account = origPick
   credsModule.rotate_to = origRotate
@@ -1117,6 +1153,25 @@ test('checkCapWarning: cooldown prevents double-fire within 1h', async () => {
   assert(second.skipped === 'cooldown', 'second call within cooldown is skipped')
   const insertCalls = stubPool._queries.filter(q => q.sql.includes('INSERT INTO observer_signals'))
   assert(insertCalls.length === 1, 'exactly one INSERT despite two calls')
+})
+
+test('isTransientBridgeError: classifies IDE-bridge socket blips as transient, real faults as not', async () => {
+  // 2026-06-20 audit finding (c). Before this, only the literal
+  // "no IDE instances registered" string deferred; socket-class errors fell to
+  // markFailed and permanently failed one-shot/delayed rows on a transient blip.
+  assert(scheduler.isTransientBridgeError('dispatch_worker failed: populate failed (editor.open): socket hang up') === true,
+    'editor.open socket hang up -> transient')
+  assert(scheduler.isTransientBridgeError('no IDE instances registered') === true,
+    'no IDE instances registered -> transient (back-compat)')
+  assert(scheduler.isTransientBridgeError('connect ECONNRESET 127.0.0.1:8099') === true,
+    'ECONNRESET -> transient')
+  assert(scheduler.isTransientBridgeError('connect ECONNREFUSED 127.0.0.1:8099') === true,
+    'ECONNREFUSED -> transient')
+  assert(scheduler.isTransientBridgeError("worktree allocation failed: already exists") === false,
+    'worktree already-exists -> NOT transient (real, now self-healed in allocator)')
+  assert(scheduler.isTransientBridgeError('TypeError: cannot read properties of undefined') === false,
+    'code bug -> NOT transient')
+  assert(scheduler.isTransientBridgeError('') === false, 'empty -> NOT transient')
 })
 
 // ── sequential test runner ────────────────────────────────────────────────────

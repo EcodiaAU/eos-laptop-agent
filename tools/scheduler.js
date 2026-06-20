@@ -1868,6 +1868,26 @@ exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
   tally.scanned = entries.length
   if (!entries.length) return tally
 
+  // Coord live-worker set, fetched ONCE. FAIL SAFE: if coord is unreachable we
+  // cannot tell which worktrees belong to running workers, so we reap NOTHING
+  // this pass (the opposite of hasLiveWorkerForTask's fail-open - here a missed
+  // live worker means destroying its tree, which is worse than skipping a GC).
+  // 2026-06-20: the DB status/lease check ALONE missed the live coord worker
+  // 3222c393 (its os_scheduled_tasks row was not running/fresh-leased but its
+  // heartbeat was alive); the dry-run caught it before any deletion.
+  const liveIds = new Set()
+  try {
+    const r = await getCoord().list_workers({})
+    for (const w of ((r && r.workers) || [])) {
+      if (w.terminated_at || w.dead) continue
+      if (typeof w.stale_ms === 'number' && w.stale_ms >= STALE_WORKER_LIVENESS_MS) continue
+      if (w.task_id) liveIds.add(String(w.task_id))
+    }
+  } catch (e) {
+    process.stderr.write('[scheduler] reapOrphanWorktrees: coord unavailable, reaping nothing (fail-safe): ' + (e && e.message) + '\n')
+    return tally
+  }
+
   await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
   const registered = new Set()
   try {
@@ -1882,7 +1902,10 @@ exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
     const wtPath = path.join(WORKTREE_ROOT, id)
     if (!wtPath.startsWith(WORKTREE_ROOT + path.sep)) continue // safety bound
 
-    // Liveness: running row or fresh lease -> never touch.
+    // Liveness gate 1: a live coord worker (fresh heartbeat) owns this dir.
+    if (liveIds.has(id)) { tally.skippedLive++; continue }
+
+    // Liveness gate 2: running row or fresh lease -> never touch.
     let live = false
     try {
       const r = await pool.query(
