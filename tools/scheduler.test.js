@@ -341,6 +341,90 @@ test('dispatchOne: tolerates worktree allocate failure (proceeds without isolate
   scheduler._resetWorktreeFns()
 })
 
+// ── 2026-06-20 bind-time cancellation guard (continuity item 247058ac) ───────
+// Closes the dispatching-to-tab-open window: a row cancelled/archived after
+// leaseDueRows but before bind must NOT be marked running, and the worker must
+// be stood down. makeStubPool returns its seed rows for the SELECT re-check.
+
+test('dispatchOne: cancelled-mid-dispatch row is NOT marked running and worker is stood down', async () => {
+  // Re-check SELECT returns a row that has since been cancelled.
+  const pool = makeStubPool([{ status: 'dispatching', last_status: 'cancelled', archived_at: null }])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'code'
+  credsModule.rotate_to = async (acct) => ({ previous: 'tate', current: acct })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => ({ ok: true, tab_id: 'tab_cancel_test', task_id: params.task_id }),
+    kill_worker: async () => {},
+  })
+
+  const origPeekInbox = coordModule.peek_inbox
+  const origReadInbox = coordModule.read_inbox
+  const origSend = coordModule.send_message
+  coordModule.peek_inbox = async () => ({ messages: [{ body: { type: 'bound', task_id: 'task-cancel-mid' } }] })
+  coordModule.read_inbox = async () => ({ messages: [] })
+  let standDown = null
+  coordModule.send_message = async (m) => { if (m && m.body && m.body.type === 'stand_down') standDown = m; return { message_id: 'm1' } }
+
+  const row = makeRow({ id: 'task-cancel-mid', preferred_account: 'code' })
+
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [cancel-guard threw]:', e.message) }
+
+  assert(!threw, 'dispatchOne cancel-guard: no throw')
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!runningUpdate, 'dispatchOne cancel-guard: row NOT marked running')
+  assert(!!standDown, 'dispatchOne cancel-guard: stand_down message sent to worker')
+  assert(standDown && standDown.to === 'chat.tab_cancel_test.inbox', 'dispatchOne cancel-guard: stand_down addressed to the worker tab inbox')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+  coordModule.peek_inbox = origPeekInbox
+  coordModule.read_inbox = origReadInbox
+  coordModule.send_message = origSend
+})
+
+test('dispatchOne: archived-mid-dispatch row (archived_at set) is NOT marked running', async () => {
+  const pool = makeStubPool([{ status: 'dispatching', last_status: null, archived_at: '2026-06-20T16:00:00Z' }])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'code'
+  credsModule.rotate_to = async (acct) => ({ previous: 'tate', current: acct })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => ({ ok: true, tab_id: 'tab_arch_test', task_id: params.task_id }),
+    kill_worker: async () => {},
+  })
+
+  const origPeekInbox = coordModule.peek_inbox
+  const origReadInbox = coordModule.read_inbox
+  const origSend = coordModule.send_message
+  coordModule.peek_inbox = async () => ({ messages: [{ body: { type: 'bound', task_id: 'task-arch-mid' } }] })
+  coordModule.read_inbox = async () => ({ messages: [] })
+  coordModule.send_message = async () => ({ message_id: 'm1' })
+
+  const row = makeRow({ id: 'task-arch-mid', preferred_account: 'code' })
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true }
+
+  assert(!threw, 'dispatchOne archive-guard: no throw')
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!runningUpdate, 'dispatchOne archive-guard: archived row NOT marked running')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+  coordModule.peek_inbox = origPeekInbox
+  coordModule.read_inbox = origReadInbox
+  coordModule.send_message = origSend
+})
+
 test('markComplete: calls pruneWorktreeForRow', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)

@@ -487,12 +487,73 @@ exports.dispatchOne = async function dispatchOne(row) {
       await new Promise(r => setTimeout(r, 1000))
     }
 
+    // 4b. Bind-time cancellation guard (2026-06-20, continuity item 247058ac).
+    // Closes the dispatching-to-tab-open window. Between leaseDueRows marking
+    // this row status='dispatching' and the worker reaching this point, the row
+    // can be cancelled (schedule_cancel sets last_status='cancelled') or archived
+    // (archived_at set). Without this guard dispatchOne would still mark it
+    // status='running' below and the worker would do zombie work on a cancelled
+    // task - the signal_bound-timeout dispatch storm this item names. Re-check
+    // the row at bind time and, if it is now cancelled/archived, skip the running
+    // transition and stand the worker down.
+    // FAIL-OPEN by design: no matching row (ad-hoc / non-scheduler dispatch) or a
+    // re-check error falls through to the normal running transition. The guard
+    // only ever SUPPRESSES a running transition for a provably-cancelled row; it
+    // never fabricates one, so it cannot break workers dispatched outside
+    // os_scheduled_tasks.
+    let cancelledMidDispatch = false
+    try {
+      const chk = await pool.query(
+        `SELECT status, last_status, archived_at FROM os_scheduled_tasks WHERE id = $1`,
+        [row.id]
+      )
+      const cur = chk && chk.rows && chk.rows[0]
+      if (cur && (cur.archived_at != null || cur.last_status === 'cancelled')) {
+        cancelledMidDispatch = true
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] dispatchOne: bind-time cancel re-check failed for ' + row.id + ': ' + (e && e.message || e) + ' (failing open, proceeding to running)\n')
+    }
+
+    if (cancelledMidDispatch) {
+      process.stderr.write('[scheduler] dispatchOne: task ' + row.id + ' cancelled/archived mid-dispatch; skipping status=running, standing down tab ' + tabId + '\n')
+      // Tell the worker to stand down so it exits cleanly instead of doing work.
+      try {
+        await coord.send_message({
+          to: 'chat.' + tabId + '.inbox',
+          body: { type: 'stand_down', task_id: String(row.id), reason: 'task-cancelled-mid-dispatch' },
+          task_id: String(row.id),
+        })
+      } catch (e) {
+        process.stderr.write('[scheduler] dispatchOne: stand_down send failed for ' + row.id + ': ' + (e && e.message || e) + '\n')
+      }
+      // Release the lease so the row does not linger stuck in status='dispatching'.
+      // Guarded WHERE keeps this terminal: only a still-cancelled/archived row is
+      // touched, and we never resurrect it to active.
+      try {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET leased_by = NULL, leased_at = NULL, dispatched_tab_id = $1, updated_at = NOW()
+           WHERE id = $2 AND (archived_at IS NOT NULL OR last_status = 'cancelled')`,
+          [tabId, row.id]
+        )
+      } catch (e) {
+        process.stderr.write('[scheduler] dispatchOne: lease-release after cancel failed for ' + row.id + ': ' + (e && e.message || e) + '\n')
+      }
+      return  // do NOT mark running; finally{} still releases the launch-lock
+    }
+
     // 5. Update row to running.
+    // The WHERE guard is an atomic backstop for the bind-time guard above: if a
+    // cancel/archive lands in the microsecond TOCTOU window between the re-check
+    // and this write, the UPDATE matches 0 rows rather than reviving a dead task.
     await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'running', actual_account = $1, dispatched_tab_id = $2,
            leased_at = NOW(), updated_at = NOW()
-       WHERE id = $3`,
+       WHERE id = $3
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status <> 'cancelled')`,
       [account, tabId, row.id]
     )
 
