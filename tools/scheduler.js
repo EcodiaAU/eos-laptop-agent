@@ -434,7 +434,13 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
       WHERE status = 'active'
         AND archived_at IS NULL
         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))
-        AND austerity_paused IS NOT TRUE
+        -- Austerity suppresses RECURRING crons only. One-shot delayed/chain/followup
+        -- rows have no austerity band (L4 doctrine: "only one-off delayed tasks +
+        -- followups" fire = delayed tasks survive at EVERY level), so the marker must
+        -- never strand them. Without the type guard, a stray marker on a delayed row
+        -- (a manual bulk UPDATE over-reaching, as happened 2026-06-15) excludes it
+        -- forever because the cron-only austerity resume sweep can never clear it.
+        AND (austerity_paused IS NOT TRUE OR type <> 'cron')
         AND (next_run_at IS NULL OR next_run_at <= NOW())
         AND (chain_after IS NULL OR next_run_at IS NOT NULL)
       ORDER BY priority ASC, next_run_at ASC NULLS FIRST
@@ -545,6 +551,23 @@ exports.markFailed = async function markFailed(row, err) {
       [newRetryCount, errMsg, row.id]
     )
   }
+}
+
+// ── isTransientBridgeError ───────────────────────────────────────────────────
+//
+// 2026-06-20 autonomy audit finding (c). The dispatch_worker editor.open path
+// can fail not only with "no IDE instances registered" (no IDE bound) but with
+// a socket-class error when the IDE bridge blips mid-open: "populate failed
+// (editor.open): socket hang up", ECONNRESET, ECONNREFUSED, ETIMEDOUT, EPIPE.
+// All are TRANSIENT infra unavailability, not a task fault. Before this fix only
+// the literal "no IDE instances registered" string got the gentle 5min defer;
+// the socket-class errors fell through to markFailed, which PERMANENTLY fails a
+// one-shot / delayed row once retry_count hits MAX (silent loss of scheduled
+// work - the self-scheduling backbone). Classify all of them as transient so
+// dispatchOne defers instead of failing.
+const _TRANSIENT_BRIDGE_RE = /(no IDE instances registered|populate failed|editor\.open|socket hang up|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EPIPE|socket disconnected|bridge (?:unavailable|timeout))/i
+exports.isTransientBridgeError = function isTransientBridgeError(msg) {
+  return _TRANSIENT_BRIDGE_RE.test(String(msg || ''))
 }
 
 // ── dispatchOne ──────────────────────────────────────────────────────────────
@@ -764,13 +787,18 @@ exports.dispatchOne = async function dispatchOne(row) {
       } catch (pgErr) {
         process.stderr.write('[scheduler] markFailed pg error: ' + pgErr.message + '\n')
       }
-    } else if (errMsg.includes('no IDE instances registered')) {
-      // 2026-06-02 P0 fix. The dispatch_worker editor.open path throws this when
-      // no VS Code / Cursor / Insiders instance has registered the ecodia-preview
-      // extension with the laptop-agent bridge. This is TRANSIENT (Tate closes
-      // the IDE, machine reboots, extension reloads). Treat it the same way as
-      // AllAccountsCappedError: defer ~5min, do NOT increment retry_count, do
-      // NOT mark failed. The cron survives the gap window naturally.
+    } else if (exports.isTransientBridgeError(errMsg)) {
+      // 2026-06-02 P0 fix, broadened 2026-06-20 (audit finding c). The
+      // dispatch_worker editor.open path throws a transient error when no IDE has
+      // registered the bridge ("no IDE instances registered") OR when the bridge
+      // socket blips mid-open ("populate failed (editor.open): socket hang up",
+      // ECONNRESET, ECONNREFUSED, ETIMEDOUT, EPIPE). All are TRANSIENT infra
+      // unavailability (Tate closes the IDE, machine sleeps, extension reloads,
+      // bridge restarts), not a task fault. Treat like AllAccountsCappedError:
+      // defer ~5min, do NOT increment retry_count, do NOT mark failed - for cron
+      // AND one-shot/delayed rows alike (the latter would otherwise burn retries
+      // to a permanent status='failed' on a transient blip and silently lose the
+      // scheduled work). The row survives the gap window naturally.
       const deferMs = 5 * 60 * 1000
       const nextRun = new Date(Date.now() + deferMs)
       try {
@@ -779,10 +807,10 @@ exports.dispatchOne = async function dispatchOne(row) {
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
            WHERE id = $3`,
-          [nextRun.toISOString(), 'no IDE bridge registered - deferred 5min', row.id]
+          [nextRun.toISOString(), 'transient IDE-bridge error - deferred 5min (' + errMsg.slice(0, 80) + ')', row.id]
         )
       } catch (pgErr) {
-        process.stderr.write('[scheduler] no-IDE defer pg error: ' + pgErr.message + '\n')
+        process.stderr.write('[scheduler] transient-bridge defer pg error: ' + pgErr.message + '\n')
       }
     } else {
       try {
@@ -1815,6 +1843,84 @@ exports._priorityForClass = priorityForClass
 exports._toAestIso = toAestIso
 exports._resolveRow = _resolveRow
 
+// ── reapOrphanWorktrees ──────────────────────────────────────────────────────
+//
+// 2026-06-20 autonomy audit finding (b). Standing GC for leaked dispatched-worker
+// worktrees. pruneWorktreeForRow only fires on a row's OWN completion / failure /
+// recovery, so a crashed worker or a dispatcher restart mid-dispatch leaks its
+// dir forever (5.0 GB / 70 dirs observed 2026-06-20). This sweeps WORKTREE_ROOT
+// on boot and removes ONLY dirs that provably cannot lose work and are not live:
+//   - the row is not running and not freshly leased (< REAP_LIVE_GRACE_MS), AND
+//   - it is a REGISTERED worktree whose worker/<id> branch is fully merged into
+//     origin/main AND whose working tree is clean (git status --porcelain empty).
+// Unregistered leftover dirs and any dir with unpushed commits / uncommitted
+// changes / a live lease are PRESERVED (worktree work must be pushed before
+// removal, never orphaned). Best-effort and fully tolerant; returns a tally.
+const REAP_LIVE_GRACE_MS = 30 * 60 * 1000
+exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
+  const dryRun = !!(opts && opts.dryRun)
+  const tally = { scanned: 0, reaped: 0, preserved: 0, skippedLive: 0, reapedIds: [] }
+  let entries = []
+  try {
+    entries = fs.readdirSync(WORKTREE_ROOT, { withFileTypes: true })
+      .filter(d => d.isDirectory()).map(d => d.name)
+  } catch (_e) { return tally }
+  tally.scanned = entries.length
+  if (!entries.length) return tally
+
+  await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
+  const registered = new Set()
+  try {
+    const out = await runGit(['worktree', 'list', '--porcelain'])
+    for (const line of String((out && out.stdout) || out || '').split('\n')) {
+      if (line.startsWith('worktree ')) registered.add(line.slice('worktree '.length).trim())
+    }
+  } catch (_e) {}
+
+  const pool = getPool()
+  for (const id of entries) {
+    const wtPath = path.join(WORKTREE_ROOT, id)
+    if (!wtPath.startsWith(WORKTREE_ROOT + path.sep)) continue // safety bound
+
+    // Liveness: running row or fresh lease -> never touch.
+    let live = false
+    try {
+      const r = await pool.query(
+        `SELECT status, leased_at FROM os_scheduled_tasks WHERE id = $1`, [id])
+      const row = r.rows[0]
+      if (row) {
+        if (row.status === 'running') live = true
+        if (row.leased_at && (Date.now() - new Date(row.leased_at).getTime()) < REAP_LIVE_GRACE_MS) live = true
+      }
+    } catch (_e) { live = true } // fail safe: cannot confirm dead -> keep
+    if (live) { tally.skippedLive++; continue }
+
+    // Safe-to-drop: registered + branch merged + working tree clean. Anything
+    // else (unregistered leftover, unpushed branch, dirty tree) is preserved.
+    if (!registered.has(wtPath)) { tally.preserved++; continue }
+    const merged = await runGit(['merge-base', '--is-ancestor', 'worker/' + id, 'origin/main'])
+      .then(() => true).catch(() => false)
+    if (!merged) { tally.preserved++; continue }
+    let clean = false
+    try {
+      const st = await execFileP('git', ['-C', wtPath, 'status', '--porcelain'], { timeout: WORKTREE_GIT_TIMEOUT_MS })
+      clean = !String((st && st.stdout) || '').trim()
+    } catch (_e) { clean = false }
+    if (!clean) { tally.preserved++; continue }
+
+    if (dryRun) { tally.reaped++; tally.reapedIds.push(id); continue }
+    await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
+    await runGit(['worktree', 'prune']).catch(() => {})
+    if (fs.existsSync(wtPath)) {
+      try { fs.rmSync(wtPath, { recursive: true, force: true }) } catch (_e) {}
+      await runGit(['worktree', 'prune']).catch(() => {})
+    }
+    await runGit(['branch', '-D', 'worker/' + id]).catch(() => {})
+    tally.reaped++; tally.reapedIds.push(id)
+  }
+  return tally
+}
+
 // ── start ────────────────────────────────────────────────────────────────────
 //
 // Starts all three intervals plus the usage-cap observer. Wraps each in
@@ -1826,6 +1932,17 @@ exports.start = function start() {
   // Non-blocking startup cleanup.
   exports.startupCleanup().catch(e => {
     process.stderr.write('[scheduler] startupCleanup error: ' + e.message + '\n')
+  })
+
+  // Non-blocking orphan-worktree GC (2026-06-20 audit finding b). Conservative:
+  // only reaps registered worktrees whose branch is merged + tree is clean + not
+  // live; preserves everything else. Boot cadence (restarts are the natural GC
+  // point); idempotent.
+  exports.reapOrphanWorktrees().then(t => {
+    process.stderr.write('[scheduler] reapOrphanWorktrees: scanned=' + t.scanned +
+      ' reaped=' + t.reaped + ' preserved=' + t.preserved + ' skippedLive=' + t.skippedLive + '\n')
+  }).catch(e => {
+    process.stderr.write('[scheduler] reapOrphanWorktrees error: ' + e.message + '\n')
   })
 
   // Dispatch loop.
