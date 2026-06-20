@@ -1038,25 +1038,57 @@ async function hasLiveWorkerForTask(taskId) {
 exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   const pool = getPool()
 
-  // 1. Stale dispatching, retryable. 2026-06-19: re-arm next_run_at to a BOUNDED
-  // retry backoff (NOW + RETRY_BACKOFF_MS) instead of leaving it past-due. The old
-  // form left next_run_at untouched, so the row was due on the next 30s poll and
-  // re-fired off-cadence; this bounds the re-dispatch to once per backoff window
-  // while preserving up to MAX_RETRY quick re-attempts. See RETRY_BACKOFF_MS note
-  // and [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
-  await pool.query(
-    `UPDATE os_scheduled_tasks
-     SET status = 'active', retry_count = retry_count + 1,
-         last_error = 'stale lease recovered (next_run_at re-armed to bounded retry backoff)',
-         next_run_at = NOW() + ($3 || ' milliseconds')::interval,
-         leased_by = NULL, leased_at = NULL, updated_at = NOW()
+  // 1. Stale dispatching, retryable. 2026-06-21 reclaim-vs-bind race fix
+  // (status_board 128b7c82): converted from a bulk UPDATE to SELECT + per-row
+  // UPDATE so this branch consults coord worker liveness BEFORE reclaiming, exactly
+  // as branches 2a/2b/3 already do. The bulk form reclaimed ANY dispatching row
+  // whose leased_at aged past STALE_DISPATCHING_MS (15min) with NO liveness check,
+  // but the observed p99 cold-bind tail (~21min, see the SIGNAL_BOUND_TIMEOUT_MS
+  // note above) EXCEEDS that window: a slow-but-live worker still inside its
+  // legitimate bind / early-work window had its lease freed, next_run_at re-armed,
+  // retry_count bumped, and the next 30s poll re-dispatched the SAME task while the
+  // first worker was still alive. dispatchOne's running-flip guard only blocks the
+  // zombie half-state; it does NOT stop the duplicate re-dispatch, so the fleet
+  // thrashed ('stale lease recovered' grew to 48 active rows 2026-06-20 even after
+  // a mitigation restart). Per [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]]
+  // a guard wired into N parallel branches must cover ALL branches of the same
+  // routine; branch 1 was the one staleLeaseRecovery branch the liveness gate was
+  // never wired into (the comment in branch 3 below even mis-stated it as already
+  // covering "branches 1 + 2a + 2b"). A genuinely dead worker (heartbeat stale
+  // >= STALE_WORKER_LIVENESS_MS, or no worker row at all) still reclaims. next_run_at
+  // re-arm is unchanged: BOUNDED retry backoff per RETRY_BACKOFF_MS +
+  // [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
+  const staleRetryableRows = await pool.query(
+    `SELECT id, name FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
        AND retry_count < $2
        AND archived_at IS NULL
        AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
-    [STALE_DISPATCHING_MS, MAX_RETRY_COUNT, RETRY_BACKOFF_MS]
+    [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
+  for (const row of staleRetryableRows.rows) {
+    const liveWorker = await hasLiveWorkerForTask(row.id)
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping stale-lease retry reclaim\n'
+      )
+      continue
+    }
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET status = 'active', retry_count = retry_count + 1,
+           last_error = 'stale lease recovered (next_run_at re-armed to bounded retry backoff)',
+           next_run_at = NOW() + ($2 || ' milliseconds')::interval,
+           leased_by = NULL, leased_at = NULL, updated_at = NOW()
+       WHERE id = $1
+         AND status = 'dispatching'
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+      [row.id, RETRY_BACKOFF_MS]
+    )
+  }
 
   // 2a. Stale dispatching, max retries exhausted, CRON row: defer to next
   // scheduled interval and reset retry_count per

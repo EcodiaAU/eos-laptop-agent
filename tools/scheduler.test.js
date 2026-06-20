@@ -767,8 +767,12 @@ test('completionPass: stale done (created_at < leased_at) does NOT complete (fre
 // 2026-06-10: shape changed after the per-row coord-liveness gate landed.
 // Branch 2b (non-cron max-retry) converted from a bulk UPDATE to SELECT +
 // per-row UPDATE so each row can be skipped if a live worker tab is still
-// heartbeating. With empty stub rows, the new shape emits 4 queries
-// (1 bulk UPDATE + 3 SELECTs), not 3.
+// heartbeating.
+// 2026-06-21: branch 1 (retryable stale-dispatch) converted the SAME way for the
+// reclaim-vs-bind race fix (status_board 128b7c82) - it now SELECTs the stale
+// rows then liveness-gates each per-row UPDATE. With empty stub rows all four
+// branches are SELECT-only, so the routine emits 4 SELECTs (no per-row UPDATE),
+// still exactly 4 queries.
 
 test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () => {
   const pool = makeStubPool([])
@@ -779,13 +783,18 @@ test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () =>
 
   assert(pool._queries.length === 4, 'staleLeaseRecovery: exactly 4 queries issued (got ' + pool._queries.length + ')')
 
-  const retryable = pool._queries.find(q =>
-    q.sql.includes("status = 'active'") &&
+  // Branch 1 retryable stale-dispatch is now a liveness-gated SELECT (status='dispatching'
+  // AND retry_count < $2), distinct from the cron/non-cron max-retry SELECTs (>= $2) and
+  // the running-orphan SELECT (status='running').
+  const retryableSelect = pool._queries.find(q =>
+    q.sql.includes('SELECT') &&
     q.sql.includes("status = 'dispatching'") &&
-    q.sql.includes('retry_count + 1') &&
-    q.sql.includes('< $2')
+    q.sql.includes('< $2') &&
+    !q.sql.includes("type = 'cron'") &&
+    !q.sql.includes("type != 'cron'") &&
+    !q.sql.includes("status = 'running'")
   )
-  assert(!!retryable, 'staleLeaseRecovery: retryable stale-dispatch query correct shape')
+  assert(!!retryableSelect, 'staleLeaseRecovery: retryable stale-dispatch SELECT correct shape (per-row liveness-gated)')
 
   const cronStaleSelect = pool._queries.find(q =>
     q.sql.includes('SELECT') &&
@@ -816,8 +825,10 @@ test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () =>
 // re-dispatch if a non-dead heartbeating worker exists on the same task_id.
 
 function makeSplitStubPool(opts) {
-  // Returns different rows for the cron-stale SELECT vs the non-cron-stale
-  // SELECT so focused liveness tests can exercise one branch at a time.
+  // Returns different rows for the retryable stale-dispatch SELECT vs the cron-stale
+  // vs non-cron-stale vs running-orphan SELECTs so focused liveness tests can
+  // exercise one branch at a time.
+  const retryableRows = opts.retryableRows || []
   const cronRows = opts.cronRows || []
   const nonCronRows = opts.nonCronRows || []
   const orphanRows = opts.orphanRows || []
@@ -826,6 +837,11 @@ function makeSplitStubPool(opts) {
     _queries: queries,
     query(sql, params) {
       queries.push({ sql, params: params || [] })
+      // Branch 1 retryable stale-dispatch SELECT: status='dispatching' AND retry_count < $2.
+      // Uniquely identified by '< $2' (max-retry branches 2a/2b use '>= $2').
+      if (sql.includes('SELECT') && sql.includes("status = 'dispatching'") && sql.includes('< $2')) {
+        return Promise.resolve({ rows: retryableRows, rowCount: retryableRows.length })
+      }
       if (sql.includes('SELECT') && sql.includes("type = 'cron'")) {
         return Promise.resolve({ rows: cronRows, rowCount: cronRows.length })
       }
@@ -967,6 +983,96 @@ test('staleLeaseRecovery: coord error fails open (UPDATE still fires)', async ()
     q.sql.includes("status = 'failed'")
   )
   assert(!!perRowFail, 'fail-open: coord unreachable does not block stale-lease recovery')
+
+  scheduler._setCoord(null)
+})
+
+// ── 2026-06-21: branch 1 (retryable stale-dispatch) reclaim-vs-bind race gate ──
+//
+// status_board 128b7c82. dispatchOne leases a due row, opens a worker tab, then
+// waits up to SIGNAL_BOUND_TIMEOUT_MS (600s) for coord.signal_bound. The observed
+// p99 cold-bind tail (~21min) EXCEEDS STALE_DISPATCHING_MS (15min), so a slow but
+// genuinely-live worker would have its lease reclaimed mid-bind by branch 1's old
+// bulk UPDATE (no liveness check), re-armed + re-dispatched on the next 30s poll,
+// thrashing the fleet ('stale lease recovered' grew to 48 active rows 2026-06-20).
+// Branch 1 now SELECTs the stale rows and liveness-gates each reclaim, exactly as
+// branches 2a/2b/3. A live worker -> skip; a dead/silent worker -> reclaim.
+
+test('staleLeaseRecovery branch 1: live worker mid-bind (~49s) -> NO reclaim, lease intact', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-binding-1', name: 'slow-cold-bind-cron' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_binding_live',
+        task_id: 'task-binding-1',
+        last_heartbeat_at: new Date().toISOString(),
+        stale_ms: 49_000,   // bound at ~49s, well inside STALE_WORKER_LIVENESS_MS (180s)
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!reclaim, 'branch 1: no reclaim UPDATE emitted while a live worker is still bound to the task (the race fix)')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery branch 1: no live worker (genuinely dead) -> reclaim UPDATE fires, targets row by id', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-binding-2', name: 'genuinely-dead-cron' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!!reclaim, 'branch 1 negative control: reclaim UPDATE fires when no live worker exists (dead worker still reclaimed)')
+  assert(reclaim && reclaim.params[0] === 'task-binding-2', 'branch 1: per-row reclaim UPDATE targets the stale row by id ($1)')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery branch 1: stale-heartbeat worker (>=180s, hung) does not block reclaim', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-binding-3', name: 'hung-cron' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_hung',
+        task_id: 'task-binding-3',
+        last_heartbeat_at: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
+        stale_ms: 360_000,   // 6min stale >> STALE_WORKER_LIVENESS_MS (180s): counts as dead
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!!reclaim, 'branch 1: a hung worker past the liveness window does not block reclaim (no permanent wedge)')
 
   scheduler._setCoord(null)
 })
