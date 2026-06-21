@@ -1074,8 +1074,41 @@ async function append_to_conductor({ envelope, idempotency_key, source, force_pa
     return { ok: true, fired: false, dedupe: 'duplicate', idempotency_key: idemKey, mode: 'append' }
   }
 
-  // Step 4: figure out which IDE to drive.
-  const ideFilter = _ideFilterForConductor(conductor)
+  // Step 4: figure out which IDE to drive. We start with the conductor's
+  // recorded IDE filter, but THEN probe foreground - if Tate has switched
+  // IDEs since the last heartbeat (race window between switch + next
+  // prompt), foreground tells the truth. Use foreground's matching
+  // instances.json entry for BOTH the IDE bridge port AND the AHK target,
+  // so bridge commands focus the right chat input AND keystrokes land in
+  // the right window.
+  let ideFilter = _ideFilterForConductor(conductor)
+  let foregroundOverride = null
+  try {
+    const fg = await foreground_window().catch(() => null)
+    if (fg && fg.process_name && fg.pid) {
+      const isIde = /^(Code|Code - Insiders|Cursor)\.exe$/i.test(fg.process_name)
+      if (isIde) {
+        // Try to find an instance whose ide matches the foreground exe.
+        const ideExeToName = {
+          'Code.exe': 'Visual Studio Code',
+          'Code - Insiders.exe': 'Visual Studio Code - Insiders',
+          'Cursor.exe': 'Cursor',
+        }
+        const wantIdeName = ideExeToName[fg.process_name]
+        const instances = _listInstancesAlive()
+        const fgInstance = instances.find(i => (i.ide || '') === wantIdeName) || null
+        const conductorIdeBridgePort = conductor.ide_bridge_port || null
+        if (fgInstance && fgInstance.port !== conductorIdeBridgePort) {
+          foregroundOverride = {
+            fg_pid: fg.pid, fg_process: fg.process_name, fg_title: fg.window_title,
+            instance_pid: fgInstance.pid, instance_port: fgInstance.port,
+          }
+          ideFilter = { port: fgInstance.port }
+        }
+      }
+    }
+  } catch {}
+
   if (!ideFilter) {
     return { ok: false, fired: false, reason: 'cannot_resolve_ide_for_conductor', conductor }
   }
@@ -1093,24 +1126,31 @@ async function append_to_conductor({ envelope, idempotency_key, source, force_pa
   }
 
   // Step 6: focus the chat input via IDE bridge.
+  // IMPORTANT 2026-05-19 b: drop claude-vscode.editor.openLast - in stable
+  // VS Code (and Insiders too in some states) openLast CREATES A NEW CHAT
+  // TAB when there's no current "last chat" pointer, which spawns the
+  // ghost-chat problem (paste lands in the new tab, not the conductor).
+  // Instead trust that the conductor's chat tab is already visible (the
+  // heartbeat hook fired from it on the most recent turn, so it WAS active).
+  // claude-vscode.focus focuses the chat input of whichever Claude chat is
+  // currently displayed in the active editor group, without switching tabs.
   let bridgeFocusOk = false
   try {
-    // claude-vscode.editor.openLast brings up (or re-mounts) the last Claude
-    // Code chat in the current tab.
-    await _ideCommand(ideFilter, 'claude-vscode.editor.openLast').catch(() => {})
-    // claude-vscode.focus forces focus into chat input (one-way, no toggle).
-    await _ideCommand(ideFilter, 'claude-vscode.focus').catch(() => {})
-    // Raise the IDE's editor group so the chat tab is visible.
+    // Raise the IDE's editor group so any open Claude chat tab is visible.
     await _ideCommand(ideFilter, 'workbench.action.focusActiveEditorGroup').catch(() => {})
+    // Force focus into chat input (one-way; does not switch chats).
+    await _ideCommand(ideFilter, 'claude-vscode.focus').catch(() => {})
     bridgeFocusOk = true
   } catch (err) {
     // Fall through; AHK still tries WinActivate by hwnd/pid.
   }
 
   // Step 7: resolve hwnd + pid for the AHK keystroke.
+  // If foreground override kicked in, use the foreground pid; else use the
+  // extension-host pid resolved from ideFilter.
   const { pid: idePid } = await _ideHwndAndPid(ideFilter).catch(() => ({ pid: null }))
-  const targetPid = idePid || conductor.ide_pid || null
-  const targetHwnd = conductor.hwnd || 0
+  const targetPid = (foregroundOverride && foregroundOverride.fg_pid) || idePid || conductor.ide_pid || null
+  const targetHwnd = (foregroundOverride ? 0 : (conductor.hwnd || 0))
 
   if (!targetPid && !targetHwnd) {
     return { ok: false, fired: false, reason: 'no_target_pid_or_hwnd', queued: true, clipboard_set: clipboardOk, bridge_focus_ok: bridgeFocusOk }
@@ -1271,4 +1311,10 @@ async function seed_conductor({ envelope, idempotency_key, source, thread_mirror
   }
 }
 
-module.exports = { fire, fire_if_clear, foreground_window, list_mouths, last_fires, append_to_master, append_to_conductor, seed_conductor }
+// 2026-05-19 evening: append_to_master + append_to_conductor + seed_conductor
+// are DEPRECATED. The keystroke-paste-into-existing-chat architecture they
+// implemented was replaced by the headless-conductor-on-VPS architecture
+// (see backend/src/services/headlessConductor.js). Function bodies retained
+// in this file for ~30 days as reference; do not call them. Will be deleted
+// in a follow-up pass after the native iOS channel ships.
+module.exports = { fire, fire_if_clear, foreground_window, list_mouths, last_fires }

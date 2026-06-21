@@ -20,6 +20,14 @@ const TOKEN = process.env.AGENT_TOKEN || ''
 app.use(cors())
 app.use(express.json({ limit: '50mb' }))
 
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) {
+    console.error(`[body-parser] rejected malformed JSON from ${req.ip || 'unknown'}: ${err.message}`)
+    return res.status(400).json({ error: 'invalid JSON in request body', detail: err.message })
+  }
+  next(err)
+})
+
 function auth(req, res, next) {
   if (!TOKEN) return next()
   const header = req.headers.authorization || ''

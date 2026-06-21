@@ -30,19 +30,28 @@ async function ensureBrowser() {
 }
 
 // Restart Chrome with remote debugging enabled (connects to user's Chrome profile)
+// DELEGATES to gui.enableChromeCdp - which is the single canonical CDP launch path
+// (kill-loop, SingletonLock clear, auto-detect user-data-dir, --user-data-dir EXPLICIT,
+// verify-port-binds). The hand-rolled version that lived here returned cdpEnabled:true
+// while port 9222 was unbound, because Chrome 121+ silently drops the debug flag when
+// launched without an explicit --user-data-dir on the system default profile.
+// See ~/ecodiaos/patterns/chrome-cdp-attach-requires-explicit-user-data-dir-and-singleton-clear.md
 async function enableCDP() {
-  try { runSilent('taskkill /F /IM chrome.exe', { stdio: 'ignore' }) } catch(e) {}
-  await new Promise(r => setTimeout(r, 1500))
-  // Launch Chrome with CDP and user profile
-  const { spawn } = require('child_process')
-  spawn('chrome', ['--remote-debugging-port=9222', '--restore-last-session'], {
-    detached: true, stdio: 'ignore', shell: true,
-    windowsHide: true, creationFlags: CREATE_NO_WINDOW,
-  }).unref()
-  await new Promise(r => setTimeout(r, 2500))
+  const gui = require('./gui')
+  // NOTE: gui.js exports the function as `enable_chrome_cdp` (snake-case, mirroring
+  // the public tool name), not `enableChromeCdp`. The internal `async function
+  // enableChromeCdp(params)` is the IMPLEMENTATION; the exports map renames it.
+  const result = await gui.enable_chrome_cdp({ port: 9222 })
   browser = null
   page = null
-  return { cdpEnabled: true, port: 9222, note: 'Chrome restarted with CDP. Call navigate() to use.' }
+  return {
+    cdpEnabled: !!result.ok,
+    port: result.port || 9222,
+    already_up: !!result.already_up,
+    version: result.version || null,
+    ms_to_ready: result.ms_to_ready || null,
+    note: 'Delegated to gui.enableChromeCdp (verified port binds before returning).',
+  }
 }
 
 // Switch to a tab matching a URL pattern, or open new tab
