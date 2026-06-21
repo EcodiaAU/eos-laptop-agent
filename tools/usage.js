@@ -57,10 +57,17 @@ const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS || (
 )
 const NODE_EXE = process.execPath  // current node binary, always valid
 
+// Mac canonical coordination root is ~/.ecodiaos/coordination (the path the
+// launchd usage-poller plist sets via COORD_ROOT, and the path coord.* +
+// account-cap-decide.js read). The prior Mac default '/Users/ecodia/.code/
+// ecodiaos/coordination' DISAGREED with all of those, so a poller started
+// without the plist env silently wrote honest data to a file nobody reads while
+// consumers served a stale file - a latent "measurement disconnect" found
+// 2026-06-21. Default now matches the canonical path; env still overrides.
 const COORD_ROOT = process.env.COORD_ROOT || (
   process.platform === 'win32'
     ? 'D:\\.code\\EcodiaOS\\coordination'
-    : '/Users/ecodia/.code/ecodiaos/coordination'
+    : path.join(os.homedir(), '.ecodiaos', 'coordination')
 )
 const USAGE_DIR = path.join(COORD_ROOT, 'usage')
 const AUDIT_DIR = path.join(USAGE_DIR, 'audit')
@@ -129,6 +136,27 @@ function getCaps() {
   const cap5h = Number(process.env.CAPS_5H_TOKENS) || DEFAULT_CAP_5H
   const capWeekly = Number(process.env.CAPS_WEEKLY_TOKENS) || DEFAULT_CAP_WEEKLY
   return { cap_5h: cap5h, cap_weekly: capWeekly }
+}
+
+// Limit-relevant token count for a ccusage row. ccusage `totalTokens` is
+// DOMINATED by cache-read tokens (measured 2026-06-21: cacheRead = 94.6% of an
+// active block's totalTokens, 708.8M of 749.5M). Anthropic's 5h/weekly usage
+// limits do NOT count cache-read at full weight, so summing totalTokens made
+// every WORKING account read as 2x over the 5h cap within hours - the account
+// the conductor was actively thinking on reported "capped" while it served. That
+// false-capped signal is the root of "every measurement is going wrong"
+// (Tate 2026-06-21). The honest measure: input + output + cacheCreation, plus
+// cacheRead at CACHE_READ_WEIGHT (default 0 = exclude; tunable if calibration vs
+// the live UI shows cache-read should carry a small weight). Doctrine:
+// patterns/usage-5h-measure-must-exclude-cache-read-tokens-2026-06-21.md
+const CACHE_READ_WEIGHT = process.env.CACHE_READ_WEIGHT != null ? Number(process.env.CACHE_READ_WEIGHT) : 0
+function limitTokens(row) {
+  if (!row) return 0
+  const input = Number(row.inputTokens) || 0
+  const output = Number(row.outputTokens) || 0
+  const cacheCreate = Number(row.cacheCreationTokens || row.cacheCreationInputTokens) || 0
+  const cacheRead = Number(row.cacheReadTokens || row.cacheReadInputTokens) || 0
+  return input + output + cacheCreate + cacheRead * CACHE_READ_WEIGHT
 }
 
 // ── active_account ────────────────────────────────────────────────────────
@@ -479,7 +507,7 @@ function poll() {
     if (!acct || !KNOWN_ACCOUNTS.includes(acct)) continue
     const laMs = sessionLastActivityMs(row)
     if (laMs >= weekStartMs) {
-      accounts[acct].tokens_weekly += Number(row.totalTokens) || 0
+      accounts[acct].tokens_weekly += limitTokens(row)  // exclude cache-read inflation
       accounts[acct].sessions_weekly += 1
     }
   }
@@ -497,7 +525,7 @@ function poll() {
     if (!acct || !KNOWN_ACCOUNTS.includes(acct)) continue
     const laMs = sessionLastActivityMs(row)
     if (laMs >= active5hStartMs) {
-      accounts[acct].tokens_5h += Number(row.totalTokens) || 0
+      accounts[acct].tokens_5h += limitTokens(row)  // exclude cache-read inflation
       accounts[acct].sessions_5h += 1
     }
   }

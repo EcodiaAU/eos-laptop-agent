@@ -64,6 +64,7 @@ const path = require('path')
 const os   = require('os')
 const http  = require('http')
 const https = require('https')
+const { spawnSync } = require('child_process')
 
 const _DEFAULT_CREDS_DIR = process.platform === 'win32'
   ? 'D:/PRIVATE/ecodia-creds'
@@ -79,6 +80,18 @@ try {
 
 const ACCOUNTS = ['tate', 'code', 'money']
 
+// Accounts the operator has flagged as paused/unaffordable. The refresher
+// will not attempt OAuth refresh against them (their refresh_token is
+// expected to be invalid) and creds.rotate_to refuses to pick them. Set
+// via env var ACCOUNTS_DISABLED as a comma-separated short-name list.
+// Origin: 2026-06-11 code@ plan paused.
+const DISABLED_ACCOUNTS = new Set(
+  (process.env.ACCOUNTS_DISABLED || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+)
+
 const CREDS_DIR          = process.env.CREDS_DIR          || _DEFAULT_CREDS_DIR
 const OAUTH_REFRESH_URL  = process.env.OAUTH_REFRESH_URL  || 'https://platform.claude.com/v1/oauth/token'
 const OAUTH_CLIENT_ID    = process.env.OAUTH_CLIENT_ID    || '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
@@ -86,6 +99,45 @@ const OAUTH_USER_AGENT   = process.env.OAUTH_USER_AGENT   || 'claude-cli-refresh
 const REFRESH_INTERVAL_MS   = Number(process.env.REFRESH_INTERVAL_MS)   || 30 * 60 * 1000
 const REFRESH_THRESHOLD_MS  = Number(process.env.REFRESH_THRESHOLD_MS)  || 20 * 60 * 1000
 const FAILURE_ESCALATION_COUNT = 3
+
+// ── loud alarm channel (SMS Tate) ─────────────────────────────────────────────
+// The kv_store escalation below is a SILENT log nobody reads, and it skips
+// entirely when SUPABASE_* env is absent (it is, under launchd). That silence is
+// the 2026-06-21 root cause: code@/money@ refresh tokens died and rotted for
+// 14-32h with zero alarm, so when the live account capped there was no fresh
+// snapshot to rotate to and the switch had to be done by hand. A dead snapshot
+// must SCREAM the moment it dies - while a healthy account is still live and a
+// 30-second re-auth is all that is needed - not surface days later as a stall.
+// text-tate.js is the free, secret-free iMessage channel launchd crons already
+// use to reach Tate. Rate-limited per account so a persistent failure (re-tried
+// every 30 min) does not spam.
+const TEXT_TATE_PATH = process.env.TEXT_TATE_PATH ||
+  path.join(os.homedir(), '.code', 'ecodiaos', 'backend', 'imessage-agent', 'text-tate.js')
+const ALERT_COOLDOWN_MS = Number(process.env.CRED_ALERT_COOLDOWN_MS) || 6 * 60 * 60 * 1000
+const _lastAlertAt = { tate: 0, code: 0, money: 0 }
+
+// SMS Tate that an account's token has died and needs a re-auth. Rate-limited.
+// Returns true if a message was actually sent. Never throws (best-effort alarm).
+function alertTateRefreshDead(account, consecutive, reason) {
+  const now = Date.now()
+  if (now - (_lastAlertAt[account] || 0) < ALERT_COOLDOWN_MS) return false
+  const short = String(reason || '').slice(0, 90)
+  const msg = `Claude account ${account}@ cannot auto-refresh (${consecutive} fails): ${short}. Snapshot is dead - it cannot be switched to until you re-auth ${account}@ (run account-login). Other accounts still cover, but this one is offline for auto-switch.`
+  try {
+    const r = spawnSync('node', [TEXT_TATE_PATH, '--from', 'cred-refresher', msg], {
+      timeout: 20000, encoding: 'utf8',
+    })
+    if (r.status === 0) {
+      _lastAlertAt[account] = now
+      console.error('[cred-refresher] SMS-alerted Tate: ' + account + ' refresh dead')
+      return true
+    }
+    console.error('[cred-refresher] text-tate alert FAILED (status ' + r.status + '): ' + ((r.stderr || r.stdout || '').trim().slice(0, 200)))
+  } catch (e) {
+    console.error('[cred-refresher] text-tate alert threw: ' + e.message)
+  }
+  return false
+}
 
 // ── failure counter (per-account, resets on success) ─────────────────────────
 
@@ -195,19 +247,60 @@ function readAccountFile(account) {
   return JSON.parse(fs.readFileSync(p, 'utf8'))
 }
 
-// Path to the live credentials file Claude Code uses. ONE-SHOT READ ONLY -
-// never write, never watch (see the INVARIANT block at the top of this file).
+// Path to the live credentials file Claude Code uses on non-Mac platforms.
+// ONE-SHOT READ ONLY - never write, never watch (see the INVARIANT block at
+// the top of this file).
+//
+// 2026-06-11: on darwin the LIVE source-of-truth is the macOS Keychain entry
+// "Claude Code-credentials/ecodia". ~/.claude/.credentials.json is a vestigial
+// best-effort mirror that drifts (the Claude Code Mac binary in-place refreshes
+// the Keychain blob without touching the file). Reading the file for
+// live-session detection misled the refresher into thinking a fossil tate.json
+// was active when the real Keychain had a totally different token lineage,
+// which is what allowed scheduler.dispatchOne -> rotate_to to repeatedly
+// clobber the live Keychain blob with the stale per-account file (Tate's
+// 30-minute re-login loop, 2026-06-11).
+const KEYCHAIN_SERVICE = 'Claude Code-credentials'
+const KEYCHAIN_ACCOUNT = 'ecodia'
+const USE_KEYCHAIN = process.platform === 'darwin'
 const LIVE_CREDENTIALS_PATH =
   process.env.CLAUDE_CREDENTIALS_PATH ||
   path.join(require('os').homedir(), '.claude', '.credentials.json')
 
-// Read the live credentials once. Returns { accessToken, refreshToken } or null.
-// Used only to identify + protect the active interactive session's token
-// lineage. Read-only; tolerant of missing/corrupt file.
+function _readKeychainText() {
+  if (!USE_KEYCHAIN) return null
+  const res = spawnSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w'], {
+    encoding: 'utf8',
+    timeout: 5000,
+  })
+  if (res.status !== 0) return null
+  return (res.stdout || '').trim()
+}
+
+// Read the live credentials once. Returns { accessToken, refreshToken, raw }
+// or null. Used only to identify + protect the active interactive session's
+// token lineage AND to seed the existing "sync backup from live credentials
+// (active session)" branch in refresh_account so the per-account files stay
+// alive when Claude Code self-refreshes the Keychain.
+//
+// Mac: prefer the Keychain blob; fall back to the file mirror if the Keychain
+// read fails (e.g. permission denied in a foreign environment) so tests
+// continue to exercise the file path.
 function readLiveCredentials() {
+  let text = null
+  if (USE_KEYCHAIN) {
+    text = _readKeychainText()
+  }
+  if (!text) {
+    try {
+      if (!fs.existsSync(LIVE_CREDENTIALS_PATH)) return null
+      text = fs.readFileSync(LIVE_CREDENTIALS_PATH, 'utf8')
+    } catch (_) {
+      return null
+    }
+  }
   try {
-    if (!fs.existsSync(LIVE_CREDENTIALS_PATH)) return null
-    const parsed = JSON.parse(fs.readFileSync(LIVE_CREDENTIALS_PATH, 'utf8'))
+    const parsed = JSON.parse(text)
     const o = parsed && parsed.claudeAiOauth
     if (!o || !o.accessToken) return null
     return { accessToken: o.accessToken, refreshToken: o.refreshToken, raw: parsed }
@@ -372,6 +465,11 @@ async function handleFailure(account, reason) {
     } catch (kvErr) {
       console.error('[cred-refresher] kv_store escalation itself failed: ' + kvErr.message)
     }
+    // LOUD alarm: the kv write above is silent (and skips with no SUPABASE env).
+    // SMS Tate so a dead snapshot is known immediately, not days later. The live
+    // account (tate@) is never alerted here - if it is failing it IS the live
+    // session and Claude Code owns its refresh; this fires for code@/money@.
+    alertTateRefreshDead(account, failureCount[account], reason)
   }
 }
 
@@ -381,6 +479,10 @@ async function handleFailure(account, reason) {
 async function _runOnce() {
   const live = readLiveCredentials()
   for (const account of ACCOUNTS) {
+    if (DISABLED_ACCOUNTS.has(account)) {
+      // No-op + no failure count: this account is operator-paused.
+      continue
+    }
     try {
       await refresh_account(account, live)
     } catch (e) {
