@@ -664,6 +664,40 @@ exports.dispatchOne = async function dispatchOne(row) {
     const rowWithAccount = Object.assign({}, row, { actual_account: account, worktree_path: worktreePath })
     const brief = exports.buildBrief(rowWithAccount)
 
+    // 2c. Dispatch-start lease refresh + pre-spawn reclaim guard.
+    // 2026-06-21 lease-aging-in-launch-lock-queue fix (the live 5-6h cron-fleet
+    // stall: gmail-inbox-poll / calendar-watch / infra-health-pulse / status-board-
+    // execute-top all sat status=dispatching retry_count=3, last_run_at frozen ~5h,
+    // "stale lease recovered"). leased_at is stamped by leaseDueRows at QUEUE-ENTRY
+    // time, but dispatchOne holds the SERIAL launch-lock across each bind (up to
+    // SIGNAL_BOUND_TIMEOUT_MS). Under a due-row burst a row's leased_at ages past
+    // STALE_DISPATCHING_MS (15min) WHILE STILL QUEUED behind the lock - before its
+    // worker is ever spawned - so staleLeaseRecovery branch-1's liveness gate
+    // (4cab6c3) cannot protect it (hasLiveWorkerForTask returns null: no worker
+    // exists in coord yet). branch-1 reclaims it, and the eventual running-flip
+    // no-ops (rowCount 0), leaving an ORPHAN tab that inflates active_workers,
+    // forces rotation to defer, and collapses dispatch throughput into the spiral.
+    // Refresh leased_at to NOW() HERE, at dispatch-start under the lock and as late
+    // as possible before spawn (after the slow rotate_to + worktree alloc), so the
+    // 15min stale window measures the actual bind duration (<=10min) with the
+    // intended 5min headroom rather than the queue wait. Guarded on still owning
+    // the lease: if the row was reclaimed/cancelled during account-rotation or
+    // worktree prep, bail WITHOUT spawning a worker - preventing the orphan tab
+    // entirely instead of discovering the loss after the spawn at the running-flip.
+    const startGuard = await pool.query(
+      `UPDATE os_scheduled_tasks
+          SET leased_at = NOW(), updated_at = NOW()
+        WHERE id = $1
+          AND status = 'dispatching'
+          AND leased_by IS NOT DISTINCT FROM $2`,
+      [row.id, row.leased_by || null]
+    )
+    if (startGuard.rowCount === 0) {
+      process.stderr.write('[scheduler] dispatchOne: row ' + row.id +
+        ' lease lost during dispatch prep (reclaimed/cancelled before worker spawn); skipping spawn\n')
+      return
+    }
+
     // 3. Dispatch worker.
     const dispatcher = getDispatcher()
     const result = await dispatcher.dispatch_worker({

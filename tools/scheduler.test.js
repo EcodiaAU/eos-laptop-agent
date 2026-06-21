@@ -52,6 +52,34 @@ function makeStubPool(rowsForSelect) {
       if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
         return Promise.resolve({ rows: rowsForSelect || [], rowCount: (rowsForSelect || []).length })
       }
+      // 2026-06-21 dispatch-start lease refresh (SET leased_at first, no status
+      // change): in production this matches the held dispatching row (rowCount 1).
+      // Model that here so dispatchOne's pre-spawn reclaim guard does not false-bail
+      // on a valid seeded row. The reclaim-bail path is covered by its own test
+      // (makeReclaimBailPool), which returns rowCount 0 for exactly this UPDATE.
+      if (/UPDATE\s+os_scheduled_tasks\s+SET\s+leased_at = NOW\(\), updated_at = NOW\(\)\s+WHERE/i.test(sql)) {
+        return Promise.resolve({ rows: [], rowCount: 1 })
+      }
+      return Promise.resolve({ rows: [], rowCount: 0 })
+    }
+  }
+  return pool
+}
+
+// Variant of makeStubPool where the dispatch-start lease-refresh UPDATE returns
+// rowCount 0 (lease lost / reclaimed before worker spawn). Used to assert
+// dispatchOne's pre-spawn reclaim guard bails WITHOUT spawning a worker. The
+// refresh is the first non-SELECT UPDATE dispatchOne issues; the guard bails on
+// rowCount 0, so returning 0 for every non-SELECT here is sufficient.
+function makeReclaimBailPool(rowsForSelect) {
+  const queries = []
+  const pool = {
+    _queries: queries,
+    query(sql, params) {
+      queries.push({ sql, params: params || [] })
+      if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
+        return Promise.resolve({ rows: rowsForSelect || [], rowCount: (rowsForSelect || []).length })
+      }
       return Promise.resolve({ rows: [], rowCount: 0 })
     }
   }
@@ -240,6 +268,50 @@ test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', 
   credsModule.rotate_to = origRotate
   coordModule.peek_inbox = origPeekInbox
   coordModule.read_inbox = origReadInbox
+})
+
+// ── 2026-06-21 dispatch-start reclaim guard: bail before spawn when lease lost ──
+// leased_at is stamped at queue-entry by leaseDueRows, but dispatchOne holds the
+// serial launch-lock across each bind, so under a due-row burst a row's leased_at
+// can age past STALE_DISPATCHING_MS while still QUEUED, letting staleLeaseRecovery
+// branch-1 reclaim it before its worker ever spawns (the live 5-6h cron-fleet
+// stall). dispatchOne refreshes leased_at at dispatch-start, guarded on still
+// owning the lease; if the refresh matches 0 rows (reclaimed/cancelled during
+// rotate/worktree prep) it MUST bail without spawning a worker - no orphan tab, no
+// active_workers inflation, no eventual zombie running-flip.
+test('dispatchOne: lease lost before spawn -> bails, no dispatch_worker, no running flip', async () => {
+  const pool = makeReclaimBailPool([{
+    austerity_paused: false, status: 'dispatching', archived_at: null,
+    last_status: null, name: 'gmail-inbox-poll',
+  }])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'code'
+  credsModule.rotate_to = async (acct) => ({ previous: 'tate', current: acct })
+
+  let dispatched = null
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => { dispatched = params; return { ok: true, tab_id: 'tab_should_not_spawn', task_id: params.task_id } },
+    kill_worker: async () => {}
+  })
+
+  const row = makeRow({ id: 'task-reclaimed-pre-spawn', preferred_account: 'code' })
+
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [reclaim-bail threw]:', e.message) }
+
+  assert(!threw, 'dispatchOne reclaim-bail: no throw')
+  assert(dispatched === null, 'dispatchOne reclaim-bail: dispatch_worker NOT called (no orphan tab spawned)')
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!runningUpdate, 'dispatchOne reclaim-bail: no status=running flip issued')
+  const refreshUpdate = pool._queries.find(q => /SET leased_at = NOW\(\), updated_at = NOW\(\)\s+WHERE/i.test(q.sql))
+  assert(!!refreshUpdate, 'dispatchOne reclaim-bail: dispatch-start lease-refresh UPDATE was issued')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
 })
 
 // ── 2026-06-19 defense-in-depth austerity gate inside dispatchOne ───────────
