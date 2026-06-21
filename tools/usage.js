@@ -161,6 +161,21 @@ function limitTokens(row) {
 
 // ── active_account ────────────────────────────────────────────────────────
 
+// The account Claude Code itself records as logged-in. ~/.claude.json
+// oauthAccount.emailAddress is rewritten on every `claude auth login` (INCLUDING
+// a manual /login Tate types), so it is the authoritative live identity when
+// current_account()'s token-match returns 'unknown' - a fresh login mints an
+// opaque token (sk-...) that matches no per-account snapshot, so token-equality
+// cannot name the account. Origin: 2026-06-21, a manual /login drifted the
+// active_account marker and the autoswitch decision evaluated the wrong account.
+function liveAccountFromClaudeConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'))
+    const email = cfg && cfg.oauthAccount && cfg.oauthAccount.emailAddress
+    return email ? normalizeAccount(email) : null
+  } catch (e) { return null }
+}
+
 function getActiveAccount() {
   ensureDirs()
   // 2026-06-08 (attribution fix): defer to creds.current_account first. The
@@ -186,6 +201,17 @@ function getActiveAccount() {
     }
   } catch (e) {
     // creds module unavailable or threw - fall through to file-based read
+  }
+  // Marker self-heal (2026-06-21): current_account() returned 'unknown' (a manual
+  // /login minted a snapshot-mismatched token). Trust Claude Code's own record of
+  // the logged-in account and re-point the marker, instead of serving a stale one.
+  const fromCfg = liveAccountFromClaudeConfig()
+  if (fromCfg) {
+    const row0 = readJsonSafe(ACTIVE_ACCOUNT_FILE, null)
+    if (!row0 || row0.account !== fromCfg) {
+      try { setActiveAccount(fromCfg, 'claude-config-oauthaccount-selfheal') } catch (e) {}
+    }
+    return fromCfg
   }
   const row = readJsonSafe(ACTIVE_ACCOUNT_FILE, null)
   if (row && row.account) return row.account
@@ -783,6 +809,7 @@ module.exports = {
   // Internal helpers (NOT exposed as tools)
   _poll: poll,
   _getActiveAccount: getActiveAccount,
+  _liveAccountFromClaudeConfig: liveAccountFromClaudeConfig,
   _setActiveAccount: setActiveAccount,
   _readAccountsState: readAccountsState,
   _computeAlerts: computeAlerts,

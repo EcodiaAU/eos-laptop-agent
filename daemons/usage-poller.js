@@ -86,53 +86,35 @@ function agentTool(tool, params) {
 
 function capAutoSwitch() {
   try {
-    const r = spawnSync(process.execPath, [CCUSAGE_CLI_JS, 'blocks', '--active', '--json'], { encoding: 'utf8', timeout: 30000 })
-    if (r.status !== 0 || !r.stdout) return
-    const blocks = (JSON.parse(r.stdout).blocks) || []
-    const b = blocks.find(x => x.isActive) || blocks[0]
-    if (!b || !b.endTime) return
-    const cur = b.totalTokens || 0
-    const pct = cur / CAP_5H_TOKENS
-    if (pct < SWITCH_TRIGGER_PCT) return  // plenty of headroom, nothing to do
+    // Fast cap-switch path (every poll, ~5min). Uses the SAME honest decision as
+    // the 25-min cron: account-cap-decide.js (cache-read-EXCLUDED usage via
+    // tools/usage, calibrated caps, rotatable-snapshot gate, and a no-usable-target
+    // SMS fired inside the module). Single source of truth - no second heuristic.
+    // The prior path read cache-inflated ccusage b.totalTokens / cap and so crossed
+    // 80% almost immediately, scheduling a FALSE OAuth-switch chat every 5h block
+    // (2026-06-21). Execution is now creds.rotate_to: instant + headless, safe
+    // because the cred-refresher keeps all snapshots fresh (it was NOT safe when
+    // snapshots rotted, hence the old heavyweight OAuth-CC-chat). rotate_to is its
+    // own dedupe + guard: no-ops when already on target, DEFERS under active worker
+    // tabs (never clobbers a mid-flight Keychain), refuses a stale snapshot, skips
+    // disabled accounts. The 25-min cron remains the robust backstop (a worker can
+    // force / re-login if rotate_to keeps deferring).
+    const decideR = spawnSync(process.execPath, [path.join(AGENT_ROOT, 'tools', 'account-cap-decide.js')], { encoding: 'utf8', timeout: 25000 })
+    let d = null
+    try { d = JSON.parse(decideR.stdout) } catch (_) { return }
+    if (!d || !d.shouldSwitch || !d.target) return  // hold / no-usable-target (SMS handled in the module)
 
-    // Cap approaching. Ask the agent for the healthiest account and the live one.
-    // pick_healthiest_account honours ACCOUNTS_DISABLED + headroom; current_account
-    // is the live Keychain identity. A switch is only worthwhile if the healthiest
-    // is a DIFFERENT, enabled account (i.e. a real alternate exists).
-    const best = agentTool('creds.pick_healthiest_account', { required_headroom_minutes: 15 })
-    const live = agentTool('creds.current_account', {})
-    const haveAlternate = best && live && best !== live && best !== 'unknown' && best !== 'current-process'
-
-    if (!haveAlternate) {
-      // Single-account reality: nowhere to switch. Hold silently. NO text to Tate.
-      console.log('[' + nowIso() + '] cap-auto-switch: ' + Math.round(pct * 100) + '% of 5h block, no alternate account available (best=' + best + ' live=' + live + ') - holding')
-      return
-    }
-
-    // A healthy alternate exists. Fire the EXISTING switch procedure: schedule a
-    // fresh CC chat (scheduler.schedule_delayed = "open a chat via scheduler")
-    // whose prompt drives the Claude VS Code OAuth sign-in flow to `best` (which
-    // mints a FRESH token, unlike the clobber-prone file-swap). Dedupe per block.
-    const st = readJsonSafe(SWITCH_REQUEST_FILE, {})
-    if (st.block === b.endTime && st.target === best) return
-
-    const switchPrompt = [
-      'You are EcodiaOS. AUTONOMOUS ACCOUNT SWITCH (fired by the usage-poller cap trigger at ' + Math.round(pct * 100) + '% of the 5h block on ' + live + ').',
-      'GOAL: switch the active Claude Code account from ' + live + ' to ' + best + ' via the VS Code OAuth sign-in flow (this mints a FRESH token; do NOT use the file-swap rotate_to, which clobbers with a stale snapshot).',
-      'STEPS: (1) trigger Claude Code sign-out/sign-in (command palette "Claude Code: Sign In" / the /login link). (2) gui.enable_chrome_cdp and CDP-drive the claude.ai OAuth page: pick the ' + best + '@ecodia.au Google account and approve. (3) verify the new live token: creds.current_account should report ' + best + ' (or the Keychain accessToken changed). (4) confirm the IDE quota bar reflects ' + best + '.',
-      'Reference doctrine: claude-max-account-routing-is-vscode-extension-driven, cc-webview-chat-input-and-submit-unreachable, scheduler-cred-rotation-clobbered-live-keychain-2026-06-14. End with coord.signal_done + coord.close_my_tab.',
-    ].join('\n\n')
-
-    const sched = agentTool('scheduler.schedule_delayed', {
-      name: 'autonomous-account-switch-' + best + '-' + Date.now(),
-      delay: 'in 1m',
-      prompt: switchPrompt,
-    })
+    const targetShort = String(d.target).split('@')[0]
+    const rot = agentTool('creds.rotate_to', { account: targetShort })
+    const status = !rot ? 'agent_unreachable'
+      : rot.target ? 'switched'
+      : rot.deferred ? ('deferred:' + (rot.reason || 'workers'))
+      : (rot.reason || 'noop')
     fs.writeFileSync(SWITCH_REQUEST_FILE, JSON.stringify({
-      block: b.endTime, target: best, from: live, pct: Math.round(pct * 100),
-      raised_at: nowIso(), scheduled: !!sched, status: sched ? 'scheduled' : 'schedule_failed',
+      target: d.target, from: d.live, reason: d.reason, via: 'rotate_to',
+      result: status, raised_at: nowIso(),
     }), 'utf8')
-    console.log('[' + nowIso() + '] cap-auto-switch: ' + Math.round(pct * 100) + '% - scheduled OAuth switch ' + live + ' -> ' + best + ' (sched=' + !!sched + ')')
+    console.log('[' + nowIso() + '] cap-auto-switch: ' + d.live + ' -> ' + d.target + ' via rotate_to (' + status + ')')
   } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
 }
 
