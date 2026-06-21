@@ -76,6 +76,24 @@ const DISPATCH_LIMIT = 5
 // every 10min worst-case). Tunable via env without code change.
 const SIGNAL_BOUND_TIMEOUT_MS = parseInt(process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS, 10) || 600_000
 const ORPHAN_TIMEOUT_MS = 6 * 60 * 60 * 1000
+// 2026-06-22 cadence-aware running-orphan reclaim. ORPHAN_TIMEOUT_MS (6h) is the
+// correct backstop for a one-shot delayed worker (orphaning it is terminal and
+// destructive, and a one-shot can legitimately run long), but it is far too slow
+// for a fast CRON whose worker binds (flips to status='running') then dies
+// silently without coord.signal_done: the row sits stuck 'running' and BLOCKS
+// every subsequent fire until 6h elapse. For an hourly cron that is ~6 lost
+// cycles. Observed twice in the same shape on gmail-inbox-poll (heal 2026-06-21
+// 11:43Z, recurred 2026-06-22 ~07:16Z lease, inbox triage cadence blind ~6h).
+// The branch-3 liveness gate (hasLiveWorkerForTask) already refuses to reclaim a
+// worker that is still heartbeating, so a SHORTER window for cron rows cannot
+// thunder-herd a live worker; it only lets a provably-dead cron worker (heartbeat
+// stale > STALE_WORKER_LIVENESS_MS, or absent from coord) recover within minutes
+// instead of hours, and cron reclaim is non-destructive (defer to next interval,
+// never terminal orphan). 30min sits decisively above the ~21min p99 cold-bind
+// tail (a running row has already bound, so that tail does not even apply) yet is
+// 12x faster than 6h. Non-cron rows keep the full 6h ORPHAN_TIMEOUT_MS. Tunable.
+// Doctrine: scheduler-running-orphan-reclaim-must-be-cadence-aware-2026-06-22.
+const RUNNING_CRON_ORPHAN_MS = parseInt(process.env.SCHEDULER_RUNNING_CRON_ORPHAN_MS, 10) || 30 * 60 * 1000
 const COMPLETION_POLL_INTERVAL_MS = 5_000
 // 2026-06-18 half-state race fix. Must stay ABOVE SIGNAL_BOUND_TIMEOUT_MS (600s)
 // so staleLeaseRecovery branch-1 cannot reap a row that dispatchOne is still
@@ -1245,11 +1263,21 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // [[scheduler-no-ide-defer-and-cron-rows-never-permanently-fail-2026-06-02]],
   // cron rows must defer to their next scheduled interval; only one-shot
   // (delayed/chained) rows go to terminal status='orphaned'.
+  // 2026-06-22 cadence-aware window: a stuck-running CRON row is eligible after
+  // RUNNING_CRON_ORPHAN_MS (30min); a one-shot (non-cron) keeps the 6h
+  // ORPHAN_TIMEOUT_MS. Both still pass through the per-row liveness gate below,
+  // so this only TIGHTENS eligibility for fast crons, never bypasses the gate.
   const orphans = await pool.query(
     `SELECT id, dispatched_tab_id, type, cron_expression, tz FROM os_scheduled_tasks
      WHERE status = 'running'
-       AND leased_at < NOW() - ($1 || ' milliseconds')::interval`,
-    [ORPHAN_TIMEOUT_MS]
+       AND (
+         (type = 'cron' AND cron_expression IS NOT NULL
+            AND leased_at < NOW() - ($1 || ' milliseconds')::interval)
+         OR
+         ((type <> 'cron' OR cron_expression IS NULL)
+            AND leased_at < NOW() - ($2 || ' milliseconds')::interval)
+       )`,
+    [RUNNING_CRON_ORPHAN_MS, ORPHAN_TIMEOUT_MS]
   )
   const dispatcher = getDispatcher()
   for (const row of orphans.rows) {
