@@ -118,6 +118,24 @@ function capAutoSwitch() {
   } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
 }
 
+// ── TRUE RATE-LIMIT WATCH (ground truth, not prediction) ─────────────────────
+// Thin wrapper over tools/real-limit-watch (pure detector + selftest live there).
+// Detects a FRESH "You've hit your (session|weekly) limit" synthetic message that
+// Claude Code injects into a live transcript the instant a cap is actually hit,
+// then FORCE rotate_to a healthy account + SMS Tate so the next session/worker
+// opens fresh. Injects the daemon's localhost agentTool + the self-healing live-
+// account resolver. Runs every 60s (see main()). Origin: Tate 2026-06-21.
+const realLimitWatchMod = require(path.join(AGENT_ROOT, 'tools', 'real-limit-watch'))
+const REAL_LIMIT_WATCH_INTERVAL_MS = Number(process.env.REAL_LIMIT_WATCH_INTERVAL_MS) || 60 * 1000
+function realLimitWatch() {
+  try {
+    const r = realLimitWatchMod.run({ agentTool, getActiveAccount: usage._getActiveAccount, coordRoot: _COORD_ROOT })
+    if (r && r.action && r.action !== 'none' && r.action !== 'already_fired') {
+      console.log('[' + nowIso() + '] real-limit-watch: ' + JSON.stringify(r))
+    }
+  } catch (e) { console.error('[real-limit-watch] ' + (e && e.message || e)) }
+}
+
 async function runOnePoll() {
   const t0 = Date.now()
   try {
@@ -149,6 +167,11 @@ async function main() {
   await new Promise(r => setTimeout(r, POLL_INITIAL_DELAY_MS))
   await runOnePoll()
   setInterval(runOnePoll, POLL_INTERVAL_MS)
+  // True rate-limit watch on a tight interval (ground-truth backstop, ~1min
+  // latency) - independent of the 5-min predictive usage poll above.
+  realLimitWatch()
+  setInterval(realLimitWatch, REAL_LIMIT_WATCH_INTERVAL_MS)
+  console.log('[' + nowIso() + '] real-limit-watch armed, interval=' + REAL_LIMIT_WATCH_INTERVAL_MS + 'ms')
 }
 
 main().catch(e => { console.error('fatal: ' + (e && e.stack || e)); process.exit(1) })

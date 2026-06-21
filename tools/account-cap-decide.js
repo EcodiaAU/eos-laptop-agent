@@ -24,6 +24,33 @@ function used5h(a) { return 1 - (a.headroom_5h_fraction != null ? a.headroom_5h_
 function usedWeekly(a) { return 1 - (a.headroom_weekly_fraction != null ? a.headroom_weekly_fraction : (a.remaining_weekly / a.cap_weekly)) }
 
 /**
+ * pickTarget(state, liveAccount, opts) -> { usable, staleButHealthy }
+ * The healthiest eligible switch targets, ranked, INDEPENDENT of whether the live
+ * account has crossed a predictive threshold. decide() gates this behind the
+ * usage trigger; the real-limit watch (daemons/usage-poller.js) calls it directly
+ * because an actual "You've hit your ... limit" event from Claude Code IS the
+ * trigger - it is ground truth, not a token estimate, so it does not consult %.
+ *   usable          = ranked targets with a FRESH (rotatable) snapshot
+ *   staleButHealthy = targets with budget but a stale snapshot (need re-auth)
+ */
+function pickTarget(state, liveAccount, opts) {
+  opts = opts || {}
+  const flaky = new Set(opts.flaky || [])
+  const disabled = new Set(opts.disabled || [])
+  const rotatable = opts.rotatable ? new Set(opts.rotatable) : null
+  const accounts = (state && state.accounts) || {}
+  const headroomTargets = Object.keys(accounts)
+    .filter(e => e !== liveAccount && !flaky.has(e) && !disabled.has(e))
+    .map(e => ({ email: e, u5: used5h(accounts[e]), uw: usedWeekly(accounts[e]) }))
+    .filter(c => c.u5 < TARGET_MAX_USED && c.uw < TARGET_MAX_USED)
+    // highest min-headroom = lowest max-used
+    .sort((a, b) => Math.max(a.u5, a.uw) - Math.max(b.u5, b.uw))
+  const usable = rotatable ? headroomTargets.filter(c => rotatable.has(c.email)) : headroomTargets
+  const staleButHealthy = rotatable ? headroomTargets.filter(c => !rotatable.has(c.email)).map(c => c.email) : []
+  return { usable, staleButHealthy }
+}
+
+/**
  * decide(state, liveAccount, opts) -> { shouldSwitch, reason, target, live, slots }
  *   state.accounts: { "<email>": {headroom_5h_fraction, headroom_weekly_fraction, ...} }
  *   opts.flaky / opts.disabled: arrays of emails to exclude as targets
@@ -60,15 +87,7 @@ function decide(state, liveAccount, opts) {
   // a usable auto-switch target - but it IS exactly what to tell Tate to re-auth.
   // opts.rotatable, when provided, is the set of emails whose snapshot is fresh
   // enough for creds.rotate_to (expiresAt > now + 5min, the creds.js stale gate).
-  const rotatable = opts.rotatable ? new Set(opts.rotatable) : null
-  const headroomTargets = Object.keys(accounts)
-    .filter(e => e !== liveAccount && !flaky.has(e) && !disabled.has(e))
-    .map(e => ({ email: e, u5: used5h(accounts[e]), uw: usedWeekly(accounts[e]) }))
-    .filter(c => c.u5 < TARGET_MAX_USED && c.uw < TARGET_MAX_USED)
-    // highest min-headroom = lowest max-used
-    .sort((a, b) => Math.max(a.u5, a.uw) - Math.max(b.u5, b.uw))
-  const usable = rotatable ? headroomTargets.filter(c => rotatable.has(c.email)) : headroomTargets
-  const staleButHealthy = rotatable ? headroomTargets.filter(c => !rotatable.has(c.email)).map(c => c.email) : []
+  const { usable, staleButHealthy } = pickTarget(state, liveAccount, opts)
 
   const trigReason = `live ${liveAccount} hit cap (5h_used=${liveU5.toFixed(2)}>=${sTrig} or weekly_used=${liveUW.toFixed(2)}>=${wTrig})`
   if (!usable.length) {
@@ -204,4 +223,4 @@ if (require.main === module) {
   else { liveDecide() }
 }
 
-module.exports = { decide, used5h, usedWeekly, SESSION_USED_TRIGGER, WEEKLY_USED_TRIGGER, TARGET_MAX_USED }
+module.exports = { decide, pickTarget, used5h, usedWeekly, SESSION_USED_TRIGGER, WEEKLY_USED_TRIGGER, TARGET_MAX_USED }
