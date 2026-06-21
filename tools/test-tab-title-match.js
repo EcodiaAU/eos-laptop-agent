@@ -1,16 +1,18 @@
 'use strict'
 // Standalone test for tab-title-match (no framework; run: node tools/test-tab-title-match.js).
+//
+// IMPORTANT: the tools/ autoloader require()s every tools/*.js at boot. This
+// file is guarded with `if (require.main === module)` so that a require() (e.g.
+// a stray autoloader) does NOT run assertions or call process.exit() and kill
+// the dispatcher. The autoloader also filters `^test-` by name (commit
+// 8f9e1e5); this guard is the second line of defence. Doctrine:
+// cc-auto-title-summarizer-strips-eos-w-sentinel-tabs-leak-2026-06-08.
+//
 // Grounded in the REAL candidate set that failed close_my_tab for the
 // bookkeeping-xero-sync worker (task 721c05e0) on 2026-06-22, where the
 // auto-titler renamed [EOS-W-a986a437] -> "Reconcile Xero push back…".
 
 const { computeFingerprint, pickByFingerprint } = require('./tab-title-match')
-
-let pass = 0, fail = 0
-function ok(name, cond, extra) {
-  if (cond) { pass++; console.log('  PASS ' + name) }
-  else { fail++; console.log('  FAIL ' + name + (extra ? ' :: ' + extra : '')) }
-}
 
 // The actual live candidate set echoed by the real no_match (vc1).
 function realCandidates() {
@@ -43,68 +45,78 @@ push backlog directly from staged_transactions. Mint a client_credentials token.
 const GLOVEBOX_BRIEF = `You are EcodiaOS. Glovebox ui polish: fix the offline basemap
 tiles and the turn-by-turn navigation corridor rendering on the Android surface.`
 
-// ---- Test 1: the real failure case now resolves to the right tab ----
-{
-  const fp = computeFingerprint(XERO_BRIEF)
-  const r = pickByFingerprint(realCandidates(), fp, '[EOS-W-a986a437]')
-  ok('xero fingerprint picks the auto-titled xero tab',
-     r.match && r.match.label === 'Reconcile Xero push back…', JSON.stringify(r))
+function run() {
+  let pass = 0, fail = 0
+  function ok(name, cond, extra) {
+    if (cond) { pass++; console.log('  PASS ' + name) }
+    else { fail++; console.log('  FAIL ' + name + (extra ? ' :: ' + extra : '')) }
+  }
+
+  // 1: the real failure case now resolves to the right tab
+  {
+    const fp = computeFingerprint(XERO_BRIEF)
+    const r = pickByFingerprint(realCandidates(), fp, '[EOS-W-a986a437]')
+    ok('xero fingerprint picks the auto-titled xero tab',
+       r.match && r.match.label === 'Reconcile Xero push back…', JSON.stringify(r))
+  }
+
+  // 2: a DIFFERENT worker's sentinel is never fuzzy-closed
+  {
+    const fp = computeFingerprint('dispatched worker reconcile xero push backlog')
+    const r = pickByFingerprint(realCandidates(), fp, '[EOS-W-a986a437]')
+    ok('never selects a tab bearing a different sentinel',
+       !r.match || !/^\[EOS-W-/.test(r.match.label), JSON.stringify(r))
+  }
+
+  // 3: ambiguity refuses (two identical xero auto-titles)
+  {
+    const cands = realCandidates()
+    cands.push({ label: 'Reconcile Xero push back…' })
+    const fp = computeFingerprint(XERO_BRIEF)
+    const r = pickByFingerprint(cands, fp, '[EOS-W-a986a437]')
+    ok('two identical xero titles -> ambiguous refuse (no wrong-close)',
+       r.match === null && /ambiguous/.test(r.reason), JSON.stringify(r))
+  }
+
+  // 4: a glovebox worker does NOT match the xero tab
+  {
+    const fp = computeFingerprint(GLOVEBOX_BRIEF)
+    const r = pickByFingerprint(realCandidates(), fp, '[EOS-W-zzzzzzzz]')
+    ok('glovebox fingerprint never closes the xero tab',
+       !r.match || r.match.label !== 'Reconcile Xero push back…', JSON.stringify(r))
+  }
+
+  // 5: no fingerprint -> null (legacy workers, pre-fix)
+  {
+    const r = pickByFingerprint(realCandidates(), null, '[EOS-W-a986a437]')
+    ok('absent fingerprint -> no match (graceful legacy behaviour)',
+       r.match === null && r.reason === 'no_fingerprint', JSON.stringify(r))
+  }
+
+  // 6: unrelated tabs only -> null (no spurious close)
+  {
+    const fp = computeFingerprint(XERO_BRIEF)
+    const r = pickByFingerprint(
+      [{ label: 'ESPS' }, { label: 'Glovebox ui' }, { label: 'Review bootstrap directi…' }],
+      fp, '[EOS-W-a986a437]')
+    ok('no xero tab present -> refuse (no false positive)', r.match === null, JSON.stringify(r))
+  }
+
+  // 7: prefix tolerance on truncated final token ("back" <- "backlog")
+  {
+    const fp = computeFingerprint('reconcile xero push backlog staged transactions')
+    const r = pickByFingerprint([{ label: 'Reconcile Xero push back…' }], fp, '[EOS-W-a986a437]')
+    ok('truncated final token matches by prefix',
+       r.match && r.match.label === 'Reconcile Xero push back…', JSON.stringify(r))
+  }
+
+  console.log('\n' + pass + ' passed, ' + fail + ' failed')
+  return fail
 }
 
-// ---- Test 2: a DIFFERENT worker's sentinel is never fuzzy-closed ----
-{
-  // Even with a fingerprint that shares the wrapper word "dispat", the still-
-  // sentinelled other-worker tabs must be excluded (they carry [EOS-W-...]).
-  const fp = computeFingerprint('dispatched worker reconcile xero push backlog')
-  const r = pickByFingerprint(realCandidates(), fp, '[EOS-W-a986a437]')
-  ok('never selects a tab bearing a different sentinel',
-     !r.match || !/^\[EOS-W-/.test(r.match.label), JSON.stringify(r))
+// Only execute (and exit) when invoked directly. A require() is a no-op import.
+if (require.main === module) {
+  process.exit(run() ? 1 : 0)
 }
 
-// ---- Test 3: ambiguity refuses (two identical xero auto-titles) ----
-{
-  const cands = realCandidates()
-  cands.push({ label: 'Reconcile Xero push back…' }) // a second xero worker
-  const fp = computeFingerprint(XERO_BRIEF)
-  const r = pickByFingerprint(cands, fp, '[EOS-W-a986a437]')
-  ok('two identical xero titles -> ambiguous refuse (no wrong-close)',
-     r.match === null && /ambiguous/.test(r.reason), JSON.stringify(r))
-}
-
-// ---- Test 4: a glovebox worker does NOT match the xero tab ----
-{
-  const fp = computeFingerprint(GLOVEBOX_BRIEF)
-  const r = pickByFingerprint(realCandidates(), fp, '[EOS-W-zzzzzzzz]')
-  // It may legitimately match "Glovebox ui"; the safety property is that it
-  // NEVER matches the xero tab with a glovebox fingerprint.
-  ok('glovebox fingerprint never closes the xero tab',
-     !r.match || r.match.label !== 'Reconcile Xero push back…', JSON.stringify(r))
-}
-
-// ---- Test 5: no fingerprint -> null (legacy workers, pre-fix) ----
-{
-  const r = pickByFingerprint(realCandidates(), null, '[EOS-W-a986a437]')
-  ok('absent fingerprint -> no match (graceful legacy behaviour)',
-     r.match === null && r.reason === 'no_fingerprint', JSON.stringify(r))
-}
-
-// ---- Test 6: unrelated tabs only -> null (no spurious close) ----
-{
-  const fp = computeFingerprint(XERO_BRIEF)
-  const r = pickByFingerprint(
-    [{ label: 'ESPS' }, { label: 'Glovebox ui' }, { label: 'Review bootstrap directi…' }],
-    fp, '[EOS-W-a986a437]')
-  ok('no xero tab present -> refuse (no false positive)',
-     r.match === null, JSON.stringify(r))
-}
-
-// ---- Test 7: prefix tolerance on truncated final token ("back" <- "backlog") ----
-{
-  const fp = computeFingerprint('reconcile xero push backlog staged transactions')
-  const r = pickByFingerprint([{ label: 'Reconcile Xero push back…' }], fp, '[EOS-W-a986a437]')
-  ok('truncated final token matches by prefix',
-     r.match && r.match.label === 'Reconcile Xero push back…', JSON.stringify(r))
-}
-
-console.log('\n' + pass + ' passed, ' + fail + ' failed')
-process.exit(fail ? 1 : 0)
+module.exports = { run, realCandidates }
