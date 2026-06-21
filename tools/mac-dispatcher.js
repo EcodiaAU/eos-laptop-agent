@@ -188,6 +188,13 @@ async function dispatch_worker(params) {
   const sentinel_prefix = '[' + sentinel_inner + ']'
   const briefed_body = sentinel_prefix + ' ' + brief_body
 
+  // 2026-06-22: auto-title fingerprint so close_my_tab / kill_worker can find
+  // this tab after Claude Code summarises the brief into the title and strips
+  // the sentinel. Uniqueness-gated at match time (better leak than wrong-close).
+  // Doctrine: cc-auto-title-summarizer-strips-eos-w-sentinel-tabs-leak-2026-06-08.
+  let autotitle_fingerprint = null
+  try { autotitle_fingerprint = require('./tab-title-match').computeFingerprint(brief_body) } catch (_e) {}
+
   const brief_size_bytes = Buffer.byteLength(briefed_body, 'utf8')
   let brief_storage = 'inline'
   let brief_file_path = null
@@ -273,6 +280,7 @@ async function dispatch_worker(params) {
         viewType: ot.viewType || 'mainThreadWebview-claudeVSCodePanel',
         label_at_spawn: ot.label,
         tabIndex: (typeof ot.index === 'number') ? ot.index : null,
+        autotitle_fingerprint,
         captured_via: 'bridge_chat_send_message',
         captured_label_is_provisional: true,
       }

@@ -324,6 +324,15 @@ async function dispatch_worker(params) {
   const sentinel_prefix = '[' + sentinel_inner + ']'
   const briefed_body = sentinel_prefix + ' ' + brief_body
 
+  // 2026-06-22: auto-title fingerprint. Claude Code rewrites the tab label a few
+  // seconds after spawn, summarising the brief and stripping the sentinel, which
+  // breaks close_my_tab's identity tiers. Fingerprint the brief's salient tokens
+  // now so close_my_tab can recognise the auto-titled label later (uniqueness-
+  // gated, so ambiguity still leaks rather than wrong-closes).
+  // Doctrine: cc-auto-title-summarizer-strips-eos-w-sentinel-tabs-leak-2026-06-08.
+  let autotitle_fingerprint = null
+  try { autotitle_fingerprint = require('./tab-title-match').computeFingerprint(brief_body) } catch (_e) {}
+
   // Decide inline vs file (use briefed body for size calc + paste)
   const brief_size_bytes = Buffer.byteLength(briefed_body, 'utf8')
   let brief_storage = 'inline'
@@ -494,6 +503,7 @@ async function dispatch_worker(params) {
         viewType: ot.viewType || 'mainThreadWebview-claudeVSCodePanel',
         label_at_spawn: ot.label,
         tabIndex: (typeof ot.index === 'number') ? ot.index : null,
+        autotitle_fingerprint: autotitle_fingerprint,
         captured_via: 'bridge_chat_send_message',
         captured_label_is_provisional: true,
       }
@@ -917,10 +927,22 @@ async function kill_worker(params) {
         const hit = candidates.find(t => t.label === exactLabel)
         if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
       }
+      // (d) auto-title fingerprint match (mirrors coord.close_my_tab tier d,
+      // 2026-06-22). Uniqueness-gated: closes only on a single decisive winner.
+      let fingerprintReason = null
+      if (!foundExact && tab_handle.autotitle_fingerprint) {
+        try {
+          const ttm = require('./tab-title-match')
+          const picked = ttm.pickByFingerprint(candidates, tab_handle.autotitle_fingerprint, sentinelPrefix)
+          fingerprintReason = picked.reason
+          if (picked.match) { foundExact = picked.match; matchedBy = 'autotitle_' + picked.reason }
+        } catch (e) { fingerprintReason = 'fingerprint_error:' + (e.message || String(e)) }
+      }
       if (!foundExact) {
         refused = 'no_match:tabIndex=' + (storedTabIndex == null ? 'null' : storedTabIndex)
           + '|sentinel=' + (sentinelPrefix || 'null')
           + '|exact=' + (exactLabel || 'null')
+          + '|fp=' + (fingerprintReason || (tab_handle.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + tab_handle.viewColumn
       } else {
         const closeReq = { viewColumn: tab_handle.viewColumn, viewType: CC_CHAT_VIEW_TYPE }

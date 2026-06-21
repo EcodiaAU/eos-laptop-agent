@@ -793,6 +793,24 @@ async function close_my_tab(params, ctx) {
         if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
       }
 
+      // (d) auto-title fingerprint match. 2026-06-22. The sentinel + spawn label
+      // are gone once Claude Code summarises the brief into the tab title, so
+      // (a)/(b)/(c) all miss for any worker that ran long enough to be retitled
+      // (the common case). The auto-title is drawn from the brief, so a
+      // fingerprint of the brief's salient tokens recognises it. Uniqueness-
+      // gated inside pickByFingerprint: closes ONLY on a single decisive winner,
+      // else returns null and we still refuse + leak (never wrong-close).
+      // Doctrine: cc-auto-title-summarizer-strips-eos-w-sentinel-tabs-leak-2026-06-08.
+      let fingerprintReason = null
+      if (!foundExact && stored.autotitle_fingerprint) {
+        try {
+          const ttm = require('./tab-title-match')
+          const picked = ttm.pickByFingerprint(candidates, stored.autotitle_fingerprint, sentinelPrefix)
+          fingerprintReason = picked.reason
+          if (picked.match) { foundExact = picked.match; matchedBy = 'autotitle_' + picked.reason }
+        } catch (e) { fingerprintReason = 'fingerprint_error:' + (e.message || String(e)) }
+      }
+
       if (!foundExact) {
         // 2026-05-29 Fix C: echo the candidate set inline so a no_match is
         // debuggable in ONE round-trip (was just a count, which forced a
@@ -801,6 +819,7 @@ async function close_my_tab(params, ctx) {
         refused = 'no_match:tabIndex=' + (storedTabIndex == null ? 'null' : storedTabIndex)
           + '|sentinel=' + (sentinelPrefix || 'null')
           + '|exact=' + (exactLabel || 'null')
+          + '|fp=' + (fingerprintReason || (stored.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ': [' + candLabels + '])'
       } else {
         // Compose close request. If we matched via tabIndex use the deterministic
