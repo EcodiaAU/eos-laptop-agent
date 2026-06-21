@@ -277,20 +277,21 @@ async function dispatch_worker(params) {
         captured_label_is_provisional: true,
       }
     }
-    // Submit step (ports cowork.js post-2026-06-03 'click window center + 4x
-    // Enter' fix to Mac). The bridge has populated the textarea but the first
-    // Enter often no-ops if populate races with submit handler's
-    // textContent.trim() check. The Windows fix is: focusFirstEditorGroup +
-    // WinActivate + settle 1200ms + physical click window center +
-    // 4x Enter spaced 800ms (the 4x is because the first Enter on empty
-    // textarea is a no-op per CC's submit handler; subsequent Enters catch
-    // the populated textarea; post-submit Enters are no-ops). Mac mirror:
+    // Submit step. The bridge has populated the textarea; the 1200ms settle
+    // below guarantees populate has finished before the Enter lands, so a
+    // single Return reliably submits the already-prefilled brief. (History:
+    // this used to fire 4x Enter spaced 800ms as belt-and-suspenders against a
+    // populate/submit race, but the settle already closes that race and the
+    // first Enter is the only one that ever submitted - the extra 3 were
+    // no-ops landing on whatever surface had focus. Cut to 1x on 2026-06-21
+    // per Tate: the trailing presses were disruptive, not load-bearing.)
+    // Mac mirror:
     //   1) bridge ide.command focusNthEditorGroup (by viewColumn) - already
     //      moves keyboard focus into that group from the extension host
     //   2) applescript.activate_app (Apple Events activate, no focus steal
     //      beyond bringing VS Code forward)
     //   3) 1200ms settle for populate to finish
-    //   4) 4x applescript.keystroke 'return' spaced 800ms
+    //   4) 1x applescript.keystroke 'return'
     if (tab_handle && !spawn_error) {
       try {
         // 1. Focus the editor group hosting the new chat tab via bridge.
@@ -316,18 +317,14 @@ async function dispatch_worker(params) {
         await applescript.activate_app({ app: 'Visual Studio Code' })
         // 3. Settle for the bridge's editor.open + textarea-populate to finish.
         await sleep(1200)
-        // 4. 4x Enter spaced 800ms. First Enter usually catches; extras are
-        //    no-ops on empty input. Sequential await sleeps so the gap is
-        //    real (Node setTimeout precision is fine for >100ms gaps).
-        for (let i = 0; i < 4; i++) {
-          try {
-            await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
-          } catch (e) {
-            // tolerate individual keystroke failures, keep retrying
-          }
-          if (i < 3) await sleep(800)
+        // 4. Single Enter. The 1200ms settle above guarantees the populated
+        //    textarea is ready, so one Return submits the brief.
+        try {
+          await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
+        } catch (e) {
+          // tolerate keystroke failure; tab is open + prefilled, recoverable by hand
         }
-        submit_path = 'focus_group+activate+1200ms_settle+4x_return_800ms'
+        submit_path = 'focus_group+activate+1200ms_settle+1x_return'
       } catch (e) {
         submit_path = 'submit_chain_threw: ' + e.message
       }
