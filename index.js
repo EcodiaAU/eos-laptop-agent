@@ -39,9 +39,13 @@ const tools = {}
 const toolDir = path.join(__dirname, 'tools')
 for (const file of fs.readdirSync(toolDir)) {
   if (!file.endsWith('.js')) continue
-  // Skip *.test.js, *.spec.js and similar harness files - they call process.exit()
-  // at the end of a run, which would kill the server during autoload.
-  if (/\.(test|spec|bench)\.js$/.test(file)) continue
+  // Skip test/harness files - they run assertions and call process.exit() at load
+  // (no require.main guard), which kills the server mid-autoload. Match BOTH the
+  // suffix conventions (*.test.js / *.spec.js / *.bench.js / *.integration.js) AND
+  // the `test-` prefix convention: tools/test-tab-title-match.js slipped the old
+  // suffix-only filter, ran its suite at require(), printed "7 passed" and exited
+  // before app.listen - the agent was down ~5h on 2026-06-22 (no API, no cron).
+  if (/(^test-|\.(test|spec|bench|integration)\.js$)/.test(file)) continue
   const mod = require(path.join(toolDir, file))
   const moduleName = path.basename(file, '.js')
   for (const [name, fn] of Object.entries(mod)) {
