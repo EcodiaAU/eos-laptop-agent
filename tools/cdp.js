@@ -15,8 +15,12 @@
 //           (the relaunch side is handled by gui.enable_chrome_cdp).
 
 const http = require('http')
+const fs = require('fs')
+const path = require('path')
+const os = require('os')
 
 const DEFAULT_PORT = 9222
+const KV_MIRROR_DIR = path.join(os.homedir(), 'PRIVATE', 'ecodia-creds', 'kv-mirror')
 let connection = null  // { browser, page } - legacy, kept for compat with selectTab
 let connectedPort = null
 // Map<alias, targetId>. Per-call page resolution (no singleton). Aliases let
@@ -29,37 +33,56 @@ function _extractTargetId(page) {
   catch (_e) { return null }
 }
 
-// Per-call page resolver. Picks the lookup strategy from `opts.target`:
-//   {targetId}      stable CDP id
-//   {alias}         pre-registered name -> targetId
-//   {urlContains}   substring match on page URL
-//   {titleContains} substring match on page title
-//   {index}         browser.pages()[index]
-// Falls back to last-touched, then last page. Existing callers without
-// `target` keep the legacy behaviour via the lastTouched fallback.
+// Per-call page resolver. Picks the lookup strategy from EITHER:
+//   - flat opts (canonical):  {alias} / {targetId} / {urlContains} / {titleContains} / {index}
+//   - nested opts.target (legacy): {target: {alias|targetId|...}}
+//
+// STRICT: when a caller names a specific tab (alias / targetId / urlContains
+// / titleContains / index), a miss THROWS - never silently falls back to
+// some other tab. The silent-fallback behaviour caused every parallel-tab
+// CDP bug we hit: a registered alias would be ignored because resolveTarget
+// only checked nested opts.target, the lookup would fall through to
+// lastTouchedTargetId, and a different tab got the operation. (fix 2026-05-28)
+//
+// Only when the caller passes NO target spec at all does the fallback chain
+// (lastTouchedTargetId -> last page) kick in - that's the "fire-and-forget"
+// single-tab case from the very first cdp.* drafts.
 async function resolveTarget(opts) {
+  opts = opts || {}
   const c = await ensureConnected(opts)
-  const target = (opts && opts.target) || {}
+  // Merge flat + nested specs. Flat (top-level) wins over nested for the
+  // same key - flat is the canonical surface, nested is kept for legacy
+  // callers that still pass {target: {alias: ...}}.
+  const nested = opts.target || {}
+  const spec = {
+    targetId: opts.targetId || nested.targetId,
+    alias: opts.alias || nested.alias,
+    urlContains: opts.urlContains || nested.urlContains,
+    titleContains: opts.titleContains || nested.titleContains,
+    index: (typeof opts.index === 'number') ? opts.index : nested.index,
+  }
+  const explicit = !!(spec.targetId || spec.alias || spec.urlContains || spec.titleContains || (typeof spec.index === 'number'))
+
   const pages = await c.browser.pages()
   const byId = async (tid) => {
     for (const p of pages) if (_extractTargetId(p) === tid) return p
     return null
   }
-  if (target.targetId) {
-    const p = await byId(target.targetId)
-    if (p) { lastTouchedTargetId = target.targetId; return p }
-    throw new Error('no page matches targetId ' + target.targetId + ' (tab closed)')
+  if (spec.targetId) {
+    const p = await byId(spec.targetId)
+    if (p) { lastTouchedTargetId = spec.targetId; return p }
+    throw new Error('no page matches targetId ' + spec.targetId + ' (tab closed)')
   }
-  if (target.alias) {
-    const tid = aliasToTargetId.get(target.alias)
-    if (!tid) throw new Error('alias not registered: ' + target.alias + '. Use cdp.attach_tab first.')
+  if (spec.alias) {
+    const tid = aliasToTargetId.get(spec.alias)
+    if (!tid) throw new Error('alias not registered: ' + spec.alias + '. Use cdp.attach first.')
     const p = await byId(tid)
     if (p) { lastTouchedTargetId = tid; return p }
-    aliasToTargetId.delete(target.alias)
-    throw new Error('alias ' + target.alias + ' pointed at a closed tab; alias dropped')
+    aliasToTargetId.delete(spec.alias)
+    throw new Error('alias ' + spec.alias + ' pointed at a closed tab; alias dropped')
   }
-  if (target.urlContains) {
-    const needle = String(target.urlContains).toLowerCase()
+  if (spec.urlContains) {
+    const needle = String(spec.urlContains).toLowerCase()
     for (const p of pages) {
       try {
         if (String(await p.url()).toLowerCase().indexOf(needle) !== -1) {
@@ -68,10 +91,10 @@ async function resolveTarget(opts) {
         }
       } catch (_e) {}
     }
-    throw new Error('no tab url contains: ' + target.urlContains)
+    throw new Error('no tab url contains: ' + spec.urlContains)
   }
-  if (target.titleContains) {
-    const needle = String(target.titleContains).toLowerCase()
+  if (spec.titleContains) {
+    const needle = String(spec.titleContains).toLowerCase()
     for (const p of pages) {
       try {
         if (String(await p.title()).toLowerCase().indexOf(needle) !== -1) {
@@ -80,15 +103,18 @@ async function resolveTarget(opts) {
         }
       } catch (_e) {}
     }
-    throw new Error('no tab title contains: ' + target.titleContains)
+    throw new Error('no tab title contains: ' + spec.titleContains)
   }
-  if (typeof target.index === 'number') {
-    if (target.index < 0 || target.index >= pages.length) throw new Error('index out of range')
-    const p = pages[target.index]
+  if (typeof spec.index === 'number') {
+    if (spec.index < 0 || spec.index >= pages.length) throw new Error('index out of range')
+    const p = pages[spec.index]
     lastTouchedTargetId = _extractTargetId(p)
     return p
   }
-  // fallback: last-touched, then last
+  // explicit caller is guaranteed to have hit one of the branches above; if
+  // we get here the caller passed no spec at all. Use the unattached
+  // fallback chain (lastTouched -> last page).
+  if (explicit) throw new Error('resolveTarget: explicit spec set but no branch matched (bug)')
   if (lastTouchedTargetId) {
     const p = await byId(lastTouchedTargetId)
     if (p) return p
@@ -122,9 +148,14 @@ async function ensureConnected(opts) {
   }
   const puppeteer = require('puppeteer')
   try {
+    // protocolTimeout default 30s is too short when the Chrome being connected
+    // to has many targets (extensions, iframes, stripe popups) - Puppeteer
+    // enables Network on every target during connect and the cascade can
+    // exceed 30s on a working session with 10+ tabs. Bump to 120s. (fix 2026-05-28)
     const browser = await puppeteer.connect({
       browserURL: `http://localhost:${port}`,
       defaultViewport: null,
+      protocolTimeout: 120000,
     })
     const pages = await browser.pages()
     const page = pages[pages.length - 1] || await browser.newPage()
@@ -293,12 +324,14 @@ async function listTabs(opts) {
   return { count: tabs.length, tabs: tabs }
 }
 
-// LEGACY: bring tab to front + set implicit-fallback target. Use cdp.attach_tab
-// for stable named aliasing in new code - that's what unlocks true parallelism.
+// Bring a tab to front. Accepts the same target spec as every other cdp.*
+// tool (alias / targetId / urlContains / titleContains / index, flat or
+// nested). Mutates lastTouchedTargetId so subsequent fallback-mode calls
+// land on this tab - explicit-alias callers are unaffected (the resolver
+// never falls back when an alias is set).
 async function selectTab(opts) {
   opts = opts || {}
-  const target = opts.target || { index: opts.index, urlContains: opts.urlContains, titleContains: opts.titleContains }
-  const page = await resolveTarget({ target })
+  const page = await resolveTarget(opts)
   await page.bringToFront()
   lastTouchedTargetId = _extractTargetId(page)
   return { ok: true, url: await page.url(), title: await page.title(), brought_to_front: true }
@@ -630,6 +663,94 @@ async function deepFindRect(opts) {
   return result
 }
 
+// _extractSecretFromMirror - pull the plaintext secret out of a kv-mirror file
+// body. Mirror files come in two shapes (see kv-mirror-refresh):
+//   - scalar: raw text / a bare JSON string (the value itself)
+//   - object: a JSON object carrying the secret under `value` (plus metadata
+//             like apple_id / rotation / stored_at), e.g. apple.password.json
+// credField overrides which object field to read. Never logs the value.
+function _extractSecretFromMirror(raw, credField) {
+  let parsed
+  try { parsed = JSON.parse(raw) } catch (_e) { return String(raw).trim() }
+  if (typeof parsed === 'string') return parsed
+  if (parsed && typeof parsed === 'object') {
+    if (credField && typeof parsed[credField] === 'string') return parsed[credField]
+    for (const k of ['value', 'password', 'secret', 'token', 'api_key', 'apiKey', 'key']) {
+      if (typeof parsed[k] === 'string') return parsed[k]
+    }
+    const strFields = Object.keys(parsed).filter(k => typeof parsed[k] === 'string')
+    if (strFields.length === 1) return parsed[strFields[0]]
+  }
+  throw new Error('credKey resolved a structured value; pass {credField:"<field>"} to disambiguate')
+}
+
+// resolveCredValue - resolve a credKey to its plaintext INSIDE the laptop-agent
+// process so the secret never enters the conductor's tool-call args / LLM
+// context. credKey is either a kv-mirror filename ("apple.password.json" or
+// "apple.password") or a kv_store key ("creds.<x>"). The kv-mirror (offline,
+// canonical local store) is tried first; a `creds.<x>` key that has no mirror
+// falls back to the live kv_store read via tools/proposed/kv.js.
+// Doctrine: kv-read-creds-helper-and-doctrine-2026-06-08.
+async function resolveCredValue(credKey, credField) {
+  if (!credKey || typeof credKey !== 'string') throw new Error('credKey (string) required')
+  if (/[\/\\]/.test(credKey) && !credKey.endsWith('.json')) {
+    throw new Error('credKey must be a kv-mirror filename or a creds.* key, not a path')
+  }
+  const candidates = []
+  if (credKey.endsWith('.json')) candidates.push(path.join(KV_MIRROR_DIR, credKey))
+  else candidates.push(path.join(KV_MIRROR_DIR, credKey + '.json'))
+  if (credKey.startsWith('creds.')) candidates.push(path.join(KV_MIRROR_DIR, credKey.slice('creds.'.length) + '.json'))
+  for (const f of candidates) {
+    try {
+      if (fs.existsSync(f)) return _extractSecretFromMirror(fs.readFileSync(f, 'utf8'), credField)
+    } catch (_e) { /* fall through to next candidate / kv_store */ }
+  }
+  if (credKey.startsWith('creds.')) {
+    let kv
+    try { kv = require('./proposed/kv.js') } catch (_e) { kv = null }
+    if (kv && typeof kv.read_creds === 'function') {
+      const res = await kv.read_creds({ key: credKey })
+      if (res && res.found) {
+        if (typeof res.value === 'string') return res.value
+        if (res.value && typeof res.value === 'object') return _extractSecretFromMirror(JSON.stringify(res.value), credField)
+      }
+    }
+  }
+  throw new Error(`credKey "${credKey}" did not resolve to a secret on disk or in kv_store`)
+}
+
+// _knownSecretSet - lazily load every kv-mirror secret value into a module-cached
+// set, so nativeFill can warn when a caller passes a plaintext opts.value that
+// matches an on-disk secret. The cache lives only inside this trusted process.
+let _secretCache = null
+function _knownSecretSet() {
+  if (_secretCache) return _secretCache
+  const map = new Map()  // secretValue -> mirror filename
+  try {
+    for (const fn of fs.readdirSync(KV_MIRROR_DIR)) {
+      if (!fn.endsWith('.json') || fn === 'MANIFEST.json') continue
+      try {
+        const v = _extractSecretFromMirror(fs.readFileSync(path.join(KV_MIRROR_DIR, fn), 'utf8'))
+        if (typeof v === 'string' && v.length >= 8) map.set(v, fn)
+      } catch (_e) { /* skip structured-only files */ }
+    }
+  } catch (_e) { /* mirror dir absent; no warn */ }
+  _secretCache = map
+  return map
+}
+
+// _knownSecretMatch - return the mirror filename whose secret equals or is a
+// substring relation of `value` (>=8 chars), else null. Never returns the value.
+function _knownSecretMatch(value) {
+  if (typeof value !== 'string' || value.length < 8) return null
+  const map = _knownSecretSet()
+  if (map.has(value)) return map.get(value)
+  for (const [secret, fn] of map) {
+    if (value.includes(secret) || secret.includes(value)) return fn
+  }
+  return null
+}
+
 // cdp.nativeFill - fill a controlled input via the native HTMLInputElement
 // prototype setter, then dispatch input + change events. The fix for React/MUI/
 // SPA inputs where `el.value = 'x'` is silently overwritten on the next render
@@ -641,9 +762,31 @@ async function deepFindRect(opts) {
 //   - {currentValue} input.value === value (e.g. find the input currently
 //                    showing the default cron expression and replace it)
 //   - {ariaLabel}    aria-label substring match
+//
+// Secret indirection (additive, backward-compatible):
+//   - {credKey}      resolve a kv-mirror filename / creds.* key to its plaintext
+//                    INSIDE this process and type it, so the conductor never
+//                    reads the password into context. {credField} disambiguates
+//                    a structured mirror file. finalValue is REDACTED on return.
+//   - {value}        plaintext (unchanged). Warns if it matches an on-disk secret.
 async function nativeFill(opts) {
   opts = opts || {}
-  if (typeof opts.value !== 'string') throw new Error('value (string) required')
+  let value = opts.value
+  let redact = false
+  if (opts.credKey) {
+    value = await resolveCredValue(opts.credKey, opts.credField)
+    redact = true
+  }
+  if (typeof value !== 'string') throw new Error('value (string) or credKey required')
+  if (!opts.credKey) {
+    try {
+      const match = _knownSecretMatch(value)
+      if (match) {
+        console.warn(`[cdp.nativeFill] WARN opts.value matches on-disk secret "${match}". ` +
+          `Pass {credKey:"${match}"} so the plaintext never enters tool-call args / conductor context.`)
+      }
+    } catch (_e) { /* warn is best-effort */ }
+  }
   const page = await resolveTarget(opts)
   const result = await page.evaluate(function(args){
     const collect = function(){
@@ -695,7 +838,13 @@ async function nativeFill(opts) {
     target.dispatchEvent(new Event('input', { bubbles: true }))
     target.dispatchEvent(new Event('change', { bubbles: true }))
     return { ok: true, tag: target.tagName, finalValue: target.value, placeholder: target.placeholder || '', aria: target.getAttribute('aria-label') || '' }
-  }, { value: opts.value, selector: opts.selector, placeholder: opts.placeholder, currentValue: opts.currentValue, ariaLabel: opts.ariaLabel })
+  }, { value: value, selector: opts.selector, placeholder: opts.placeholder, currentValue: opts.currentValue, ariaLabel: opts.ariaLabel })
+  // Redact the echoed secret on the credKey path so it never leaves this
+  // process / reaches the conductor's tool result.
+  if (redact && result && typeof result === 'object') {
+    if ('finalValue' in result) result.finalValue = '***REDACTED***'
+    result.credKey = opts.credKey
+  }
   return result
 }
 
@@ -816,34 +965,42 @@ async function helpers() {
   return {
     ok: true,
     doctrine: 'backend/patterns/cdp-helper-library-and-recursive-improvement-2026-05-18.md',
+    aliasContract: {
+      summary: 'Every cdp.* operation accepts {alias} (or targetId/urlContains/titleContains/index) at the TOP level. Strict: missing alias throws, no silent fallback. Multiple chats can drive multiple tabs in parallel by namespacing aliases (e.g. eos-<chat>-<purpose>).',
+      registerAlias: "cdp.attach_tab({alias: 'eos-main-rc', urlContains: 'revenuecat.com'})",
+      useAlias: "cdp.runJs({alias: 'eos-main-rc', js: 'document.title'}) -- and the same flat alias param on every other cdp.* tool",
+      dropAlias: "cdp.detach_tab({alias: 'eos-main-rc'})",
+      listAliases: 'cdp.list_aliases({}) -- shows registered aliases + their current live URL/title',
+    },
     helpers: [
       {
         name: 'cdp.realClick',
         whenToUse: 'Material/MUI/custom-element buttons that ignore JS .click(). Sends full Input.dispatchMouseEvent sequence.',
-        example: "cdp.realClick({x: 946, y: 874}) OR cdp.realClick({tag: 'BUTTON', text: 'Save'})",
+        example: "cdp.realClick({alias: 'eos-main-rc', x: 946, y: 874}) OR cdp.realClick({alias: '...', tag: 'BUTTON', text: 'Save'})",
       },
       {
         name: 'cdp.deepFindRect',
         whenToUse: 'Lock onto the real BUTTON when a P/SPAN wraps the same label outside the modal. Shadow-DOM aware, visible-rect filtered.',
-        example: "cdp.deepFindRect({tag: 'BUTTON', text: 'Save', exact: true})",
+        example: "cdp.deepFindRect({alias: 'eos-main-rc', tag: 'BUTTON', text: 'Save', exact: true})",
       },
       {
         name: 'cdp.nativeFill',
         whenToUse: "React/MUI controlled inputs where el.value = 'x' reverts on next render. Uses native HTMLInputElement.prototype setter.",
-        example: "cdp.nativeFill({placeholder: '0 9 * * *', value: '0 */6 * * *'})",
+        example: "cdp.nativeFill({alias: 'eos-main-rc', placeholder: '0 9 * * *', value: '0 */6 * * *'})",
       },
       {
         name: 'cdp.findVisible',
         whenToUse: '"What is on screen right now?" - shadow-DOM aware enumeration with rect + text + aria + role. Eyes-of-the-blind reflex.',
-        example: "cdp.findVisible({tag: 'BUTTON', text: 'save', limit: 10})",
+        example: "cdp.findVisible({alias: 'eos-main-rc', tag: 'BUTTON', text: 'save', limit: 10})",
       },
       {
         name: 'cdp.clickByTag',
         whenToUse: 'Default reach-for click helper. Cheap JS click first, auto-escalates to real CDP mouse if focus did not move.',
-        example: "cdp.clickByTag({tag: 'BUTTON', text: 'Save'})",
+        example: "cdp.clickByTag({alias: 'eos-main-rc', tag: 'BUTTON', text: 'Save'})",
       },
     ],
     hardRules: [
+      'Always pass {alias} on every cdp.* call once you have attached one. Implicit fallback is for unattached single-tab use only.',
       'Never send Escape (closes parent panels in GCP / Material UIs)',
       'Filter by tag:BUTTON when clicking by text (P/SPAN can wrap the same label)',
       'Use cdp.nativeFill for any controlled input, not el.value =',
@@ -902,4 +1059,31 @@ module.exports = {
   findVisible: findVisible,
   clickByTag: clickByTag,
   helpers: helpers,
+}
+
+// CLI selftest for the credKey indirection. Proves the resolver returns a
+// non-empty secret of the expected length and that _knownSecretMatch fires,
+// WITHOUT ever printing the plaintext (only length + a non-reversible sha8 +
+// the matched mirror filename, none of which leak the secret).
+//   node tools/cdp.js --selftest-cred <credKey> [credField]
+//   node tools/cdp.js --selftest-warn  <credKey>   (resolve then assert warn-match)
+if (require.main === module) {
+  const mode = process.argv[2]
+  const crypto = require('crypto')
+  const sha8 = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 8)
+  if (mode === '--selftest-cred') {
+    resolveCredValue(process.argv[3], process.argv[4])
+      .then(v => { console.log(JSON.stringify({ ok: true, credKey: process.argv[3], length: v.length, sha8: sha8(v) })) })
+      .catch(e => { console.log(JSON.stringify({ ok: false, error: e.message })); process.exit(1) })
+  } else if (mode === '--selftest-warn') {
+    resolveCredValue(process.argv[3])
+      .then(v => {
+        const matched = _knownSecretMatch(v)
+        console.log(JSON.stringify({ ok: !!matched, matched: matched || null }))
+        if (!matched) process.exit(1)
+      })
+      .catch(e => { console.log(JSON.stringify({ ok: false, error: e.message })); process.exit(1) })
+  } else {
+    console.log('usage: node tools/cdp.js --selftest-cred <credKey> [credField] | --selftest-warn <credKey>')
+  }
 }

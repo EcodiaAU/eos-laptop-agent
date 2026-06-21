@@ -18,6 +18,7 @@
 
 const path = require('path')
 const fs = require('fs')
+const { spawnSync } = require('child_process')
 
 const AGENT_ROOT = path.resolve(__dirname, '..')
 const usage = require(path.join(AGENT_ROOT, 'tools', 'usage'))
@@ -39,6 +40,84 @@ function writeHeartbeat(payload) {
   } catch (e) {}
 }
 
+// ── 5h-cap auto-switch trigger ───────────────────────────────────────────────
+// 2026-06-14. The chronic "hit the cap and get stuck" problem. Tate's rule
+// (verbatim): "idc when your thing is near capped, it needs to trigger you to do
+// the gui switch if other accounts are available". So the cap-approaching signal
+// must TRIGGER an autonomous CDP sign-in switch to a healthy account, NOT text
+// Tate. This reads the active ccusage 5h block (the same window Claude Code's UI
+// shows). When it crosses the threshold, it asks the laptop-agent for the
+// healthiest OTHER account; if one with real headroom exists, it raises a
+// switch-request that the switch executor consumes (CDP sign-in to that account,
+// which mints a FRESH token - unlike the file-swap which clobbers with a stale
+// snapshot). If no alternate account is enabled+healthy (the current single-
+// account reality), it holds silently. It NEVER texts Tate. Defensive: never
+// throws, never blocks the poll. Calibrated from Tate's live reading 2026-06-14
+// (54% at ~397M tokens -> ~735M real 5h limit).
+const CAP_5H_TOKENS = Number(process.env.CAPS_5H_TOKENS) || 735_000_000
+const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS || '/opt/homebrew/lib/node_modules/ccusage/dist/cli.js'
+const SWITCH_REQUEST_FILE = path.join(_COORD_ROOT, 'usage', 'switch-request.json')
+const SWITCH_TRIGGER_PCT = 0.80   // raise the switch request at 80% of the 5h block
+
+function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
+
+function agentToken() {
+  try {
+    const m = fs.readFileSync(path.join(AGENT_ROOT, '.env'), 'utf8').match(/^AGENT_TOKEN=(.+)$/m)
+    if (m) return m[1].trim()
+  } catch (_) {}
+  return process.env.AGENT_TOKEN || ''
+}
+
+// Call a laptop-agent tool over localhost. Returns parsed result or null.
+function agentTool(tool, params) {
+  try {
+    const payload = JSON.stringify({ tool, params: params || {} })
+    const r = spawnSync('curl', [
+      '-sS', '-m', '12', 'http://127.0.0.1:' + (process.env.AGENT_PORT || 7456) + '/api/tool',
+      '-X', 'POST', '-H', 'content-type: application/json',
+      '-H', 'authorization: Bearer ' + agentToken(), '--data-binary', payload,
+    ], { encoding: 'utf8', timeout: 15000 })
+    if (r.status !== 0 || !r.stdout) return null
+    const j = JSON.parse(r.stdout)
+    return j && j.ok ? j.result : null
+  } catch (_) { return null }
+}
+
+function capAutoSwitch() {
+  try {
+    // Fast cap-switch path (every poll, ~5min). Uses the SAME honest decision as
+    // the 25-min cron: account-cap-decide.js (cache-read-EXCLUDED usage via
+    // tools/usage, calibrated caps, rotatable-snapshot gate, and a no-usable-target
+    // SMS fired inside the module). Single source of truth - no second heuristic.
+    // The prior path read cache-inflated ccusage b.totalTokens / cap and so crossed
+    // 80% almost immediately, scheduling a FALSE OAuth-switch chat every 5h block
+    // (2026-06-21). Execution is now creds.rotate_to: instant + headless, safe
+    // because the cred-refresher keeps all snapshots fresh (it was NOT safe when
+    // snapshots rotted, hence the old heavyweight OAuth-CC-chat). rotate_to is its
+    // own dedupe + guard: no-ops when already on target, DEFERS under active worker
+    // tabs (never clobbers a mid-flight Keychain), refuses a stale snapshot, skips
+    // disabled accounts. The 25-min cron remains the robust backstop (a worker can
+    // force / re-login if rotate_to keeps deferring).
+    const decideR = spawnSync(process.execPath, [path.join(AGENT_ROOT, 'tools', 'account-cap-decide.js')], { encoding: 'utf8', timeout: 25000 })
+    let d = null
+    try { d = JSON.parse(decideR.stdout) } catch (_) { return }
+    if (!d || !d.shouldSwitch || !d.target) return  // hold / no-usable-target (SMS handled in the module)
+
+    const targetShort = String(d.target).split('@')[0]
+    const rot = agentTool('creds.rotate_to', { account: targetShort })
+    const status = !rot ? 'agent_unreachable'
+      : rot.target ? 'switched'
+      : rot.deferred ? ('deferred:' + (rot.reason || 'workers'))
+      : (rot.reason || 'noop')
+    fs.writeFileSync(SWITCH_REQUEST_FILE, JSON.stringify({
+      target: d.target, from: d.live, reason: d.reason, via: 'rotate_to',
+      result: status, raised_at: nowIso(),
+    }), 'utf8')
+    console.log('[' + nowIso() + '] cap-auto-switch: ' + d.live + ' -> ' + d.target + ' via rotate_to (' + status + ')')
+  } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
+}
+
 async function runOnePoll() {
   const t0 = Date.now()
   try {
@@ -57,6 +136,7 @@ async function runOnePoll() {
     }
     console.log('[' + nowIso() + '] poll OK in ' + elapsed + 'ms', JSON.stringify(summary))
     writeHeartbeat({ ok: true, elapsed_ms: elapsed, summary: summary })
+    capAutoSwitch()
   } catch (e) {
     const elapsed = Date.now() - t0
     console.error('[' + nowIso() + '] poll FAILED in ' + elapsed + 'ms: ' + e.message)

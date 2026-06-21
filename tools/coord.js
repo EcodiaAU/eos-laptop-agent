@@ -418,6 +418,39 @@ function readInboxForTopic(topic, sinceMs, limit) {
   return out.slice(0, limit || 50)
 }
 
+// 2026-06-18 scheduler-completion-race fix. The scheduler's completionPass and
+// the interactive conductor are BOTH consumers of chat.conductor.inbox, but a
+// message carries a single per-message seen flag. The conductor's read_inbox
+// marks a worker's `done` signal seen within ~1s of arrival; readInboxForTopic
+// (used by peek_inbox) then skips it forever via the `if (m.seen_at) continue`
+// filter, so completionPass never matches it and the os_scheduled_tasks row
+// rots in status=running until the 6h orphan timer - silently dropping up to
+// five fires of an hourly cron with zero alarm. scanTopicByType reads the FULL
+// in-memory index (seen or unseen), does NOT mark seen, and returns the NEWEST
+// matching message per task_id so the scheduler can detect completion
+// independently of whoever else drains the inbox. The in-memory index is fully
+// hydrated from disk on boot, so this is restart-safe. Doctrine:
+// patterns/scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18.md
+function scanTopicByType(topic, type, taskIds) {
+  const slug = safeTopicSlug(topic)
+  const ids = inboxIndex.get(slug) || new Set()
+  const wantTasks = (taskIds && taskIds.length) ? new Set(taskIds.map(String)) : null
+  const byTask = new Map()  // task_id -> newest matching msg
+  for (const id of ids) {
+    const m = messagesById.get(id)
+    if (!m || !m.body || m.body.type !== type) continue
+    const tid = m.body.task_id != null ? String(m.body.task_id)
+      : (m.task_id != null ? String(m.task_id) : null)
+    if (!tid) continue
+    if (wantTasks && !wantTasks.has(tid)) continue
+    const prev = byTask.get(tid)
+    if (!prev || new Date(m.created_at).getTime() > new Date(prev.created_at).getTime()) {
+      byTask.set(tid, m)
+    }
+  }
+  return byTask
+}
+
 function markSeen(messages) {
   const now = new Date().toISOString()
   for (const m of messages) {
@@ -1151,6 +1184,7 @@ module.exports = {
   send_message: send_message,
   read_inbox: read_inbox,
   peek_inbox: peek_inbox,
+  scanTopicByType: scanTopicByType,
   wait_for_inbox: wait_for_inbox,
   ack_message: ack_message,
   list_workers: list_workers,

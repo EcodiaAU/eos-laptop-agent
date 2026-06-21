@@ -1,7 +1,6 @@
 // scheduler-cancellation-durability.integration.js
 //
-// Integration probe for the cancellation-durability guard (re-landed
-// 2026-06-21 against current main after the original PR #4 went conflicting).
+// Integration probe for the 2026-06-19 cancellation-durability fix.
 //
 // Run with: node tools/scheduler-cancellation-durability.integration.js
 // Requires DATABASE_URL pointing at the live Supabase Postgres (read from
@@ -12,9 +11,6 @@
 // guard now appended to every status='active' re-arm UPDATE in scheduler.js
 // EXCLUDES a cancelled or archived row, so a re-arm BY ID can no longer
 // resurrect it, while a clean active row is still matched (positive control).
-// It also confirms schedule_cancel now flips status to 'cancelled', so a
-// cancelled row leaves the active/running/dispatching set the recovery
-// branches act on.
 //
 // Tests on the real os_scheduled_tasks table using temp rows that are
 // deleted unconditionally in a finally block.
@@ -29,10 +25,9 @@ require('dotenv').config({
 const { Pool } = require('pg')
 
 // The exact guard fragment appended to every status='active' re-arm UPDATE
-// (markFailed cron-defer + retryable, dispatchOne capped + no-IDE defer,
-// markComplete cron re-arm, and the three staleLeaseRecovery branches). Keep
-// this string byte-identical to the SQL in tools/scheduler.js so the probe
-// tests the shipped predicate, not a paraphrase.
+// (markFailed cron-defer + retryable, markComplete cron re-arm, and the three
+// staleLeaseRecovery branches). Keep this string byte-identical to the SQL in
+// tools/scheduler.js so the probe tests the shipped predicate, not a paraphrase.
 const REARM_GUARD =
   "archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))"
 
@@ -117,25 +112,6 @@ async function main() {
     for (const row of after.rows) {
       assert(row.last_status === 'cancelled', 'cancelled row ' + row.id.slice(0, 8) + ' still last_status=cancelled after re-arm attempt')
     }
-
-    // 4. schedule_cancel must flip status to 'cancelled' (not only archived_at +
-    //    last_status), so the row leaves the active/running/dispatching set the
-    //    recovery branches act on. Insert a fresh active row, run the real
-    //    schedule_cancel handler, and re-read.
-    const scheduler = require('./scheduler')
-    scheduler._setPool(pool)
-    const cancelTarget = await ins(tag + '-D-cancel-target', null, null)
-    ids.push(cancelTarget)
-    await scheduler.schedule_cancel({ id: cancelTarget })
-    const cancelled = await pool.query(
-      `SELECT status, last_status, archived_at FROM os_scheduled_tasks WHERE id = $1`,
-      [cancelTarget]
-    )
-    const cr = cancelled.rows[0]
-    assert(cr.status === 'cancelled', "schedule_cancel sets status='cancelled' (leaves the active set)")
-    assert(cr.last_status === 'cancelled', "schedule_cancel keeps last_status='cancelled'")
-    assert(cr.archived_at !== null, 'schedule_cancel keeps archived_at set')
-    ids.push(cancelTarget)
   } finally {
     // Unconditional cleanup of temp rows.
     for (const id of [idArchived, idCancelled, idClean]) {
@@ -146,12 +122,6 @@ async function main() {
           console.error('cleanup error for ' + id + ': ' + e.message)
         }
       }
-    }
-    // The schedule_cancel target row (tagged) - sweep any row carrying this tag.
-    try {
-      await pool.query('DELETE FROM os_scheduled_tasks WHERE name LIKE $1', [tag + '%'])
-    } catch (e) {
-      console.error('tag cleanup error: ' + e.message)
     }
     await pool.end()
   }

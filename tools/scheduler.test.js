@@ -52,6 +52,34 @@ function makeStubPool(rowsForSelect) {
       if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
         return Promise.resolve({ rows: rowsForSelect || [], rowCount: (rowsForSelect || []).length })
       }
+      // 2026-06-21 dispatch-start lease refresh (SET leased_at first, no status
+      // change): in production this matches the held dispatching row (rowCount 1).
+      // Model that here so dispatchOne's pre-spawn reclaim guard does not false-bail
+      // on a valid seeded row. The reclaim-bail path is covered by its own test
+      // (makeReclaimBailPool), which returns rowCount 0 for exactly this UPDATE.
+      if (/UPDATE\s+os_scheduled_tasks\s+SET\s+leased_at = NOW\(\), updated_at = NOW\(\)\s+WHERE/i.test(sql)) {
+        return Promise.resolve({ rows: [], rowCount: 1 })
+      }
+      return Promise.resolve({ rows: [], rowCount: 0 })
+    }
+  }
+  return pool
+}
+
+// Variant of makeStubPool where the dispatch-start lease-refresh UPDATE returns
+// rowCount 0 (lease lost / reclaimed before worker spawn). Used to assert
+// dispatchOne's pre-spawn reclaim guard bails WITHOUT spawning a worker. The
+// refresh is the first non-SELECT UPDATE dispatchOne issues; the guard bails on
+// rowCount 0, so returning 0 for every non-SELECT here is sufficient.
+function makeReclaimBailPool(rowsForSelect) {
+  const queries = []
+  const pool = {
+    _queries: queries,
+    query(sql, params) {
+      queries.push({ sql, params: params || [] })
+      if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
+        return Promise.resolve({ rows: rowsForSelect || [], rowCount: (rowsForSelect || []).length })
+      }
       return Promise.resolve({ rows: [], rowCount: 0 })
     }
   }
@@ -240,6 +268,98 @@ test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', 
   credsModule.rotate_to = origRotate
   coordModule.peek_inbox = origPeekInbox
   coordModule.read_inbox = origReadInbox
+})
+
+// ── 2026-06-21 dispatch-start reclaim guard: bail before spawn when lease lost ──
+// leased_at is stamped at queue-entry by leaseDueRows, but dispatchOne holds the
+// serial launch-lock across each bind, so under a due-row burst a row's leased_at
+// can age past STALE_DISPATCHING_MS while still QUEUED, letting staleLeaseRecovery
+// branch-1 reclaim it before its worker ever spawns (the live 5-6h cron-fleet
+// stall). dispatchOne refreshes leased_at at dispatch-start, guarded on still
+// owning the lease; if the refresh matches 0 rows (reclaimed/cancelled during
+// rotate/worktree prep) it MUST bail without spawning a worker - no orphan tab, no
+// active_workers inflation, no eventual zombie running-flip.
+test('dispatchOne: lease lost before spawn -> bails, no dispatch_worker, no running flip', async () => {
+  const pool = makeReclaimBailPool([{
+    austerity_paused: false, status: 'dispatching', archived_at: null,
+    last_status: null, name: 'gmail-inbox-poll',
+  }])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'code'
+  credsModule.rotate_to = async (acct) => ({ previous: 'tate', current: acct })
+
+  let dispatched = null
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => { dispatched = params; return { ok: true, tab_id: 'tab_should_not_spawn', task_id: params.task_id } },
+    kill_worker: async () => {}
+  })
+
+  const row = makeRow({ id: 'task-reclaimed-pre-spawn', preferred_account: 'code' })
+
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [reclaim-bail threw]:', e.message) }
+
+  assert(!threw, 'dispatchOne reclaim-bail: no throw')
+  assert(dispatched === null, 'dispatchOne reclaim-bail: dispatch_worker NOT called (no orphan tab spawned)')
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!runningUpdate, 'dispatchOne reclaim-bail: no status=running flip issued')
+  const refreshUpdate = pool._queries.find(q => /SET leased_at = NOW\(\), updated_at = NOW\(\)\s+WHERE/i.test(q.sql))
+  assert(!!refreshUpdate, 'dispatchOne reclaim-bail: dispatch-start lease-refresh UPDATE was issued')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+})
+
+// ── 2026-06-19 defense-in-depth austerity gate inside dispatchOne ───────────
+// leaseDueRows excludes austerity_paused rows, but an incident showed paused
+// crons reaching dispatchOne in a burst and spawning worker tabs anyway. The
+// dispatchOne re-read must SKIP a now-paused row: no dispatch_worker, lease
+// released without a retry (no markFailed, next_run_at untouched).
+test('dispatchOne: SKIPs an austerity_paused row - no dispatch, lease released, no retry', async () => {
+  // Stub pool returns the guard SELECT row as paused.
+  const pool = makeStubPool([{
+    austerity_paused: true, status: 'dispatching', archived_at: null,
+    last_status: null, name: 'calendar-watch',
+  }])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  let pickCalled = false
+  credsModule.pick_healthiest_account = async () => { pickCalled = true; return 'code' }
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'code' })
+
+  let dispatched = false
+  scheduler._setDispatcher({
+    dispatch_worker: async () => { dispatched = true; return { ok: true, tab_id: 'should_not_spawn' } },
+    kill_worker: async () => {},
+  })
+
+  const row = makeRow({ id: 'paused-cron-guard', name: 'calendar-watch', leased_by: 'lease-x' })
+
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [guard test threw]:', e.message) }
+
+  assert(!threw, 'guard: no throw')
+  assert(dispatched === false, 'guard: dispatch_worker NOT called for paused row')
+  assert(pickCalled === false, 'guard: cred rotation skipped (guard fires before step 1)')
+
+  const releaseUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('leased_by = NULL') && q.sql.includes('dispatching'))
+  assert(!!releaseUpdate, 'guard: lease released back to active')
+  const runningUpdate = pool._queries.find(q => q.sql.includes("status = 'running'"))
+  assert(!runningUpdate, 'guard: row NOT flipped to running')
+  // No markFailed (would set retry_count / status=failed or defer next_run_at).
+  const failedUpdate = pool._queries.find(q => q.sql.includes("status = 'failed'") || q.sql.includes('retry_count ='))
+  assert(!failedUpdate, 'guard: markFailed NOT invoked (suppression, not failure)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
 })
 
 // ── 2026-06-10 branch-thrash guard: dispatchOne worktree wiring + cleanup ───
@@ -432,13 +552,13 @@ test('dispatchOne no-IDE error: defers row 5min, does not mark failed, does not 
     threw = true
   }
 
-  // Find the defer UPDATE (status=active + next_run_at + last_error mentioning IDE bridge).
+  // Find the defer UPDATE (status=active + next_run_at + last_error mentioning the transient bridge marker).
   const deferUpdate = pool._queries.find(q =>
     q.sql.includes("status = 'active'") &&
     q.sql.includes('next_run_at') &&
-    q.params.some(p => typeof p === 'string' && p.includes('no IDE bridge registered'))
+    q.params.some(p => typeof p === 'string' && p.includes('transient IDE-bridge error'))
   )
-  assert(!!deferUpdate, 'dispatchOne no-IDE: defer UPDATE landed with next_run_at + IDE bridge marker')
+  assert(!!deferUpdate, 'dispatchOne no-IDE: defer UPDATE landed with next_run_at + transient bridge marker')
   assert(threw, 'dispatchOne no-IDE: still re-throws so dispatch loop logs')
 
   // CRITICAL: retry_count must NOT be incremented (no $1 = retry_count in defer UPDATE).
@@ -446,6 +566,42 @@ test('dispatchOne no-IDE error: defers row 5min, does not mark failed, does not 
     q.sql.includes('retry_count = $1') && q.sql.includes("status = 'failed'")
   )
   assert(!markFailedUpdate, 'dispatchOne no-IDE: row was NOT marked failed (cron survives IDE gap)')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.rotate_to = origRotate
+})
+
+test('dispatchOne transient SOCKET error: one-shot row at MAX retries defers, NOT permanent-fail (audit fix c)', async () => {
+  // The 2026-06-20 regression: a socket-class IDE-bridge blip ("populate failed
+  // (editor.open): socket hang up") on a ONE-SHOT/delayed row whose retry_count
+  // is already at MAX would fall through to markFailed -> status='failed',
+  // silently losing the scheduled work. With isTransientBridgeError it must
+  // defer instead (no retry burn, no fail).
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+  const origPick = credsModule.pick_healthiest_account
+  const origRotate = credsModule.rotate_to
+  credsModule.pick_healthiest_account = async () => 'tate'
+  credsModule.rotate_to = async () => ({ previous: 'tate', current: 'tate' })
+
+  scheduler._setDispatcher({
+    dispatch_worker: async () => ({ ok: false, tab_id: null, error: 'dispatch_worker failed: populate failed (editor.open): socket hang up' }),
+    kill_worker: async () => {},
+  })
+
+  // type=delayed (one-shot), retry_count already at MAX-1 so the next fail would be permanent under old code.
+  const row = makeRow({ id: 'task-socket-oneshot', type: 'delayed', cron_expression: null, retry_count: 2 })
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true }
+
+  const deferUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at') &&
+    q.params.some(p => typeof p === 'string' && p.includes('transient IDE-bridge error')))
+  assert(!!deferUpdate, 'socket-class error on one-shot row DEFERS (status=active + next_run_at)')
+  const failedUpdate = pool._queries.find(q => q.sql.includes("status = 'failed'"))
+  assert(!failedUpdate, 'socket-class error on one-shot row was NOT permanently failed (the bug)')
+  assert(threw, 're-throws so the dispatch loop logs')
 
   credsModule.pick_healthiest_account = origPick
   credsModule.rotate_to = origRotate
@@ -604,13 +760,91 @@ test('markComplete one_shot: sets status=completed', async () => {
   assert(!!completedUpdate, 'markComplete one_shot: status set to completed')
 })
 
+// ── 2026-06-18: completionPass scans seen+unseen, freshness-gated ─────────────
+//
+// Root-cause of the scheduler completion gap: completionPass used peek_inbox,
+// which only returns UNSEEN messages. The interactive conductor drains the same
+// chat.conductor.inbox via read_inbox and marks done signals seen within ~1s, so
+// completionPass lost the race and rows rotted in status=running. The fix scans
+// the full index (seen or unseen) via coord.scanTopicByType, gated on
+// created_at >= leased_at so a prior cron fire's stale done cannot complete a
+// fresh dispatch.
+
+test('completionPass: fresh done (created_at >= leased_at) completes a running cron row', async () => {
+  const leasedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString()  // 1h ago
+  const doneAt = new Date(Date.now() - 30 * 1000).toISOString()         // 30s ago (after lease)
+  const runningRow = makeRow({
+    id: 'task-comp-fresh',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    status: 'running',
+    leased_at: leasedAt,
+    dispatched_tab_id: null,
+  })
+  const pool = makeStubPool([runningRow])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
+  scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+  const origScan = coordModule.scanTopicByType
+  coordModule.scanTopicByType = () => new Map([
+    ['task-comp-fresh', { created_at: doneAt, body: { type: 'done', task_id: 'task-comp-fresh', status: 'success', result_summary: 'ok' } }],
+  ])
+
+  await scheduler.completionPass()
+
+  const rescheduled = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  )
+  assert(!!rescheduled, 'completionPass fresh: running cron row rescheduled to active (loop closed)')
+
+  coordModule.scanTopicByType = origScan
+  scheduler._resetWorktreeFns()
+})
+
+test('completionPass: stale done (created_at < leased_at) does NOT complete (freshness gate)', async () => {
+  const leasedAt = new Date(Date.now() - 60 * 1000).toISOString()        // leased 60s ago
+  const staleDoneAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()  // 3h-old done from a prior fire
+  const runningRow = makeRow({
+    id: 'task-comp-stale',
+    type: 'cron',
+    cron_expression: '0 9 * * *',
+    status: 'running',
+    leased_at: leasedAt,
+    dispatched_tab_id: null,
+  })
+  const pool = makeStubPool([runningRow])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
+  scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+  const origScan = coordModule.scanTopicByType
+  coordModule.scanTopicByType = () => new Map([
+    ['task-comp-stale', { created_at: staleDoneAt, body: { type: 'done', task_id: 'task-comp-stale', status: 'success' } }],
+  ])
+
+  await scheduler.completionPass()
+
+  const rescheduled = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  )
+  assert(!rescheduled, 'completionPass stale: prior-fire done ignored, row left running for its own worker')
+
+  coordModule.scanTopicByType = origScan
+  scheduler._resetWorktreeFns()
+})
+
 // ── Task 3.3: staleLeaseRecovery SQL shapes ───────────────────────────────────
 //
 // 2026-06-10: shape changed after the per-row coord-liveness gate landed.
 // Branch 2b (non-cron max-retry) converted from a bulk UPDATE to SELECT +
 // per-row UPDATE so each row can be skipped if a live worker tab is still
-// heartbeating. With empty stub rows, the new shape emits 4 queries
-// (1 bulk UPDATE + 3 SELECTs), not 3.
+// heartbeating.
+// 2026-06-21: branch 1 (retryable stale-dispatch) converted the SAME way for the
+// reclaim-vs-bind race fix (status_board 128b7c82) - it now SELECTs the stale
+// rows then liveness-gates each per-row UPDATE. With empty stub rows all four
+// branches are SELECT-only, so the routine emits 4 SELECTs (no per-row UPDATE),
+// still exactly 4 queries.
 
 test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () => {
   const pool = makeStubPool([])
@@ -621,13 +855,18 @@ test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () =>
 
   assert(pool._queries.length === 4, 'staleLeaseRecovery: exactly 4 queries issued (got ' + pool._queries.length + ')')
 
-  const retryable = pool._queries.find(q =>
-    q.sql.includes("status = 'active'") &&
+  // Branch 1 retryable stale-dispatch is now a liveness-gated SELECT (status='dispatching'
+  // AND retry_count < $2), distinct from the cron/non-cron max-retry SELECTs (>= $2) and
+  // the running-orphan SELECT (status='running').
+  const retryableSelect = pool._queries.find(q =>
+    q.sql.includes('SELECT') &&
     q.sql.includes("status = 'dispatching'") &&
-    q.sql.includes('retry_count + 1') &&
-    q.sql.includes('< $2')
+    q.sql.includes('< $2') &&
+    !q.sql.includes("type = 'cron'") &&
+    !q.sql.includes("type != 'cron'") &&
+    !q.sql.includes("status = 'running'")
   )
-  assert(!!retryable, 'staleLeaseRecovery: retryable stale-dispatch query correct shape')
+  assert(!!retryableSelect, 'staleLeaseRecovery: retryable stale-dispatch SELECT correct shape (per-row liveness-gated)')
 
   const cronStaleSelect = pool._queries.find(q =>
     q.sql.includes('SELECT') &&
@@ -658,8 +897,10 @@ test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () =>
 // re-dispatch if a non-dead heartbeating worker exists on the same task_id.
 
 function makeSplitStubPool(opts) {
-  // Returns different rows for the cron-stale SELECT vs the non-cron-stale
-  // SELECT so focused liveness tests can exercise one branch at a time.
+  // Returns different rows for the retryable stale-dispatch SELECT vs the cron-stale
+  // vs non-cron-stale vs running-orphan SELECTs so focused liveness tests can
+  // exercise one branch at a time.
+  const retryableRows = opts.retryableRows || []
   const cronRows = opts.cronRows || []
   const nonCronRows = opts.nonCronRows || []
   const orphanRows = opts.orphanRows || []
@@ -668,6 +909,11 @@ function makeSplitStubPool(opts) {
     _queries: queries,
     query(sql, params) {
       queries.push({ sql, params: params || [] })
+      // Branch 1 retryable stale-dispatch SELECT: status='dispatching' AND retry_count < $2.
+      // Uniquely identified by '< $2' (max-retry branches 2a/2b use '>= $2').
+      if (sql.includes('SELECT') && sql.includes("status = 'dispatching'") && sql.includes('< $2')) {
+        return Promise.resolve({ rows: retryableRows, rowCount: retryableRows.length })
+      }
       if (sql.includes('SELECT') && sql.includes("type = 'cron'")) {
         return Promise.resolve({ rows: cronRows, rowCount: cronRows.length })
       }
@@ -809,6 +1055,96 @@ test('staleLeaseRecovery: coord error fails open (UPDATE still fires)', async ()
     q.sql.includes("status = 'failed'")
   )
   assert(!!perRowFail, 'fail-open: coord unreachable does not block stale-lease recovery')
+
+  scheduler._setCoord(null)
+})
+
+// ── 2026-06-21: branch 1 (retryable stale-dispatch) reclaim-vs-bind race gate ──
+//
+// status_board 128b7c82. dispatchOne leases a due row, opens a worker tab, then
+// waits up to SIGNAL_BOUND_TIMEOUT_MS (600s) for coord.signal_bound. The observed
+// p99 cold-bind tail (~21min) EXCEEDS STALE_DISPATCHING_MS (15min), so a slow but
+// genuinely-live worker would have its lease reclaimed mid-bind by branch 1's old
+// bulk UPDATE (no liveness check), re-armed + re-dispatched on the next 30s poll,
+// thrashing the fleet ('stale lease recovered' grew to 48 active rows 2026-06-20).
+// Branch 1 now SELECTs the stale rows and liveness-gates each reclaim, exactly as
+// branches 2a/2b/3. A live worker -> skip; a dead/silent worker -> reclaim.
+
+test('staleLeaseRecovery branch 1: live worker mid-bind (~49s) -> NO reclaim, lease intact', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-binding-1', name: 'slow-cold-bind-cron' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_binding_live',
+        task_id: 'task-binding-1',
+        last_heartbeat_at: new Date().toISOString(),
+        stale_ms: 49_000,   // bound at ~49s, well inside STALE_WORKER_LIVENESS_MS (180s)
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!reclaim, 'branch 1: no reclaim UPDATE emitted while a live worker is still bound to the task (the race fix)')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery branch 1: no live worker (genuinely dead) -> reclaim UPDATE fires, targets row by id', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-binding-2', name: 'genuinely-dead-cron' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!!reclaim, 'branch 1 negative control: reclaim UPDATE fires when no live worker exists (dead worker still reclaimed)')
+  assert(reclaim && reclaim.params[0] === 'task-binding-2', 'branch 1: per-row reclaim UPDATE targets the stale row by id ($1)')
+
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery branch 1: stale-heartbeat worker (>=180s, hung) does not block reclaim', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-binding-3', name: 'hung-cron' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({
+    list_workers: async () => ({
+      count: 1,
+      workers: [{
+        tab_id: 'tab_hung',
+        task_id: 'task-binding-3',
+        last_heartbeat_at: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
+        stale_ms: 360_000,   // 6min stale >> STALE_WORKER_LIVENESS_MS (180s): counts as dead
+        dead: false,
+        terminated_at: null,
+      }]
+    })
+  })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!!reclaim, 'branch 1: a hung worker past the liveness window does not block reclaim (no permanent wedge)')
 
   scheduler._setCoord(null)
 })
@@ -995,6 +1331,25 @@ test('checkCapWarning: cooldown prevents double-fire within 1h', async () => {
   assert(second.skipped === 'cooldown', 'second call within cooldown is skipped')
   const insertCalls = stubPool._queries.filter(q => q.sql.includes('INSERT INTO observer_signals'))
   assert(insertCalls.length === 1, 'exactly one INSERT despite two calls')
+})
+
+test('isTransientBridgeError: classifies IDE-bridge socket blips as transient, real faults as not', async () => {
+  // 2026-06-20 audit finding (c). Before this, only the literal
+  // "no IDE instances registered" string deferred; socket-class errors fell to
+  // markFailed and permanently failed one-shot/delayed rows on a transient blip.
+  assert(scheduler.isTransientBridgeError('dispatch_worker failed: populate failed (editor.open): socket hang up') === true,
+    'editor.open socket hang up -> transient')
+  assert(scheduler.isTransientBridgeError('no IDE instances registered') === true,
+    'no IDE instances registered -> transient (back-compat)')
+  assert(scheduler.isTransientBridgeError('connect ECONNRESET 127.0.0.1:8099') === true,
+    'ECONNRESET -> transient')
+  assert(scheduler.isTransientBridgeError('connect ECONNREFUSED 127.0.0.1:8099') === true,
+    'ECONNREFUSED -> transient')
+  assert(scheduler.isTransientBridgeError("worktree allocation failed: already exists") === false,
+    'worktree already-exists -> NOT transient (real, now self-healed in allocator)')
+  assert(scheduler.isTransientBridgeError('TypeError: cannot read properties of undefined') === false,
+    'code bug -> NOT transient')
+  assert(scheduler.isTransientBridgeError('') === false, 'empty -> NOT transient')
 })
 
 // ── sequential test runner ────────────────────────────────────────────────────

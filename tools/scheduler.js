@@ -24,7 +24,13 @@ const { Pool } = require('pg')
 const { execFile } = require('child_process')
 const { promisify } = require('util')
 const execFileP = promisify(execFile)
-const cronParser = require('cron-parser')
+// Single source of truth for schedule semantics (vendored byte-identical from
+// ecodiaos-backend/src/lib/schedule-core.js, pinned by schedule-core-identity.test.js).
+// Handles intervals of ANY size, daily, weekly, and raw cron. Replaced the
+// in-file parseSchedule + scattered cron-parser dances that mis-fired intervals
+// over 23h (every Nh was faked into "0 */N * * *" -> cron-parser collapsed it to
+// daily). Doctrine: scheduler-one-schedule-engine-2026-06-20.
+const scheduleCore = require('../lib/schedule-core')
 let _credsModule = require('./creds')
 function getCreds() { return _credsModule }
 exports._setCredsModule = function (m) { _credsModule = m }
@@ -71,8 +77,27 @@ const DISPATCH_LIMIT = 5
 const SIGNAL_BOUND_TIMEOUT_MS = parseInt(process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS, 10) || 600_000
 const ORPHAN_TIMEOUT_MS = 6 * 60 * 60 * 1000
 const COMPLETION_POLL_INTERVAL_MS = 5_000
-const STALE_DISPATCHING_MS = 10 * 60 * 1000   // 10 min -> retry
+// 2026-06-18 half-state race fix. Must stay ABOVE SIGNAL_BOUND_TIMEOUT_MS (600s)
+// so staleLeaseRecovery branch-1 cannot reap a row that dispatchOne is still
+// legitimately waiting on for signal_bound. When the two windows were equal
+// (both 10min) a slow-but-live cold-MCP bind got reclaimed mid-wait, and the
+// running-flip then produced a status=running + leased_by=NULL zombie. 15min
+// gives 5min of headroom over the bind timeout; the p99 bind tail (~21min) is
+// covered by the dispatchOne running-flip lease guard, not by this window.
+const STALE_DISPATCHING_MS = 15 * 60 * 1000   // 15 min -> retry (> 600s bind timeout)
 const MAX_RETRY_COUNT = 3
+// 2026-06-19 next_run_at-recompute fix. staleLeaseRecovery branch 1 (retryable
+// stale-dispatch) used to free the row back to 'active' while leaving next_run_at
+// at its past-due value, so the row was due on the very next 30s poll and re-fired
+// off-cadence up to MAX_RETRY times. Per
+// [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]]
+// a retry must use a BOUNDED short delay, never an unbounded immediate re-due.
+// 5 min preserves up to MAX_RETRY quick re-attempts for a transient bind failure
+// (3 retries spread over ~15 min) without hammering every poll, and is short
+// enough that a genuinely-due cron loses no cadence. The leaseDueRows re-entry
+// guard is the second layer: a cron that already RAN this period is dropped from
+// dispatch regardless of how next_run_at got clobbered.
+const RETRY_BACKOFF_MS = 5 * 60 * 1000   // 5 min bounded retry delay
 // 2026-05-29 ultracode audit C3 fix. cleanup_orphan_workers is the only
 // backstop the chain's refuse-and-leak posture relies on; the audit caught
 // it wired to no cron at all. 7 min picks up leaked tabs within a worker
@@ -87,7 +112,24 @@ function getPool() {
   if (!_pool) {
     const connStr = process.env.DATABASE_URL
     if (!connStr) throw new Error('scheduler: DATABASE_URL env var is required')
-    _pool = new Pool({ connectionString: connStr })
+    _pool = new Pool({
+      connectionString: connStr,
+      keepAlive: true,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 10_000,
+    })
+    // 2026-06-14 restart-loop root-cause fix. node-postgres emits an 'error'
+    // event on the Pool when an IDLE pooled client's TCP connection dies. The
+    // Supabase transaction/session pooler drops idle connections routinely,
+    // surfacing as "Connection terminated unexpectedly". With NO listener on
+    // this event, Node treats it as an uncaughtException and KILLS THE PROCESS;
+    // launchd respawns the agent, the next idle connection drops again, and the
+    // whole laptop-agent restart-loops (42 boots observed in one log). A
+    // no-op-but-present listener makes the drop non-fatal - node-postgres
+    // transparently opens a fresh connection on the next query.
+    _pool.on('error', (err) => {
+      process.stderr.write('[scheduler] pg pool idle-client error (non-fatal, pool reconnects): ' + (err && err.message || err) + '\n')
+    })
   }
   return _pool
 }
@@ -136,6 +178,21 @@ async function defaultAllocateWorktreeForRow(row) {
   // Idempotent cleanup: forget any stale worktree at that path first.
   await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
   await runGit(['worktree', 'prune']).catch(() => {})
+
+  // 2026-06-20: `worktree remove --force` is a silent no-op when the path
+  // exists on disk but is no longer a REGISTERED worktree (crashed prior
+  // dispatch, or git metadata pruned out from under it). The swallowed error
+  // left the directory standing, so the `worktree add` below died with
+  // "<path> already exists" and the row fell back to an UNISOLATED shared-tree
+  // dispatch - a branch-thrash hazard that is acute when several conductor
+  // chats run concurrently. Force-clear any surviving directory so add always
+  // lands on a clean path. Same destroy-on-redispatch posture as the
+  // remove --force above (the path is keyed to THIS row.id, whose prior attempt
+  // is dead); scoped strictly under WORKTREE_ROOT as a safety bound.
+  if (fs.existsSync(wtPath) && wtPath.startsWith(WORKTREE_ROOT + path.sep)) {
+    fs.rmSync(wtPath, { recursive: true, force: true })
+    await runGit(['worktree', 'prune']).catch(() => {})
+  }
 
   // Refresh origin/main so the worktree branches off recent base.
   await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
@@ -271,6 +328,86 @@ exports.buildBrief = function buildBrief(row) {
   return lines.join('\n')
 }
 
+// ── cron re-entry guard helpers ──────────────────────────────────────────────
+//
+// Root-cause defenses for
+// [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
+// All three are PURE and FAIL-OPEN: any parse error or missing field returns the
+// "dispatch normally" answer, so the guard can never make a row un-dispatchable.
+// Worst case a helper is a no-op; it can never stall the fleet.
+
+// True iff a cron row has already run for its current scheduled period. A row is
+// "due" in leaseDueRows when next_run_at <= NOW(); if any path clobbers next_run_at
+// into the past while last_run_at still points at the run that already happened this
+// period, the row would re-dispatch every poll. This compares last_run_at against
+// the most recent scheduled boundary at/before `now`: a legitimately-due row (boundary
+// just passed, not yet run) has last_run_at from the PRIOR period (strictly before the
+// boundary); a clobbered already-ran row has last_run_at at/after it.
+exports.cronAlreadyRanThisPeriod = function cronAlreadyRanThisPeriod(row, now) {
+  try {
+    if (!row || row.type !== 'cron' || !row.cron_expression) return false
+    if (!row.last_run_at) return false // never ran -> genuinely due
+    const ref = now instanceof Date ? now : new Date()
+    const tz = row.tz || 'Australia/Brisbane'
+    const prevBoundary = scheduleCore.prevRun(row.cron_expression, ref, tz)
+    if (!prevBoundary) return false
+    const lastRun = new Date(row.last_run_at)
+    if (isNaN(lastRun.getTime())) return false
+    return lastRun.getTime() >= prevBoundary.getTime()
+  } catch (_e) {
+    return false
+  }
+}
+
+// Next scheduled boundary for a cron row as an ISO string. Fails open to a 1h
+// fallback (mirrors the catch in staleLeaseRecovery branches 2a/3).
+exports.computeNextRunAt = function computeNextRunAt(row, now) {
+  const baseMs = now instanceof Date ? now.getTime() : Date.now()
+  const tz = (row && row.tz) || 'Australia/Brisbane'
+  const d = scheduleCore.nextRun(row && row.cron_expression, new Date(baseMs), tz)
+  return d ? d.toISOString() : new Date(baseMs + 60 * 60 * 1000).toISOString()
+}
+
+// Run-count anomaly detector (observability). A cron's run_count is a LIFETIME
+// counter; a value far above what the schedule could have produced since the row
+// was created is the fingerprint of off-cadence re-firing (an annual cron created
+// two weeks ago with run_count > 1 is impossible). Returns null for non-cron rows
+// or when the period can't be derived; otherwise {anomalous, runCount, expectedMax,
+// periodMs, ageMs, name, id}. Pure + fail-open.
+exports.runCountAnomalyForRow = function runCountAnomalyForRow(row, now) {
+  try {
+    if (!row || row.type !== 'cron' || !row.cron_expression) return null
+    if (!row.created_at) return null
+    const ref = now instanceof Date ? now : new Date()
+    const tz = row.tz || 'Australia/Brisbane'
+    // Period = gap between two consecutive occurrences (interval ms, or two cron iterations).
+    const periodMs = scheduleCore.periodMs(row.cron_expression, tz)
+    if (!(periodMs > 0)) return null
+    const ageMs = ref.getTime() - new Date(row.created_at).getTime()
+    if (!(ageMs >= 0)) return null
+    // Physical maximum lifetime fires: whole periods elapsed since creation, +1
+    // for a possible fire on the creation boundary.
+    const expectedMax = Math.floor(ageMs / periodMs) + 1
+    const runCount = Number(row.run_count || 0)
+    // Alarm when run_count exceeds DOUBLE the physical maximum AND the row is
+    // still young (few periods elapsed). The young-row gate is deliberate: the
+    // bug signature is "a newly-created cron firing impossibly often" (an annual
+    // cron created two weeks ago has expectedMax=1, so run_count>=3 trips; the ten
+    // 2026-06-19 smoking guns were all <=22-day-old low-frequency crons with
+    // expectedMax=1). For a MATURE row the lifetime run_count is dominated by
+    // history and by any cron_expression edit made mid-life (live 2026-06-19:
+    // research-batch + self-evolution carry 220/153 lifetime fires against a now-
+    // weekly expression, a schedule edit, not a bug), so flagging it would be
+    // recurring noise. Capping at MAX_AUDIT_PERIODS keeps the canary to the
+    // first ~6 periods of a cron's life, where the off-cadence bug actually shows.
+    const MAX_AUDIT_PERIODS = 6
+    const anomalous = expectedMax <= MAX_AUDIT_PERIODS && runCount > expectedMax * 2
+    return { anomalous, runCount, expectedMax, periodMs, ageMs, name: row.name || null, id: row.id }
+  } catch (_e) {
+    return null
+  }
+}
+
 // ── leaseDueRows ─────────────────────────────────────────────────────────────
 //
 // Atomically transitions up to `limit` due active rows to status=dispatching
@@ -297,6 +434,13 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
       WHERE status = 'active'
         AND archived_at IS NULL
         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))
+        -- Austerity suppresses RECURRING crons only. One-shot delayed/chain/followup
+        -- rows have no austerity band (L4 doctrine: "only one-off delayed tasks +
+        -- followups" fire = delayed tasks survive at EVERY level), so the marker must
+        -- never strand them. Without the type guard, a stray marker on a delayed row
+        -- (a manual bulk UPDATE over-reaching, as happened 2026-06-15) excludes it
+        -- forever because the cron-only austerity resume sweep can never clear it.
+        AND (austerity_paused IS NOT TRUE OR type <> 'cron')
         AND (next_run_at IS NULL OR next_run_at <= NOW())
         AND (chain_after IS NULL OR next_run_at IS NOT NULL)
       ORDER BY priority ASC, next_run_at ASC NULLS FIRST
@@ -313,7 +457,41 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
     RETURNING t.*
   `
   const result = await pool.query(sql, [n, leaseId])
-  return result.rows
+
+  // Post-lease re-entry guard. The due-query above tests next_run_at <= NOW()
+  // only; a row whose next_run_at was clobbered into the past while it already
+  // ran this period (the staleLeaseRecovery branch-1 history, or any manual /
+  // script re-arm) would re-dispatch every poll. Catch it here: recompute
+  // next_run_at to the true next boundary, release the lease, and drop it from
+  // this batch. This is the clobber-source-independent layer that protects the
+  // fleet no matter HOW next_run_at got mangled. Only cron rows, only the few
+  // just leased, so the cost is negligible. The release UPDATE carries the same
+  // cancellation/pause guard as every other re-arm site, and is scoped to the
+  // row WE just leased (status='dispatching' AND leased_by=$leaseId) so a
+  // concurrent sweep cannot be clobbered.
+  // [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]]
+  const nowRef = new Date()
+  const dispatchable = []
+  for (const row of result.rows) {
+    if (exports.cronAlreadyRanThisPeriod(row, nowRef)) {
+      const nextRunAt = exports.computeNextRunAt(row, nowRef)
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'active', next_run_at = $1,
+             last_error = 'reentry-guard: already ran this period, next_run_at recomputed (clobber-safe)',
+             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+         WHERE id = $2 AND status = 'dispatching' AND leased_by = $3
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+        [nextRunAt, row.id, leaseId]
+      )
+      process.stderr.write('[scheduler] leaseDueRows: re-entry guard skipped ' + row.id +
+        ' (' + (row.name || '?') + ') - already ran this period; next_run_at -> ' + nextRunAt + '\n')
+      continue
+    }
+    dispatchable.push(row)
+  }
+  return dispatchable
 }
 
 // ── markFailed ───────────────────────────────────────────────────────────────
@@ -340,15 +518,7 @@ exports.markFailed = async function markFailed(row, err) {
     if (row.type === 'cron' && row.cron_expression) {
       let nextRunAt = null
       try {
-        const tz = row.tz || 'Australia/Brisbane'
-        // 2026-06-03: translate friendly aliases ("every 4h", "daily 20:00")
-        // via parseSchedule before handing to cron-parser. Rows inserted
-        // before the parseSchedule INSERT-side translation landed (or via
-        // direct SQL) store the raw alias; cron-parser cannot parse those
-        // and silently leaves nextRunAt=null.
-        const cronExpr = parseSchedule(row.cron_expression)
-        const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-        nextRunAt = interval.next().toDate().toISOString()
+        nextRunAt = exports.computeNextRunAt(row)
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }
@@ -357,7 +527,8 @@ exports.markFailed = async function markFailed(row, err) {
          SET status = 'active', retry_count = 0, last_error = $1, next_run_at = $2,
              leased_by = NULL, leased_at = NULL, updated_at = NOW()
          WHERE id = $3
-           AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [errMsg + ' (cron: deferred to next interval, retry_count reset)', nextRunAt, row.id]
       )
     } else {
@@ -375,10 +546,28 @@ exports.markFailed = async function markFailed(row, err) {
        SET status = 'active', retry_count = $1, last_error = $2,
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
        WHERE id = $3
-         AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [newRetryCount, errMsg, row.id]
     )
   }
+}
+
+// ── isTransientBridgeError ───────────────────────────────────────────────────
+//
+// 2026-06-20 autonomy audit finding (c). The dispatch_worker editor.open path
+// can fail not only with "no IDE instances registered" (no IDE bound) but with
+// a socket-class error when the IDE bridge blips mid-open: "populate failed
+// (editor.open): socket hang up", ECONNRESET, ECONNREFUSED, ETIMEDOUT, EPIPE.
+// All are TRANSIENT infra unavailability, not a task fault. Before this fix only
+// the literal "no IDE instances registered" string got the gentle 5min defer;
+// the socket-class errors fell through to markFailed, which PERMANENTLY fails a
+// one-shot / delayed row once retry_count hits MAX (silent loss of scheduled
+// work - the self-scheduling backbone). Classify all of them as transient so
+// dispatchOne defers instead of failing.
+const _TRANSIENT_BRIDGE_RE = /(no IDE instances registered|populate failed|editor\.open|socket hang up|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EPIPE|socket disconnected|bridge (?:unavailable|timeout))/i
+exports.isTransientBridgeError = function isTransientBridgeError(msg) {
+  return _TRANSIENT_BRIDGE_RE.test(String(msg || ''))
 }
 
 // ── dispatchOne ──────────────────────────────────────────────────────────────
@@ -395,6 +584,49 @@ exports.dispatchOne = async function dispatchOne(row) {
   let account = null
   let tabId = null
   try {
+    // 0. Defense-in-depth austerity gate. leaseDueRows already excludes
+    // austerity_paused rows, but a 2026-06-19 incident showed ~8 paused crons
+    // (calendar-watch, opportunity-triage, neo4j-maintenance, monthly-financial-close,
+    // github-push-ci-watch ...) reaching dispatchOne in a 3-min burst and spawning
+    // worker tabs despite the gate (unreproducible race between lease + stale-lease
+    // recovery under the signal_bound hold). The harm is a spawned CC session burning
+    // tokens while austerity is meant to suppress it. Re-read the marker here, under
+    // the launch-lock (fresh read), BEFORE any cred rotation / worktree / tab spawn.
+    // If the row is now paused (or gone/cancelled), release the lease and skip - NOT
+    // markFailed: this is a suppression, not a failure, so it must not burn a retry or
+    // defer the cron off its cadence. next_run_at is left intact so the row rejoins
+    // its schedule the moment austerity lifts.
+    {
+      const guard = await pool.query(
+        `SELECT austerity_paused, status, archived_at, last_status, name
+         FROM os_scheduled_tasks WHERE id = $1`,
+        [row.id]
+      )
+      const g = guard.rows[0]
+      // Fire ONLY on the explicit suppression markers. A missing read (g
+      // undefined) is left to proceed - the guard targets the austerity marker,
+      // not row existence, and a genuinely-deleted row fails downstream anyway.
+      const suppressed = !!g && (
+        g.austerity_paused === true ||
+        g.archived_at != null ||
+        g.last_status === 'cancelled'
+      )
+      if (suppressed) {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', leased_by = NULL, leased_at = NULL, updated_at = NOW()
+           WHERE id = $1
+             AND status = 'dispatching'
+             AND leased_by IS NOT DISTINCT FROM $2`,
+          [row.id, row.leased_by || null]
+        )
+        process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
+          (g && g.name || row.name || '?') + ') - austerity_paused gate ' +
+          '(defense-in-depth); upstream leaseDueRows leak, lease released without retry\n')
+        return
+      }
+    }
+
     // 1. Pick + rotate to healthiest account.
     const picked = await getCreds().pick_healthiest_account({
       preferred: row.preferred_account || null,
@@ -431,6 +663,40 @@ exports.dispatchOne = async function dispatchOne(row) {
     // 2. Build brief with actual_account + worktree_path filled in.
     const rowWithAccount = Object.assign({}, row, { actual_account: account, worktree_path: worktreePath })
     const brief = exports.buildBrief(rowWithAccount)
+
+    // 2c. Dispatch-start lease refresh + pre-spawn reclaim guard.
+    // 2026-06-21 lease-aging-in-launch-lock-queue fix (the live 5-6h cron-fleet
+    // stall: gmail-inbox-poll / calendar-watch / infra-health-pulse / status-board-
+    // execute-top all sat status=dispatching retry_count=3, last_run_at frozen ~5h,
+    // "stale lease recovered"). leased_at is stamped by leaseDueRows at QUEUE-ENTRY
+    // time, but dispatchOne holds the SERIAL launch-lock across each bind (up to
+    // SIGNAL_BOUND_TIMEOUT_MS). Under a due-row burst a row's leased_at ages past
+    // STALE_DISPATCHING_MS (15min) WHILE STILL QUEUED behind the lock - before its
+    // worker is ever spawned - so staleLeaseRecovery branch-1's liveness gate
+    // (4cab6c3) cannot protect it (hasLiveWorkerForTask returns null: no worker
+    // exists in coord yet). branch-1 reclaims it, and the eventual running-flip
+    // no-ops (rowCount 0), leaving an ORPHAN tab that inflates active_workers,
+    // forces rotation to defer, and collapses dispatch throughput into the spiral.
+    // Refresh leased_at to NOW() HERE, at dispatch-start under the lock and as late
+    // as possible before spawn (after the slow rotate_to + worktree alloc), so the
+    // 15min stale window measures the actual bind duration (<=10min) with the
+    // intended 5min headroom rather than the queue wait. Guarded on still owning
+    // the lease: if the row was reclaimed/cancelled during account-rotation or
+    // worktree prep, bail WITHOUT spawning a worker - preventing the orphan tab
+    // entirely instead of discovering the loss after the spawn at the running-flip.
+    const startGuard = await pool.query(
+      `UPDATE os_scheduled_tasks
+          SET leased_at = NOW(), updated_at = NOW()
+        WHERE id = $1
+          AND status = 'dispatching'
+          AND leased_by IS NOT DISTINCT FROM $2`,
+      [row.id, row.leased_by || null]
+    )
+    if (startGuard.rowCount === 0) {
+      process.stderr.write('[scheduler] dispatchOne: row ' + row.id +
+        ' lease lost during dispatch prep (reclaimed/cancelled before worker spawn); skipping spawn\n')
+      return
+    }
 
     // 3. Dispatch worker.
     const dispatcher = getDispatcher()
@@ -489,14 +755,41 @@ exports.dispatchOne = async function dispatchOne(row) {
       await new Promise(r => setTimeout(r, 1000))
     }
 
-    // 5. Update row to running.
-    await pool.query(
+    // 5. Update row to running - GUARDED on still owning the lease.
+    //
+    // 2026-06-18 half-state race fix. The signal_bound wait above can run up to
+    // SIGNAL_BOUND_TIMEOUT_MS (600s). If it overruns STALE_DISPATCHING_MS,
+    // staleLeaseRecovery branch-1 fires on this still-'dispatching' row, sets
+    // status='active', leased_by=NULL, retry_count++. The OLD unconditional
+    // UPDATE then blindly overwrote status back to 'running' WITHOUT reclaiming
+    // leased_by, producing the observed zombie half-state (status=running AND
+    // leased_by IS NULL - a running row with no lease owner) and risking a
+    // double-dispatch of the same task. Guarding on (status='dispatching' AND
+    // leased_by unchanged) makes the flip a no-op when recovery already reclaimed
+    // the row; we then bail and let the recovered row re-dispatch cleanly. Live
+    // evidence 2026-06-18: external-blocker / client-app-health /
+    // monthly-architectural-review all sat status=running, leased_by NULL,
+    // leased_at SET, last_error='stale lease recovered'.
+    const runRes = await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'running', actual_account = $1, dispatched_tab_id = $2,
            leased_at = NOW(), updated_at = NOW()
-       WHERE id = $3`,
-      [account, tabId, row.id]
+       WHERE id = $3
+         AND status = 'dispatching'
+         AND leased_by IS NOT DISTINCT FROM $4`,
+      [account, tabId, row.id, row.leased_by || null]
     )
+
+    if (runRes && runRes.rowCount === 0) {
+      // Lease reclaimed mid-bind (or already advanced). Do NOT resurrect to
+      // running - that is exactly the zombie half-state. The just-spawned tab,
+      // if live, is reconciled by cleanup_orphan_workers; if the worker signals
+      // done, the row is already back in the active->dispatch cycle.
+      process.stderr.write('[scheduler] dispatchOne: lease for task ' + row.id +
+        ' was reclaimed during signal_bound wait (tab ' + tabId +
+        '); skipping running-flip to avoid zombie half-state\n')
+      return
+    }
 
     if (!bound) {
       process.stderr.write('[scheduler] dispatchOne: signal_bound timeout for task ' + row.id + ' (tab ' + tabId + ')\n')
@@ -522,20 +815,24 @@ exports.dispatchOne = async function dispatchOne(row) {
           `UPDATE os_scheduled_tasks
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3
-             AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+           WHERE id = $3`,
           [nextRun.toISOString(), 'AllAccountsCappedError - deferred ' + Math.round(deferMs / 60000) + 'min', row.id]
         )
       } catch (pgErr) {
         process.stderr.write('[scheduler] markFailed pg error: ' + pgErr.message + '\n')
       }
-    } else if (errMsg.includes('no IDE instances registered')) {
-      // 2026-06-02 P0 fix. The dispatch_worker editor.open path throws this when
-      // no VS Code / Cursor / Insiders instance has registered the ecodia-preview
-      // extension with the laptop-agent bridge. This is TRANSIENT (Tate closes
-      // the IDE, machine reboots, extension reloads). Treat it the same way as
-      // AllAccountsCappedError: defer ~5min, do NOT increment retry_count, do
-      // NOT mark failed. The cron survives the gap window naturally.
+    } else if (exports.isTransientBridgeError(errMsg)) {
+      // 2026-06-02 P0 fix, broadened 2026-06-20 (audit finding c). The
+      // dispatch_worker editor.open path throws a transient error when no IDE has
+      // registered the bridge ("no IDE instances registered") OR when the bridge
+      // socket blips mid-open ("populate failed (editor.open): socket hang up",
+      // ECONNRESET, ECONNREFUSED, ETIMEDOUT, EPIPE). All are TRANSIENT infra
+      // unavailability (Tate closes the IDE, machine sleeps, extension reloads,
+      // bridge restarts), not a task fault. Treat like AllAccountsCappedError:
+      // defer ~5min, do NOT increment retry_count, do NOT mark failed - for cron
+      // AND one-shot/delayed rows alike (the latter would otherwise burn retries
+      // to a permanent status='failed' on a transient blip and silently lose the
+      // scheduled work). The row survives the gap window naturally.
       const deferMs = 5 * 60 * 1000
       const nextRun = new Date(Date.now() + deferMs)
       try {
@@ -543,12 +840,11 @@ exports.dispatchOne = async function dispatchOne(row) {
           `UPDATE os_scheduled_tasks
            SET status = 'active', leased_by = NULL, leased_at = NULL,
                next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3
-             AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
-          [nextRun.toISOString(), 'no IDE bridge registered - deferred 5min', row.id]
+           WHERE id = $3`,
+          [nextRun.toISOString(), 'transient IDE-bridge error - deferred 5min (' + errMsg.slice(0, 80) + ')', row.id]
         )
       } catch (pgErr) {
-        process.stderr.write('[scheduler] no-IDE defer pg error: ' + pgErr.message + '\n')
+        process.stderr.write('[scheduler] transient-bridge defer pg error: ' + pgErr.message + '\n')
       }
     } else {
       try {
@@ -625,11 +921,7 @@ exports.markComplete = async function markComplete(row, signal) {
     // by 10h. Phase A1 unification: every cron carries its own tz column.
     let nextRunAt = null
     try {
-      const tz = row.tz || 'Australia/Brisbane'
-      // 2026-06-03: friendly-alias translation (see markFailed for rationale).
-      const cronExpr = parseSchedule(row.cron_expression)
-      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-      nextRunAt = interval.next().toDate().toISOString()
+      nextRunAt = exports.computeNextRunAt(row)
     } catch (cronErr) {
       process.stderr.write('[scheduler] cron-parser error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
     }
@@ -640,7 +932,8 @@ exports.markComplete = async function markComplete(row, signal) {
            retry_count = 0, leased_by = NULL, leased_at = NULL,
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $3
-         AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
   } else {
@@ -687,36 +980,54 @@ exports.markComplete = async function markComplete(row, signal) {
 exports.completionPass = async function completionPass() {
   const pool = getPool()
 
-  // Fetch all running rows.
+  // Fetch all running rows (need leased_at for the freshness gate below).
   const result = await pool.query(
     `SELECT * FROM os_scheduled_tasks WHERE status = 'running' LIMIT 50`
   )
   if (!result.rows.length) return
 
-  // Peek at conductor inbox for done signals.
-  const inbox = await coord.peek_inbox({ topic: 'chat.conductor.inbox', limit: 100 })
-  if (!inbox || !inbox.messages || !inbox.messages.length) return
-
-  // Build a map: task_id -> signal
-  const doneSignals = new Map()
-  for (const msg of inbox.messages) {
-    const body = msg.body
-    if (body && body.type === 'done' && body.task_id) {
-      // keep first (oldest) signal per task
-      if (!doneSignals.has(String(body.task_id))) {
-        doneSignals.set(String(body.task_id), body)
-      }
-    }
+  // 2026-06-18 scheduler-completion-race fix. Was: coord.peek_inbox on
+  // chat.conductor.inbox, which only returns UNSEEN messages. The interactive
+  // conductor reads the SAME inbox via coord.read_inbox (its wake /
+  // UserPromptSubmit hook), which marks a worker's `done` signal seen within
+  // ~1s of arrival. completionPass (every 5s) then lost the race: the done was
+  // already seen, and peek_inbox can never return a seen message, so
+  // markComplete never fired and the row rotted in status=running until the 6h
+  // orphan timer. Live evidence 2026-06-18: external-blocker-freshness-probe
+  // done created 06:23:38.505Z, marked seen 06:23:39.117Z (0.6s later), row
+  // still running 4h on. Fix: scan the FULL inbox index (seen or unseen) for the
+  // newest done per running task_id - completion detection is now independent of
+  // whoever else drains the inbox. See
+  // [[scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18]].
+  const runningIds = result.rows.map(r => String(r.id))
+  let doneByTask
+  try {
+    doneByTask = coord.scanTopicByType('chat.conductor.inbox', 'done', runningIds)
+  } catch (e) {
+    process.stderr.write('[scheduler] completionPass scan error: ' + e.message + '\n')
+    return
   }
-
-  if (!doneSignals.size) return
+  if (!doneByTask || !doneByTask.size) return
 
   for (const row of result.rows) {
-    const taskIdStr = String(row.id)
-    const signal = doneSignals.get(taskIdStr)
-    if (!signal) continue
+    const msg = doneByTask.get(String(row.id))
+    if (!msg) continue
+    // Freshness gate. task_id == row.id is STABLE across cron fires, so the
+    // inbox accumulates many done signals with the same task_id over a row's
+    // lifetime. Only THIS dispatch's done counts: leased_at is set to NOW() when
+    // dispatchOne flips the row to running, so a prior fire's done has
+    // created_at < leased_at and must be ignored (else a fresh dispatch would be
+    // completed instantly by a days-old signal, before its worker even runs).
+    // 30s back-margin tolerates a fast worker that signals done microseconds
+    // before the running-flip timestamp; cron intervals are >= minutes and
+    // one-shot task_ids are unique, so no cross-fire collision fits that margin.
+    if (row.leased_at) {
+      const doneMs = new Date(msg.created_at).getTime()
+      const leasedMs = new Date(row.leased_at).getTime()
+      if (!isNaN(doneMs) && !isNaN(leasedMs) && doneMs < leasedMs - 30_000) continue
+    }
     try {
-      await exports.markComplete(row, signal)
+      await exports.markComplete(row, msg.body)
     } catch (e) {
       process.stderr.write('[scheduler] completionPass markComplete error for ' + row.id + ': ' + e.message + '\n')
     }
@@ -761,18 +1072,57 @@ async function hasLiveWorkerForTask(taskId) {
 exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   const pool = getPool()
 
-  // 1. Stale dispatching, retryable.
-  await pool.query(
-    `UPDATE os_scheduled_tasks
-     SET status = 'active', retry_count = retry_count + 1,
-         last_error = 'stale lease recovered',
-         leased_by = NULL, leased_at = NULL, updated_at = NOW()
+  // 1. Stale dispatching, retryable. 2026-06-21 reclaim-vs-bind race fix
+  // (status_board 128b7c82): converted from a bulk UPDATE to SELECT + per-row
+  // UPDATE so this branch consults coord worker liveness BEFORE reclaiming, exactly
+  // as branches 2a/2b/3 already do. The bulk form reclaimed ANY dispatching row
+  // whose leased_at aged past STALE_DISPATCHING_MS (15min) with NO liveness check,
+  // but the observed p99 cold-bind tail (~21min, see the SIGNAL_BOUND_TIMEOUT_MS
+  // note above) EXCEEDS that window: a slow-but-live worker still inside its
+  // legitimate bind / early-work window had its lease freed, next_run_at re-armed,
+  // retry_count bumped, and the next 30s poll re-dispatched the SAME task while the
+  // first worker was still alive. dispatchOne's running-flip guard only blocks the
+  // zombie half-state; it does NOT stop the duplicate re-dispatch, so the fleet
+  // thrashed ('stale lease recovered' grew to 48 active rows 2026-06-20 even after
+  // a mitigation restart). Per [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]]
+  // a guard wired into N parallel branches must cover ALL branches of the same
+  // routine; branch 1 was the one staleLeaseRecovery branch the liveness gate was
+  // never wired into (the comment in branch 3 below even mis-stated it as already
+  // covering "branches 1 + 2a + 2b"). A genuinely dead worker (heartbeat stale
+  // >= STALE_WORKER_LIVENESS_MS, or no worker row at all) still reclaims. next_run_at
+  // re-arm is unchanged: BOUNDED retry backoff per RETRY_BACKOFF_MS +
+  // [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
+  const staleRetryableRows = await pool.query(
+    `SELECT id, name FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
        AND retry_count < $2
-       AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+       AND archived_at IS NULL
+       AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
+  for (const row of staleRetryableRows.rows) {
+    const liveWorker = await hasLiveWorkerForTask(row.id)
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping stale-lease retry reclaim\n'
+      )
+      continue
+    }
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET status = 'active', retry_count = retry_count + 1,
+           last_error = 'stale lease recovered (next_run_at re-armed to bounded retry backoff)',
+           next_run_at = NOW() + ($2 || ' milliseconds')::interval,
+           leased_by = NULL, leased_at = NULL, updated_at = NOW()
+       WHERE id = $1
+         AND status = 'dispatching'
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+      [row.id, RETRY_BACKOFF_MS]
+    )
+  }
 
   // 2a. Stale dispatching, max retries exhausted, CRON row: defer to next
   // scheduled interval and reset retry_count per
@@ -807,10 +1157,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     }
     let nextRunAt = null
     try {
-      const tz = row.tz || 'Australia/Brisbane'
-      const cronExpr = parseSchedule(row.cron_expression)
-      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-      nextRunAt = interval.next().toDate().toISOString()
+      nextRunAt = exports.computeNextRunAt(row)
     } catch (_e) {
       nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
     }
@@ -820,7 +1167,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
            last_error = 'stale lease - max retries exhausted (cron: deferred to next interval per doctrine)',
            next_run_at = $1, leased_by = NULL, leased_at = NULL, updated_at = NOW()
        WHERE id = $2
-         AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, row.id]
     )
     // 2026-06-10 branch-thrash guard cleanup on cron-defer recovery.
@@ -887,6 +1235,32 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   )
   const dispatcher = getDispatcher()
   for (const row of orphans.rows) {
+    // Liveness gate per
+    // [[scheduler-stale-lease-must-check-coord-worker-liveness-before-redispatch-2026-06-10]].
+    // 2026-06-18: the 2026-06-10 fix wired this gate into branches 1 + 2a + 2b
+    // (the status='dispatching' sweeps) but MISSED this branch 3 (the
+    // status='running' orphan-timeout sweep). A cron worker still heartbeating
+    // but running past ORPHAN_TIMEOUT_MS (6h) had its row flipped back to
+    // 'active' with a fresh next_run_at WITHOUT a liveness check, so the next
+    // poll re-leased (re-dispatched) the task while the prior tab was still
+    // finishing. That is the exact double-fire path behind the morning dup
+    // bursts (climate-pm-chain + orphan-next-action-audit) and the
+    // partnership-watering double-dispatch on 2026-06-14. When a worker tab is
+    // still alive for this task, SKIP the reclaim and leave status='running' +
+    // leased_by + leased_at intact so the lease keeps holding (mirrors the
+    // skip in branches 2a + 2b). Once heartbeats stop, hasLiveWorkerForTask
+    // returns null within STALE_WORKER_LIVENESS_MS and the next sweep reclaims.
+    // Doctrine: [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]] -
+    // a guard wired into N parallel branches must cover ALL branches of the
+    // same routine.
+    const liveWorker = await hasLiveWorkerForTask(row.id)
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping running orphan-timeout reclaim\n'
+      )
+      continue
+    }
     let closeOk = false
     if (row.dispatched_tab_id && dispatcher.kill_worker) {
       try {
@@ -900,10 +1274,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     if (row.type === 'cron' && row.cron_expression) {
       let nextRunAt = null
       try {
-        const tz = row.tz || 'Australia/Brisbane'
-        const cronExpr = parseSchedule(row.cron_expression)
-        const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz })
-        nextRunAt = interval.next().toDate().toISOString()
+        nextRunAt = exports.computeNextRunAt(row)
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }
@@ -914,7 +1285,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
              last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
              leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
          WHERE id = $2
-           AND archived_at IS NULL AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [nextRunAt, row.id]
       )
     } else {
@@ -928,6 +1300,49 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     // 2026-06-10 branch-thrash guard cleanup on orphan + cron-defer paths.
     try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   }
+}
+
+// ── runCountAnomalyAudit ─────────────────────────────────────────────────────
+//
+// Dispatcher self-audit canary. Scans non-archived cron rows and flags any whose
+// lifetime run_count is implausibly high for the row's age given its schedule
+// (e.g. an annual cron created two weeks ago with run_count > 1). This is the
+// observability that turns the off-cadence re-fire bug from "found at the monthly
+// review" into "alarmed on day one". Read-only; returns the anomaly list and logs
+// each to stderr so the scheduler-health canary / log drain surfaces it. Per
+// [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]]
+// fix #3 and [[scheduler-health-canary-and-cron-dupe-guard-2026-06-10]].
+exports.runCountAnomalyAudit = async function runCountAnomalyAudit() {
+  const pool = getPool()
+  const ref = new Date()
+  let rows
+  try {
+    const r = await pool.query(
+      `SELECT id, name, type, cron_expression, tz, run_count, created_at
+         FROM os_scheduled_tasks
+        WHERE type = 'cron'
+          AND cron_expression IS NOT NULL
+          AND archived_at IS NULL
+          AND (last_status IS NULL OR last_status NOT IN ('cancelled'))`
+    )
+    rows = r.rows
+  } catch (e) {
+    process.stderr.write('[scheduler] runCountAnomalyAudit query error: ' + e.message + '\n')
+    return []
+  }
+  const anomalies = []
+  for (const row of rows) {
+    const a = exports.runCountAnomalyForRow(row, ref)
+    if (a && a.anomalous) {
+      anomalies.push(a)
+      process.stderr.write(
+        '[scheduler] RUN_COUNT ANOMALY ' + a.id + ' (' + (a.name || '?') + '): run_count=' +
+        a.runCount + ' expectedMax=' + a.expectedMax + ' periodMs=' + a.periodMs +
+        ' ageDays=' + (a.ageMs / 86400000).toFixed(1) + ' - off-cadence re-fire fingerprint\n'
+      )
+    }
+  }
+  return anomalies
 }
 
 // ── startupCleanup ───────────────────────────────────────────────────────────
@@ -1105,25 +1520,20 @@ function parseDelay(delay) {
 //   'every 1h' / 'every 30m' / 'every 10s' (every <N>[smh])
 //   'daily 09:00' / 'daily 23:30'
 //   already-raw 5- or 6-field cron: passes through
+// Back-compat shim. The real schedule semantics live in scheduleCore now; this
+// only survives for external callers/tests that expect the cron STRING form of a
+// cron-kind schedule. Intervals ("every 72h") are NOT cron, so the shim returns
+// them unchanged rather than faking a (broken) "0 */N * * *". Internal next-run
+// computation no longer goes through here; it uses scheduleCore directly.
 function parseSchedule(schedule) {
   if (!schedule || typeof schedule !== 'string') {
     throw new Error('schedule required (string)')
   }
-  const s = schedule.trim()
-  const every = s.match(/^every\s+(\d+)\s*([mh])\s*$/i)
-  if (every) {
-    const n = parseInt(every[1], 10)
-    const unit = every[2].toLowerCase()
-    if (unit === 'h') return `0 */${n} * * *`
-    return `*/${n} * * * *`
-  }
-  const daily = s.match(/^daily\s+(\d{1,2}):(\d{2})\s*$/i)
-  if (daily) {
-    return `${parseInt(daily[2], 10)} ${parseInt(daily[1], 10)} * * *`
-  }
-  // Assume already cron. Validate via cron-parser at the call site.
-  return s
+  const c = scheduleCore.classify(schedule)
+  if (c && c.kind === 'cron') return c.cron
+  return schedule.trim()
 }
+exports.parseSchedule = parseSchedule
 
 const VALID_PRIORITY_CLASSES = new Set(['normal', 'high', 'low'])
 function normalisePriorityClass(pc) {
@@ -1184,19 +1594,19 @@ exports.schedule_cron = async function schedule_cron(params) {
   const p = params || {}
   if (!p.name || typeof p.name !== 'string') throw new Error('name required (string)')
   if (!p.prompt || typeof p.prompt !== 'string') throw new Error('prompt required (string)')
-  const cronExpr = parseSchedule(p.schedule)
+  if (!scheduleCore.isValid(p.schedule)) {
+    throw new Error('invalid schedule: "' + p.schedule + '" (use "every Xm|h", "daily HH:MM", "weekly <mon-sun> HH:MM", or a raw cron expression)')
+  }
   const tz = p.tz || 'Australia/Brisbane'
   const priorityClass = normalisePriorityClass(p.priority_class)
   const priority = priorityForClass(priorityClass)
 
-  // Compute first next_run_at via cron-parser with the row's tz.
-  let firstRun
-  try {
-    const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date() })
-    firstRun = interval.next().toDate()
-  } catch (e) {
-    throw new Error('invalid cron expression "' + cronExpr + '": ' + e.message)
-  }
+  // Store the schedule AS GIVEN. The shared engine reads aliases and raw cron
+  // alike; intervals ("every 72h") cannot be expressed as cron so must not be
+  // normalised. Compute the first next_run_at via the same engine the rearm uses.
+  const cronExpr = String(p.schedule).trim()
+  const firstRun = scheduleCore.nextRun(p.schedule, new Date(), tz)
+  if (!firstRun) throw new Error('invalid schedule (could not compute next run): "' + p.schedule + '"')
 
   const pool = getPool()
   const sql = `
@@ -1317,6 +1727,13 @@ exports.schedule_cancel = async function schedule_cancel(params) {
   if (!row) return { ok: false, error: 'task not found', id: p.id || null, name: p.name || null }
   const pool = getPool()
   const result = await pool.query(
+    // 2026-06-19 cancellation-durability fix: also set status='cancelled', not
+    // just last_status + archived_at. Pre-fix, a cancelled cron kept whatever
+    // status it had (often 'active'), and any re-arm UPDATE that matched BY ID
+    // without an archived_at/last_status guard would resurrect it. The guard is
+    // now applied at every status='active' re-arm site (markFailed, markComplete,
+    // staleLeaseRecovery), and status itself is made terminal here so the row is
+    // internally consistent (status agrees with last_status/archived_at).
     `UPDATE os_scheduled_tasks
      SET status = 'cancelled', archived_at = NOW(), last_status = 'cancelled', updated_at = NOW()
      WHERE id = $1
@@ -1376,11 +1793,7 @@ exports.schedule_resume = async function schedule_resume(params) {
   let nextRunAt = new Date()
   if (row.type === 'cron' && row.cron_expression) {
     try {
-      const tz = row.tz || 'Australia/Brisbane'
-      // 2026-06-03: friendly-alias translation (see markFailed for rationale).
-      const cronExpr = parseSchedule(row.cron_expression)
-      const interval = cronParser.CronExpressionParser.parse(cronExpr, { tz, currentDate: new Date() })
-      nextRunAt = interval.next().toDate()
+      nextRunAt = new Date(exports.computeNextRunAt(row))
     } catch (cronErr) {
       process.stderr.write('[scheduler] schedule_resume cron-parse error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
     }
@@ -1496,6 +1909,107 @@ exports._priorityForClass = priorityForClass
 exports._toAestIso = toAestIso
 exports._resolveRow = _resolveRow
 
+// ── reapOrphanWorktrees ──────────────────────────────────────────────────────
+//
+// 2026-06-20 autonomy audit finding (b). Standing GC for leaked dispatched-worker
+// worktrees. pruneWorktreeForRow only fires on a row's OWN completion / failure /
+// recovery, so a crashed worker or a dispatcher restart mid-dispatch leaks its
+// dir forever (5.0 GB / 70 dirs observed 2026-06-20). This sweeps WORKTREE_ROOT
+// on boot and removes ONLY dirs that provably cannot lose work and are not live:
+//   - the row is not running and not freshly leased (< REAP_LIVE_GRACE_MS), AND
+//   - it is a REGISTERED worktree whose worker/<id> branch is fully merged into
+//     origin/main AND whose working tree is clean (git status --porcelain empty).
+// Unregistered leftover dirs and any dir with unpushed commits / uncommitted
+// changes / a live lease are PRESERVED (worktree work must be pushed before
+// removal, never orphaned). Best-effort and fully tolerant; returns a tally.
+const REAP_LIVE_GRACE_MS = 30 * 60 * 1000
+exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
+  const dryRun = !!(opts && opts.dryRun)
+  const tally = { scanned: 0, reaped: 0, preserved: 0, skippedLive: 0, reapedIds: [] }
+  let entries = []
+  try {
+    entries = fs.readdirSync(WORKTREE_ROOT, { withFileTypes: true })
+      .filter(d => d.isDirectory()).map(d => d.name)
+  } catch (_e) { return tally }
+  tally.scanned = entries.length
+  if (!entries.length) return tally
+
+  // Coord live-worker set, fetched ONCE. FAIL SAFE: if coord is unreachable we
+  // cannot tell which worktrees belong to running workers, so we reap NOTHING
+  // this pass (the opposite of hasLiveWorkerForTask's fail-open - here a missed
+  // live worker means destroying its tree, which is worse than skipping a GC).
+  // 2026-06-20: the DB status/lease check ALONE missed the live coord worker
+  // 3222c393 (its os_scheduled_tasks row was not running/fresh-leased but its
+  // heartbeat was alive); the dry-run caught it before any deletion.
+  const liveIds = new Set()
+  try {
+    const r = await getCoord().list_workers({})
+    for (const w of ((r && r.workers) || [])) {
+      if (w.terminated_at || w.dead) continue
+      if (typeof w.stale_ms === 'number' && w.stale_ms >= STALE_WORKER_LIVENESS_MS) continue
+      if (w.task_id) liveIds.add(String(w.task_id))
+    }
+  } catch (e) {
+    process.stderr.write('[scheduler] reapOrphanWorktrees: coord unavailable, reaping nothing (fail-safe): ' + (e && e.message) + '\n')
+    return tally
+  }
+
+  await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
+  const registered = new Set()
+  try {
+    const out = await runGit(['worktree', 'list', '--porcelain'])
+    for (const line of String((out && out.stdout) || out || '').split('\n')) {
+      if (line.startsWith('worktree ')) registered.add(line.slice('worktree '.length).trim())
+    }
+  } catch (_e) {}
+
+  const pool = getPool()
+  for (const id of entries) {
+    const wtPath = path.join(WORKTREE_ROOT, id)
+    if (!wtPath.startsWith(WORKTREE_ROOT + path.sep)) continue // safety bound
+
+    // Liveness gate 1: a live coord worker (fresh heartbeat) owns this dir.
+    if (liveIds.has(id)) { tally.skippedLive++; continue }
+
+    // Liveness gate 2: running row or fresh lease -> never touch.
+    let live = false
+    try {
+      const r = await pool.query(
+        `SELECT status, leased_at FROM os_scheduled_tasks WHERE id = $1`, [id])
+      const row = r.rows[0]
+      if (row) {
+        if (row.status === 'running') live = true
+        if (row.leased_at && (Date.now() - new Date(row.leased_at).getTime()) < REAP_LIVE_GRACE_MS) live = true
+      }
+    } catch (_e) { live = true } // fail safe: cannot confirm dead -> keep
+    if (live) { tally.skippedLive++; continue }
+
+    // Safe-to-drop: registered + branch merged + working tree clean. Anything
+    // else (unregistered leftover, unpushed branch, dirty tree) is preserved.
+    if (!registered.has(wtPath)) { tally.preserved++; continue }
+    const merged = await runGit(['merge-base', '--is-ancestor', 'worker/' + id, 'origin/main'])
+      .then(() => true).catch(() => false)
+    if (!merged) { tally.preserved++; continue }
+    let clean = false
+    try {
+      const st = await execFileP('git', ['-C', wtPath, 'status', '--porcelain'], { timeout: WORKTREE_GIT_TIMEOUT_MS })
+      clean = !String((st && st.stdout) || '').trim()
+    } catch (_e) { clean = false }
+    if (!clean) { tally.preserved++; continue }
+
+    if (dryRun) { tally.reaped++; tally.reapedIds.push(id); continue }
+    await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
+    await runGit(['worktree', 'prune']).catch(() => {})
+    if (fs.existsSync(wtPath)) {
+      try { fs.rmSync(wtPath, { recursive: true, force: true }) } catch (_e) {}
+      await runGit(['worktree', 'prune']).catch(() => {})
+    }
+    await runGit(['branch', '-D', 'worker/' + id]).catch(() => {})
+    tally.reaped++; tally.reapedIds.push(id)
+  }
+  return tally
+}
+
 // ── start ────────────────────────────────────────────────────────────────────
 //
 // Starts all three intervals plus the usage-cap observer. Wraps each in
@@ -1507,6 +2021,17 @@ exports.start = function start() {
   // Non-blocking startup cleanup.
   exports.startupCleanup().catch(e => {
     process.stderr.write('[scheduler] startupCleanup error: ' + e.message + '\n')
+  })
+
+  // Non-blocking orphan-worktree GC (2026-06-20 audit finding b). Conservative:
+  // only reaps registered worktrees whose branch is merged + tree is clean + not
+  // live; preserves everything else. Boot cadence (restarts are the natural GC
+  // point); idempotent.
+  exports.reapOrphanWorktrees().then(t => {
+    process.stderr.write('[scheduler] reapOrphanWorktrees: scanned=' + t.scanned +
+      ' reaped=' + t.reaped + ' preserved=' + t.preserved + ' skippedLive=' + t.skippedLive + '\n')
+  }).catch(e => {
+    process.stderr.write('[scheduler] reapOrphanWorktrees error: ' + e.message + '\n')
   })
 
   // Dispatch loop.
