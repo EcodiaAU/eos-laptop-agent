@@ -128,12 +128,13 @@ function capAutoSwitch() {
 const realLimitWatchMod = require(path.join(AGENT_ROOT, 'tools', 'real-limit-watch'))
 const REAL_LIMIT_WATCH_INTERVAL_MS = Number(process.env.REAL_LIMIT_WATCH_INTERVAL_MS) || 60 * 1000
 function realLimitWatch() {
-  try {
-    const r = realLimitWatchMod.run({ agentTool, getActiveAccount: usage._getActiveAccount, coordRoot: _COORD_ROOT })
-    if (r && r.action && r.action !== 'none' && r.action !== 'already_fired') {
-      console.log('[' + nowIso() + '] real-limit-watch: ' + JSON.stringify(r))
-    }
-  } catch (e) { console.error('[real-limit-watch] ' + (e && e.message || e)) }
+  Promise.resolve(realLimitWatchMod.run({ agentTool, getActiveAccount: usage._getActiveAccount, coordRoot: _COORD_ROOT }))
+    .then(r => {
+      if (r && r.action && r.action !== 'none' && r.action !== 'already_fired') {
+        console.log('[' + nowIso() + '] real-limit-watch: ' + JSON.stringify(r))
+      }
+    })
+    .catch(e => console.error('[real-limit-watch] ' + (e && e.message || e)))
 }
 
 async function runOnePoll() {

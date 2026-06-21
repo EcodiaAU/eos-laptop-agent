@@ -160,7 +160,7 @@ function defaultAlert(textTatePath) {
  * target). Effects (rotate_to via agentTool, SMS) are injectable for testing and
  * suppressed under dryRun. Returns a structured result describing the action.
  */
-function run(opts) {
+async function run(opts) {
   opts = opts || {}
   const nowMs = opts.now || Date.now()
   const coordRoot = opts.coordRoot || process.env.COORD_ROOT || path.join(os.homedir(), '.ecodiaos', 'coordination')
@@ -218,8 +218,19 @@ function run(opts) {
   const target = usable[0].email
   const targetShort = target.split('@')[0]
   let status = 'dry_run'
+  let via = null
   if (!dryRun) {
-    const rot = agentTool('creds.rotate_to', { account: targetShort, force: true })
+    // Primary: rotate through the laptop-agent (localhost:7456). Fallback: if the
+    // agent is unreachable, call the creds module DIRECTLY - it writes the Keychain
+    // via the `security` CLI from any process, so a switch still fires even when the
+    // agent is down. The agent's own ~5h silent outage on 2026-06-22 proved this
+    // gap is the exact away-safety hole this watch exists to close. force:true
+    // bypasses the active-workers guard (which needs the agent's worker registry).
+    let rot = agentTool('creds.rotate_to', { account: targetShort, force: true })
+    via = 'agent'
+    if (!rot) {
+      try { rot = await require('./creds').rotate_to({ account: targetShort, force: true }); via = 'creds-direct' } catch (_) { rot = null }
+    }
     status = !rot ? 'agent_unreachable' : rot.target ? 'switched' : (rot.reason || 'noop')
     persist({ result: status, target })
     // Only announce + record a switch-request when the Keychain ACTUALLY changed.
@@ -234,14 +245,14 @@ function run(opts) {
           via: 'real-limit-watch', result: status, cap_at: new Date(hit.ts).toISOString(), raised_at: new Date(nowMs).toISOString(),
         }))
       } catch (_) {}
-      alert('real-limit-watch', `REAL ${hit.kind} cap hit on ${liveEmail || 'live'} (${whenLocal}) - auto-switched Keychain to ${target}. Next session/worker opens fresh.`)
+      alert('real-limit-watch', `REAL ${hit.kind} cap hit on ${liveEmail || 'live'} (${whenLocal}) - auto-switched Keychain to ${target}${via === 'creds-direct' ? ' (direct, agent was down)' : ''}. Next session/worker opens fresh.`)
     }
   }
-  return { action: 'switch', kind: hit.kind, live: liveEmail, target, status, cap_at: hit.ts }
+  return { action: 'switch', kind: hit.kind, live: liveEmail, target, status, via, cap_at: hit.ts }
 }
 
 // ── selftest ─────────────────────────────────────────────────────────────────
-function selftest() {
+async function selftest() {
   const assert = (cond, msg) => { if (!cond) { console.error('FAIL: ' + msg); process.exitCode = 1 } else console.log('ok: ' + msg) }
   const now = Date.parse('2026-06-21T11:00:00.000Z')
   const mk = (text, tsIso) => JSON.stringify({ type: 'assistant', timestamp: tsIso, message: { model: '<synthetic>', content: [{ type: 'text', text }] } })
@@ -318,7 +329,7 @@ function selftest() {
     }))
     const credsDir = path.join(tmp2, 'creds'); fs.mkdirSync(credsDir)
     fs.writeFileSync(path.join(credsDir, 'code.json'), JSON.stringify({ claudeAiOauth: { expiresAt: now + 3600 * 1000 } }))
-    const res = run({
+    const res = await run({
       now, dryRun: true,
       projectsDir: path.join(tmp2, 'projects'),
       coordRoot: path.join(tmp2, 'coord'),
@@ -330,7 +341,7 @@ function selftest() {
 
     // 9. same cap but target snapshot STALE -> no_target_alerted (away-safety)
     fs.writeFileSync(path.join(credsDir, 'code.json'), JSON.stringify({ claudeAiOauth: { expiresAt: now - 1000 } }))
-    const res2 = run({
+    const res2 = await run({
       now, dryRun: true,
       projectsDir: path.join(tmp2, 'projects'),
       coordRoot: path.join(tmp2, 'coord'),
@@ -348,7 +359,7 @@ function selftest() {
 if (require.main === module) {
   const arg = process.argv[2]
   if (arg === '--selftest') selftest()
-  else { const r = run({ dryRun: arg === '--dry' }); console.log(JSON.stringify(r, null, 1)) }
+  else run({ dryRun: arg === '--dry' }).then(r => console.log(JSON.stringify(r, null, 1)))
 }
 
 module.exports = { detectFreshRealLimit, findFreshRealLimit, rotatableEmails, run, readTail }
