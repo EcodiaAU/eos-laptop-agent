@@ -26,7 +26,10 @@
 // Usage:  OAUTH_URL=... CODE_FILE=... node account-switch-browser.js <tate|code|money>
 'use strict'
 const fs = require('fs')
+const { execSync } = require('child_process')
 const puppeteer = require('puppeteer-core')
+
+const MAGLINK_HELPER = '/Users/ecodia/.code/ecodiaos/backend/scripts/eos-read-maglink-sa.js'
 
 const TARGET = (process.argv[2] || '').trim()
 const EMAILS = { tate: 'tate@ecodia.au', code: 'code@ecodia.au', money: 'money@ecodia.au' }
@@ -225,9 +228,41 @@ async function run() {
     }
 
     if (st.hasContinueEmail && TARGET === 'money') {
-      await clickText(page, /continue with email/i); await sleep(2500)
-      log('MONEY_MAGIC_LINK_PENDING - caller reads link via eos-read-maglink-sa.js')
-      await sleep(2000); continue
+      // money@ is a tate@ alias: EMAIL magic-link only. Link lands in tate@'s
+      // mailbox, read via the Workspace SA (eos-read-maglink-sa.js).
+      log('money: Continue with email')
+      await clickText(page, /continue with email/i)
+      await sleep(3000)
+      await focusless(page)
+      const es = await page.evaluate((email) => {
+        const inp = document.querySelector('input[type=email],input[name=email],input[autocomplete=email]')
+        const sent = /check your (email|inbox)|magic link|we (just )?(sent|emailed)|verify your email/i.test((document.body && document.body.innerText) || '')
+        if (inp && !inp.value) inp.setAttribute('data-eos-email', '1')
+        return { hasInput: !!inp, filled: inp ? !!inp.value : false, sent }
+      }, EMAIL)
+      log('money email-step: ' + JSON.stringify(es))
+      if (es.hasInput && !es.filled) {
+        try { const h = await page.$('[data-eos-email="1"]'); if (h) { await h.click(); await page.keyboard.type(EMAIL, { delay: 20 }) } } catch (_e) {}
+        await sleep(500)
+      }
+      if (!es.sent) { await clickText(page, /^(continue|next|send magic link|log in|sign in|continue with email)$/i); await sleep(4500) }
+      // Poll the SA mailbox for the fresh magic link.
+      let link = null
+      for (let k = 0; k < 14; k++) {
+        try {
+          const out = execSync('node ' + MAGLINK_HELPER + ' 2>/dev/null', { timeout: 25000 }).toString()
+          const m = out.match(/MAGIC_LINK=(\S+)/)
+          if (m) { link = m[1]; break }
+        } catch (_e) {}
+        await sleep(4000)
+      }
+      if (!link) { log('NO_MAGIC_LINK from SA mailbox after polling'); await sleep(2000); continue }
+      log('money magic-link acquired; navigating it')
+      await page.goto(link, { waitUntil: 'domcontentloaded' }).catch(() => {})
+      await focusless(page); await sleep(4000)
+      await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
+      await focusless(page); await sleep(3500)
+      continue
     }
 
     await sleep(1500)
