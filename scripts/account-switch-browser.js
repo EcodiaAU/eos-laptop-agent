@@ -117,7 +117,13 @@ async function clickText(page, re) {
     const h = await page.$('[data-eos-click="1"]')
     if (!h) return false
     await h.evaluate(e => e.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {})
-    await h.click({ delay: 20 })
+    // Multi-strategy click for stubborn React OAuth buttons (Authorize):
+    // 1) programmatic .click() - many React handlers honor it and it does not
+    //    depend on hit-testing a hidden tab;
+    // 2) real box-model mouse via puppeteer (Page.getContentQuads + trusted
+    //    Input.dispatchMouseEvent) for the ones that gate on a real pointer.
+    await h.evaluate(e => e.click()).catch(() => {})
+    await h.click({ delay: 20 }).catch(() => {})
     await page.evaluate(() => { const e = document.querySelector('[data-eos-click]'); if (e) e.removeAttribute('data-eos-click') }).catch(() => {})
     return true
   } catch (_e) {
@@ -170,7 +176,14 @@ async function driveGoogle(gp) {
     }
     // Confirm/Continue BEFORE row-click: on the "signing back in" screen a row
     // click would bounce us back to the chooser.
-    if (st.signingBackIn && st.crect) { await gp.mouse.click(st.crect.x, st.crect.y); await sleep(2500); continue }
+    if (st.signingBackIn && st.crect) {
+      // Click Continue ONCE then wait for the handshake (popup closes) rather
+      // than re-clicking every poll, which kept Google re-rendering the screen
+      // (the ~30-iteration 2026-06-22 stall).
+      await gp.mouse.click(st.crect.x, st.crect.y)
+      for (let w = 0; w < 12; w++) { await sleep(1300); if (gp.isClosed && gp.isClosed()) return true }
+      continue
+    }
     if (st.rrect) { await gp.mouse.click(st.rrect.x, st.rrect.y); await sleep(2500); continue }
     if (st.contHere && st.crect) { await gp.mouse.click(st.crect.x, st.crect.y); await sleep(2500); continue }
     await sleep(1200)
@@ -208,7 +221,18 @@ async function run() {
       await browser.disconnect()
       return 0
     }
-    if (st.loggedInAs === EMAIL && st.hasAuthorize) { log('authorize'); await clickText(page, /^authorize$/i); await sleep(3500); continue }
+    if (st.loggedInAs === EMAIL && st.hasAuthorize) {
+      log('authorize')
+      await clickText(page, /^authorize$/i)
+      // Wait for the callback/code page instead of blind re-looping (the consent
+      // re-renders and a too-fast re-click races it - the 2026-06-22 loop).
+      for (let w = 0; w < 10; w++) {
+        await sleep(1200)
+        const s2 = await readState(page).catch(() => null)
+        if (s2 && (s2.authCode || !s2.hasAuthorize)) break
+      }
+      continue
+    }
     if (st.loggedInAs && st.loggedInAs !== EMAIL && st.switchHref) { log('switch-account (logout) ->'); await page.goto(st.switchHref, { waitUntil: 'domcontentloaded' }).catch(() => {}); await focusless(page); await sleep(3000); continue }
     if (st.hasContinue && st.signingBackIn) { await clickText(page, /^continue$/i); await sleep(3000); continue }
 
