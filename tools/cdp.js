@@ -582,6 +582,12 @@ async function pdf(opts) {
 async function realClick(opts) {
   opts = opts || {}
   const page = await resolveTarget(opts)
+  // Foreground the tab BEFORE measuring/clicking. A backgrounded CDP tab
+  // (visibilityState=hidden) silently no-ops React click handlers AND reports
+  // stale getBoundingClientRect coords - the root cause of the 2026-06-22
+  // multi-hour OAuth-Authorize ordeal (button reported y=631 while hidden,
+  // actually rendered at y=537 once visible; every click missed).
+  try { await page.bringToFront() } catch (_e) {}
   const client = await page.target().createCDPSession()
   try {
     let x = opts.x, y = opts.y
@@ -788,6 +794,10 @@ async function nativeFill(opts) {
     } catch (_e) { /* warn is best-effort */ }
   }
   const page = await resolveTarget(opts)
+  // Foreground before typing: a hidden tab's inputs do not receive trusted
+  // keystrokes reliably and Angular/React trust filters can drop them
+  // (2026-06-22 backgrounded-tab class fix, same root cause as realClick).
+  try { await page.bringToFront() } catch (_e) {}
   const result = await page.evaluate(function(args){
     const collect = function(){
       const out = []
@@ -912,10 +922,14 @@ async function clickByTag(opts) {
   opts = opts || {}
   const tag = (opts.tag || 'BUTTON').toUpperCase()
   if (!opts.text && !opts.aria) throw new Error('text or aria required')
+  // Foreground BEFORE measuring: a hidden tab reports stale rects and ignores
+  // clicks (2026-06-22 Authorize-button ordeal). bringToFront makes layout and
+  // hit-testing correct, so deepFindRect reads the real on-screen position.
+  const page = await resolveTarget(opts)
+  try { await page.bringToFront() } catch (_e) {}
   const rect = await deepFindRect({ tag: tag, text: opts.text, aria: opts.aria, exact: !!opts.exact, target: opts.target })
   if (!rect || !rect.ok) return { ok: false, error: 'no ' + tag + ' matched', detail: rect && rect.error }
   // Try JS click first - cheaper, succeeds on plain DOM buttons.
-  const page = await resolveTarget(opts)
   const jsResult = await page.evaluate(function(args){
     const candidates = []
     const walk = function(root){
