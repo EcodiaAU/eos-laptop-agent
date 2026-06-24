@@ -89,6 +89,38 @@ const CLAUDE_CREDENTIALS_PATH =
   process.env.CLAUDE_CREDENTIALS_PATH ||
   path.join(os.homedir(), '.claude', '.credentials.json')
 
+// ~/.claude.json holds `oauthAccount` - the DISPLAY identity (emailAddress,
+// accountUuid, organizationUuid, seat/rate-limit tiers) that `claude auth status`
+// and the VS Code extension UI read, and that usage attribution can key off.
+// The Keychain holds the TOKEN (what authenticates/bills); ~/.claude.json holds
+// the LABEL. A headless rotate_to that swaps only the token leaves this label
+// stale, so the switch BILLS the new account but DISPLAYS the old one - the exact
+// "you didn't switch at all" confusion (2026-06-22). rotate_to now swaps both;
+// seed_from_live snapshots oauthAccount alongside the token.
+const CLAUDE_JSON_PATH =
+  process.env.CLAUDE_JSON_PATH ||
+  path.join(os.homedir(), '.claude.json')
+
+// Merge a snapshot's saved oauthAccount into ~/.claude.json (best-effort, atomic).
+// Only writes when the snapshot actually carries an oauthAccount (older snapshots
+// predate capture; those rotations leave the label as-is rather than wipe it).
+function applyOauthAccount(parsedSnapshot) {
+  try {
+    const oa = parsedSnapshot && parsedSnapshot.oauthAccount
+    if (!oa || !oa.emailAddress) return { applied: false, reason: 'snapshot_has_no_oauthAccount' }
+    if (!fs.existsSync(CLAUDE_JSON_PATH)) return { applied: false, reason: 'no_claude_json' }
+    const j = JSON.parse(fs.readFileSync(CLAUDE_JSON_PATH, 'utf8'))
+    j.oauthAccount = oa
+    const tmp = CLAUDE_JSON_PATH + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(j, null, 2))
+    fs.renameSync(tmp, CLAUDE_JSON_PATH)
+    return { applied: true, emailAddress: oa.emailAddress }
+  } catch (e) {
+    return { applied: false, reason: e.message }
+  }
+}
+exports.applyOauthAccount = applyOauthAccount
+
 const ACCOUNTS = ['tate', 'code', 'money']
 
 // Accounts the operator has flagged as paused/unaffordable. pick_healthiest_account
@@ -448,7 +480,11 @@ exports.rotate_to = async function (accountOrParams) {
     } catch (_) {
       // best-effort mirror; Keychain is the source of truth on Mac
     }
-    return { previous, current: account, target: 'keychain' }
+    // Swap the DISPLAY identity too so `claude auth status` / the extension UI /
+    // usage attribution follow the token. Stale label = the 2026-06-22 "didn't
+    // switch" illusion. Best-effort: a snapshot without oauthAccount leaves it.
+    const oaRes = applyOauthAccount(_parsedSource)
+    return { previous, current: account, target: 'keychain', oauthAccount: oaRes }
   }
 
   // Windows / Linux: file-swap rotation. .credentials.json IS the source of truth.
@@ -458,7 +494,8 @@ exports.rotate_to = async function (accountOrParams) {
   fs.writeFileSync(tmp, content)
   fs.renameSync(tmp, CLAUDE_CREDENTIALS_PATH)
 
-  return { previous, current: account, target: 'file' }
+  const oaRes = applyOauthAccount(_parsedSource)
+  return { previous, current: account, target: 'file', oauthAccount: oaRes }
 }
 
 // ── seed_from_live ────────────────────────────────────────────────────────────
@@ -504,6 +541,39 @@ exports.seed_from_live = function (accountOrParams) {
     throw new Error('refusing to seed ' + account + ' from stale live blob (expiresAt=' + o.expiresAt + ', age=' + Math.round((Date.now() - (o.expiresAt || 0)) / 60000) + 'min). Log in as ' + account + ' in Claude Code first.')
   }
 
+  // Anti-clobber identity guard (2026-06-22). seed_from_live trusts the caller to
+  // NAME the account that owns the live blob; it does not verify it. On 2026-06-22
+  // a seed_from_live({account:'tate'}) ran while code@ was the live Keychain
+  // identity, writing code@'s token into tate.json. current_account() then matched
+  // the live token to tate.json and the auto-switch reasoned about the WRONG live
+  // account (the silent-stall root cause). Offline, alias-safe guard: refuse when
+  // the live blob is byte-identical to a DIFFERENT account's current snapshot -
+  // that proves the live identity is the other account, not `account`.
+  // (Token-equality sidesteps the money@/tate@ alias-email ambiguity an API-email
+  // check would hit.)
+  for (const other of ACCOUNTS) {
+    if (other === account) continue
+    try {
+      const otherTok = JSON.parse(fs.readFileSync(path.join(CREDS_DIR, other + '.json'), 'utf8'))?.claudeAiOauth?.accessToken
+      if (otherTok && otherTok === o.accessToken) {
+        throw new Error('CLOBBER GUARD: live token already belongs to ' + other + '.json; refusing to also write it as ' + account + '.json (live identity is ' + other + ', not ' + account + '). Log in as ' + account + ' before seeding.')
+      }
+    } catch (e) { if (/CLOBBER GUARD/.test(e.message)) throw e }
+  }
+
+  // Capture the live DISPLAY identity (oauthAccount from ~/.claude.json) into the
+  // snapshot so a future rotate_to can restore the label alongside the token.
+  // Guarded by emailAddress == this account (alias-safe: money@'s oauthAccount
+  // reads money@ecodia.au, not tate@), so we never snapshot the wrong label even
+  // if ~/.claude.json is mid-drift. Missing/mismatched -> snapshot carries no
+  // oauthAccount and rotate_to leaves the label as-is (no regression).
+  let oauthCaptured = false
+  try {
+    const cj = JSON.parse(fs.readFileSync(CLAUDE_JSON_PATH, 'utf8'))
+    const oa = cj && cj.oauthAccount
+    if (oa && oa.emailAddress === account + '@ecodia.au') { parsed.oauthAccount = oa; oauthCaptured = true }
+  } catch (_) {}
+
   const dest = path.join(CREDS_DIR, account + '.json')
   const tmp = dest + '.tmp'
   if (!fs.existsSync(CREDS_DIR)) fs.mkdirSync(CREDS_DIR, { recursive: true })
@@ -517,5 +587,6 @@ exports.seed_from_live = function (accountOrParams) {
     dest,
     expiresAt: o.expiresAt,
     expires_in_min: Math.round((o.expiresAt - Date.now()) / 60000),
+    oauthAccountCaptured: oauthCaptured,
   }
 }

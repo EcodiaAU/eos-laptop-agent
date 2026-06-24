@@ -664,8 +664,25 @@ exports.dispatchOne = async function dispatchOne(row) {
     }
 
     // 1. Pick + rotate to healthiest account.
+    // 2026-06-25 single-keychain stickiness. The Mac shares ONE Keychain, so a
+    // dispatched worker and the interactive conductor are ALWAYS on the same
+    // account at any instant - "dispatch a worker on code@ while Tate is on
+    // money@" is incoherent; rotate_to moves EVERYONE. Picking the globally
+    // headroom-healthiest account per dispatch therefore CLOBBERS the interactive
+    // session onto whatever scores highest (e.g. money@ -> code@), and if that
+    // account is really capped, Tate's chats die. The active-workers safety gate
+    // in rotate_to cannot see the interactive session (it is not in workers/), so
+    // it does not protect against this. Fix: prefer the account the live session
+    // is already on; pick_healthiest only overrides it when that account drops
+    // below the headroom threshold (genuine cap pressure), at which point the
+    // cap-watch/autoswitch is the right mover - not per-dispatch load-balancing.
+    // Origin: 2026-06-24 money@ -> code@ clobber stopped all chats while money@
+    // had 52.6% weekly headroom. row.preferred_account still wins when set.
+    const liveShort = (() => { try { return getCreds().current_account() } catch (_) { return null } })()
+    const stickyPreferred = row.preferred_account ||
+      (liveShort && liveShort !== 'unknown' ? liveShort : null)
     const picked = await getCreds().pick_healthiest_account({
-      preferred: row.preferred_account || null,
+      preferred: stickyPreferred,
       required_headroom_minutes: 15,
     })
     const rotateResult = await getCreds().rotate_to(picked)

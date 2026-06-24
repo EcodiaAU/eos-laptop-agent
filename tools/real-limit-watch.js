@@ -35,6 +35,18 @@ const REAL_LIMIT_RE = /You've hit your (session|weekly) limit/
 const DEFAULT_FRESH_MS = 12 * 60 * 1000          // act only on a cap-hit seen in the last 12min
 const DEFAULT_ALERT_COOLDOWN_MS = 60 * 60 * 1000 // rate-limit the no-target SMS
 const POST_SWITCH_GRACE_MS = 30 * 60 * 1000      // window in which a fresh cap is presumed a lagging re-injection from the account we just switched off
+// 2026-06-25 no-target SMS debounce. On a single shared Keychain the cap banner
+// bleeds into collateral worker transcripts, so for ONE scan the heaviest
+// fresh-capped session can resolve to the (healthy) live account before the
+// truly-capped account's heavy session gets its own cap line - the next 60s scan
+// self-corrects to capped_not_live. Require the same no-target verdict to persist
+// across N scans before alerting Tate. Demand MORE persistence when the blamed
+// account still shows comfortable ccusage headroom (a cap on it is implausible),
+// but never permanently veto - ccusage can under-report a genuine cap.
+const NO_TARGET_MIN_SCANS = 2                     // consecutive no-target scans before the SMS fires
+const NO_TARGET_MIN_SCANS_WHEN_HEADROOM = 5       // when the blamed account looks healthy by ccusage, demand more
+const NO_TARGET_HEADROOM_FLOOR = 0.25             // headroom fraction above which a real cap on that account is implausible
+const NO_TARGET_STREAK_WINDOW_MS = 15 * 60 * 1000 // a pending streak older than this is stale; start fresh
 const SAFE_HEADROOM_FLOOR = 0.5                  // an account above this headroom for the cap kind cannot be the real capped account (ccusage undercounts, but not 2x past this)
 
 function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
@@ -308,16 +320,42 @@ async function run(opts) {
     const staleNote = staleButHealthy.length
       ? ` ${staleButHealthy.join(',')} has budget but its snapshot is STALE - re-auth (account-login) so I can switch.`
       : ' No account has budget.'
+
+    // Debounce: require the no-target verdict (capped == live, no rotatable
+    // target) to persist across consecutive scans before alerting. A genuine
+    // cap re-injects a fresh cap notice every retry, so the streak builds; a
+    // single-scan misattribution to the live account is reset the moment any
+    // other outcome (capped_not_live / none / suppressed / switched) runs,
+    // because persist() writes a fresh state object without pendingNoTarget.
+    // The 2026-06-24 23:44 false "money@ capped" SMS fired on exactly such a
+    // one-scan blip (money@ at 52.6% weekly headroom).
+    const liveHeadroom = headroomFor(accountsState, liveEmail, hit.kind)
+    const minScans = (liveHeadroom != null && liveHeadroom > NO_TARGET_HEADROOM_FLOOR)
+      ? NO_TARGET_MIN_SCANS_WHEN_HEADROOM : NO_TARGET_MIN_SCANS
+    const prevPending = state.pendingNoTarget
+    const sameStreak = !!prevPending &&
+      prevPending.account === (liveEmail || null) &&
+      prevPending.kind === hit.kind &&
+      (nowMs - (prevPending.firstMs || 0)) < NO_TARGET_STREAK_WINDOW_MS
+    const scans = sameStreak ? (prevPending.scans || 1) + 1 : 1
+    const firstMs = sameStreak ? prevPending.firstMs : nowMs
+    const pendingNoTarget = { account: liveEmail || null, kind: hit.kind, firstMs, scans }
+
+    if (scans < minScans) {
+      persist({ result: 'no_target_pending', staleButHealthy, lastAlertTs: state.lastAlertTs || 0, pendingNoTarget })
+      return { action: 'no_target_pending', kind: hit.kind, live: liveEmail, staleButHealthy, scans, minScans, liveHeadroom, cap_at: hit.ts }
+    }
+
     const lastAlert = state.lastAlertTs || 0
     let alerted = false
     if (nowMs - lastAlert >= alertCooldownMs) {
       if (!dryRun) alert('real-limit-watch', `REAL ${hit.kind} cap hit on ${liveEmail || 'live account'} (${whenLocal}). Cannot auto-switch.${staleNote}`)
       alerted = true
-      persist({ result: 'no_target_alerted', lastAlertTs: nowMs, staleButHealthy })
+      persist({ result: 'no_target_alerted', lastAlertTs: nowMs, staleButHealthy, pendingNoTarget })
     } else {
-      persist({ result: 'no_target', staleButHealthy, lastAlertTs: lastAlert })
+      persist({ result: 'no_target', staleButHealthy, lastAlertTs: lastAlert, pendingNoTarget })
     }
-    return { action: alerted ? 'no_target_alerted' : 'no_target', kind: hit.kind, live: liveEmail, staleButHealthy, cap_at: hit.ts }
+    return { action: alerted ? 'no_target_alerted' : 'no_target', kind: hit.kind, live: liveEmail, staleButHealthy, scans, minScans, cap_at: hit.ts }
   }
 
   const target = usable[0].email
@@ -444,7 +482,10 @@ async function selftest() {
     })
     assert(res.action === 'switch' && res.target === 'code@ecodia.au', 'run(dry): real cap + healthy target -> switch to code@')
 
-    // 9. same cap but target snapshot STALE -> no_target_alerted (away-safety)
+    // 9. same cap but target snapshot STALE -> first scan is held by the debounce
+    // (no_target_pending) but still surfaces the stale-but-healthy target so the
+    // re-auth need is visible; the SMS fires once the verdict persists (cf. test 19).
+    // Under dryRun persist() is a no-op, so a single call can only ever be scan 1.
     fs.writeFileSync(path.join(credsDir, 'code.json'), JSON.stringify({ claudeAiOauth: { expiresAt: now - 1000 } }))
     const res2 = await run({
       now, dryRun: true,
@@ -454,8 +495,8 @@ async function selftest() {
       getActiveAccount: () => 'money@ecodia.au',
       agentTool: () => null,
     })
-    assert(res2.action === 'no_target_alerted' && res2.staleButHealthy.includes('code@ecodia.au'),
-      'run(dry): real cap + only-stale target -> alert Tate to re-auth')
+    assert(res2.action === 'no_target_pending' && res2.staleButHealthy.includes('code@ecodia.au'),
+      'run(dry): real cap + only-stale target -> first scan held by debounce, stale target surfaced')
   } finally { try { fs.rmSync(tmp2, { recursive: true, force: true }) } catch (_) {} }
 
   // ── lagging-cap suppression (2026-06-24 inverted-alarm regression) ──────────
@@ -580,7 +621,68 @@ async function selftest() {
       'run(): genuine live cap on code@ still switches onto healthy money@')
   } finally { try { fs.rmSync(tmp5, { recursive: true, force: true }) } catch (_) {} }
 
-  console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED (22/22)')
+  // 18. DEBOUNCE the 2026-06-24 23:44 false alarm: live=money@, the fresh-capped
+  // session resolves to money@ (collateral keychain bleed) AND money@ shows
+  // healthy ccusage headroom (0.52 > floor) -> a SINGLE scan must NOT alert; it
+  // returns no_target_pending and waits for persistence.
+  const tmp6 = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-debounce-'))
+  try {
+    const pdir = path.join(tmp6, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    fs.writeFileSync(path.join(pdir, 'money-collateral.jsonl'), mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    const usageDir = path.join(tmp6, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_weekly_fraction: 0.52 },
+    } }))
+    let alerted = false
+    const res = await run({
+      now, dryRun: false,
+      projectsDir: path.join(tmp6, 'projects'),
+      coordRoot: path.join(tmp6, 'coord'),
+      credsDir: path.join(tmp6, 'creds'),       // empty -> no rotatable target -> usable=[]
+      stateFile: path.join(usageDir, 'real-limit-watch.json'),
+      getActiveAccount: () => 'money@ecodia.au',
+      sessionsJson: { 'money-collateral': { account: 'money@ecodia.au', total_tokens: 110212 } },
+      alert: () => { alerted = true; return true },
+    })
+    assert(res.action === 'no_target_pending' && !alerted,
+      'run(): one-scan no-target on healthy live money@ -> no_target_pending, NO SMS (the 23:44 false alarm)')
+  } finally { try { fs.rmSync(tmp6, { recursive: true, force: true }) } catch (_) {} }
+
+  // 19. GENUINE persistent cap still alerts: live=money@, session->money@, money@
+  // headroom LOW (0.05 -> minScans=2), no rotatable target. Two consecutive scans
+  // sharing one state file -> scan1 pending (no SMS), scan2 fires the SMS.
+  const tmp7 = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-persist-'))
+  try {
+    const pdir = path.join(tmp7, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    const sfile = path.join(pdir, 'money-real.jsonl')
+    const usageDir = path.join(tmp7, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_weekly_fraction: 0.05 },
+    } }))
+    const stateFile = path.join(usageDir, 'real-limit-watch.json')
+    const common = {
+      dryRun: false,
+      projectsDir: path.join(tmp7, 'projects'),
+      coordRoot: path.join(tmp7, 'coord'),
+      credsDir: path.join(tmp7, 'creds'),
+      stateFile,
+      getActiveAccount: () => 'money@ecodia.au',
+      sessionsJson: { 'money-real': { account: 'money@ecodia.au', total_tokens: 951183694 } },
+    }
+    // scan 1
+    fs.writeFileSync(sfile, mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    let a1 = false
+    const r1 = await run({ ...common, now, alert: () => { a1 = true; return true } })
+    assert(r1.action === 'no_target_pending' && !a1, 'run(): genuine cap scan 1 -> no_target_pending, no SMS yet')
+    // scan 2 (fresh cap ts so it clears already_fired; +60s later)
+    const now2 = now + 60000
+    fs.writeFileSync(sfile, mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now2 - 20000).toISOString()) + '\n')
+    let a2 = false
+    const r2 = await run({ ...common, now: now2, alert: () => { a2 = true; return true } })
+    assert(r2.action === 'no_target_alerted' && a2, 'run(): genuine cap scan 2 -> no_target_alerted, SMS fires')
+  } finally { try { fs.rmSync(tmp7, { recursive: true, force: true }) } catch (_) {} }
+
+  console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED')
 }
 
 if (require.main === module) {
