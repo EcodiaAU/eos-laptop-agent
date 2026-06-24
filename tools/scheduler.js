@@ -951,6 +951,14 @@ exports.markComplete = async function markComplete(row, signal) {
 
   const rowType = row.type || 'one_shot'
 
+  // 2026-06-21 rot-w10: terminal disposition of a SUCCESSFUL run. explicitFailure
+  // already routed any non-success signal through markFailed above, so a row that
+  // reaches here finished cleanly. A worker MAY self-report a finer terminal status
+  // (billing engine writes its own); default to 'success'. Persisted as last_status
+  // on the cron re-arm so cold-start health canaries can distinguish a healthy cron
+  // that re-armed from a never-run NULL row.
+  const completionStatus = (signal && signal.status) || 'success'
+
   if (rowType === 'cron' && row.cron_expression) {
     // Compute next_run_at via cron-parser using the row's tz (default Brisbane).
     // Pre-2026-05-31 this was hardcoded {utc:true}, which mis-fired AEST schedules
@@ -964,13 +972,13 @@ exports.markComplete = async function markComplete(row, signal) {
     await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'active', last_run_at = NOW(), next_run_at = $1,
-           run_count = run_count + 1, last_result = $2,
+           run_count = run_count + 1, last_result = $2, last_status = $4,
            retry_count = 0, leased_by = NULL, leased_at = NULL,
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $3
          AND archived_at IS NULL
          AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
-      [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
+      [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id, completionStatus]
     )
   } else {
     // one_shot or delayed: mark completed.
