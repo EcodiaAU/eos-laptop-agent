@@ -34,6 +34,8 @@ const { spawnSync } = require('child_process')
 const REAL_LIMIT_RE = /You've hit your (session|weekly) limit/
 const DEFAULT_FRESH_MS = 12 * 60 * 1000          // act only on a cap-hit seen in the last 12min
 const DEFAULT_ALERT_COOLDOWN_MS = 60 * 60 * 1000 // rate-limit the no-target SMS
+const POST_SWITCH_GRACE_MS = 30 * 60 * 1000      // window in which a fresh cap is presumed a lagging re-injection from the account we just switched off
+const SAFE_HEADROOM_FLOOR = 0.5                  // an account above this headroom for the cap kind cannot be the real capped account (ccusage undercounts, but not 2x past this)
 
 function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
 
@@ -101,7 +103,12 @@ function readTail(fp, bytes) {
  * Scan recently-touched transcripts for the freshest real cap-hit across the whole
  * projects tree. Cheap: only opens .jsonl files modified inside the freshness
  * window, reads only their 256KB tail (a cap-hit is the latest event when a session
- * blocks). Returns { ts, kind, file } or null.
+ * blocks). Returns the freshest hit { ts, kind, file, sessionId } PLUS `sessions` -
+ * EVERY fresh cap-hit session id (the transcript filename, minus .jsonl). The
+ * machine shares ONE keychain, so a cap blocks every live session at once; the
+ * `sessions` list lets the caller pick the genuinely-capped account by usage weight
+ * instead of trusting the freshest (often a tiny collateral worker). Returns null
+ * when nothing fresh.
  */
 function findFreshRealLimit(opts) {
   opts = opts || {}
@@ -110,6 +117,7 @@ function findFreshRealLimit(opts) {
   const freshMs = opts.freshMs || DEFAULT_FRESH_MS
   const cutoff = nowMs - freshMs
   let best = null
+  const sessions = []
   let projs
   try { projs = fs.readdirSync(projectsDir) } catch (_) { return null }
   for (const proj of projs) {
@@ -123,10 +131,33 @@ function findFreshRealLimit(opts) {
       try { st = fs.statSync(fp) } catch (_) { continue }
       if (st.mtimeMs < cutoff) continue
       const hit = detectFreshRealLimit(readTail(fp, 256 * 1024), nowMs, freshMs)
-      if (hit && (!best || hit.ts > best.ts)) best = { ts: hit.ts, kind: hit.kind, file: fp }
+      if (!hit) continue
+      const sessionId = f.slice(0, -'.jsonl'.length)
+      sessions.push({ sessionId, ts: hit.ts, kind: hit.kind })
+      if (!best || hit.ts > best.ts) best = { ts: hit.ts, kind: hit.kind, file: fp, sessionId }
     }
   }
+  if (!best) return null
+  best.sessions = sessions
   return best
+}
+
+// PURE. Given the fresh cap-hit session ids and the poller's session->account map
+// (sessions.json: { <sessionId>: { account, total_tokens } }), return the account
+// running the HEAVIEST capped session - the one actually burning tokens into the
+// cap, not a tiny collateral worker that merely shared the keychain. Falls back to
+// `fallbackLive` when no session resolves. This is what makes attribution robust to
+// a thrashing/unknown live-account read: the 951M-token code@ session outweighs a
+// 110K-token money@ worker, so the cap is correctly pinned to code@.
+function resolveCappedAccount(sessions, sessionsJson, fallbackLive) {
+  let bestAcct = null, bestTok = -1
+  for (const s of (sessions || [])) {
+    const row = sessionsJson && sessionsJson[s.sessionId]
+    if (!row || !row.account) continue
+    const tok = typeof row.total_tokens === 'number' ? row.total_tokens : 0
+    if (tok > bestTok) { bestTok = tok; bestAcct = row.account }
+  }
+  return bestAcct || fallbackLive || null
 }
 
 // rotatable = snapshots fresh enough for creds.rotate_to (expiresAt > now+5min),
@@ -144,6 +175,50 @@ function rotatableEmails(accounts, credsDir, nowMs) {
     } catch (_) {}
   }
   return out
+}
+
+// Headroom fraction for the cap kind from the ccusage snapshot, or null if absent.
+function headroomFor(accountsState, email, kind) {
+  const a = accountsState && accountsState.accounts && accountsState.accounts[email]
+  if (!a) return null
+  const f = kind === 'weekly' ? a.headroom_weekly_fraction : a.headroom_5h_fraction
+  return (typeof f === 'number') ? f : null
+}
+
+/**
+ * PURE. Decide whether a FRESH real-cap detection is actually a lagging
+ * re-injection from an account we ALREADY switched off, mis-landing on the
+ * now-live (healthy) account.
+ *
+ * After a forced switch away from a capped account, that account's still-open
+ * sessions keep retrying; Claude Code re-injects the cap notice on every blocked
+ * retry, each with a NEW timestamp that clears the ts-dedup. A later scan reads
+ * getActiveAccount() = the account we just switched TO and blames IT - the inverted
+ * false alarm Tate hit 2026-06-24 ("REAL weekly cap on money@" while money@ had 90%
+ * headroom and code@ was the real capped account).
+ *
+ * Suppress IFF: (a) the last action was a real 'switched' away from `from` -> `target`,
+ * (b) we are still on that `target` (== liveEmail), (c) the switch was within graceMs,
+ * and (d) the now-live account still shows healthy headroom for THIS cap kind. (d) is
+ * the safety that keeps a genuine fresh cap on the new account from being masked:
+ * ccusage can undercount, but a truly-capped account never sits above the floor.
+ */
+function laggingCapSuppression(o) {
+  o = o || {}
+  const { liveEmail, kind, nowMs, lastSwitch, accountsState } = o
+  const graceMs = o.graceMs || POST_SWITCH_GRACE_MS
+  const headroomFloor = (typeof o.headroomFloor === 'number') ? o.headroomFloor : SAFE_HEADROOM_FLOOR
+  if (!lastSwitch || lastSwitch.result !== 'switched' || !lastSwitch.from || !lastSwitch.target) return { suppressed: false }
+  if (liveEmail && lastSwitch.target !== liveEmail) return { suppressed: false }     // something moved us off the switch target; normal attribution applies
+  const switchedAtMs = Date.parse(lastSwitch.raised_at || lastSwitch.cap_at || '')
+  if (!switchedAtMs || (nowMs - switchedAtMs) > graceMs) return { suppressed: false } // switch too old to still be lagging
+  const hr = headroomFor(accountsState, liveEmail, kind)
+  if (hr != null && hr <= headroomFloor) return { suppressed: false }                // now-live account may itself be genuinely capped - do NOT mask
+  return {
+    suppressed: true,
+    cappedAccount: lastSwitch.from,
+    reason: `lagging ${kind} cap re-injection from ${lastSwitch.from} (switched off ${Math.round((nowMs - switchedAtMs) / 60000)}min ago; live ${liveEmail} headroom=${hr == null ? 'n/a' : hr.toFixed(2)})`,
+  }
 }
 
 function defaultAlert(textTatePath) {
@@ -190,6 +265,15 @@ async function run(opts) {
     : (liveShort && liveShort !== 'unknown' ? liveShort + '@ecodia.au' : null)
 
   const accountsState = readJsonSafe(path.join(coordRoot, 'usage', 'accounts.json'), { accounts: {} })
+
+  // Attribute the cap to the account running the HEAVIEST fresh cap session, not to
+  // the live-account read (which is unreliable when current_account() is 'unknown'
+  // and thrashes between accounts). The 951M-token code@ session outweighs a 110K
+  // collateral money@ worker, so the cap pins to code@ even while the keychain shows
+  // money@. Origin: 2026-06-24 inverted "money@ capped" SMS while code@ was capped.
+  const sessionsJson = opts.sessionsJson || readJsonSafe(opts.sessionsFile || path.join(coordRoot, 'usage', 'sessions.json'), {})
+  const cappedEmail = resolveCappedAccount(hit.sessions, sessionsJson, liveEmail)
+
   const decideMod = require('./account-cap-decide')
   const disabled = (opts.disabled || (process.env.ACCOUNTS_DISABLED || '').split(',').map(s => s.trim()).filter(Boolean))
     .map(s => s.includes('@') ? s : s + '@ecodia.au')
@@ -198,6 +282,27 @@ async function run(opts) {
 
   const whenLocal = new Date(hit.ts).toLocaleString('en-AU', { timeZone: 'Australia/Brisbane' })
   const persist = (extra) => { if (!dryRun) try { fs.writeFileSync(stateFile, JSON.stringify({ lastFiredCapTs: hit.ts, kind: hit.kind, live: liveEmail, raised_at: new Date(nowMs).toISOString(), ...extra })) } catch (_) {} }
+
+  // Capped-account-not-live guard: if the genuinely-capped account (heaviest fresh
+  // cap session) is NOT the account currently live, we are already on a different
+  // (healthy) account - there is nothing to switch and, crucially, we must NOT blame
+  // the live account. This is the root fix for the inverted alarm: the cap belongs
+  // to code@ (951M-token session), we are on money@, so the correct action is none.
+  if (cappedEmail && liveEmail && cappedEmail !== liveEmail) {
+    persist({ result: 'capped_not_live', capped_account: cappedEmail })
+    return { action: 'capped_not_live', kind: hit.kind, cappedAccount: cappedEmail, live: liveEmail, cap_at: hit.ts }
+  }
+
+  // Lagging-cap guard: a fresh cap notice arriving just after we switched off a
+  // capped account is that account's still-open retries re-injecting, not a cap on
+  // the healthy account we moved to. Suppress before it can blame the live account.
+  const lastSwitch = opts.lastSwitch || readJsonSafe(switchRequestFile, null)
+  const sup = laggingCapSuppression({ liveEmail, kind: hit.kind, nowMs, lastSwitch, accountsState,
+    graceMs: opts.graceMs || POST_SWITCH_GRACE_MS, headroomFloor: opts.headroomFloor })
+  if (sup.suppressed) {
+    persist({ result: 'suppressed_post_switch_lagging_cap', capped_account: sup.cappedAccount, reason: sup.reason })
+    return { action: 'suppressed_post_switch', kind: hit.kind, live: liveEmail, cappedAccount: sup.cappedAccount, reason: sup.reason, cap_at: hit.ts }
+  }
 
   if (!usable.length) {
     const staleNote = staleButHealthy.length
@@ -353,7 +458,129 @@ async function selftest() {
       'run(dry): real cap + only-stale target -> alert Tate to re-auth')
   } finally { try { fs.rmSync(tmp2, { recursive: true, force: true }) } catch (_) {} }
 
-  console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED (11/11)')
+  // ── lagging-cap suppression (2026-06-24 inverted-alarm regression) ──────────
+  const accts = { accounts: {
+    'money@ecodia.au': { headroom_5h_fraction: 0.93, headroom_weekly_fraction: 0.90 },
+    'code@ecodia.au': { headroom_5h_fraction: 0.90, headroom_weekly_fraction: 0.95 },
+  } }
+  const switched = { result: 'switched', from: 'code@ecodia.au', target: 'money@ecodia.au',
+    cap_at: '2026-06-24T06:09:23.302Z', raised_at: '2026-06-24T06:10:21.413Z' }
+  const t2 = Date.parse('2026-06-24T06:11:21.000Z')   // 1 min after the switch
+
+  // 10. THE incident: fresh cap, we just switched code@ -> money@, money@ healthy -> SUPPRESS, blame stays code@
+  let s = laggingCapSuppression({ liveEmail: 'money@ecodia.au', kind: 'weekly', nowMs: t2, lastSwitch: switched, accountsState: accts })
+  assert(s.suppressed && s.cappedAccount === 'code@ecodia.au', 'post-switch lagging cap suppressed, blame stays on switched-off account')
+
+  // 11. SAME timing but the now-live account is itself genuinely low -> do NOT mask (real double-cap must fire)
+  const acctsLow = { accounts: { 'money@ecodia.au': { headroom_weekly_fraction: 0.15 }, 'code@ecodia.au': { headroom_weekly_fraction: 0.95 } } }
+  s = laggingCapSuppression({ liveEmail: 'money@ecodia.au', kind: 'weekly', nowMs: t2, lastSwitch: switched, accountsState: acctsLow })
+  assert(!s.suppressed, 'low-headroom live account is NOT suppressed (genuine fresh cap can still fire)')
+
+  // 12. switch too old (>grace) -> normal attribution resumes, no suppression
+  const tLate = Date.parse('2026-06-24T06:50:00.000Z')  // ~40min after switch
+  s = laggingCapSuppression({ liveEmail: 'money@ecodia.au', kind: 'weekly', nowMs: tLate, lastSwitch: switched, accountsState: accts })
+  assert(!s.suppressed, 'stale switch (>30min) does not suppress')
+
+  // 13. something moved us off the switch target -> not a lagging re-injection of THIS switch
+  s = laggingCapSuppression({ liveEmail: 'code@ecodia.au', kind: 'weekly', nowMs: t2, lastSwitch: switched, accountsState: accts })
+  assert(!s.suppressed, 'live account != switch target -> no suppression')
+
+  // 14. no prior switch / a noop result -> never suppress
+  assert(!laggingCapSuppression({ liveEmail: 'money@ecodia.au', kind: 'weekly', nowMs: t2, lastSwitch: null, accountsState: accts }).suppressed, 'no lastSwitch -> no suppression')
+  assert(!laggingCapSuppression({ liveEmail: 'money@ecodia.au', kind: 'weekly', nowMs: t2, lastSwitch: { result: 'already_on_target', from: 'code@ecodia.au', target: 'money@ecodia.au', raised_at: switched.raised_at }, accountsState: accts }).suppressed, 'noop switch result -> no suppression')
+
+  // 15. run() end-to-end: fresh cap + we just switched off code@ onto money@ (healthy) -> action suppressed_post_switch, no alert, no re-switch
+  const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-sup-'))
+  try {
+    const pdir = path.join(tmp3, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    fs.writeFileSync(path.join(pdir, 's.jsonl'), mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    const usageDir = path.join(tmp3, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_5h_fraction: 0.93, headroom_weekly_fraction: 0.90 },
+      'code@ecodia.au': { headroom_5h_fraction: 0.90, headroom_weekly_fraction: 0.95 },
+    } }))
+    let alerted = false
+    const res = await run({
+      now, dryRun: false,
+      projectsDir: path.join(tmp3, 'projects'),
+      coordRoot: path.join(tmp3, 'coord'),
+      credsDir: path.join(tmp3, 'creds'),
+      stateFile: path.join(usageDir, 'real-limit-watch.json'),
+      getActiveAccount: () => 'money@ecodia.au',
+      lastSwitch: { result: 'switched', from: 'code@ecodia.au', target: 'money@ecodia.au', cap_at: new Date(now - 60000).toISOString(), raised_at: new Date(now - 60000).toISOString() },
+      agentTool: () => { throw new Error('must not rotate during suppression') },
+      alert: () => { alerted = true; return true },
+    })
+    assert(res.action === 'suppressed_post_switch' && res.cappedAccount === 'code@ecodia.au' && !alerted,
+      'run(): lagging cap after switch -> suppressed, no alert, no rotate')
+  } finally { try { fs.rmSync(tmp3, { recursive: true, force: true }) } catch (_) {} }
+
+  // ── dominant-session cap attribution (2026-06-24 root fix) ──────────────────
+  const sj = {
+    'big-code': { account: 'code@ecodia.au', total_tokens: 951183694 },
+    'tiny-money': { account: 'money@ecodia.au', total_tokens: 110212 },
+  }
+  // heaviest capped session wins, even though the freshest message is the tiny one
+  assert(resolveCappedAccount([{ sessionId: 'tiny-money' }, { sessionId: 'big-code' }], sj, 'money@ecodia.au') === 'code@ecodia.au',
+    'resolveCappedAccount picks the heaviest capped session (code@), not the live fallback')
+  // unknown session ids -> fallback to live
+  assert(resolveCappedAccount([{ sessionId: 'nope' }], sj, 'money@ecodia.au') === 'money@ecodia.au',
+    'resolveCappedAccount falls back to live when no session resolves')
+
+  // 16. run() end-to-end THE Tate incident: live=money@ (healthy), but the heavy
+  // fresh cap session is code@'s -> action capped_not_live, NO alert, NO rotate.
+  const tmp4 = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-cnl-'))
+  try {
+    const pdir = path.join(tmp4, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    // session id is the filename stem; make it 'heavy-code'
+    fs.writeFileSync(path.join(pdir, 'heavy-code.jsonl'), mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    const usageDir = path.join(tmp4, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_weekly_fraction: 0.90 }, 'code@ecodia.au': { headroom_weekly_fraction: 0.95 },
+    } }))
+    let alerted = false
+    const res = await run({
+      now, dryRun: false,
+      projectsDir: path.join(tmp4, 'projects'),
+      coordRoot: path.join(tmp4, 'coord'),
+      credsDir: path.join(tmp4, 'creds'),
+      stateFile: path.join(usageDir, 'real-limit-watch.json'),
+      getActiveAccount: () => 'money@ecodia.au',
+      sessionsJson: { 'heavy-code': { account: 'code@ecodia.au', total_tokens: 951183694 } },
+      agentTool: () => { throw new Error('must not rotate when capped account is not live') },
+      alert: () => { alerted = true; return true },
+    })
+    assert(res.action === 'capped_not_live' && res.cappedAccount === 'code@ecodia.au' && res.live === 'money@ecodia.au' && !alerted,
+      'run(): cap on non-live code@ while on healthy money@ -> capped_not_live, no alert, no rotate')
+  } finally { try { fs.rmSync(tmp4, { recursive: true, force: true }) } catch (_) {} }
+
+  // 17. run() the GENUINE live-cap case still works: live=code@ AND heavy cap session
+  // is code@ -> proceeds to switch onto a healthy target (money@).
+  const tmp5 = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-live-'))
+  try {
+    const pdir = path.join(tmp5, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    fs.writeFileSync(path.join(pdir, 'heavy-code.jsonl'), mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    const usageDir = path.join(tmp5, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_5h_fraction: 0.95, headroom_weekly_fraction: 0.90 },
+      'code@ecodia.au': { headroom_5h_fraction: 0.05, headroom_weekly_fraction: 0.05 },
+    } }))
+    const credsDir = path.join(tmp5, 'creds'); fs.mkdirSync(credsDir)
+    fs.writeFileSync(path.join(credsDir, 'money.json'), JSON.stringify({ claudeAiOauth: { expiresAt: now + 3600 * 1000 } }))
+    const res = await run({
+      now, dryRun: true,
+      projectsDir: path.join(tmp5, 'projects'),
+      coordRoot: path.join(tmp5, 'coord'),
+      credsDir,
+      getActiveAccount: () => 'code@ecodia.au',
+      sessionsJson: { 'heavy-code': { account: 'code@ecodia.au', total_tokens: 951183694 } },
+      agentTool: () => ({ target: 'money@ecodia.au' }),
+    })
+    assert(res.action === 'switch' && res.target === 'money@ecodia.au',
+      'run(): genuine live cap on code@ still switches onto healthy money@')
+  } finally { try { fs.rmSync(tmp5, { recursive: true, force: true }) } catch (_) {} }
+
+  console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED (22/22)')
 }
 
 if (require.main === module) {
@@ -362,4 +589,4 @@ if (require.main === module) {
   else run({ dryRun: arg === '--dry' }).then(r => console.log(JSON.stringify(r, null, 1)))
 }
 
-module.exports = { detectFreshRealLimit, findFreshRealLimit, rotatableEmails, run, readTail }
+module.exports = { detectFreshRealLimit, findFreshRealLimit, resolveCappedAccount, rotatableEmails, headroomFor, laggingCapSuppression, run, readTail }
