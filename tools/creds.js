@@ -204,6 +204,7 @@ function getUsageSource() {
 exports.pick_healthiest_account = async function ({
   preferred = null,
   required_headroom_minutes = 15,
+  preferred_retention_minutes = 2,
 } = {}) {
   // 2026-06-08 Mac-day: when CREDS_DIR doesn't exist or has zero per-account
   // files, cred-rotation is impossible. Return 'current-process' so the
@@ -226,12 +227,23 @@ exports.pick_healthiest_account = async function ({
     states[acct] = usage.get_usage_state(acct)
   }
 
-  // Honour preferred only if it clears the threshold AND is not disabled.
+  // Sticky-to-live retention (2026-06-25 single-keychain stickiness, hardened
+  // 2026-06-29). The live/preferred interactive account is ALWAYS the busiest, so
+  // its 5h headroom routinely dips below the 15-min worker-dispatch threshold
+  // during normal work. Evicting it there rotated the shared keychain onto
+  // another account every time Tate was active - and the 5h window self-heals in
+  // minutes, so the switch bought nothing and broke the flow (recurring
+  // code@ -> money@ onto a weekly-capped account). Retain the preferred account
+  // through transient dips: abandon it only when genuinely near-exhausted on its
+  // tightest window (headroom_minutes <= preferred_retention_minutes, default 2),
+  // not merely busy. The eligible-pick below still uses the full
+  // required_headroom_minutes for choosing among NON-preferred candidates (fresh
+  // worker dispatch / genuine failover).
   if (
     preferred &&
     !DISABLED_ACCOUNTS.has(preferred) &&
     states[preferred] &&
-    states[preferred].headroom_minutes > required_headroom_minutes
+    states[preferred].headroom_minutes > preferred_retention_minutes
   ) {
     return preferred
   }
@@ -271,36 +283,65 @@ exports.current_account = function () {
   // read .credentials.json on darwin). Read the Keychain blob and hash-match
   // its accessToken against the per-account files. Fall back to the file path
   // on non-Mac platforms (existing Windows behaviour).
+  // Authoritative-when-fresh: match the live access token against the per-account
+  // snapshot files. The token IS the billing identity, so a match is definitive -
+  // but the snapshots freeze the token at capture time while the live token
+  // (Keychain on Mac) rotates ~hourly on refresh, so this only matches for the
+  // first hour after a rotate_to. Every other path falls through to the
+  // refresh-stable oauthAccount label below.
   let liveJsonText
   if (USE_KEYCHAIN) {
     liveJsonText = readKeychain()
-    if (!liveJsonText) return 'unknown'
-  } else {
-    if (!fs.existsSync(CLAUDE_CREDENTIALS_PATH)) return 'unknown'
-    try {
-      liveJsonText = fs.readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf8')
-    } catch (_) {
-      return 'unknown'
+  } else if (fs.existsSync(CLAUDE_CREDENTIALS_PATH)) {
+    try { liveJsonText = fs.readFileSync(CLAUDE_CREDENTIALS_PATH, 'utf8') } catch (_) {}
+  }
+  if (liveJsonText) {
+    let parsed
+    try { parsed = JSON.parse(liveJsonText) } catch (_) { parsed = null }
+    const activeToken = parsed && parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken
+    if (activeToken) {
+      for (const acct of ACCOUNTS) {
+        const file = path.join(CREDS_DIR, acct + '.json')
+        if (!fs.existsSync(file)) continue
+        try {
+          const acctData = JSON.parse(fs.readFileSync(file, 'utf8'))
+          if (acctData && acctData.claudeAiOauth && acctData.claudeAiOauth.accessToken === activeToken) {
+            return acct
+          }
+        } catch (_) {}
+      }
     }
   }
+  // Token match failed or the live blob was unreadable. The per-account SNAPSHOT
+  // files freeze the access token at capture time, but the live access token
+  // rotates ~hourly on refresh - so for most of every cycle this returned
+  // 'unknown'. That silently collapsed the scheduler's sticky-to-live preference
+  // to null (scheduler.js treats 'unknown' as "no live account") and let
+  // per-dispatch pick_healthiest clobber the shared keychain onto the
+  // higher-headroom-minutes account: the recurring "random code@ -> money@"
+  // switch onto a weekly-capped account that breaks the interactive flow. Fall
+  // back to the DISPLAY identity in ~/.claude.json oauthAccount, which changes
+  // only on a REAL account switch (not on token refresh) and is kept in sync by
+  // rotate_to/applyOauthAccount. Origin: 2026-06-29 Tate report.
+  return currentAccountFromOauthLabel()
+}
 
-  let parsed
-  try { parsed = JSON.parse(liveJsonText) } catch (_) { return 'unknown' }
-  const activeToken = parsed && parsed.claudeAiOauth && parsed.claudeAiOauth.accessToken
-  if (!activeToken) return 'unknown'
-
-  for (const acct of ACCOUNTS) {
-    const file = path.join(CREDS_DIR, acct + '.json')
-    if (!fs.existsSync(file)) continue
-    try {
-      const acctData = JSON.parse(fs.readFileSync(file, 'utf8'))
-      if (acctData && acctData.claudeAiOauth && acctData.claudeAiOauth.accessToken === activeToken) {
-        return acct
-      }
-    } catch (_) {}
-  }
+// Resolve the live account from the ~/.claude.json oauthAccount display label.
+// emailAddress local-part maps 1:1 to a short account name (code@ecodia.au ->
+// 'code'). Returns 'unknown' when the file/label is absent or names an account
+// outside ACCOUNTS. This is the refresh-stable identity source that backstops the
+// token match in current_account().
+function currentAccountFromOauthLabel() {
+  try {
+    if (!fs.existsSync(CLAUDE_JSON_PATH)) return 'unknown'
+    const j = JSON.parse(fs.readFileSync(CLAUDE_JSON_PATH, 'utf8'))
+    const email = j && j.oauthAccount && j.oauthAccount.emailAddress
+    const short = email ? String(email).split('@')[0].trim().toLowerCase() : null
+    if (short && ACCOUNTS.includes(short)) return short
+  } catch (_) {}
   return 'unknown'
 }
+exports._currentAccountFromOauthLabel = currentAccountFromOauthLabel
 
 // ── rotate_to ─────────────────────────────────────────────────────────────────
 //

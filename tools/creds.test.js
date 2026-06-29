@@ -32,6 +32,12 @@ const CLAUDE_DIR = path.join(TMP, 'claude')
 fs.mkdirSync(CLAUDE_DIR, { recursive: true })
 process.env.CLAUDE_CREDENTIALS_PATH = path.join(CLAUDE_DIR, '.credentials.json')
 
+// Sandbox ~/.claude.json so current_account()'s oauthAccount fallback (the
+// 2026-06-29 refresh-stable identity source) reads a fixture, never the
+// operator's real account label. Seed it to code@ so the fallback is testable.
+process.env.CLAUDE_JSON_PATH = path.join(CLAUDE_DIR, 'claude.json')
+fs.writeFileSync(process.env.CLAUDE_JSON_PATH, JSON.stringify({ oauthAccount: { emailAddress: 'code@ecodia.au' } }))
+
 // ── seed three account files ─────────────────────────────────────────────────
 const TATE = { claudeAiOauth: { accessToken: 'AT-tate', refreshToken: 'RT-tate', expiresAt: 9999999999000 } }
 const CODE = { claudeAiOauth: { accessToken: 'AT-code', refreshToken: 'RT-code', expiresAt: 9999999999000 } }
@@ -81,11 +87,21 @@ async function test(name, fn) {
     if (pick !== 'code') throw new Error('expected code (preferred), got ' + pick)
   })
 
-  await test('pick_healthiest_account falls back from preferred when below threshold', async () => {
+  await test('pick_healthiest_account RETAINS preferred through a transient dip (2026-06-29)', async () => {
+    // A busy live account routinely dips below the 15-min worker threshold but
+    // stays well above the 2-min retention floor. It must be retained, not
+    // clobbered onto another account (the recurring code@ -> money@ switch).
     usageMock.states.money.headroom_minutes = 5
     const pick = await creds.pick_healthiest_account({ preferred: 'money', required_headroom_minutes: 15 })
     usageMock.states.money.headroom_minutes = 50  // restore
-    if (pick !== 'tate') throw new Error('expected tate (fallback), got ' + pick)
+    if (pick !== 'money') throw new Error('expected money (retained through dip), got ' + pick)
+  })
+
+  await test('pick_healthiest_account falls back from preferred only when near-exhausted', async () => {
+    usageMock.states.money.headroom_minutes = 1  // below the 2-min retention floor
+    const pick = await creds.pick_healthiest_account({ preferred: 'money', required_headroom_minutes: 15 })
+    usageMock.states.money.headroom_minutes = 50  // restore
+    if (pick !== 'tate') throw new Error('expected tate (fallback when preferred exhausted), got ' + pick)
   })
 
   await test('pick_healthiest_account throws AllAccountsCappedError when none have headroom', async () => {
@@ -110,6 +126,7 @@ async function test(name, fn) {
   // ── rotate_to tests ──────────────────────────────────────────────────────
 
   await test('rotate_to copies the right account file to claude credentials path', async () => {
+    if (creds.USE_KEYCHAIN) { console.log('  (skip on darwin: rotate_to writes the Keychain, not the file path)'); return }
     await creds.rotate_to('code')
     const content = JSON.parse(fs.readFileSync(process.env.CLAUDE_CREDENTIALS_PATH, 'utf8'))
     if (content.claudeAiOauth.accessToken !== 'AT-code') {
@@ -118,6 +135,7 @@ async function test(name, fn) {
   })
 
   await test('rotate_to is atomic - corrupted .tmp does not leak', async () => {
+    if (creds.USE_KEYCHAIN) { console.log('  (skip on darwin: rotate_to writes the Keychain, not the file path)'); return }
     // Write a corrupted .tmp file; rotate_to must overwrite it atomically
     fs.writeFileSync(process.env.CLAUDE_CREDENTIALS_PATH + '.tmp', 'CORRUPT')
     await creds.rotate_to('tate')
@@ -157,18 +175,36 @@ async function test(name, fn) {
   // ── current_account tests ────────────────────────────────────────────────
 
   await test('current_account identifies account by matching access token', async () => {
+    if (creds.USE_KEYCHAIN) { console.log('  (skip on darwin: live token is in the Keychain, not the file fixture)'); return }
     await creds.rotate_to('tate')
     const acct = creds.current_account()
     if (acct !== 'tate') throw new Error('expected tate, got ' + acct)
   })
 
-  await test('current_account returns unknown when credentials file is absent', async () => {
+  await test('current_account falls back to oauthAccount label when token match fails (2026-06-29)', async () => {
+    // The refresh-stable identity source: token rotates ~hourly so the snapshot
+    // match goes stale, but ~/.claude.json oauthAccount stays put. Fixture seeds
+    // code@; the resolver must return 'code' regardless of platform/keychain.
+    if (creds._currentAccountFromOauthLabel() !== 'code') {
+      throw new Error('expected code from oauthAccount fallback, got ' + creds._currentAccountFromOauthLabel())
+    }
+    // And the public current_account() returns it too when no token matches.
+    if (creds.current_account() !== 'code') {
+      throw new Error('expected code from current_account(), got ' + creds.current_account())
+    }
+  })
+
+  await test('current_account returns unknown when no token match and no oauth label', async () => {
+    if (creds.USE_KEYCHAIN) { console.log('  (skip on darwin: cannot clear the shared Keychain blob from a test)'); return }
     const credPath = process.env.CLAUDE_CREDENTIALS_PATH
-    // temporarily remove the file
-    const backup = fs.readFileSync(credPath)
+    const jsonPath = process.env.CLAUDE_JSON_PATH
+    const credBackup = fs.readFileSync(credPath)
+    const jsonBackup = fs.readFileSync(jsonPath)
     fs.unlinkSync(credPath)
+    fs.unlinkSync(jsonPath)  // remove both identity sources
     const acct = creds.current_account()
-    fs.writeFileSync(credPath, backup)  // restore
+    fs.writeFileSync(credPath, credBackup)  // restore
+    fs.writeFileSync(jsonPath, jsonBackup)
     if (acct !== 'unknown') throw new Error('expected unknown, got ' + acct)
   })
 
