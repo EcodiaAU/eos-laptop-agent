@@ -48,6 +48,15 @@ const NO_TARGET_MIN_SCANS_WHEN_HEADROOM = 5       // when the blamed account loo
 const NO_TARGET_HEADROOM_FLOOR = 0.25             // headroom fraction above which a real cap on that account is implausible
 const NO_TARGET_STREAK_WINDOW_MS = 15 * 60 * 1000 // a pending streak older than this is stale; start fresh
 const SAFE_HEADROOM_FLOOR = 0.5                  // an account above this headroom for the cap kind cannot be the real capped account (ccusage undercounts, but not 2x past this)
+// 2026-06-29 switch-corroboration floor. A force-switch overwrites the shared
+// Keychain and KILLS the live interactive session, so it must never fire on a
+// transcript synthetic cap message ALONE - that message is a CLAIM, the poller's
+// measured headroom is the discriminating PROBE. Only switch when the live account
+// is genuinely near-exhausted by measurement (<= this fraction). Above it (or with
+// no measurement), the cap is a shared-Keychain bleed/misattribution and the switch
+// is blocked. Origin: repeated code@ (81% real weekly headroom) -> money@ force-
+// switches that killed all of Tate's chats.
+const SWITCH_CORROBORATION_FLOOR = 0.10
 
 function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
 
@@ -358,6 +367,22 @@ async function run(opts) {
     return { action: alerted ? 'no_target_alerted' : 'no_target', kind: hit.kind, live: liveEmail, staleButHealthy, scans, minScans, cap_at: hit.ts }
   }
 
+  // Switch-corroboration guard (2026-06-29). The synthetic transcript cap message
+  // that got us here is a CLAIM. Before overwriting the shared Keychain (which
+  // kills the live interactive session), require the poller's MEASURED headroom to
+  // CORROBORATE that the live account is genuinely capped. On the shared single
+  // Keychain a real weekly cap on money@ bleeds its "You've hit your weekly limit"
+  // banner into transcripts that resolveCappedAccount attributes to the heavy live
+  // code@ session, so the watch was switching code@ (81% real weekly headroom) ->
+  // money@ (the account ACTUALLY capped). If the live account still shows real
+  // measured headroom, or headroom is unmeasurable, the cap is a misattribution -
+  // do NOT switch. A genuine cap measures near-zero headroom and passes this guard.
+  const liveMeasuredHeadroom = headroomFor(accountsState, liveEmail, hit.kind)
+  if (liveMeasuredHeadroom == null || liveMeasuredHeadroom > SWITCH_CORROBORATION_FLOOR) {
+    persist({ result: 'switch_blocked_headroom_contradiction', capped_account: cappedEmail || liveEmail, live_measured_headroom: liveMeasuredHeadroom })
+    return { action: 'switch_blocked_headroom_contradiction', kind: hit.kind, live: liveEmail, liveMeasuredHeadroom, target: usable[0].email, cap_at: hit.ts }
+  }
+
   const target = usable[0].email
   const targetShort = target.split('@')[0]
   let status = 'dry_run'
@@ -620,6 +645,37 @@ async function selftest() {
     assert(res.action === 'switch' && res.target === 'money@ecodia.au',
       'run(): genuine live cap on code@ still switches onto healthy money@')
   } finally { try { fs.rmSync(tmp5, { recursive: true, force: true }) } catch (_) {} }
+
+  // 17b. THE 2026-06-29 incident: transcript cap resolves to live code@, BUT code@
+  // shows HEALTHY measured headroom (0.81) - the cap banner bled from genuinely-
+  // capped money@. The switch-corroboration guard must BLOCK the switch (the prior
+  // behaviour force-switched code@ -> money@ and killed all of Tate's chats).
+  const tmp5b = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-contradiction-'))
+  try {
+    const pdir = path.join(tmp5b, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    fs.writeFileSync(path.join(pdir, 'heavy-code.jsonl'), mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    const usageDir = path.join(tmp5b, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_5h_fraction: 0.95, headroom_weekly_fraction: 0.66 },
+      'code@ecodia.au': { headroom_5h_fraction: 0.35, headroom_weekly_fraction: 0.81 },
+    } }))
+    const credsDir = path.join(tmp5b, 'creds'); fs.mkdirSync(credsDir)
+    fs.writeFileSync(path.join(credsDir, 'money.json'), JSON.stringify({ claudeAiOauth: { expiresAt: now + 3600 * 1000 } }))
+    let rotated = false
+    const res = await run({
+      now, dryRun: false,
+      projectsDir: path.join(tmp5b, 'projects'),
+      coordRoot: path.join(tmp5b, 'coord'),
+      credsDir,
+      stateFile: path.join(usageDir, 'real-limit-watch.json'),
+      getActiveAccount: () => 'code@ecodia.au',
+      sessionsJson: { 'heavy-code': { account: 'code@ecodia.au', total_tokens: 951183694 } },
+      agentTool: () => { rotated = true; return { target: 'money@ecodia.au' } },
+      alert: () => { rotated = true; return true },
+    })
+    assert(res.action === 'switch_blocked_headroom_contradiction' && !rotated,
+      'run(): transcript cap on code@ but code@ measured healthy -> switch BLOCKED, no rotate, no SMS')
+  } finally { try { fs.rmSync(tmp5b, { recursive: true, force: true }) } catch (_) {} }
 
   // 18. DEBOUNCE the 2026-06-24 23:44 false alarm: live=money@, the fresh-capped
   // session resolves to money@ (collateral keychain bleed) AND money@ shows
