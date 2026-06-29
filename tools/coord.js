@@ -946,11 +946,27 @@ const SWEEP_INTERVAL_MS = 60 * 1000
 // 60min gives substantial coding tasks room without masking genuine deaths.
 const SWEEP_STALE_THRESHOLD_MS = 60 * 60 * 1000  // 60 min
 
+// 2026-06-29 disk-leak root-cause fix. Terminated worker .json files were NEVER
+// unlinked by ANY code path: this sweep only removed the STATE_DIR .spawned
+// marker, and cleanup_orphan_workers only closes IDE tabs + stamps
+// closed_tab_ok=true on the .json. So the registry grew unbounded (3468 stale
+// files on 2026-06-29, oldest 2026-06-08), forcing countActiveWorkers() and
+// loadFromDisk() to readdir+JSON.parse the whole pile on every rotate_to /
+// startup. A terminated row has no remaining consumer once its tab is confirmed
+// closed (countActiveWorkers + hasLiveWorkerForTask both skip terminated rows;
+// cleanup_orphan_workers can no longer tabIndex-match a long-gone tab), so GC it.
+// closed_tab_ok=true -> unlink immediately (common signal_done -> close_my_tab
+// path). Otherwise keep until WORKER_JSON_RETENTION_MS as a backstop so a
+// not-yet-closed tab still has a window for cleanup_orphan_workers to match it
+// against live ide.tabs(); a tab gone longer than that is unmatchable anyway.
+const WORKER_JSON_RETENTION_MS = 24 * 60 * 60 * 1000  // 24h
+
 function sweepStaleWorkers() {
   const now = Date.now()
   const nowIso = new Date(now).toISOString()
   let marked = 0
   let unlinked = 0
+  let purged = 0
   for (const [tab_id, w] of workers.entries()) {
     if (w.terminated_at) {
       // Already terminated - ensure .spawned is gone too (cheap idempotent op).
@@ -960,6 +976,17 @@ function sweepStaleWorkers() {
           unlinked++
         }
       } catch (e) {}
+      // GC the registry .json once the tab is confirmed closed, or after the
+      // retention backstop. See WORKER_JSON_RETENTION_MS note above.
+      const termMs = Date.parse(w.terminated_at)
+      const ageOk = Number.isFinite(termMs) && (now - termMs) > WORKER_JSON_RETENTION_MS
+      if (w.closed_tab_ok === true || ageOk) {
+        try {
+          fs.unlinkSync(path.join(WORKERS_DIR, tab_id + '.json'))
+          workers.delete(tab_id)
+          purged++
+        } catch (e) {}
+      }
       continue
     }
     const lastHbMs = new Date(w.last_heartbeat_at || w.registered_at).getTime()
@@ -978,10 +1005,10 @@ function sweepStaleWorkers() {
       marked++
     }
   }
-  if (marked > 0 || unlinked > 0) {
-    try { process.stderr.write(`[coord-sweep] marked=${marked} unlinked=${unlinked}\n`) } catch (e) {}
+  if (marked > 0 || unlinked > 0 || purged > 0) {
+    try { process.stderr.write(`[coord-sweep] marked=${marked} unlinked=${unlinked} purged=${purged}\n`) } catch (e) {}
   }
-  return { marked, unlinked }
+  return { marked, unlinked, purged }
 }
 
 // Start the sweep loop unless explicitly disabled (e.g. for unit tests).
