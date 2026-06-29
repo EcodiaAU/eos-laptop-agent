@@ -893,6 +893,15 @@ async function kill_worker(params) {
       const storedTabIndex = (typeof tab_handle.tabIndex === 'number') ? tab_handle.tabIndex : null
       const sentinelPrefix = tab_handle.sentinel_prefix || null
       const exactLabel = tab_handle.label || tab_handle.label_at_spawn || null
+      // 2026-06-25. 'Claude Code' is the default untitled label every fresh CC
+      // tab (workers, conductor, Tate's chats) carries before auto-retitle, so
+      // it is NOT an identity key - matching on it grabs the first untitled tab,
+      // routinely the conductor. kill_worker is called by scheduler.markComplete
+      // on every completion AND replayed on agent restart, so this is the
+      // primary cascade vector. Guard label-based matches against the generic
+      // default; require sentinel or fingerprint, else refuse + leak.
+      // Doctrine: coord-close-my-tab-multi-close-on-shared-label-2026-06-25.
+      const isGenericLabel = (s) => !s || s === 'Claude Code' || s === 'New Chat' || s === 'Cursor'
       let group = null
       const candidates = []
       for (const g of groups) {
@@ -911,7 +920,7 @@ async function kill_worker(params) {
       if (group && storedTabIndex != null) {
         const tabAtIndex = (group.tabs || [])[storedTabIndex]
         if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
-          const labelMatch = exactLabel && tabAtIndex.label === exactLabel
+          const labelMatch = exactLabel && !isGenericLabel(exactLabel) && tabAtIndex.label === exactLabel
           const sentinelMatch = sentinelPrefix && tabAtIndex.label && tabAtIndex.label.startsWith(sentinelPrefix)
           if (labelMatch || sentinelMatch) {
             foundExact = tabAtIndex
@@ -923,7 +932,7 @@ async function kill_worker(params) {
         const hit = candidates.find(t => t.label && t.label.startsWith(sentinelPrefix))
         if (hit) { foundExact = hit; matchedBy = 'sentinel_prefix:' + sentinelPrefix }
       }
-      if (!foundExact && exactLabel) {
+      if (!foundExact && exactLabel && !isGenericLabel(exactLabel)) {
         const hit = candidates.find(t => t.label === exactLabel)
         if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
       }
@@ -945,13 +954,26 @@ async function kill_worker(params) {
           + '|fp=' + (fingerprintReason || (tab_handle.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + tab_handle.viewColumn
       } else {
-        const closeReq = { viewColumn: tab_handle.viewColumn, viewType: CC_CHAT_VIEW_TYPE }
-        if (matchedBy && matchedBy.startsWith('tabIndex')) {
-          closeReq.tabIndex = storedTabIndex
-          closeReq.exactLabel = foundExact.label
+        // 2026-06-25 multi-close fix (mirrors coord.close_my_tab). ALWAYS send
+        // the CURRENT index of the matched tab. foundExact came from the fresh
+        // ide.tabs() probe above, so foundExact.index is its live position - NOT
+        // the stale spawn-time storedTabIndex. Sending tabIndex + exactLabel
+        // routes every close through the bridge's deterministic single-target
+        // Path A, so it can NEVER hit the else-branch label loop that closes
+        // EVERY tab sharing a label. That loop is the cascade source:
+        // cleanup_orphan_workers calls kill_worker per orphan, and a stale
+        // orphan label colliding with a live tab (worker OR conductor) mass-
+        // closed live chats. exactLabel is the race guard (refuse on shift).
+        // Doctrine: coord-close-my-tab-multi-close-on-shared-label-2026-06-25.
+        const closeReq = {
+          viewColumn: tab_handle.viewColumn,
+          viewType: CC_CHAT_VIEW_TYPE,
+          exactLabel: foundExact.label,
+        }
+        if (typeof foundExact.index === 'number') {
+          closeReq.tabIndex = foundExact.index  // current index from the fresh probe -> deterministic single close
         } else {
-          closeReq.exactLabel = foundExact.label
-          closeReq.label = foundExact.label  // legacy substring fallback
+          closeReq.label = foundExact.label  // legacy substring fallback for pre-v2 bridges
         }
         const closeResult = await ide.tabs_close(closeReq)
         const inner = (closeResult && closeResult.result) || closeResult || {}
@@ -1063,7 +1085,10 @@ async function cleanup_orphan_workers(params) {
     if (ctx && ti != null) {
       const tabAtIndex = ctx.allTabs[ti]
       if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE && !ctx.claimed.has(tabAtIndex.label + '#' + ti)) {
-        const labelMatch = labelAtSpawn && tabAtIndex.label === labelAtSpawn
+        // 2026-06-25: never confirm via the generic default label (matches
+        // every untitled tab incl. the conductor). sentinel/fingerprint only.
+        const isGenericLabel = (s) => !s || s === 'Claude Code' || s === 'New Chat' || s === 'Cursor'
+        const labelMatch = labelAtSpawn && !isGenericLabel(labelAtSpawn) && tabAtIndex.label === labelAtSpawn
         const sentinelMatch = sp && tabAtIndex.label && tabAtIndex.label.startsWith(sp)
         if (labelMatch || sentinelMatch) {
           match = tabAtIndex
@@ -1100,13 +1125,21 @@ async function cleanup_orphan_workers(params) {
 
     // Close
     try {
-      const closeReq = { viewColumn: vc, viewType: CC_CHAT_VIEW_TYPE }
-      if (strategy === 'tabIndex') {
-        closeReq.tabIndex = usedTabIndex
-        closeReq.exactLabel = match.label  // sanity check on bridge v2
+      // 2026-06-25 multi-close fix (mirrors coord.close_my_tab + kill_worker).
+      // ALWAYS send the matched tab's CURRENT index (match.index from the fresh
+      // probe), so every close takes the bridge's deterministic single-target
+      // path and can NEVER hit the else-branch label loop that closes EVERY tab
+      // sharing a label. cleanup_orphan_workers loops over all orphans in one
+      // pass, so a single exactLabel-only close colliding with a live tab
+      // (worker OR conductor) was THE cascade source - this drove the
+      // conductor-tab mass-close on agent restart via markComplete replay.
+      // Doctrine: coord-close-my-tab-multi-close-on-shared-label-2026-06-25.
+      const currentIndex = (typeof match.index === 'number') ? match.index : usedTabIndex
+      const closeReq = { viewColumn: vc, viewType: CC_CHAT_VIEW_TYPE, exactLabel: match.label }
+      if (typeof currentIndex === 'number') {
+        closeReq.tabIndex = currentIndex  // current index from the fresh probe -> deterministic single close
       } else {
-        closeReq.exactLabel = match.label
-        closeReq.label = match.label  // legacy substring fallback
+        closeReq.label = match.label  // legacy substring fallback for pre-v2 bridges
       }
       const cr = await ide.tabs_close(closeReq)
       const inner = (cr && cr.result) || cr || {}

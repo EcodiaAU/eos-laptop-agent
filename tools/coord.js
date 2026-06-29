@@ -746,6 +746,17 @@ async function close_my_tab(params, ctx) {
       const storedTabIndex = (typeof stored.tabIndex === 'number') ? stored.tabIndex : null
       const sentinelPrefix = stored.sentinel_prefix || null
       const exactLabel = stored.label || stored.label_at_spawn || null
+      // 2026-06-25. The default untitled CC chat label is 'Claude Code' - EVERY
+      // freshly-spawned worker tab AND the conductor AND Tate's own new chats
+      // carry it until they auto-retitle. It is therefore NOT an identity key:
+      // matching a worker by exactLabel='Claude Code' grabs the first untitled
+      // tab in the column, which is routinely the conductor or a sibling. That
+      // is the wrong-MATCH half of the mass-close cascade (the multi-close half
+      // is fixed by always sending a current tabIndex). A worker still showing
+      // the generic label must be identified ONLY by sentinel_prefix or a
+      // confirmed fingerprint; if neither matches, REFUSE and leak.
+      // Doctrine: coord-close-my-tab-multi-close-on-shared-label-2026-06-25.
+      const isGenericLabel = (s) => !s || s === 'Claude Code' || s === 'New Chat' || s === 'Cursor'
       const candidates = []
       let group = null
       for (const g of groups) {
@@ -772,7 +783,7 @@ async function close_my_tab(params, ctx) {
       if (group && storedTabIndex != null) {
         const tabAtIndex = (group.tabs || [])[storedTabIndex]
         if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
-          const labelMatch = exactLabel && tabAtIndex.label === exactLabel
+          const labelMatch = exactLabel && !isGenericLabel(exactLabel) && tabAtIndex.label === exactLabel
           const sentinelMatch = sentinelPrefix && tabAtIndex.label && tabAtIndex.label.startsWith(sentinelPrefix)
           if (labelMatch || sentinelMatch) {
             foundExact = tabAtIndex
@@ -787,8 +798,9 @@ async function close_my_tab(params, ctx) {
         if (hit) { foundExact = hit; matchedBy = 'sentinel_prefix:' + sentinelPrefix }
       }
 
-      // (c) exact_label match (legacy fallback)
-      if (!foundExact && exactLabel) {
+      // (c) exact_label match (legacy fallback) - NEVER on the generic default
+      // label, which matches every untitled tab including the conductor.
+      if (!foundExact && exactLabel && !isGenericLabel(exactLabel)) {
         const hit = candidates.find(t => t.label === exactLabel)
         if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
       }
@@ -822,19 +834,33 @@ async function close_my_tab(params, ctx) {
           + '|fp=' + (fingerprintReason || (stored.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ': [' + candLabels + '])'
       } else {
-        // Compose close request. If we matched via tabIndex use the deterministic
-        // index path on bridge v2; otherwise use exact-label.
+        // Compose close request. 2026-06-25 multi-close fix: ALWAYS send the
+        // CURRENT index of the matched tab, regardless of which tier (a/b/c/d)
+        // resolved it. foundExact came from the fresh ide.tabs() probe a few
+        // lines up, so foundExact.index is its live position, NOT the stale
+        // spawn-time storedTabIndex. This routes the close through the bridge's
+        // deterministic Path A (closes exactly tabGroups[vc].tabs[index], gated
+        // by exactLabel + viewType) for EVERY tier - the bridge's else-branch
+        // label loop can match and close MULTIPLE tabs when two CC chats share
+        // an identical auto-summarised title, which is the "closed itself AND
+        // another chat" wrong-close. tiers (c) exact_label and (d) autotitle
+        // previously sent no tabIndex and took that multi-close-capable branch.
+        // exactLabel stays as the race guard: if the tab shifted in the ms
+        // between probe and close, the bridge refuses rather than wrong-closes.
+        // Doctrine: coord-close-my-tab-multi-close-on-shared-label-2026-06-25.
         const closeReq = {
           viewColumn: stored.viewColumn,
           viewType: CC_CHAT_VIEW_TYPE,
+          exactLabel: foundExact.label,  // single-target race guard + sanity check
           ide_port: conductor.ide_bridge_port,
         }
-        if (matchedBy && matchedBy.startsWith('tabIndex')) {
-          closeReq.tabIndex = storedTabIndex
-          closeReq.exactLabel = foundExact.label  // belt-and-braces sanity check
+        if (typeof foundExact.index === 'number') {
+          closeReq.tabIndex = foundExact.index  // current index from the fresh probe -> deterministic single close
         } else {
-          closeReq.exactLabel = foundExact.label  // new bridge v2 exact-match field
-          closeReq.label = foundExact.label       // legacy substring fallback for pre-v2 bridges
+          // No positional handle from the probe (should not happen) - fall back
+          // to exact-label; the bridge refuses on exactLabel ambiguity so this
+          // still cannot mass-close.
+          closeReq.label = foundExact.label  // legacy substring fallback for pre-v2 bridges
         }
         const closeResult = await ide.tabs_close(closeReq)
         const inner = (closeResult && closeResult.result) || closeResult || {}
