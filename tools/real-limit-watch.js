@@ -29,7 +29,7 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { spawnSync } = require('child_process')
+const { spawnSync, spawn } = require('child_process')
 
 const REAL_LIMIT_RE = /You've hit your (session|weekly) limit/
 const DEFAULT_FRESH_MS = 12 * 60 * 1000          // act only on a cap-hit seen in the last 12min
@@ -57,6 +57,13 @@ const SAFE_HEADROOM_FLOOR = 0.5                  // an account above this headro
 // is blocked. Origin: repeated code@ (81% real weekly headroom) -> money@ force-
 // switches that killed all of Tate's chats.
 const SWITCH_CORROBORATION_FLOOR = 0.10
+// 2026-06-29 switcher consolidation. The away-safety switch now routes through the
+// CANONICAL re-login (account-switch.sh -> FRESH tokens) instead of the rotate_to
+// snapshot-swap, whose stale snapshots clobbered the live session with a dead token.
+const ACCOUNT_SWITCH_SH = path.join(__dirname, '..', 'scripts', 'account-switch.sh')
+// account-switch.sh is an async ~30-60s CDP re-login; a cap banner re-injected with
+// a fresh timestamp must not spawn a second login while one is in flight.
+const SWITCH_RELAUNCH_COOLDOWN_MS = 10 * 60 * 1000
 
 function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
 
@@ -386,34 +393,47 @@ async function run(opts) {
   const target = usable[0].email
   const targetShort = target.split('@')[0]
   let status = 'dry_run'
-  let via = null
+  let via = 'account-switch.sh'
   if (!dryRun) {
-    // Primary: rotate through the laptop-agent (localhost:7456). Fallback: if the
-    // agent is unreachable, call the creds module DIRECTLY - it writes the Keychain
-    // via the `security` CLI from any process, so a switch still fires even when the
-    // agent is down. The agent's own ~5h silent outage on 2026-06-22 proved this
-    // gap is the exact away-safety hole this watch exists to close. force:true
-    // bypasses the active-workers guard (which needs the agent's worker registry).
-    let rot = agentTool('creds.rotate_to', { account: targetShort, force: true })
-    via = 'agent'
-    if (!rot) {
-      try { rot = await require('./creds').rotate_to({ account: targetShort, force: true }); via = 'creds-direct' } catch (_) { rot = null }
+    // Pin gate (universal override). The operator account-pin is the hard override
+    // across BOTH switch mechanisms; honour it here before launching a re-login.
+    const pinFile = path.join(coordRoot, 'usage', 'account-pin')
+    let pinned = null
+    try {
+      const raw = fs.readFileSync(pinFile, 'utf8').trim()
+      pinned = raw ? (raw.includes('@') ? raw.split('@')[0] : raw).toLowerCase() : null
+    } catch (_) {}
+    if (pinned && pinned !== targetShort) {
+      persist({ result: 'switch_blocked_pinned', target, pinned_to: pinned })
+      return { action: 'switch_blocked_pinned', kind: hit.kind, live: liveEmail, target, pinned_to: pinned, cap_at: hit.ts }
     }
-    status = !rot ? 'agent_unreachable' : rot.target ? 'switched' : (rot.reason || 'noop')
-    persist({ result: status, target })
-    // Only announce + record a switch-request when the Keychain ACTUALLY changed.
-    // rotate_to no-ops to 'already_on_target' once we are on the best account, so a
-    // repeated cap message for the SAME incident (Claude Code re-injects it on each
-    // blocked retry, each with a new timestamp that passes the dedup) lands here as
-    // a noop - we must NOT re-SMS Tate or rewrite the request on those.
-    if (status === 'switched') {
+    // Relaunch cooldown: account-switch.sh is an async ~30-60s CDP re-login, so a
+    // cap banner re-injected with a fresh timestamp must not spawn a second login.
+    if (state.lastSwitchLaunchMs && (nowMs - state.lastSwitchLaunchMs) < SWITCH_RELAUNCH_COOLDOWN_MS) {
+      persist({ result: 'switch_cooldown', target, lastSwitchLaunchMs: state.lastSwitchLaunchMs })
+      return { action: 'switch_cooldown', kind: hit.kind, live: liveEmail, target, cap_at: hit.ts }
+    }
+    // CANONICAL switch: full OAuth re-login via account-switch.sh -> FRESH tokens.
+    // Replaces the old rotate_to snapshot-swap, whose stale per-account snapshots
+    // overwrote the live Keychain with a dead access token and signed the session
+    // out (the 2026-06-29 repeated code@ murders). Detached + unref so the 60s poll
+    // loop is not blocked; the re-login completes in the background.
+    let launchOk = false
+    try {
+      const child = spawn('bash', [ACCOUNT_SWITCH_SH, targetShort], { detached: true, stdio: 'ignore' })
+      child.unref()
+      launchOk = true
+      status = 'switch_launched'
+    } catch (_) { status = 'switch_launch_failed' }
+    persist({ result: status, target, lastSwitchLaunchMs: launchOk ? nowMs : (state.lastSwitchLaunchMs || 0) })
+    if (launchOk) {
       try {
         fs.writeFileSync(switchRequestFile, JSON.stringify({
           target, from: liveEmail, reason: 'REAL ' + hit.kind + ' cap hit (transcript synthetic message)',
-          via: 'real-limit-watch', result: status, cap_at: new Date(hit.ts).toISOString(), raised_at: new Date(nowMs).toISOString(),
+          via: 'real-limit-watch:account-switch.sh', result: status, cap_at: new Date(hit.ts).toISOString(), raised_at: new Date(nowMs).toISOString(),
         }))
       } catch (_) {}
-      alert('real-limit-watch', `REAL ${hit.kind} cap hit on ${liveEmail || 'live'} (${whenLocal}) - auto-switched Keychain to ${target}${via === 'creds-direct' ? ' (direct, agent was down)' : ''}. Next session/worker opens fresh.`)
+      alert('real-limit-watch', `REAL ${hit.kind} cap hit on ${liveEmail || 'live'} (${whenLocal}) - re-logging in to ${target} (account-switch.sh, fresh tokens). Next session opens fresh.`)
     }
   }
   return { action: 'switch', kind: hit.kind, live: liveEmail, target, status, via, cap_at: hit.ts }
@@ -676,6 +696,37 @@ async function selftest() {
     assert(res.action === 'switch_blocked_headroom_contradiction' && !rotated,
       'run(): transcript cap on code@ but code@ measured healthy -> switch BLOCKED, no rotate, no SMS')
   } finally { try { fs.rmSync(tmp5b, { recursive: true, force: true }) } catch (_) {} }
+
+  // 17c. ACCOUNT PIN gate (2026-06-29 consolidation): a GENUINE corroborated cap on
+  // live code@ (low measured headroom, passes the corroboration guard) with a usable
+  // money@ target must NOT re-login while the operator pin holds code@. The pin is
+  // the universal override across both switch mechanisms.
+  const tmp5c = fs.mkdtempSync(path.join(os.tmpdir(), 'rlw-pin-'))
+  try {
+    const pdir = path.join(tmp5c, 'projects', 'p'); fs.mkdirSync(pdir, { recursive: true })
+    fs.writeFileSync(path.join(pdir, 'heavy-code.jsonl'), mk("You've hit your weekly limit · resets Jun 26 at 11am (Australia/Brisbane)", new Date(now - 20000).toISOString()) + '\n')
+    const usageDir = path.join(tmp5c, 'coord', 'usage'); fs.mkdirSync(usageDir, { recursive: true })
+    fs.writeFileSync(path.join(usageDir, 'accounts.json'), JSON.stringify({ accounts: {
+      'money@ecodia.au': { headroom_5h_fraction: 0.95, headroom_weekly_fraction: 0.90 },
+      'code@ecodia.au': { headroom_5h_fraction: 0.05, headroom_weekly_fraction: 0.05 },
+    } }))
+    fs.writeFileSync(path.join(usageDir, 'account-pin'), 'code')  // PIN to code
+    const credsDir = path.join(tmp5c, 'creds'); fs.mkdirSync(credsDir)
+    fs.writeFileSync(path.join(credsDir, 'money.json'), JSON.stringify({ claudeAiOauth: { expiresAt: now + 3600 * 1000 } }))
+    let launched = false
+    const res = await run({
+      now, dryRun: false,
+      projectsDir: path.join(tmp5c, 'projects'),
+      coordRoot: path.join(tmp5c, 'coord'),
+      credsDir,
+      stateFile: path.join(usageDir, 'real-limit-watch.json'),
+      getActiveAccount: () => 'code@ecodia.au',
+      sessionsJson: { 'heavy-code': { account: 'code@ecodia.au', total_tokens: 951183694 } },
+      alert: () => { launched = true; return true },
+    })
+    assert(res.action === 'switch_blocked_pinned' && res.pinned_to === 'code' && !launched,
+      'run(): genuine cap but PINNED to code -> switch_blocked_pinned, no re-login, no SMS')
+  } finally { try { fs.rmSync(tmp5c, { recursive: true, force: true }) } catch (_) {} }
 
   // 18. DEBOUNCE the 2026-06-24 23:44 false alarm: live=money@, the fresh-capped
   // session resolves to money@ (collateral keychain bleed) AND money@ shows

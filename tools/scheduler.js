@@ -663,43 +663,27 @@ exports.dispatchOne = async function dispatchOne(row) {
       }
     }
 
-    // 1. Pick + rotate to healthiest account.
-    // 2026-06-25 single-keychain stickiness. The Mac shares ONE Keychain, so a
-    // dispatched worker and the interactive conductor are ALWAYS on the same
-    // account at any instant - "dispatch a worker on code@ while Tate is on
-    // money@" is incoherent; rotate_to moves EVERYONE. Picking the globally
-    // headroom-healthiest account per dispatch therefore CLOBBERS the interactive
-    // session onto whatever scores highest (e.g. money@ -> code@), and if that
-    // account is really capped, Tate's chats die. The active-workers safety gate
-    // in rotate_to cannot see the interactive session (it is not in workers/), so
-    // it does not protect against this. Fix: prefer the account the live session
-    // is already on; pick_healthiest only overrides it when that account drops
-    // below the headroom threshold (genuine cap pressure), at which point the
-    // cap-watch/autoswitch is the right mover - not per-dispatch load-balancing.
-    // Origin: 2026-06-24 money@ -> code@ clobber stopped all chats while money@
-    // had 52.6% weekly headroom. row.preferred_account still wins when set.
+    // 1. Dispatch on the account that is ALREADY live. No per-dispatch rotation.
+    // 2026-06-29 switcher consolidation. The Mac shares ONE Keychain, so a
+    // dispatched worker and the interactive conductor are ALWAYS the same account
+    // at any instant - rotating for a worker moves EVERYONE, including Tate's live
+    // session. Per-dispatch rotation is therefore incoherent on this substrate
+    // (it can only ever clobber, never load-balance - 2026-06-25 doctrine), and
+    // it was a recurring murder path for the live account. The scheduler no longer
+    // rotates at all: it dispatches the worker onto whatever account is live. The
+    // ONLY sanctioned account mover is the cap-watch/autoswitch -> account-switch.sh
+    // canonical re-login, gated by the operator pin (<COORD_ROOT>/usage/account-pin).
+    // Origin: 2026-06-29, status_board 3b604f2e. Prior sticky half-measure: f3e097c.
+    //
+    // Defer-on-all-capped guard (DETECTION ONLY, no rotation). Consult
+    // pick_healthiest_account purely for its side effect: it throws
+    // AllAccountsCappedError when every enabled account is capped, which the catch
+    // below turns into a row deferral instead of spawning a worker onto a dead
+    // account. Its RETURN value is deliberately discarded - dispatch runs on the
+    // live account, never a picked one.
+    await getCreds().pick_healthiest_account({ required_headroom_minutes: 1 })
     const liveShort = (() => { try { return getCreds().current_account() } catch (_) { return null } })()
-    const stickyPreferred = row.preferred_account ||
-      (liveShort && liveShort !== 'unknown' ? liveShort : null)
-    const picked = await getCreds().pick_healthiest_account({
-      preferred: stickyPreferred,
-      required_headroom_minutes: 15,
-    })
-    const rotateResult = await getCreds().rotate_to(picked)
-    // 2026-06-08 (safety gate): rotate_to returns {deferred:true} on Mac when
-    // other workers are active (Keychain is a shared resource - rotating
-    // while other-account workers are mid-flight would 401 them on next refresh).
-    // When deferred, dispatch on whatever account is currently authenticated;
-    // the next cron fire will retry rotation when the registry is idle.
-    if (rotateResult && rotateResult.deferred) {
-      const liveAccount = getCreds().current_account()
-      process.stderr.write('[scheduler] dispatchOne: rotation to ' + picked +
-        ' deferred (active_workers=' + rotateResult.active_count + '), dispatching on ' +
-        liveAccount + ' instead\n')
-      account = liveAccount
-    } else {
-      account = picked
-    }
+    account = (liveShort && liveShort !== 'unknown') ? liveShort : 'current-process'
 
     // 2026-06-10 branch-thrash guard: allocate isolated worktree off origin/main
     // so the worker tab cannot flip the conductor's shared tree. Allocation

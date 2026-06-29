@@ -13,6 +13,21 @@
 # tate@ is DISABLED (subscription paused 2026-06-22) via ACCOUNTS_DISABLED.
 set -uo pipefail
 T="${1:?usage: account-switch.sh <tate|code|money>}"
+
+# 2026-06-29 ACCOUNT PIN (universal override). account-switch.sh re-logs in via
+# `claude auth login`, which writes the Keychain DIRECTLY - it bypasses
+# creds.rotate_to, so the rotate_to pin does not cover it. Honour the same pin file
+# here so the operator override holds across BOTH switch mechanisms. Set: write the
+# short account name to <COORD_ROOT>/usage/account-pin. Clear: delete it.
+PIN_FILE="${COORD_ROOT:-$HOME/.ecodiaos/coordination}/usage/account-pin"
+if [ -f "$PIN_FILE" ]; then
+  PIN=$(tr -d '[:space:]' < "$PIN_FILE" | cut -d@ -f1)
+  if [ -n "$PIN" ] && [ "$PIN" != "$T" ]; then
+    echo "REFUSED: live account is PINNED to '$PIN' (account-pin present); not switching to '$T'. Delete $PIN_FILE to allow."
+    exit 5
+  fi
+fi
+
 OUT="/tmp/acct-login-$T.out"
 rm -f "$OUT" "/tmp/eos-acct-code-$T.txt"
 

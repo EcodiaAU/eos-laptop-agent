@@ -209,18 +209,25 @@ function stubNoopWorktreeFns() {
   })
 }
 
-test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', async () => {
+test('dispatchOne happy path: dispatches on the LIVE account (no rotate), row -> running', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
   stubNoopWorktreeFns()
 
-  // Stub creds module exports in-place (same cached object scheduler uses).
+  // 2026-06-29 switcher consolidation: dispatchOne NO LONGER picks/rotates. On the
+  // single shared Keychain, rotating for a worker clobbers the live interactive
+  // session, so dispatch runs on whatever account is already live (current_account).
+  // Stub current_account; rotate_to/pick_healthiest must NOT be called.
   const origPick = credsModule.pick_healthiest_account
   const origRotate = credsModule.rotate_to
-  let pickedAccount = null
-  let rotatedTo = null
-  credsModule.pick_healthiest_account = async () => { pickedAccount = 'code'; return 'code' }
-  credsModule.rotate_to = async (acct) => { rotatedTo = acct; return { previous: 'tate', current: acct } }
+  const origCurrent = credsModule.current_account
+  let pickCalled = false
+  let rotateCalled = false
+  // pick returns 'money' (a DIFFERENT account) to prove dispatch ignores its result
+  // and lands on the live account; pick is consulted only for all-capped detection.
+  credsModule.pick_healthiest_account = async () => { pickCalled = true; return 'money' }
+  credsModule.rotate_to = async () => { rotateCalled = true; return { deferred: true } }
+  credsModule.current_account = () => 'code'
 
   // Stub dispatcher.
   let dispatched = null
@@ -251,8 +258,8 @@ test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', 
   }
 
   assert(!threw, 'dispatchOne happy path: no throw')
-  assert(pickedAccount === 'code', 'dispatchOne: pick_healthiest_account called, got code')
-  assert(rotatedTo === 'code', 'dispatchOne: rotate_to called with code')
+  assert(pickCalled, 'dispatchOne: pick_healthiest_account consulted for all-capped detection')
+  assert(!rotateCalled, 'dispatchOne: rotate_to NOT called (no per-dispatch rotation)')
   assert(dispatched !== null, 'dispatchOne: dispatch_worker called')
   assert(dispatched && dispatched.ide === 'stable', 'dispatchOne: ide=stable passed')
 
@@ -260,12 +267,13 @@ test('dispatchOne happy path: rotates creds, calls dispatcher, row -> running', 
   assert(!!runningUpdate, 'dispatchOne: row updated to status=running')
   assert(
     runningUpdate && runningUpdate.params.includes('code'),
-    'dispatchOne: actual_account=code in UPDATE params'
+    'dispatchOne: actual_account=code (the live account) in UPDATE params'
   )
 
   // Restore.
   credsModule.pick_healthiest_account = origPick
   credsModule.rotate_to = origRotate
+  credsModule.current_account = origCurrent
   coordModule.peek_inbox = origPeekInbox
   coordModule.read_inbox = origReadInbox
 })
