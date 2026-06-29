@@ -309,6 +309,24 @@ function readLiveCredentials() {
   }
 }
 
+// The live account's short name from the refresh-stable ~/.claude.json oauthAccount
+// label (2026-06-29). The token-match below (backupMatchesLive) goes stale within
+// ~1h of any Claude Code refresh, which made this refresher mis-identify the live
+// account: it skipped whichever backup happened to match the live token (money@,
+// freshly self-healed) and hammered the TRUE live account's (code@) dead snapshot
+// with invalid_grant refreshes (failure #244 + "code refresh dead" SMS spam). The
+// oauthAccount label changes only on a real switch, so it names the live account
+// reliably. Mirrors creds.current_account()'s fallback.
+function liveShortFromOauthLabel() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'))
+    const email = cfg && cfg.oauthAccount && cfg.oauthAccount.emailAddress
+    if (!email) return null
+    const short = email.split('@')[0].trim().toLowerCase()
+    return ACCOUNTS.includes(short) ? short : null
+  } catch (_) { return null }
+}
+
 // True when this account's backup shares the live session's token lineage
 // (same access token OR same refresh token). If so, Claude Code owns this
 // account's refresh - we must NOT consume its single-use refresh_token.
@@ -344,11 +362,19 @@ async function refresh_account(account, live) {
   // live file so the scheduler can still rotate to a valid token. (Sync is a
   // no-op while they're identical; it matters after Claude Code self-refreshes.)
   if (live === undefined) live = readLiveCredentials()
-  if (backupMatchesLive(oauth, live)) {
+  // Live-account identity is the refresh-stable oauthAccount label FIRST, with the
+  // token-match as a secondary signal (still valid right after a sync, before the
+  // next Claude Code refresh). Either makes THIS account the protected live one.
+  const liveShort = liveShortFromOauthLabel()
+  const isLiveByLabel = liveShort && liveShort === account
+  if (isLiveByLabel || backupMatchesLive(oauth, live)) {
     _lastActiveAccount = account  // positive evidence: this account IS the live session
-    if (live.raw && live.raw.claudeAiOauth && live.raw.claudeAiOauth.accessToken !== oauth.accessToken) {
+    if (live && live.raw && live.raw.claudeAiOauth && live.raw.claudeAiOauth.accessToken !== oauth.accessToken) {
+      // Sync the backup FROM the live Keychain so the snapshot stays valid for an
+      // emergency rotate. This also HEALS a snapshot whose own refresh token died
+      // (the code@ invalid_grant case): the live session's token replaces it.
       writeAccountFileAtomic(account, { claudeAiOauth: live.raw.claudeAiOauth })
-      console.log('[cred-refresher] synced ' + account + ' backup from live credentials (active session)')
+      console.log('[cred-refresher] synced ' + account + ' backup from live credentials (active session, identity=' + (isLiveByLabel ? 'oauthAccount' : 'token-match') + ')')
     } else {
       console.log('[cred-refresher] skipped ' + account + ' - active interactive session owns its refresh')
     }
