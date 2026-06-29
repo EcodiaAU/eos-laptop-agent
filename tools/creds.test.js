@@ -210,6 +210,21 @@ async function test(name, fn) {
 
   // ── regression guard ─────────────────────────────────────────────────────
 
+  await test('ACCOUNT PIN: rotate_to refuses any non-pinned account even with force (2026-06-29)', async () => {
+    const pinPath = creds._accountPinPath()
+    fs.mkdirSync(require("path").dirname(pinPath), { recursive: true })
+    fs.writeFileSync(pinPath, "code")
+    try {
+      const r = await creds.rotate_to({ account: "money", force: true })
+      if (r.reason !== "account_pinned" || r.pinned_to !== "code" || r.refused !== "money") {
+        throw new Error("pin did not refuse forced money switch: " + JSON.stringify(r))
+      }
+      // pinned account itself is allowed (no-op / write)
+      const ok = await creds.rotate_to({ account: "code" })
+      if (ok.reason === "account_pinned") throw new Error("pin wrongly blocked the pinned account")
+    } finally { try { fs.unlinkSync(pinPath) } catch (_) {} }
+  })
+
   await test('REGRESSION: creds module never calls fs.watch', async () => {
     if (watchCalls.length > 0) {
       throw new Error(

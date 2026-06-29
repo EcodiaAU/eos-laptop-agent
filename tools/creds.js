@@ -387,6 +387,28 @@ function countActiveWorkers(excludeTabId) {
 
 exports._countActiveWorkers = countActiveWorkers
 
+// Account-pin file: <COORD_ROOT>/usage/account-pin holding a short account name.
+// While present, rotate_to refuses (force-proof) to switch the live Keychain to
+// any other account. The single operator override for "stop moving me off X".
+function accountPinPath() {
+  const coordRoot = process.env.COORD_ROOT || (
+    process.platform === 'win32'
+      ? 'D:\\.code\\EcodiaOS\\coordination'
+      : path.join(os.homedir(), '.ecodiaos', 'coordination')
+  )
+  return path.join(coordRoot, 'usage', 'account-pin')
+}
+function readAccountPin() {
+  try {
+    const raw = fs.readFileSync(accountPinPath(), 'utf8').trim()
+    if (!raw) return null
+    const short = raw.includes('@') ? raw.split('@')[0].trim().toLowerCase() : raw.toLowerCase()
+    return ACCOUNTS.includes(short) ? short : null
+  } catch (_) { return null }
+}
+exports._accountPinPath = accountPinPath
+exports._readAccountPin = readAccountPin
+
 exports.rotate_to = async function (accountOrParams) {
   // Agent dispatcher passes the full params object as the first argument; CLI/test
   // callers historically pass a bare string. Accept either to avoid a dispatcher
@@ -406,6 +428,29 @@ exports.rotate_to = async function (accountOrParams) {
 
   if (!ACCOUNTS.includes(account)) {
     throw new Error('unknown account: ' + account)
+  }
+
+  // 2026-06-29 ACCOUNT PIN (hard, force-proof). When the operator pin file exists,
+  // rotate_to refuses to make ANY other account the live Keychain identity - even
+  // with {force:true}. This is THE single force-proof chokepoint: every programmatic
+  // switcher (scheduler dispatch, real-limit-watch force-switch, cred-refresher) goes
+  // through rotate_to -> writeKeychain, the ONLY `security add-generic-password` call
+  // site in laptop-agent or backend, so one pin here stops them all without per-
+  // switcher whack-a-mole. Set: write the short account name to
+  // <COORD_ROOT>/usage/account-pin. Clear: delete that file. Origin: 2026-06-29 -
+  // repeated code@ -> money@ force-switches kept killing Tate's live session even
+  // after the scheduler (f3e097c) and real-limit-watch (a503313) fixes.
+  const pinned = readAccountPin()
+  if (pinned && account !== pinned) {
+    return {
+      previous: exports.current_account(),
+      current: exports.current_account(),
+      deferred: true,
+      refused: account,
+      reason: 'account_pinned',
+      pinned_to: pinned,
+      hint: 'live account is PINNED to ' + pinned + '; delete ' + accountPinPath() + ' to allow switching',
+    }
   }
 
   // Disabled-account guard: operator-paused accounts must never become the
