@@ -1,0 +1,6 @@
+{
+  "task_id": "audit-fix-e2e-2026-05-29",
+  "ide": "stable",
+  "worker_acknowledgment_timeout_ms": 180000,
+  "brief": "AUDIT-FIX E2E VALIDATION (Episode 4439 chain). Do exactly this, in order: (1) coord.heartbeat to mark alive. (2) Write file D:/.code/EcodiaOS/backend/drafts/audit-fix-e2e-2026-05-29.txt with content 'audit-fix e2e validated - tabIndex close path through hardened chain - <ISO timestamp>'. (3) coord.signal_done with status=success, terminate=true, result_summary='audit-fix e2e validated; close via hardened chain'. (4) coord.close_my_tab as final action. Do NOT do anything else. No exploration. No status_board writes. No Neo4j writes. Test scope only."
+}
