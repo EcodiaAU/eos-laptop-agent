@@ -842,6 +842,37 @@ test('completionPass: stale done (created_at < leased_at) does NOT complete (fre
   scheduler._resetWorktreeFns()
 })
 
+test('completionPass: unleased running row (leased_at NULL) is NOT completed (phantom-completion guard)', async () => {
+  // A running row with no lease is a half-state, never a completable run. A
+  // matching done in the inbox must not flip it to completed with no worker
+  // having run this dispatch. 2026-07-08 phantom-completion-class guard.
+  const doneAt = new Date(Date.now() - 30 * 1000).toISOString()
+  const runningRow = makeRow({
+    id: 'task-comp-unleased',
+    type: 'delayed',
+    status: 'running',
+    leased_at: null,
+    dispatched_tab_id: null,
+  })
+  const pool = makeStubPool([runningRow])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
+  scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+  const origScan = coordModule.scanTopicByType
+  coordModule.scanTopicByType = () => new Map([
+    ['task-comp-unleased', { created_at: doneAt, body: { type: 'done', task_id: 'task-comp-unleased', status: 'success', result_summary: 'stale-or-phantom' } }],
+  ])
+
+  await scheduler.completionPass()
+
+  const completed = pool._queries.find(q => q.sql.includes("status = 'completed'"))
+  assert(!completed, 'completionPass unleased: running row with NULL leased_at NOT flipped to completed')
+
+  coordModule.scanTopicByType = origScan
+  scheduler._resetWorktreeFns()
+})
+
 // ── Task 3.3: staleLeaseRecovery SQL shapes ───────────────────────────────────
 //
 // 2026-06-10: shape changed after the per-row coord-liveness gate landed.

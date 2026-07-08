@@ -1058,11 +1058,27 @@ exports.completionPass = async function completionPass() {
     // 30s back-margin tolerates a fast worker that signals done microseconds
     // before the running-flip timestamp; cron intervals are >= minutes and
     // one-shot task_ids are unique, so no cross-fire collision fits that margin.
-    if (row.leased_at) {
-      const doneMs = new Date(msg.created_at).getTime()
-      const leasedMs = new Date(row.leased_at).getTime()
-      if (!isNaN(doneMs) && !isNaN(leasedMs) && doneMs < leasedMs - 30_000) continue
+    //
+    // 2026-07-08 phantom-completion-class guard. A legitimately-running row
+    // ALWAYS carries a lease: dispatchOne stamps leased_at = NOW() when it flips
+    // the row to running (line ~812) and refreshes it at dispatch-start. A
+    // running row with leased_at IS NULL is a half-state (a recovery race per the
+    // 2026-06-18 dispatch half-state note), NOT a completable run. The prior gate
+    // was `if (row.leased_at) { freshness-check }` - a NULL leased_at SKIPPED the
+    // check entirely, so ANY matching done in the inbox would complete the row.
+    // Because task_id == row.id is STABLE across cron fires, a stale prior-fire
+    // done could then flip an unleased running row to completed with no worker
+    // having run this dispatch - the phantom-completion class. Require a lease
+    // before completing; freshness-gate against it; leave an unleased running row
+    // for staleLeaseRecovery's orphan path. See
+    // [[scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18]].
+    if (!row.leased_at) {
+      process.stderr.write('[scheduler] completionPass: skip unleased running row ' + row.id + ' (leased_at NULL; leaving for staleLeaseRecovery)\n')
+      continue
     }
+    const doneMs = new Date(msg.created_at).getTime()
+    const leasedMs = new Date(row.leased_at).getTime()
+    if (!isNaN(doneMs) && !isNaN(leasedMs) && doneMs < leasedMs - 30_000) continue
     try {
       await exports.markComplete(row, msg.body)
     } catch (e) {

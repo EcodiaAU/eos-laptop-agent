@@ -155,6 +155,30 @@ async function runTests() {
   assertEq(bound6 && bound6.body.parent_conductor_tab_id, conductorTabId,
     'parent_conductor_tab_id propagated into bound message body')
 
+  // ── TEST 7: read_inbox({ids}) consumes ONLY the given ids, leaving others ─
+  // 2026-07-08 regression guard for the lost-signal_done defect. The conductor
+  // turn hooks surface inbound_* messages and must dedupe ONLY those; a blanket
+  // read_inbox marked the whole conductor inbox seen and ate worker done signals.
+  console.log('TEST 7: read_inbox({ids}) marks seen ONLY the named ids; a sibling done survives')
+  const t7topic = 'chat.conductor.inbox'
+  // An inbound_ message (what the hook surfaces + should consume) ...
+  const inbMsg = await coord.send_message(
+    { to: t7topic, body: { type: 'inbound_sms', envelope: { channel: 'sms', body: 'hi' } } }, {})
+  // ... and a worker done that MUST survive for coord_events_pending to surface.
+  const doneMsg = await coord.send_message(
+    { to: t7topic, body: { type: 'done', task_id: 'test-task-7', status: 'success', result_summary: 'must survive' } },
+    {})
+  // Targeted consume: only the inbound id.
+  const consumed = await coord.read_inbox({ topic: t7topic, ids: [inbMsg.message_id] }, {})
+  assertEq(consumed.count, 1, 'read_inbox({ids}) returned exactly the 1 named message')
+  assertEq(consumed.messages[0] && consumed.messages[0].id, inbMsg.message_id, 'the returned message is the inbound one')
+  // Now peek: the done must still be unseen/visible; the inbound must be gone.
+  const after7 = await peekAll(t7topic)
+  const doneStill = after7.find(m => m.id === doneMsg.message_id)
+  const inbGone = !after7.find(m => m.id === inbMsg.message_id)
+  assertTrue(!!doneStill, 'worker done message SURVIVES (not marked seen) after targeted inbound consume')
+  assertTrue(inbGone, 'inbound message was consumed (marked seen) and no longer peekable')
+
   // ── summary ─────────────────────────────────────────────────────────────
 
   if (failures > 0) {

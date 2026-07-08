@@ -485,7 +485,24 @@ async function read_inbox(params, ctx) {
   const topic = params.topic || inboxTopicFor(ctx)
   const since = params.since ? new Date(params.since).getTime() : 0
   const limit = params.limit || 50
-  const messages = readInboxForTopic(topic, since, limit)
+  let messages = readInboxForTopic(topic, since, limit)
+  // 2026-07-08 targeted-consume. When `ids` is supplied, mark seen ONLY the
+  // messages in that id set (still scoped to this topic + unseen); return them.
+  // Why: the conductor turn hooks (conductor_heartbeat.py / conductor_turn_end.py)
+  // surface inbound_* SMS/telegram messages and then consumed them by calling
+  // read_inbox with a bare `limit`, which marked the ENTIRE conductor inbox seen.
+  // That collaterally consumed worker done/signal_done/progress messages, which
+  // coord_events_pending.py (the turn-start peek that builds <coord_events>)
+  // surfaces via readInboxForTopic's `if (m.seen_at) continue` filter - so every
+  // worker completion report was marked seen before the conductor could see it
+  // and silently vanished. Passing the surfaced message ids confines the consume
+  // to exactly the inbound messages the hook handled. Backward compatible: no
+  // `ids` => prior whole-topic drain behaviour. See
+  // [[scheduler-signal-done-lost-when-conductor-turn-hook-blanket-consumes-inbox-2026-07-08]].
+  if (Array.isArray(params.ids) && params.ids.length) {
+    const want = new Set(params.ids.map(String))
+    messages = messages.filter(m => want.has(String(m.id)))
+  }
   markSeen(messages)
   return { topic: topic, count: messages.length, messages: messages }
 }
