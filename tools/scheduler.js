@@ -934,6 +934,20 @@ exports.dispatchOne = async function dispatchOne(row) {
     const taskIdStr = String(row.id)
     const start = Date.now()
     let bound = false
+    // 2026-07-17 fast-worker completion race fix. A short task (e.g. the
+    // dispatch selftest: "signal_done immediately") can signal DONE without
+    // ever signalling BOUND, well inside this wait. The old loop only matched
+    // 'bound', so the wait ran the full SIGNAL_BOUND_TIMEOUT_MS, and the
+    // running-flip below then re-stamped leased_at = NOW() - which made
+    // completionPass's freshness gate (doneMs < leasedMs - 30s -> skip) reject
+    // the already-landed done forever. The row rotted at status=running until
+    // the 6h orphan sweep despite a clean success signal. Live evidence
+    // 2026-07-17: selftest 973d712e done at 02:08:22Z, running-flip 02:17:58Z,
+    // completionPass skipping. Fix: treat a done for THIS dispatch (created at
+    // or after dispatch start) as terminal - exit the wait and complete the
+    // row inline right after the guarded running-flip.
+    let doneSignal = null
+    const dispatchStartMs = Date.now()
     while (Date.now() - start < SIGNAL_BOUND_TIMEOUT_MS) {
       const inbox = await coord.peek_inbox({ topic: 'chat.conductor.inbox', limit: 50 })
       if (inbox && inbox.messages) {
@@ -949,6 +963,17 @@ exports.dispatchOne = async function dispatchOne(row) {
             // ack_message by id - addresses exactly the matched message.
             try { await coord.ack_message({ message_id: msg.id }) } catch (e) {}
             break
+          }
+          if (body && body.type === 'done' && String(body.task_id) === taskIdStr) {
+            const createdMs = new Date(msg.created_at).getTime()
+            // Freshness: only THIS dispatch's done counts (task_id is stable
+            // across cron fires; a days-old done must not complete a fresh
+            // dispatch). 60s back-margin tolerates clock skew.
+            if (!isNaN(createdMs) && createdMs >= dispatchStartMs - 60_000) {
+              bound = true
+              doneSignal = body
+              break
+            }
           }
         }
       }
@@ -994,6 +1019,22 @@ exports.dispatchOne = async function dispatchOne(row) {
 
     if (!bound) {
       process.stderr.write('[scheduler] dispatchOne: signal_bound timeout for task ' + row.id + ' (tab ' + tabId + ')\n')
+    }
+
+    // 2026-07-17 fast-worker completion race fix (part 2). If the bind wait
+    // observed this dispatch's done signal, complete the row NOW. Waiting for
+    // completionPass would lose it: the running-flip above just re-stamped
+    // leased_at = NOW(), so its freshness gate (doneMs < leasedMs - 30s)
+    // classifies the in-wait done as a prior fire's stale signal and skips it
+    // forever. See the bind-wait comment above for the live evidence.
+    if (doneSignal) {
+      try {
+        await exports.markComplete({ ...row, dispatched_tab_id: tabId }, doneSignal)
+        process.stderr.write('[scheduler] dispatchOne: fast-worker done for task ' + row.id +
+          ' consumed inline (worker signalled done during bind wait)\n')
+      } catch (e) {
+        process.stderr.write('[scheduler] dispatchOne: inline markComplete error for ' + row.id + ': ' + e.message + '\n')
+      }
     }
   } catch (err) {
     const errMsg = err && err.message || ''
@@ -2372,13 +2413,32 @@ exports.start = function start() {
         process.stderr.write('[scheduler] leaseDueRows error: ' + e.message + '\n')
         return
       }
-      for (const row of rows) {
-        try {
-          await exports.dispatchOne(row)
-        } catch (e) {
-          // dispatchOne already called markFailed; just log.
-          process.stderr.write('[scheduler] dispatchOne error for ' + row.id + ': ' + e.message + '\n')
+      // 2026-07-17 batch-aging fix. This loop awaits dispatchOne SERIALLY, so
+      // rows 3..N of a leased batch are not yet inside dispatchOne (and thus
+      // not in _inFlightDispatchIds) while earlier rows burn bind waits of up
+      // to SIGNAL_BOUND_TIMEOUT_MS each. Their leases age past
+      // STALE_DISPATCHING_MS while merely WAITING THEIR TURN, and
+      // staleLeaseRecovery branch-1 reclaims them (registry miss, no live
+      // worker) - the residual "lease lost during dispatch prep" fingerprint
+      // with the CURRENT pid observed 3x on 2026-07-17 (rows f1016859,
+      // 524a87e4, ccecd418, leased 11:47:20, reclaimed ~12:02:20 mid-queue).
+      // Fix: register the WHOLE leased batch in the in-flight Set at lease
+      // time. Deregister each row just before its dispatchOne (dispatchOne
+      // re-registers on entry and would otherwise dup-skip); the finally
+      // sweep clears any rows a thrown error left behind.
+      for (const row of rows) exports._inFlightDispatchIds.add(String(row.id))
+      try {
+        for (const row of rows) {
+          exports._inFlightDispatchIds.delete(String(row.id))
+          try {
+            await exports.dispatchOne(row)
+          } catch (e) {
+            // dispatchOne already called markFailed; just log.
+            process.stderr.write('[scheduler] dispatchOne error for ' + row.id + ': ' + e.message + '\n')
+          }
         }
+      } finally {
+        for (const row of rows) exports._inFlightDispatchIds.delete(String(row.id))
       }
     } catch (e) {
       process.stderr.write('[scheduler] dispatch loop error: ' + e.message + '\n')
