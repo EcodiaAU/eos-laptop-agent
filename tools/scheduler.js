@@ -965,8 +965,16 @@ exports.dispatchOne = async function dispatchOne(row) {
     // row inline right after the guarded running-flip.
     let doneSignal = null
     const dispatchStartMs = Date.now()
+    // 2026-07-17 peek-window starvation fix. peek_inbox returns the OLDEST
+    // unseen messages (created_at asc, limit 50). The conductor inbox had
+    // accumulated 525 unseen messages spanning a week, so every bind wait's
+    // window showed only 2026-07-09 backlog and NEVER the fresh bound/done -
+    // every dispatch logged signal_bound timeout even when its worker bound
+    // and finished within seconds. Pass `since` scoped to this dispatch so
+    // backlog depth can never blind the wait again.
+    const peekSinceIso = new Date(dispatchStartMs - 60_000).toISOString()
     while (Date.now() - start < SIGNAL_BOUND_TIMEOUT_MS) {
-      const inbox = await coord.peek_inbox({ topic: 'chat.conductor.inbox', limit: 50 })
+      const inbox = await coord.peek_inbox({ topic: 'chat.conductor.inbox', limit: 50, since: peekSinceIso })
       if (inbox && inbox.messages) {
         for (const msg of inbox.messages) {
           const body = msg.body
