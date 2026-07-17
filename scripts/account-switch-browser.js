@@ -81,6 +81,19 @@ async function readState(page) {
     else if (codeEl && /^[A-Za-z0-9/_#-]{20,}$/.test((codeEl.value || codeEl.textContent || '').trim())) {
       authCode = (codeEl.value || codeEl.textContent || '').trim()
     }
+    // 2026-07-17 vendor drift: the platform.claude.com callback no longer renders
+    // the code#state string in page text - it rides ONLY in the URL query
+    // (?code=...&state=...). Both switch runs that night EXHAUSTED at this exact
+    // point while the code sat in location.search. Claude Code's paste format is
+    // code#state, so rebuild it from the params when the text/DOM reads miss.
+    if (!authCode && /\/oauth\/code\/callback/.test(location.pathname + location.href)) {
+      try {
+        const q = new URLSearchParams(location.search)
+        const c = q.get('code')
+        const s = q.get('state')
+        if (c && c.length >= 20) authCode = s ? (c + '#' + s) : c
+      } catch (_e) { /* state read must never throw */ }
+    }
     return {
       url: location.href,
       loggedInAs: loggedMatch ? loggedMatch[1] : null,
