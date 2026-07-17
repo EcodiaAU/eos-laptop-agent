@@ -34,7 +34,23 @@ const screenshot = require('./screenshot')
 const win = require('./window')
 const ide = require('./ide')
 
-const COORD_ROOT = 'D:\\.code\\EcodiaOS\\coordination'
+// 2026-07-17 Corazon-ghost fix. This was hardcoded to the Windows Corazon path
+// with NO env read, so on the Mac canonical host it resolved to a LITERAL
+// './D:\.code\EcodiaOS\coordination' dir in the repo root - a dead ghost whose
+// workers/ subdir is always empty. Every registry WRITER (mac-dispatcher,
+// coord.js, usage.js) already resolves COORD_ROOT via the env var with a
+// platform-aware default, and mac-dispatcher's own header even says "cowork.js
+// stays untouched EXCEPT for the COORD_ROOT env-var" - but this line never read
+// it. The consequence: cowork.cleanup_orphan_workers (still live on Mac via
+// mac-dispatcher) swept the empty ghost dir and reported closed=0 of ~70 real
+// leaked tabs, because the ~70 orphan .json files live in the REAL dir
+// (~/.ecodiaos/coordination/workers). Read the env like every other module.
+// Doctrine: substrate-path-coupling-survives-host-swap-as-silent-no-op.
+const COORD_ROOT = process.env.COORD_ROOT || (
+  process.platform === 'win32'
+    ? 'D:\\.code\\EcodiaOS\\coordination'
+    : path.join(os.homedir(), '.ecodiaos', 'coordination')
+)
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
 const STATE_DIR = path.join(COORD_ROOT, 'state')
 
