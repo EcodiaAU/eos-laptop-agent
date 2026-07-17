@@ -370,6 +370,80 @@ test('dispatchOne: SKIPs an austerity_paused row - no dispatch, lease released, 
   credsModule.rotate_to = origRotate
 })
 
+// ── 2026-07-15 band-aware austerity gate: marker-less suppressed cron is caught ─
+// The `set <N>` lever is a POINT-IN-TIME snapshot, so a cron created OR re-
+// registered after it is suppressed-by-band yet carries austerity_paused=false
+// (registration upserts reset the marker to its column DEFAULT). A marker-only
+// gate is blind to it - 20 such crons fired past L4 on 2026-07-15, incl
+// status-board-execute-top cascading worker-tab spawns. dispatchOne must compute
+// the band live from (name -> band, live kv level) and SKIP regardless of the
+// marker. Cron-only: one-shots have no band and still fire at L4 by design.
+test('dispatchOne: SKIPs a marker-less cron suppressed by band>level - no dispatch, lease released', async () => {
+  // Custom pool: guard SELECT returns a marker-FALSE cron row; kv_store SELECT
+  // returns level 4. Everything else mirrors makeStubPool's UPDATE handling.
+  const queries = []
+  const pool = {
+    _queries: queries,
+    query(sql, params) {
+      queries.push({ sql, params: params || [] })
+      if (/FROM\s+kv_store/i.test(sql)) {
+        return Promise.resolve({ rows: [{ value: JSON.stringify({ level: 4 }) }], rowCount: 1 })
+      }
+      if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
+        return Promise.resolve({ rows: [{
+          austerity_paused: false, status: 'dispatching', archived_at: null,
+          last_status: null, name: 'calendar-watch', type: 'cron',
+        }], rowCount: 1 })
+      }
+      if (/UPDATE\s+os_scheduled_tasks\s+SET\s+leased_at = NOW\(\), updated_at = NOW\(\)\s+WHERE/i.test(sql)) {
+        return Promise.resolve({ rows: [], rowCount: 1 })
+      }
+      return Promise.resolve({ rows: [], rowCount: 0 })
+    }
+  }
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+
+  // Hermetic band table so the test does not depend on the backend repo being
+  // present. calendar-watch is cosmetic -> suppressed at any level >= 2.
+  const realCfg = (() => { try { return require('/Users/ecodia/.code/ecodiaos/backend/src/config/cronAusterity') } catch (_) { return null } })()
+  scheduler._setAusterityCfg({
+    KV_KEY: 'scheduler.austerity_level',
+    DEFAULT_LEVEL: 1,
+    normalizeLevel: (n) => { const x = parseInt(n, 10); return Number.isNaN(x) ? 1 : Math.max(1, Math.min(4, x)) },
+    decideAusterity: (name, lvl) => ({ suppressed: lvl >= 2, band: 'cosmetic' }),
+  })
+
+  const origPick = credsModule.pick_healthiest_account
+  let pickCalled = false
+  credsModule.pick_healthiest_account = async () => { pickCalled = true; return 'code' }
+
+  let dispatched = false
+  scheduler._setDispatcher({
+    dispatch_worker: async () => { dispatched = true; return { ok: true, tab_id: 'should_not_spawn' } },
+    kill_worker: async () => {},
+  })
+
+  const row = makeRow({ id: 'bandless-cron-guard', name: 'calendar-watch', type: 'cron', leased_by: 'lease-y' })
+
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [band guard test threw]:', e.message) }
+
+  assert(!threw, 'band guard: no throw')
+  assert(dispatched === false, 'band guard: dispatch_worker NOT called for band-suppressed marker-less row')
+  assert(pickCalled === false, 'band guard: cred rotation skipped (guard fires before step 1)')
+  const kvRead = pool._queries.find(q => /FROM\s+kv_store/i.test(q.sql))
+  assert(!!kvRead, 'band guard: live austerity level was read from kv_store')
+  const releaseUpdate = pool._queries.find(q =>
+    q.sql.includes("status = 'active'") && q.sql.includes('leased_by = NULL') && q.sql.includes('dispatching'))
+  assert(!!releaseUpdate, 'band guard: lease released back to active')
+  const failedUpdate = pool._queries.find(q => q.sql.includes("status = 'failed'") || q.sql.includes('retry_count ='))
+  assert(!failedUpdate, 'band guard: markFailed NOT invoked (suppression, not failure)')
+
+  credsModule.pick_healthiest_account = origPick
+  scheduler._setAusterityCfg(realCfg) // restore real band table for later tests
+})
+
 // ── 2026-06-10 branch-thrash guard: dispatchOne worktree wiring + cleanup ───
 
 test('dispatchOne: allocates worktree, passes path into brief, dispatches with worker_acknowledgment_timeout_ms=0', async () => {
@@ -1370,6 +1444,104 @@ test('checkCapWarning: cooldown prevents double-fire within 1h', async () => {
   assert(second.skipped === 'cooldown', 'second call within cooldown is skipped')
   const insertCalls = stubPool._queries.filter(q => q.sql.includes('INSERT INTO observer_signals'))
   assert(insertCalls.length === 1, 'exactly one INSERT despite two calls')
+})
+
+// ── 2026-07-17 self-lease-steal race: in-flight dispatch shield ──────────────
+//
+// The dispatcher was eating its own dispatches: rows queued behind the serial
+// launch-lock aged past STALE_DISPATCHING_MS, staleLeaseRecovery branch-1
+// reclaimed them, a later lease pass re-leased them under a new token (same
+// pid), and the original dispatchOne aborted at its startGuard. Fix: rows
+// inside dispatchOne register in scheduler._inFlightDispatchIds; the
+// 'dispatching' recovery sweeps skip registered rows, and dispatchOne skips a
+// duplicate invocation for an already-in-flight row.
+
+test('staleLeaseRecovery branch-1: in-flight row is NOT reclaimed (self-lease-steal shield)', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-inflight-1', name: 'cowork.inflight-test' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
+  scheduler._inFlightDispatchIds.add('task-inflight-1')
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!reclaim, 'branch-1: no reclaim UPDATE for an in-flight row')
+
+  scheduler._inFlightDispatchIds.delete('task-inflight-1')
+  scheduler._setCoord(null)
+})
+
+test('staleLeaseRecovery branch-1: same row IS reclaimed once no longer in-flight', async () => {
+  const pool = makeSplitStubPool({
+    retryableRows: [{ id: 'task-inflight-1', name: 'cowork.inflight-test' }]
+  })
+  scheduler._setPool(pool)
+  scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
+
+  await scheduler.staleLeaseRecovery()
+
+  const reclaim = pool._queries.find(q =>
+    q.sql.includes('UPDATE os_scheduled_tasks') &&
+    q.sql.includes('stale lease recovered')
+  )
+  assert(!!reclaim, 'branch-1: reclaim UPDATE proceeds when the row is not in-flight (negative control)')
+  scheduler._setCoord(null)
+})
+
+test('dispatchOne: duplicate invocation for an in-flight row is skipped (no queries, no spawn)', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+  let dispatched = false
+  scheduler._setDispatcher({
+    dispatch_worker: async () => { dispatched = true; return { ok: true, tab_id: 'dup_no_spawn' } },
+    kill_worker: async () => {},
+  })
+
+  scheduler._inFlightDispatchIds.add('task-dup-1')
+  const row = makeRow({ id: 'task-dup-1' })
+  let threw = false
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true }
+
+  assert(!threw, 'duplicate-skip: no throw')
+  assert(!dispatched, 'duplicate-skip: dispatch_worker NOT called')
+  assert(pool._queries.length === 0, 'duplicate-skip: no SQL issued')
+  assert(scheduler._inFlightDispatchIds.has('task-dup-1'),
+    'duplicate-skip: original in-flight registration left intact (only the duplicate bails)')
+  scheduler._inFlightDispatchIds.delete('task-dup-1')
+})
+
+test('dispatchOne: registry is cleaned up in finally (row removed after a normal run)', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  stubNoopWorktreeFns()
+  const origPick = credsModule.pick_healthiest_account
+  const origCurrent = credsModule.current_account
+  credsModule.pick_healthiest_account = async () => 'code'
+  credsModule.current_account = () => 'code'
+  const origPeekInbox = coordModule.peek_inbox
+  coordModule.peek_inbox = async () => ({
+    messages: [{ body: { type: 'bound', task_id: 'task-registry-clean' } }]
+  })
+  scheduler._setDispatcher({
+    dispatch_worker: async (params) => ({ ok: true, tab_id: 'tab_reg_clean', task_id: params.task_id }),
+    kill_worker: async () => {},
+  })
+
+  const row = makeRow({ id: 'task-registry-clean' })
+  try { await scheduler.dispatchOne(row) } catch (e) {}
+
+  assert(!scheduler._inFlightDispatchIds.has('task-registry-clean'),
+    'registry-clean: row deregistered from _inFlightDispatchIds after dispatchOne returns')
+
+  credsModule.pick_healthiest_account = origPick
+  credsModule.current_account = origCurrent
+  coordModule.peek_inbox = origPeekInbox
 })
 
 test('isTransientBridgeError: classifies IDE-bridge socket blips as transient, real faults as not', async () => {

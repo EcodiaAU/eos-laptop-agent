@@ -43,6 +43,46 @@ let _coordOverride = null
 function getCoord() { return _coordOverride || coord }
 exports._setCoord = function (c) { _coordOverride = c }
 
+// ── Austerity band table (single source of truth, cross-repo) ────────────────
+// The dispatch-time austerity gate must catch suppressed crons that carry NO
+// austerity_paused marker: the `set <N>` lever is a POINT-IN-TIME snapshot, so a
+// cron created OR re-registered after the last set (registration upserts reset
+// austerity_paused to its column DEFAULT false) is suppressed-by-band yet
+// marker-less, and a marker-only gate is blind to it (2026-07-15: 20 such crons
+// fired past L4, incl status-board-execute-top cascading worker-tab spawns). We
+// compute the band live from (name -> band, live level) instead of trusting the
+// marker. cronAusterity.js is a pure module (no requires); required by absolute
+// path so the band definitions stay single-source in the backend. If the path
+// ever moves the require fails and the gate degrades to marker-only (prior
+// behaviour) rather than crashing dispatch.
+// Doctrine: austerity-gate-needs-dispatch-time-twin-not-just-lease-time (band-aware extension).
+let _austerityCfg = null
+try {
+  _austerityCfg = require('/Users/ecodia/.code/ecodiaos/backend/src/config/cronAusterity')
+} catch (e) {
+  process.stderr.write('[scheduler] austerity band table unavailable (' +
+    (e && e.message || e) + '); dispatch gate falls back to marker-only\n')
+}
+exports._setAusterityCfg = function (c) { _austerityCfg = c } // test seam
+
+// Read the live austerity level from kv_store (same key the lever writes).
+// Returns an integer 1..4, or null on any failure so the caller treats band
+// suppression as unknown and proceeds on the marker alone.
+async function readAusterityLevel(pool) {
+  if (!_austerityCfg) return null
+  try {
+    const r = await pool.query(
+      `SELECT value FROM kv_store WHERE key = $1 LIMIT 1`, [_austerityCfg.KV_KEY])
+    const raw = r.rows[0] && r.rows[0].value
+    if (raw == null) return _austerityCfg.DEFAULT_LEVEL
+    let parsed = raw
+    if (typeof raw === 'string') { try { parsed = JSON.parse(raw) } catch (_) { parsed = raw } }
+    return _austerityCfg.normalizeLevel(
+      typeof parsed === 'object' && parsed ? parsed.level : parsed)
+  } catch (_) { return null }
+}
+exports._readAusterityLevel = readAusterityLevel
+
 // ── constants ────────────────────────────────────────────────────────────────
 
 // 2026-06-10 branch-thrash guard: each dispatched worker gets its own git
@@ -102,7 +142,16 @@ const COMPLETION_POLL_INTERVAL_MS = 5_000
 // running-flip then produced a status=running + leased_by=NULL zombie. 15min
 // gives 5min of headroom over the bind timeout; the p99 bind tail (~21min) is
 // covered by the dispatchOne running-flip lease guard, not by this window.
-const STALE_DISPATCHING_MS = 15 * 60 * 1000   // 15 min -> retry (> 600s bind timeout)
+// 2026-07-17: STALE_DISPATCHING_MS is ALSO the dispatch-prep grace ceiling: no
+// reclaim path (staleLeaseRecovery branches 1/2a/2b) may touch a 'dispatching'
+// row whose lease is younger than this. Observed prep time on this Mac (brief
+// build + worktree alloc + IDE tab spawn + paste + signal_bound wait): p50 ~24s,
+// p95 ~402s, hard bind timeout 600s - so 15 min = observed floor-safe ceiling
+// (600s bind timeout + 5 min headroom). The ceiling only measures REAL prep now:
+// dispatchOne refreshes leased_at at dispatch-start (step 2c), and rows queued
+// in-process are additionally shielded by the _inFlightDispatchIds registry
+// below, so queue wait can no longer age a lease into reclaim eligibility.
+const STALE_DISPATCHING_MS = 15 * 60 * 1000   // 15 min -> retry (> 600s bind timeout); dispatch-prep grace ceiling
 const MAX_RETRY_COUNT = 3
 // 2026-06-19 next_run_at-recompute fix. staleLeaseRecovery branch 1 (retryable
 // stale-dispatch) used to free the row back to 'active' while leaving next_run_at
@@ -152,7 +201,12 @@ function getPool() {
       connectionString: connStr,
       keepAlive: true,
       idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 10_000,
+      // 2026-07-12: raised from 10s. macOS mDNSResponder degrades after sleep/wake and takes
+      // 5 to 9 seconds to resolve a name that 1.1.1.1 answers in 50ms. TLS and auth then land
+      // on top, so a 10s budget expired mid-handshake and EVERY lease failed with
+      // "Connection terminated due to connection timeout". The scheduler went silent for 88h
+      // and no cron fired. The DB was healthy the whole time; the resolver was not.
+      connectionTimeoutMillis: 30_000,
     })
     // 2026-06-14 restart-loop root-cause fix. node-postgres emits an 'error'
     // event on the Pool when an IDLE pooled client's TCP connection dies. The
@@ -301,6 +355,40 @@ function _launchLockRelease() {
 }
 
 exports._launchLock = { acquire: launchLockAcquire }
+
+// ── in-flight dispatch registry (self-lease-steal race fix, 2026-07-17) ─────
+//
+// THE RACE (root cause of the 2026-07-17 dispatch-eating incident; canonical
+// comment, referenced from staleLeaseRecovery + start()):
+// The dispatch loop was a re-entrant setInterval: with a large due-row backlog
+// (77 rows observed) every 30s tick ran leaseDueRows and stacked 5 MORE
+// dispatchOne calls onto the serial launch-lock, whose holder can legitimately
+// take up to SIGNAL_BOUND_TIMEOUT_MS (10 min) per row. leased_at is stamped at
+// QUEUE-ENTRY, so queued rows aged past STALE_DISPATCHING_MS before their prep
+// ever started. staleLeaseRecovery branch-1 then reclaimed them (status='active',
+// retry_count++, next_run_at=+5min) OUT FROM UNDER this process's own queued
+// dispatchOne; a later lease pass re-leased them under a NEW token (same pid,
+// different timestamp - the log fingerprint), the old dispatchOne aborted at its
+// startGuard AFTER burning a full launch-lock hold on prep, and rows cycled
+// active->dispatching->active until retries exhausted (one-shot rows died at
+// status='failed' with run_count=0) or wedged at 'dispatching'. When a first
+// spawn had actually succeeded before the steal, the re-lease double-ran the
+// task (cowork.friend-mcp-memory-tools-morning-reexec, runs=2).
+//
+// THE FIX, three layers:
+//  1. start()'s dispatch loop is non-reentrant (skip the tick when a pass is
+//     still draining) so the launch-lock queue is bounded to one batch.
+//  2. This registry: every row currently inside dispatchOne (queued OR prepping)
+//     is listed here; staleLeaseRecovery's 'dispatching' sweeps skip listed rows
+//     no matter how old their lease is. In-process prep is alive by definition.
+//     Crash-safe: if this process dies, the Set dies with it and the normal
+//     leased_at-age reclaim (grace ceiling STALE_DISPATCHING_MS) takes over.
+//  3. dispatchOne's pre-spawn guard re-checks run_count and coord worker
+//     liveness so a stolen-then-recovered row can never double-spawn
+//     (doctrine: scheduler-stale-lease-must-check-coord-worker-liveness-
+//     before-redispatch-2026-06-10).
+const _inFlightDispatchIds = new Set()
+exports._inFlightDispatchIds = _inFlightDispatchIds  // test seam / introspection
 
 // ── buildBrief ───────────────────────────────────────────────────────────────
 //
@@ -616,6 +704,17 @@ exports.isTransientBridgeError = function isTransientBridgeError(msg) {
 
 exports.dispatchOne = async function dispatchOne(row) {
   const pool = getPool()
+  // Self-lease-steal shield (see _inFlightDispatchIds above): register BEFORE
+  // queueing on the launch-lock so staleLeaseRecovery cannot reclaim this row
+  // while it waits its turn, and skip outright if a duplicate dispatch for the
+  // same row is already in flight in this process.
+  const inFlightKey = String(row.id)
+  if (_inFlightDispatchIds.has(inFlightKey)) {
+    process.stderr.write('[scheduler] dispatchOne: row ' + row.id +
+      ' already in-flight in this process; skipping duplicate dispatch\n')
+    return
+  }
+  _inFlightDispatchIds.add(inFlightKey)
   const release = await launchLockAcquire()
   let account = null
   let tabId = null
@@ -634,18 +733,29 @@ exports.dispatchOne = async function dispatchOne(row) {
     // its schedule the moment austerity lifts.
     {
       const guard = await pool.query(
-        `SELECT austerity_paused, status, archived_at, last_status, name
+        `SELECT austerity_paused, status, archived_at, last_status, name, type
          FROM os_scheduled_tasks WHERE id = $1`,
         [row.id]
       )
       const g = guard.rows[0]
-      // Fire ONLY on the explicit suppression markers. A missing read (g
-      // undefined) is left to proceed - the guard targets the austerity marker,
+      // Band-aware suppression: a suppressed cron may carry NO marker (created or
+      // re-registered after the last `set`), so ALSO compute the band live from
+      // (name -> band, live kv level). Cron-only: one-shot delayed/followup rows
+      // have no band and MUST still fire at L4 by design. null level (read failure
+      // or band table absent) leaves bandSuppressed false -> proceed on the marker.
+      let bandSuppressed = false
+      if (_austerityCfg && g && g.type === 'cron') {
+        const lvl = await readAusterityLevel(pool)
+        if (lvl != null) bandSuppressed = _austerityCfg.decideAusterity(g.name, lvl).suppressed
+      }
+      // Fire ONLY on the explicit suppression signals. A missing read (g
+      // undefined) is left to proceed - the guard targets suppression state,
       // not row existence, and a genuinely-deleted row fails downstream anyway.
       const suppressed = !!g && (
         g.austerity_paused === true ||
         g.archived_at != null ||
-        g.last_status === 'cancelled'
+        g.last_status === 'cancelled' ||
+        bandSuppressed
       )
       if (suppressed) {
         await pool.query(
@@ -656,9 +766,17 @@ exports.dispatchOne = async function dispatchOne(row) {
              AND leased_by IS NOT DISTINCT FROM $2`,
           [row.id, row.leased_by || null]
         )
+        // Distinguish the cause so the log tells us WHICH gate fired. A
+        // 'band>level(no-marker)' skip means a marker-less suppressed cron was
+        // caught - the exact 2026-07-15 leak class - now harmless and self-reporting.
+        const cause =
+          g.austerity_paused === true ? 'marker' :
+          g.archived_at != null ? 'archived' :
+          g.last_status === 'cancelled' ? 'cancelled' :
+          bandSuppressed ? 'band>level(no-marker)' : 'unknown'
         process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
-          (g && g.name || row.name || '?') + ') - austerity_paused gate ' +
-          '(defense-in-depth); upstream leaseDueRows leak, lease released without retry\n')
+          (g && g.name || row.name || '?') + ') - austerity gate [' + cause + ']; ' +
+          'lease released without retry\n')
         return
       }
     }
@@ -721,18 +839,64 @@ exports.dispatchOne = async function dispatchOne(row) {
     // the lease: if the row was reclaimed/cancelled during account-rotation or
     // worktree prep, bail WITHOUT spawning a worker - preventing the orphan tab
     // entirely instead of discovering the loss after the spawn at the running-flip.
+    // 2026-07-17 double-run guard (a): run_count re-check folded into the guard.
+    // If run_count advanced past our leased snapshot, a prior spawn of this row
+    // already COMPLETED (markComplete is the only writer of run_count) - spawning
+    // again would double-run the task. Atomic here rather than SELECT-then-act.
     const startGuard = await pool.query(
       `UPDATE os_scheduled_tasks
           SET leased_at = NOW(), updated_at = NOW()
         WHERE id = $1
           AND status = 'dispatching'
-          AND leased_by IS NOT DISTINCT FROM $2`,
-      [row.id, row.leased_by || null]
+          AND leased_by IS NOT DISTINCT FROM $2
+          AND run_count IS NOT DISTINCT FROM $3`,
+      [row.id, row.leased_by || null, row.run_count == null ? null : row.run_count]
     )
     if (startGuard.rowCount === 0) {
+      // 2026-07-12: this guard was failing for EVERY row, so nothing ever spawned and the whole
+      // fleet drained into a stuck 'dispatching' state. "Lease lost" alone does not say WHY, so
+      // print what the row actually looks like against what we expected to own.
+      let actual = '(unreadable)'
+      try {
+        const chk = await pool.query(
+          'SELECT status, leased_by, archived_at, last_status FROM os_scheduled_tasks WHERE id = $1',
+          [row.id]
+        )
+        actual = chk.rows[0] ? JSON.stringify(chk.rows[0]) : '(row gone)'
+      } catch (e) {
+        actual = '(check failed: ' + e.message + ')'
+      }
       process.stderr.write('[scheduler] dispatchOne: row ' + row.id +
-        ' lease lost during dispatch prep (reclaimed/cancelled before worker spawn); skipping spawn\n')
+        ' lease lost during dispatch prep (reclaimed/cancelled before worker spawn); skipping spawn' +
+        ' | expected leased_by=' + JSON.stringify(row.leased_by || null) +
+        ' | actual=' + actual + '\n')
       return
+    }
+
+    // 2d. 2026-07-17 double-run guard (b): coord worker liveness. If a live
+    // worker already exists for this task (a prior spawn survived a lease steal:
+    // its running-flip no-op'd, the row cycled back through active->dispatching,
+    // and we are now about to spawn a SECOND worker for the same task), do NOT
+    // spawn. ADOPT the live worker instead: flip the row to running against its
+    // tab so completionPass can complete it when it signals done. Doctrine:
+    // [[scheduler-stale-lease-must-check-coord-worker-liveness-before-redispatch-2026-06-10]].
+    {
+      const liveWorker = await hasLiveWorkerForTask(String(row.id))
+      if (liveWorker) {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'running', dispatched_tab_id = $1,
+               leased_at = NOW(), updated_at = NOW()
+           WHERE id = $2
+             AND status = 'dispatching'
+             AND leased_by IS NOT DISTINCT FROM $3`,
+          [liveWorker.tab_id || row.dispatched_tab_id || null, row.id, row.leased_by || null]
+        )
+        process.stderr.write('[scheduler] dispatchOne: task ' + row.id +
+          ' already has live worker ' + liveWorker.tab_id +
+          ' (stale_ms=' + liveWorker.stale_ms + '); adopting it as running instead of double-spawning\n')
+        return
+      }
     }
 
     // 3. Dispatch worker.
@@ -893,7 +1057,8 @@ exports.dispatchOne = async function dispatchOne(row) {
     // Re-throw so the caller knows this row failed.
     throw err
   } finally {
-    // Always release the launch-lock.
+    // Always deregister from the in-flight registry and release the launch-lock.
+    _inFlightDispatchIds.delete(inFlightKey)
     release()
   }
 }
@@ -1155,6 +1320,14 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
   for (const row of staleRetryableRows.rows) {
+    // 2026-07-17 self-lease-steal shield: never reclaim a row THIS process is
+    // still dispatching (queued on the launch-lock or mid-prep) - reclaiming it
+    // is stealing our own in-flight dispatch. See _inFlightDispatchIds.
+    if (_inFlightDispatchIds.has(String(row.id))) {
+      process.stderr.write('[scheduler] task ' + row.id +
+        ' is in-flight in this process, skipping stale-lease retry reclaim\n')
+      continue
+    }
     const liveWorker = await hasLiveWorkerForTask(row.id)
     if (liveWorker) {
       process.stderr.write(
@@ -1200,6 +1373,12 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     // holding. Freeing the lease here is the thundering-herd anti-pattern
     // (origin: 2026-06-10T04:23Z, telemetry-batch fired 4 sibling workers
     // inside 4 min because cold-start binds breached STALE_DISPATCHING_MS).
+    // 2026-07-17 self-lease-steal shield (see _inFlightDispatchIds).
+    if (_inFlightDispatchIds.has(String(row.id))) {
+      process.stderr.write('[scheduler] task ' + row.id +
+        ' is in-flight in this process, skipping stale-lease cron-defer\n')
+      continue
+    }
     const liveWorker = await hasLiveWorkerForTask(row.id)
     if (liveWorker) {
       process.stderr.write(
@@ -1243,6 +1422,12 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
   for (const row of staleNonCronRows.rows) {
+    // 2026-07-17 self-lease-steal shield (see _inFlightDispatchIds).
+    if (_inFlightDispatchIds.has(String(row.id))) {
+      process.stderr.write('[scheduler] task ' + row.id +
+        ' is in-flight in this process, skipping stale-lease fail\n')
+      continue
+    }
     const liveWorker = await hasLiveWorkerForTask(row.id)
     if (liveWorker) {
       process.stderr.write(
@@ -2168,8 +2353,17 @@ exports.start = function start() {
     process.stderr.write('[scheduler] startup staleLeaseRecovery error: ' + e.message + '\n')
   })
 
-  // Dispatch loop.
+  // Dispatch loop. NON-REENTRANT (2026-07-17 self-lease-steal race fix, see
+  // _inFlightDispatchIds): a dispatch pass can hold the launch-lock for up to
+  // SIGNAL_BOUND_TIMEOUT_MS per row, far longer than POLL_INTERVAL_MS, and a
+  // re-entrant setInterval stacked a fresh 5-row batch onto the lock queue
+  // every 30s under a due backlog - the queue pileup whose lease-aging fed the
+  // steal cycle. One pass at a time; a tick that finds the previous pass still
+  // draining just skips (the next tick re-leases whatever is still due).
+  let dispatchPassRunning = false
   const dispatchInterval = setInterval(async () => {
+    if (dispatchPassRunning) return
+    dispatchPassRunning = true
     try {
       let rows = []
       try {
@@ -2188,6 +2382,8 @@ exports.start = function start() {
       }
     } catch (e) {
       process.stderr.write('[scheduler] dispatch loop error: ' + e.message + '\n')
+    } finally {
+      dispatchPassRunning = false
     }
   }, POLL_INTERVAL_MS)
 
