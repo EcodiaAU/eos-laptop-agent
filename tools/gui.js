@@ -26,6 +26,27 @@ const screenshot = require('./screenshot')
 
 const AHK = 'C:\\Users\\tjdTa\\AppData\\Local\\Programs\\AutoHotkey\\v2\\AutoHotkey64.exe'
 
+// On the canonical Mac host there is exactly ONE CDP Chrome: profile
+// ~/chrome-canonical on port 9222. The Windows relaunch paths below (AHK /
+// PowerShell / chrome.exe / AppData) are dead here. Both enable_chrome_cdp and
+// install_cdp_to_chrome delegate to the sole sanctioned launcher and ignore any
+// port/dir/force params, so no caller can fragment the fleet.
+// Doctrine: patterns/chrome-cdp-canonical-single-profile-9222-2026-07-08.md
+async function macCanonicalCdp() {
+  const sh = path.join(os.homedir(), '.code', 'ecodiaos', 'backend', 'scripts', 'chrome-cdp.sh')
+  try { spawnSync('bash', [sh], { encoding: 'utf8', timeout: 12000 }) } catch (e) {}
+  let version = null
+  try {
+    const pre = await probeChromeCdp(9222, 1500)
+    version = pre && pre.ok && pre.version ? pre.version.Browser : null
+  } catch (e) {}
+  return {
+    ok: !!version, already_up: !!version, port: 9222, canonical: true,
+    profile: '~/chrome-canonical', version,
+    note: 'Mac has ONE canonical CDP Chrome; delegated to chrome-cdp.sh. Attach at http://127.0.0.1:9222/json.',
+  }
+}
+
 // ----- helpers -----
 
 function runAHK(script, timeoutMs) {
@@ -535,6 +556,7 @@ async function switchTab(params) {
 // approach. Idempotent: skips shortcuts that already have the flag.
 async function installCdpToChrome(params) {
   params = params || {}
+  if (process.platform === 'darwin') return await macCanonicalCdp()
   const port = params.port || 9222
   // Chrome 136+ silently drops --remote-debugging-port unless --user-data-dir
   // is also explicitly passed. We pin it to Default profile so cookies / tabs
@@ -637,6 +659,7 @@ async function installCdpToChrome(params) {
 //                needs to be swapped without freeing port 9222 first.
 async function enableChromeCdp(params) {
   params = params || {}
+  if (process.platform === 'darwin') return await macCanonicalCdp()
   const port = params.port || 9222
   const force = !!params.force
 
