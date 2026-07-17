@@ -1134,9 +1134,16 @@ async function cleanup_orphan_workers(params) {
     if (!match && th.autotitle_fingerprint && ctx) {
       try {
         const ttm = require('./tab-title-match')
+        // 2026-07-17 MASS-CLOSE FIX: pickByFingerprint returns {match, reason},
+        // NOT the tab itself. The initial port assigned the wrapper object as
+        // `match` (always truthy, even on no-match), so match.label/match.index
+        // were undefined -> closeReq degraded to {viewColumn, viewType} only ->
+        // the bridge's fallback branch matched EVERY Claude Code chat tab in the
+        // column and mass-closed all live tabs (conductor included) once per
+        // 7-min sweep. Use picked.match, exactly like the kill_worker tier-d path.
         const picked = ttm.pickByFingerprint(cands, th.autotitle_fingerprint, sp)
-        if (picked && !ctx.claimed.has(picked.label + '#fp')) {
-          match = picked
+        if (picked && picked.match && picked.match.label && !ctx.claimed.has(picked.match.label + '#fp')) {
+          match = picked.match
           strategy = 'autotitle_fingerprint'
         }
       } catch (_e) { /* ttm missing -> fall through to Pass 3 gate */ }
@@ -1173,6 +1180,13 @@ async function cleanup_orphan_workers(params) {
       // conductor-tab mass-close on agent restart via markComplete replay.
       // Doctrine: coord-close-my-tab-multi-close-on-shared-label-2026-06-25.
       const currentIndex = (typeof match.index === 'number') ? match.index : usedTabIndex
+      // 2026-07-17 MASS-CLOSE GUARD: a closeReq without BOTH a real label and/or
+      // a numeric tabIndex degrades at the bridge to a viewType-only filter that
+      // matches every CC chat tab in the column. Refuse-and-leak instead.
+      if (!match.label && typeof currentIndex !== 'number') {
+        results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'identity_less_match_refused', strategy: strategy, viewColumn: vc })
+        continue
+      }
       const closeReq = { viewColumn: vc, viewType: CC_CHAT_VIEW_TYPE, exactLabel: match.label }
       if (typeof currentIndex === 'number') {
         closeReq.tabIndex = currentIndex  // current index from the fresh probe -> deterministic single close
