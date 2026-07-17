@@ -321,6 +321,38 @@ async function dispatch_worker(params) {
             await sleep(200)
           } catch (_e) { /* tolerate */ }
         }
+        // 1b. Re-activate the worker tab by index (guards against the human
+        //     switching tabs between the bridge open and this submit chain -
+        //     the window is shared with Tate's live session).
+        //     workbench.action.openEditorAtIndexN is 1-based over the active
+        //     group; opened_tab.index is 0-based.
+        if (typeof tab_handle.tabIndex === 'number' && tab_handle.tabIndex >= 0 && tab_handle.tabIndex < 30) {
+          try {
+            await Promise.race([
+              ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (tab_handle.tabIndex + 1) }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('open_at_index_timeout_3s')), 3000)),
+            ])
+            await sleep(150)
+          } catch (_e) { /* tolerate */ }
+        }
+        // 1c. Explicitly focus the Claude Code chat INPUT. Since CC extension
+        //     2.1.211 (loaded at the 2026-07-17 08:17 window restart),
+        //     claude-vscode.editor.open populates the input but no longer
+        //     leaves keyboard focus inside the webview textarea, so a naked
+        //     Return dies at the editor-group wrapper and the brief sits
+        //     unsubmitted forever (zero worker sessions, tab labels showing
+        //     raw brief text). claude-vscode.focus is CC's own "Focus input"
+        //     command and restores the pre-2.1.211 focus state. Proven
+        //     end-to-end 2026-07-17: without it 3/3 probes never submitted;
+        //     with it 2/2 probes submitted and a transcript appeared in <5s.
+        try {
+          await Promise.race([
+            ide.command({ cmd: 'claude-vscode.focus' }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('cc_focus_timeout_3s')), 3000)),
+          ])
+        } catch (e) {
+          process.stderr.write('[mac-dispatcher] claude-vscode.focus failed for ' + tab_id + ': ' + e.message + '\n')
+        }
         // 2. Activate VS Code (Apple Events; gentler than Win32 WinActivate).
         await applescript.activate_app({ app: 'Visual Studio Code' })
         // 3. Settle for the bridge's editor.open + textarea-populate to finish.
@@ -328,11 +360,15 @@ async function dispatch_worker(params) {
         // 4. Single Enter. The 1200ms settle above guarantees the populated
         //    textarea is ready, so one Return submits the brief.
         try {
-          await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
+          const kr = await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
+          if (kr && kr.ok === false) {
+            process.stderr.write('[mac-dispatcher] submit Return keystroke not ok for ' + tab_id + ': ' + JSON.stringify(kr).slice(0, 300) + '\n')
+          }
         } catch (e) {
-          // tolerate keystroke failure; tab is open + prefilled, recoverable by hand
+          // tab is open + prefilled, recoverable by hand - but never swallow silently
+          process.stderr.write('[mac-dispatcher] submit Return keystroke threw for ' + tab_id + ': ' + e.message + '\n')
         }
-        submit_path = 'focus_group+activate+1200ms_settle+1x_return'
+        submit_path = 'focus_group+open_at_index+cc_focus_input+activate+1200ms_settle+1x_return'
       } catch (e) {
         submit_path = 'submit_chain_threw: ' + e.message
       }
