@@ -21,10 +21,33 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const os = require('os')
 
 // 2026-05-29: env-overridable so test harnesses can sandbox to a tmp dir
-// without polluting the production registry. Defaults to the canonical path.
-const COORD_ROOT = process.env.COORD_ROOT || 'D:\\.code\\EcodiaOS\\coordination'
+// without polluting the production registry.
+//
+// 2026-07-18: the default was the bare Windows path, which on the Mac canonical
+// host resolves to a LITERAL './D:\.code\EcodiaOS\coordination' dir under the
+// agent's cwd - a ghost whose workers/ is always empty. This is the same bug
+// 037d422 fixed in cowork.js and left here. It was dormant only because the
+// live process happened to carry COORD_ROOT in its env from an earlier
+// bootstrap: the laptop-agent plist does NOT set COORD_ROOT (the usage-poller
+// plist does), and `launchctl kickstart -k` preserves the loaded env rather
+// than re-reading the plist. So a reboot or a bootout/bootstrap would have
+// silently pointed the ENTIRE coord substrate (worker registry, inboxes,
+// messages, conductor rows) at an empty ghost dir, and every worker would have
+// looked unregistered. A ghost briefs file dated 2026-07-17 10:51 shows some
+// process already resolving this way.
+//
+// Platform-aware default, matching cowork.js: correct with no env at all, so
+// the substrate no longer depends on an env var that one plist forgot.
+// Doctrine: [[substrate-path-coupling-survives-host-swap-as-silent-no-op]],
+//           [[launchctl-kickstart-does-not-reload-plist-env-use-bootout-bootstrap]]
+const COORD_ROOT = process.env.COORD_ROOT || (
+  process.platform === 'win32'
+    ? 'D:\\.code\\EcodiaOS\\coordination'
+    : path.join(os.homedir(), '.ecodiaos', 'coordination')
+)
 const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
 const MESSAGES_DIR = path.join(COORD_ROOT, 'messages')
 const BRIEFS_DIR = path.join(COORD_ROOT, 'briefs')
@@ -941,6 +964,123 @@ async function signal_bound(params, ctx) {
   return r
 }
 
+// ── kill_worker (conductor-callable HARD stop) ───────────────────────────
+//
+// 2026-07-18. close_my_tab is SELF-only: a worker that never polls its inbox
+// cannot be reached, so a stand-down had no enforcement and Tate had to close
+// the tab by hand. cowork.kill_worker already did the safe single-tab close for
+// the scheduler's orphan sweep, but it was never on the MCP surface, so the
+// conductor could not call it. This is that exposure, plus the guards a
+// conductor-facing kill needs that an internal sweep did not.
+//
+// The target is named target_tab_id, NOT tab_id, on purpose. Every other coord.*
+// tool reads tab_id as "who am I" (the caller identity ctx), and mcpCoord.js
+// injects tab_id into every tool schema for exactly that reason. Reusing tab_id
+// for "who do I kill" would collide the two meanings in one call, which is how a
+// caller ends up killing itself or the wrong tab. A distinct name makes the
+// target explicit and unambiguous at every layer.
+//
+// Mass-close is impossible BY CONSTRUCTION, not by convention: this takes one
+// exact string, never a filter object, and resolves it through the worker
+// registry to a single stored tab_handle. There is no code path here that can
+// produce a multi-tab match. That is the structural lesson of the mass-close
+// incident (a {viewColumn, viewType} filter matched every chat tab in the
+// column); the bridge refuses identity-less filters as the backstop, and this
+// layer never builds one in the first place.
+// Doctrine: [[worker-interruptibility-soft-poll-hard-kill-2026-07-18]],
+//           [[coord-close-my-tab-multi-close-on-shared-label-2026-06-25]].
+
+// tab_id is interpolated into a filesystem path by loadWorkerRegistry
+// (path.join(WORKERS_DIR, tab_id + '.json')), so a traversal-shaped id must
+// never reach it. Real ids look like tab_1784292867909_94dddf94.
+const SAFE_TAB_ID_RE = /^[A-Za-z0-9._-]+$/
+
+async function kill_worker(params, ctx) {
+  params = params || {}
+  ctx = ctx || {}
+  const killed_by = ctx.tab_id || 'conductor'
+  const reason = params.reason || null
+  const raw = params.target_tab_id
+
+  const refuse = (refused, extra) => {
+    const out = Object.assign({ ok: false, closed: false, refused: refused, killed_by: killed_by }, extra || {})
+    try {
+      process.stderr.write('[coord] kill_worker REFUSED by=' + killed_by + ' target=' +
+        (typeof raw === 'string' ? raw : typeof raw) + ' reason=' + refused + '\n')
+    } catch (e) {}
+    return out
+  }
+
+  // GUARD 1: identity-less kill. No target, no kill. This is the same refusal
+  // the IDE bridge makes on a filter carrying no identity (2d980f88); enforcing
+  // it here too means a caller bug cannot even reach the bridge to be refused.
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return refuse('identity_less_kill: target_tab_id required (exact worker tab id, never a filter or wildcard)')
+  }
+  const target_tab_id = raw.trim()
+
+  // GUARD 2: no wildcard / glob / "all". There is no bulk kill and there will
+  // not be one: bulk is what cleanup_orphan_workers does, per-orphan, through
+  // this same single-target path.
+  if (!SAFE_TAB_ID_RE.test(target_tab_id) || target_tab_id.toLowerCase() === 'all') {
+    return refuse('unsafe_or_wildcard_target: target_tab_id must match ' + String(SAFE_TAB_ID_RE), { target_tab_id: target_tab_id })
+  }
+
+  // GUARD 3: never the conductor. The conductor is not a worker and killing it
+  // takes down the session driving the fleet. Checks the literal default id and
+  // the registered row, stale or not (a stale registration still means that tab
+  // is a conductor, not a worker).
+  const conductorRow = loadConductorRegistration()
+  const conductorIds = new Set(['conductor'])
+  if (conductorRow && conductorRow.tab_id) conductorIds.add(conductorRow.tab_id)
+  if (conductorIds.has(target_tab_id)) {
+    return refuse('conductor_tab_refused: kill_worker targets dispatched workers only', { target_tab_id: target_tab_id })
+  }
+
+  // GUARD 4: must be a registered worker with a stored handle. An unregistered
+  // id has no tab_handle, so cowork.kill_worker would refuse-and-leak anyway;
+  // failing here makes the reason legible instead of surfacing as a no_match.
+  const row = loadWorkerRegistry(target_tab_id)
+  if (!row) {
+    return refuse('unknown_worker: no registry row for target_tab_id', { target_tab_id: target_tab_id })
+  }
+
+  // Delegate the close itself. cowork.kill_worker owns the tab-handle
+  // resolution precedence (tabIndex+identity / sentinel / exact label /
+  // fingerprint), refuses on a generic label, and always sends a live index +
+  // exactLabel so the bridge routes through its deterministic single-target
+  // path. Do not reimplement that here; one owner for the close.
+  // Lazy require: cowork requires coord, so a top-level require is circular.
+  let closed = false
+  let refused = null
+  let error = null
+  try {
+    const cowork = require('./cowork')
+    const res = await cowork.kill_worker({ tab_id: target_tab_id })
+    closed = !!(res && res.closed)
+    refused = (res && res.refused) || null
+    error = (res && res.error) || null
+  } catch (e) {
+    error = e.message || String(e)
+  }
+
+  try {
+    process.stderr.write('[coord] kill_worker by=' + killed_by + ' target=' + target_tab_id +
+      ' closed=' + closed + (refused ? ' refused=' + refused : '') +
+      (reason ? ' reason=' + JSON.stringify(reason) : '') + '\n')
+  } catch (e) {}
+
+  return {
+    ok: true,
+    target_tab_id: target_tab_id,
+    closed: closed,
+    refused: refused,
+    error: error,
+    killed_by: killed_by,
+    reason: reason,
+  }
+}
+
 // ── sweep loop ───────────────────────────────────────────────────────────
 // Periodic janitor: mark stale workers terminated + unlink their .spawned
 // markers. Per pattern worker-registry-truth-is-on-disk-not-mtime-2026-05-18.
@@ -1282,6 +1422,7 @@ module.exports = {
   signal_done: signal_done,
   signal_bound: signal_bound,
   close_my_tab: close_my_tab,
+  kill_worker: kill_worker,
   setWorkerTabHandle: setWorkerTabHandle,
   loadWorkerRegistry: loadWorkerRegistry,
   verify_paste: verify_paste,

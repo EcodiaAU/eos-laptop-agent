@@ -142,6 +142,34 @@ function composeBrief(opts) {
     'Returns the canonical brief from the dispatcher audit file. If the brief pasted below\n' +
     'looks truncated or corrupted, trust verify_paste.brief_body over the in-chat copy.\n'
 
+  // 2026-07-18. Plumbing, not policy: this is the coord protocol for being
+  // recalled, which a worker cannot infer from the cron body. Before this, a
+  // dispatched worker never read its inbox mid-run, so a conductor stand_down
+  // sat unread until the worker finished anyway and Tate closed the tab by hand.
+  // It lives in composeBrief so EVERY dispatch inherits it by construction; a
+  // clause each brief author has to remember is a clause that is missing exactly
+  // when the fleet is busiest and a stand-down matters most.
+  // Doctrine: [[worker-interruptibility-soft-poll-hard-kill-2026-07-18]].
+  const standDown =
+    'STAND-DOWN CHECK (do this if your task runs longer than a few minutes):\n' +
+    'You can be recalled mid-run. Nothing interrupts you, so you must look:\n' +
+    '  mcp__coord__coord_peek_inbox({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"})\n' +
+    'Peek at natural checkpoints - between phases, before any long or hard-to-undo\n' +
+    'step (a push, a deploy, a migration, an outbound send), and after any step that\n' +
+    'took a while. It is a cheap non-consuming read; it does not eat your messages.\n' +
+    'If any message body has type "stand_down", STOP. Do not finish the current\n' +
+    'thing first, do not start anything new. Leave the tree in a safe state\n' +
+    '(no half-written file, nothing staged mid-push), then:\n' +
+    '  1. mcp__coord__coord_signal_done({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", task_id:"' + task_id + '", status:"stood_down", result_summary:"stood down at <checkpoint>: <what is done, what is not, what the next worker needs>", terminate:true})\n' +
+    '  2. mcp__coord__coord_close_my_tab({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"})\n' +
+    'status:"stood_down" is required and is NOT a failure - it is terminal and\n' +
+    'stops this task being retried or re-dispatched. Reporting "failed" instead\n' +
+    'burns a retry and brings you straight back. Your result_summary is the whole\n' +
+    'handover, so say what you actually finished and what you did not.\n' +
+    'A stand_down is the conductor reclaiming the lane. It is not a question.\n' +
+    'Ignore it and the conductor will close this tab under you (coord.kill_worker),\n' +
+    'and then nobody learns what you had done.\n'
+
   const taskBlock = brief_storage === 'file'
     ? 'YOUR TASK (full brief at: ' + brief_file_path + ' - read in full, then execute):\n'
     : 'YOUR TASK:\n' + brief_body + '\n'
@@ -156,7 +184,7 @@ function composeBrief(opts) {
     '2. mcp__coord__coord_close_my_tab({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"})\n' +
     'Without close_my_tab as your final tool call, every worker tab accumulates in the IDE.\n'
 
-  return [header, '', identity, '', verifyFirst, '', taskBlock, '', closing].join('\n')
+  return [header, '', identity, '', verifyFirst, '', standDown, '', taskBlock, '', closing].join('\n')
 }
 
 async function dispatch_worker(params) {
@@ -501,6 +529,10 @@ async function dispatch_worker(params) {
 // no platform dependency.
 module.exports = {
   dispatch_worker,
+  // Exposed for tests only: the stand-down clause is inherited by every dispatch
+  // BECAUSE it lives in here, so a test has to be able to assert on the composed
+  // brief directly rather than trust that callers remember it.
+  _composeBrief: composeBrief,
   kill_worker: cowork.kill_worker,
   cleanup_orphan_workers: cowork.cleanup_orphan_workers,
   list_workers: cowork.list_workers,

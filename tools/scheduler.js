@@ -1170,7 +1170,18 @@ exports.markComplete = async function markComplete(row, signal) {
   // "I finished" signal; only an EXPLICIT signal.status === 'failed' (or any
   // non-success value) should route through markFailed. See
   // [[scheduler-signal-done-status-must-survive-coord-to-inbox-2026-06-09]].
-  const explicitFailure = signal && signal.status && signal.status !== 'success'
+  // 2026-07-18: stand-down is terminal, never a failure. A worker that honours
+  // a stand_down reports status='stood_down'; without this branch that value is
+  // "not success", so it routed through markFailed, burned a retry, and the
+  // dispatch loop RE-DISPATCHED the very worker the conductor just stood down.
+  // The stand-down would resurrect itself, which is worse than the gap it fixes.
+  // A stood-down run is a run that correctly did not finish: no retry, no chain
+  // wake (children must not fire on work that was abandoned), and a one_shot is
+  // cancelled rather than completed because its scope was never done. A cron
+  // just skips this fire and keeps its schedule.
+  // Doctrine: [[worker-interruptibility-soft-poll-hard-kill-2026-07-18]].
+  const stoodDown = !!(signal && signal.status === 'stood_down')
+  const explicitFailure = signal && signal.status && signal.status !== 'success' && !stoodDown
 
   if (explicitFailure) {
     // Treat as failure: delegate to markFailed with a synthetic error.
@@ -1205,10 +1216,17 @@ exports.markComplete = async function markComplete(row, signal) {
       [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
   } else {
-    // one_shot or delayed: mark completed.
+    // one_shot or delayed: mark completed - or cancelled when stood down, since
+    // the scope was abandoned rather than finished. 'cancelled' is also what
+    // keeps the row out of any re-arm path that respects last_status.
+    // Inlined as a literal (not a bound param) to match dispatchedTabIdSqlFrag
+    // above: both are constants chosen by a local boolean, never caller input,
+    // and keeping the literal keeps the SQL greppable for the assertions that
+    // read it.
+    const oneShotStatusSqlLiteral = stoodDown ? 'cancelled' : 'completed'
     await pool.query(
       `UPDATE os_scheduled_tasks
-       SET status = 'completed', last_run_at = NOW(), last_result = $1,
+       SET status = '${oneShotStatusSqlLiteral}', last_run_at = NOW(), last_result = $1,
            run_count = run_count + 1, leased_by = NULL, leased_at = NULL,
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $2`,
@@ -1223,7 +1241,12 @@ exports.markComplete = async function markComplete(row, signal) {
   // variable, throwing on every completionPass markComplete and caught by the outer
   // try/catch. !explicitFailure is the correct success predicate at this point
   // (explicitFailure path already returned early via markFailed above).
-  if (!explicitFailure) {
+  // 2026-07-18: !stoodDown added. Chain children encode "the parent's work is
+  // done, now do the next stage"; a stood-down parent abandoned its work, so
+  // waking children would run the next stage on a foundation that was never
+  // built - the stand-down would leak downstream into the exact fleet the
+  // conductor was trying to quiet.
+  if (!explicitFailure && !stoodDown) {
     try {
       await pool.query(
         `UPDATE os_scheduled_tasks

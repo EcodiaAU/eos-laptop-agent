@@ -174,6 +174,19 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: 'coord.kill_worker',
+    description: 'HARD-stop ONE dispatched worker by closing its IDE chat tab. The conductor-side counterpart to the worker-side stand_down: use it when a worker will not stand down on its own (never polls its inbox, wedged, or mid-run on work you have cancelled). Cancelling the os_scheduled_tasks row only stops re-dispatch, it does not touch the live tab. Prefer a stand_down message first (coord.send_message body {type:"stand_down"}) so the worker can stop cleanly and report what it did; kill_worker is the enforcement when that goes unread. Targets EXACTLY the one worker named by target_tab_id and can never match more than one tab: it takes an exact id, not a filter, and resolves it through the worker registry to a single stored tab handle. Refuses an absent/wildcard target, the conductor tab, and any id with no registry row. Returns {ok, target_tab_id, closed, refused, error, killed_by}. closed=false with a refused reason means the tab was left alone on purpose (better a leaked tab than a wrong close).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target_tab_id: { type: 'string', description: 'The EXACT tab_id of the worker to close, e.g. "tab_1784292867909_94dddf94" (from coord.list_workers). Never a filter, glob, label, or "all". Deliberately NOT named tab_id: that arg is the CALLER identity on every coord.* tool.' },
+        reason: { type: 'string', description: 'Why this worker is being killed. Recorded in the agent log for audit.' },
+      },
+      required: ['target_tab_id'],
+      additionalProperties: true,
+    },
+  },
+  {
     name: 'coord.pick_account',
     description: 'Select the highest-headroom Claude Max account for the next dispatch. Score: min(remaining_5h, remaining_weekly) * 0.85 - estimated_tokens. Returns {account, score, remaining_5h, remaining_weekly, reason, candidates[]}.',
     inputSchema: {
