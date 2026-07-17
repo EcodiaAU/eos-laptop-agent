@@ -1262,18 +1262,21 @@ test('staleLeaseRecovery branch 1: stale-heartbeat worker (>=180s, hung) does no
   scheduler._setCoord(null)
 })
 
-// ── Task 3.4: start() schedules 4 intervals (3 core + Phase 7 cap observer) ──
+// ── Task 3.4: start() schedules 6 intervals + returns an API-SAFE object ──────
+//
+// 6 = dispatch, completion, stale-lease, cap-observer, cleanup-orphan, and the
+// 2026-07-17 dispatch watchdog. The return MUST be a plain serialisable object
+// ({ok, armed, intervals:[names]}) - returning the raw Timeout handles made
+// `scheduler.start` over the HTTP API throw "Converting circular structure to
+// JSON". The handles themselves live on scheduler._intervals for the watchdog.
 
-test('start() schedules exactly 4 setIntervals and returns 4 handles', async () => {
+test('start() schedules 6 setIntervals and returns an API-safe object', async () => {
   const origSetInterval = global.setInterval
   const origClearInterval = global.clearInterval
   let callCount = 0
-  const savedHandles = []
   global.setInterval = function (fn, ms) {
     callCount++
-    const handle = { _id: callCount, unref: () => {} }
-    savedHandles.push(handle)
-    return handle
+    return { _id: callCount, unref: () => {} }
   }
   global.clearInterval = function (h) {}  // noop for cleanup in test
 
@@ -1281,16 +1284,49 @@ test('start() schedules exactly 4 setIntervals and returns 4 handles', async () 
   scheduler._setPool(pool)
   scheduler._setDispatcher({ dispatch_worker: async () => ({}), kill_worker: async () => {} })
 
-  const handles = scheduler.start()
+  const ret = scheduler.start()
 
   global.setInterval = origSetInterval
   global.clearInterval = origClearInterval
 
-  assert(callCount === 4, 'start(): setInterval called 4 times (got ' + callCount + ')')
-  assert(handles && handles.dispatchInterval, 'start(): returns dispatchInterval')
-  assert(handles && handles.completionInterval, 'start(): returns completionInterval')
-  assert(handles && handles.staleInterval, 'start(): returns staleInterval')
-  assert(handles && handles.capObserverInterval, 'start(): returns capObserverInterval')
+  assert(callCount === 6, 'start(): setInterval called 6 times (got ' + callCount + ')')
+  // API-safe return: plain object, no raw Timeout handles (would be circular over HTTP).
+  assert(ret && ret.ok === true && ret.armed === true, 'start(): returns {ok:true, armed:true}')
+  assert(Array.isArray(ret.intervals) && ret.intervals.length === 6, 'start(): lists 6 interval names')
+  JSON.stringify(ret)  // must not throw (the circular-JSON regression guard)
+  // Handles stashed for the watchdog / callers that need them.
+  assert(scheduler._intervals && scheduler._intervals.dispatchInterval, 'start(): stashes dispatchInterval on _intervals')
+  assert(scheduler._intervals.watchdogInterval, 'start(): stashes watchdogInterval on _intervals')
+})
+
+// ── dispatch watchdog: force-releases a latched guard (silent-death self-heal) ─
+//
+// The exact death mode from the 2026-07-16/17 fleet stall: a pass await never
+// settles, so the non-reentrant guard latches TRUE and leasing stops forever.
+// The watchdog must detect a pass older than DISPATCH_PASS_MAX_MS and release it.
+
+test('dispatchWatchdogTick: releases a wedged pass and leaves a healthy one alone', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)  // recordDispatchWedge writes an observer_signal via the stub
+
+  // Idle -> no action.
+  scheduler._resetDispatchWatchdogState({ running: false })
+  let r = await scheduler.dispatchWatchdogTick(Date.now())
+  assert(r.wedged === false, 'idle loop is not wedged')
+
+  // A pass running for 5s -> healthy, not wedged (well under the ~57min ceiling).
+  const now = 1_000_000_000_000
+  scheduler._resetDispatchWatchdogState({ running: true, startedAt: now - 5_000 })
+  r = await scheduler.dispatchWatchdogTick(now)
+  assert(r.wedged === false, 'a 5s-old pass is healthy, not wedged')
+  assert(scheduler._dispatchWatchdogState().running === true, 'healthy pass guard left set')
+
+  // A pass running for 2 hours (> ceiling) -> WEDGED: guard force-released.
+  scheduler._resetDispatchWatchdogState({ running: true, startedAt: now - 2 * 60 * 60 * 1000 })
+  r = await scheduler.dispatchWatchdogTick(now)
+  assert(r.wedged === true, 'a 2h-old pass is wedged')
+  assert(scheduler._dispatchWatchdogState().running === false, 'wedged guard was force-released so the next tick re-leases')
+  assert(scheduler._dispatchWatchdogState().wedgeResets === 1, 'wedge reset counted')
 })
 
 // ── Task 3.4: startupCleanup tolerates close_tab errors ──────────────────────

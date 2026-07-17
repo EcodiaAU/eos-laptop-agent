@@ -54,6 +54,16 @@ for (const file of fs.readdirSync(toolDir)) {
 }
 
 app.get('/api/health', (_req, res) => {
+  // 2026-07-17: surface the scheduler dispatch-loop liveness so an external probe
+  // can distinguish "process green but loop wedged" (the silent-death fingerprint)
+  // from a genuinely healthy loop. Best-effort: absent if the scheduler is off.
+  let scheduler_health = null
+  try {
+    const scheduler = require('./tools/scheduler')
+    if (typeof scheduler.schedulerHealthSnapshot === 'function') {
+      scheduler_health = scheduler.schedulerHealthSnapshot()
+    }
+  } catch (e) { scheduler_health = { error: e.message } }
   res.json({
     status: 'ok',
     uptime: process.uptime(),
@@ -65,6 +75,7 @@ app.get('/api/health', (_req, res) => {
       usedPercent: Math.round((1 - os.freemem() / os.totalmem()) * 100),
     },
     hostname: os.hostname(),
+    scheduler_health,
   })
 })
 

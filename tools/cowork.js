@@ -1104,6 +1104,28 @@ async function cleanup_orphan_workers(params) {
       if (hit) { match = hit; strategy = 'sentinel_prefix' }
     }
 
+    // Pass 2.5: autotitle-fingerprint match (2026-07-17 leak fix). CC summarises
+    // a long brief into a Title-Case headline that drops the sentinel prefix, so
+    // Pass 1/2 miss the tab and it LEAKS - the exact reason the sweep reported
+    // closed=0 of ~70 orphans (all 53 recent candidates carried a fingerprint but
+    // no live sentinel label). close_my_tab already trusts this decisive
+    // fingerprint match (cowork.js close path); porting it here lets the sweep
+    // reclaim the retitled orphans it was leaking. SAFE: pickByFingerprint returns
+    // a match ONLY on a single decisive winner scored against the worker's OWN
+    // spawn brief tokens, so it cannot collide with the conductor or a live worker
+    // (whose brief differs). Doctrine: vs-code-webview-tabs-have-no-stable-id-pin-
+    // label-or-leak-2026-05-28.
+    if (!match && th.autotitle_fingerprint && ctx) {
+      try {
+        const ttm = require('./tab-title-match')
+        const picked = ttm.pickByFingerprint(cands, th.autotitle_fingerprint, sp)
+        if (picked && !ctx.claimed.has(picked.label + '#fp')) {
+          match = picked
+          strategy = 'autotitle_fingerprint'
+        }
+      } catch (_e) { /* ttm missing -> fall through to Pass 3 gate */ }
+    }
+
     // Pass 3 (opt-in): exact "Claude Code" untitled match - RISKY.
     if (!match && force_untitled && ctx) {
       const hit = cands.find(t => t.label === 'Claude Code' && !t.active && !ctx.claimed.has('Claude Code#' + cands.indexOf(t)))
@@ -1119,7 +1141,7 @@ async function cleanup_orphan_workers(params) {
 
     if (dry_run) {
       results.push({ tab_id: worker.tab_id, action: 'would_close', label: match.label, strategy: strategy, viewColumn: vc, tabIndex: usedTabIndex })
-      if (ctx) ctx.claimed.add(match.label + '#' + (strategy === 'tabIndex' ? usedTabIndex : (strategy === 'sentinel_prefix' ? 'sp' : cands.indexOf(match))))
+      if (ctx) ctx.claimed.add(match.label + '#' + (strategy === 'tabIndex' ? usedTabIndex : (strategy === 'sentinel_prefix' ? 'sp' : (strategy === 'autotitle_fingerprint' ? 'fp' : cands.indexOf(match)))))
       continue
     }
 
@@ -1154,7 +1176,7 @@ async function cleanup_orphan_workers(params) {
           if (usedTabIndex != null) cur.closed_tab_index = usedTabIndex
           fs.writeFileSync(filePath, JSON.stringify(cur, null, 2))
         } catch (e) {}
-        if (ctx) ctx.claimed.add(match.label + '#' + (strategy === 'tabIndex' ? usedTabIndex : (strategy === 'sentinel_prefix' ? 'sp' : cands.indexOf(match))))
+        if (ctx) ctx.claimed.add(match.label + '#' + (strategy === 'tabIndex' ? usedTabIndex : (strategy === 'sentinel_prefix' ? 'sp' : (strategy === 'autotitle_fingerprint' ? 'fp' : cands.indexOf(match)))))
         closedCount++
         results.push({ tab_id: worker.tab_id, action: 'closed', label: match.label, strategy: strategy, viewColumn: vc, tabIndex: usedTabIndex })
       } else {

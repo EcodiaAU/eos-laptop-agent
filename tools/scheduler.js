@@ -207,6 +207,23 @@ function getPool() {
       // "Connection terminated due to connection timeout". The scheduler went silent for 88h
       // and no cron fired. The DB was healthy the whole time; the resolver was not.
       connectionTimeoutMillis: 30_000,
+      // 2026-07-17 silent-dispatch-death root-cause fix. The dispatch loop is a
+      // NON-REENTRANT setInterval guarded by `dispatchPassRunning`, reset ONLY in
+      // its own finally. A query that STALLS server-side (a lock wait, a Supavisor
+      // hiccup, post-sleep mDNS lag mid-statement) neither resolves nor rejects, so
+      // the pass's await never settles, finally never runs, and dispatchPassRunning
+      // latches TRUE forever - every later tick then no-ops at `if (running) return`.
+      // The interval keeps firing and the process stays alive (health + API still
+      // serve), so launchd KeepAlive never restarts it: the loop is DEAD while the
+      // process is GREEN. The pool 'error' handler only catches connection DROPS,
+      // not query HANGS, so it could not save us. query_timeout is a pure client-side
+      // JS timer that REJECTS a query that overruns (works on any pooler mode);
+      // statement_timeout is the server-side belt that also cancels the zombie query
+      // (safe here: port 5432 is Supavisor SESSION mode, so the startup param sticks).
+      // A rejected lease query now hits leaseDueRows' inner catch -> the pass returns
+      // -> finally resets the guard -> the next 30s tick re-leases. Self-healing.
+      statement_timeout: 25_000,
+      query_timeout: 30_000,
     })
     // 2026-06-14 restart-loop root-cause fix. node-postgres emits an 'error'
     // event on the Pool when an IDLE pooled client's TCP connection dies. The
@@ -2361,10 +2378,114 @@ exports.staleTick = async function staleTick(nowMs) {
 }
 exports._wakeStallCount = 0
 
+// ── dispatch-loop watchdog (2026-07-17 silent-death self-heal) ───────────────
+//
+// THE DEATH MODE this guards against (root cause of the 2026-07-16/17 fleet
+// stall): the dispatch loop is a non-reentrant setInterval guarded by
+// _dispatchPassRunning, reset ONLY in the pass's own finally. If any await
+// inside a pass never settles (an unbounded query hang - now bounded by the
+// pool query_timeout added the same day - or any other stuck sub-await), the
+// finally never runs, the guard latches TRUE, and every future 30s tick no-ops
+// at `if (running) return`. The interval keeps firing and the process stays
+// alive, so launchd KeepAlive never restarts it: the loop is dead while the
+// process is green. The pool query_timeout closes the common (DB) vector; this
+// watchdog is defense-in-depth for ANY other stuck await, and the self-healing
+// backstop the incident proved was missing (nothing detected the stuck pass or
+// re-armed leasing; the external scheduler-health canary only ALARMS into the
+// next session, it does not heal).
+//
+// State is module-scope (not a start() local) so the watchdog tick and the
+// /api/health snapshot can read + reset it, and so it is unit-testable.
+let _dispatchPassRunning = false
+let _dispatchPassStartedAt = 0     // ms; when the in-flight pass began (0 = idle)
+let _lastLeasePassAt = 0           // ms; when a lease pass last COMPLETED (heartbeat)
+let _dispatchWedgeResets = 0       // count of watchdog force-resets (health signal)
+let _wedgeStallLast = { hourKey: null }
+
+// Ceiling for a LEGIT dispatch pass: DISPATCH_LIMIT rows, each up to a full
+// SIGNAL_BOUND_TIMEOUT_MS bind wait + ~60s prep, plus slack. A pass older than
+// this is not slow, it is wedged. Computed from the live constants so it tracks
+// any future retune of the limit or bind timeout.
+const DISPATCH_PASS_MAX_MS = DISPATCH_LIMIT * (SIGNAL_BOUND_TIMEOUT_MS + 60_000) + 120_000
+const DISPATCH_WATCHDOG_INTERVAL_MS = 60_000
+
+// Testable core. Returns {wedged, ageMs}. On a wedge it force-releases the guard
+// so the NEXT dispatch tick runs a fresh pass (the leaked hung promise, if any,
+// stays pending but harmless - query_timeout will reject it), logs loudly, and
+// records an observer_signal so the wedge is externally visible within a minute
+// instead of only via the 2h-latency overdue-actives canary.
+exports.dispatchWatchdogTick = async function dispatchWatchdogTick(nowMs) {
+  const now = (typeof nowMs === 'number') ? nowMs : Date.now()
+  if (!_dispatchPassRunning || !_dispatchPassStartedAt) return { wedged: false }
+  const ageMs = now - _dispatchPassStartedAt
+  if (ageMs <= DISPATCH_PASS_MAX_MS) return { wedged: false, ageMs }
+  _dispatchWedgeResets += 1
+  _dispatchPassRunning = false
+  _dispatchPassStartedAt = 0
+  process.stderr.write('[scheduler] WATCHDOG: dispatch pass wedged ~' +
+    Math.round(ageMs / 1000) + 's (> ceiling ' + Math.round(DISPATCH_PASS_MAX_MS / 1000) +
+    's) - force-released the non-reentrant guard so the next tick re-leases. ' +
+    'A stuck await never settled; the loop was leasing NOTHING until this reset. reset#' +
+    _dispatchWedgeResets + '\n')
+  try { await exports.recordDispatchWedge(ageMs) } catch (e) {
+    process.stderr.write('[scheduler] recordDispatchWedge error: ' + e.message + '\n')
+  }
+  return { wedged: true, ageMs }
+}
+
+// Surface a dispatch-loop wedge to the conductor / Tate via observer_signals.
+exports.recordDispatchWedge = async function recordDispatchWedge(ageMs) {
+  const secs = Math.round(ageMs / 1000)
+  const hourKey = new Date().toISOString().slice(0, 13)   // dedup per host-hour
+  if (_wedgeStallLast.hourKey === hourKey) return { skipped: 'cooldown' }
+  await getPool().query(
+    `INSERT INTO observer_signals (observer_name, signal_kind, message, fingerprint, priority, created_at)
+     VALUES ($1, $2, $3, $4, $5, now())`,
+    ['scheduler-dispatch-watchdog', 'scheduler_dispatch_wedge',
+     'Scheduler dispatch loop was WEDGED ~' + secs + 's (a pass await never settled; the non-reentrant guard latched and leasing had STOPPED). The watchdog force-released it and leasing resumed. If this recurs, find the stuck await (most hangs are now bounded by the pool query_timeout added 2026-07-17); check for a coord/tab-open path with no timeout.',
+     'scheduler_dispatch_wedge:' + hourKey, 1]
+  )
+  _wedgeStallLast.hourKey = hourKey
+  return { fired: true, seconds: secs }
+}
+
+// Health snapshot for /api/health + on-demand probes (the external canary reads
+// os_scheduled_tasks, but this gives a direct in-process liveness read).
+exports.schedulerHealthSnapshot = function schedulerHealthSnapshot() {
+  const now = Date.now()
+  return {
+    dispatch_pass_running: _dispatchPassRunning,
+    dispatch_pass_age_ms: _dispatchPassStartedAt ? (now - _dispatchPassStartedAt) : 0,
+    dispatch_pass_max_ms: DISPATCH_PASS_MAX_MS,
+    last_lease_pass_at: _lastLeasePassAt ? new Date(_lastLeasePassAt).toISOString() : null,
+    ms_since_last_lease_pass: _lastLeasePassAt ? (now - _lastLeasePassAt) : null,
+    dispatch_wedge_resets: _dispatchWedgeResets,
+    armed: !!(exports._intervals && exports._intervals.dispatchInterval),
+  }
+}
+
+// Test seams.
+exports._resetDispatchWatchdogState = function (o) {
+  o = o || {}
+  _dispatchPassRunning = !!o.running
+  _dispatchPassStartedAt = o.startedAt || 0
+  _lastLeasePassAt = o.lastLeasePassAt || 0
+  _dispatchWedgeResets = o.wedgeResets || 0
+  _wedgeStallLast = { hourKey: null }
+}
+exports._dispatchWatchdogState = function () {
+  return { running: _dispatchPassRunning, startedAt: _dispatchPassStartedAt, lastLeasePassAt: _lastLeasePassAt, wedgeResets: _dispatchWedgeResets }
+}
+exports._intervals = null
+
 // ── start ────────────────────────────────────────────────────────────────────
 //
-// Starts all three intervals plus the usage-cap observer. Wraps each in
-// try/catch so one bad pass does not tank the entire loop.
+// Starts all three intervals plus the usage-cap observer + the dispatch
+// watchdog. Wraps each tick in try/catch so one bad pass does not tank the loop.
+// Returns an API-SAFE plain object (never the raw Timeout handles, which are
+// circular and made `scheduler.start` over the HTTP API throw "Converting
+// circular structure to JSON"); the handles live on exports._intervals for the
+// watchdog and tests.
 
 exports.start = function start() {
   process.stderr.write('[scheduler] starting dispatch loop + completion poller + stale-lease recovery + cap observer\n')
@@ -2401,10 +2522,10 @@ exports.start = function start() {
   // every 30s under a due backlog - the queue pileup whose lease-aging fed the
   // steal cycle. One pass at a time; a tick that finds the previous pass still
   // draining just skips (the next tick re-leases whatever is still due).
-  let dispatchPassRunning = false
   const dispatchInterval = setInterval(async () => {
-    if (dispatchPassRunning) return
-    dispatchPassRunning = true
+    if (_dispatchPassRunning) return
+    _dispatchPassRunning = true
+    _dispatchPassStartedAt = Date.now()
     try {
       let rows = []
       try {
@@ -2443,7 +2564,9 @@ exports.start = function start() {
     } catch (e) {
       process.stderr.write('[scheduler] dispatch loop error: ' + e.message + '\n')
     } finally {
-      dispatchPassRunning = false
+      _dispatchPassRunning = false
+      _dispatchPassStartedAt = 0
+      _lastLeasePassAt = Date.now()   // heartbeat: a pass reached its finally (leasing is alive)
     }
   }, POLL_INTERVAL_MS)
 
@@ -2496,12 +2619,29 @@ exports.start = function start() {
     }
   }, CLEANUP_ORPHAN_INTERVAL_MS)
 
+  // Dispatch-loop watchdog (2026-07-17 silent-death self-heal). Detects a pass
+  // whose await never settled (guard latched TRUE, leasing stopped) and force-
+  // releases it so the next tick re-leases. Its own tick is try/catch wrapped so
+  // a watchdog error can never itself wedge anything.
+  const watchdogInterval = setInterval(async () => {
+    try {
+      await exports.dispatchWatchdogTick(Date.now())
+    } catch (e) {
+      process.stderr.write('[scheduler] dispatchWatchdogTick error: ' + e.message + '\n')
+    }
+  }, DISPATCH_WATCHDOG_INTERVAL_MS)
+
   // Unref so the intervals don't prevent process exit in test environments.
   if (dispatchInterval.unref) dispatchInterval.unref()
   if (completionInterval.unref) completionInterval.unref()
   if (staleInterval.unref) staleInterval.unref()
   if (capObserverInterval.unref) capObserverInterval.unref()
   if (cleanupOrphanInterval.unref) cleanupOrphanInterval.unref()
+  if (watchdogInterval.unref) watchdogInterval.unref()
 
-  return { dispatchInterval, completionInterval, staleInterval, capObserverInterval, cleanupOrphanInterval }
+  // Handles live on exports._intervals for the watchdog + tests. The API caller
+  // gets a plain, serialisable object - returning the raw Timeout handles made
+  // `scheduler.start` over HTTP throw "Converting circular structure to JSON".
+  exports._intervals = { dispatchInterval, completionInterval, staleInterval, capObserverInterval, cleanupOrphanInterval, watchdogInterval }
+  return { ok: true, armed: true, intervals: ['dispatch', 'completion', 'stale', 'capObserver', 'cleanupOrphan', 'watchdog'] }
 }

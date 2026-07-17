@@ -556,6 +556,68 @@ function poll() {
     }
   }
 
+  // ── window-truth normalisation (2026-07-17 "cried wolf" fix) ────────────────
+  //
+  // Cache-read is ALREADY excluded above (limitTokens, CACHE_READ_WEIGHT=0), so
+  // the 2026-06-21 doctrine is in place. But the per-account sums above add each
+  // matched session's LIFETIME limit-relevant total (ccusage `session` reports
+  // cumulative-per-session), gated only by whether the session was TOUCHED in the
+  // window (mtime/date). A long-lived session active for 10 min in the last 5h
+  // therefore dumps its ENTIRE multi-hour lifetime total into the 5h bucket.
+  // Measured 2026-07-17: the poller read code@ 5h = 130.5M vs the TRUE 5h window
+  // (ccusage `blocks` active-block limit-relevant, all accounts) of 64.9M - a
+  // ~2.8x over-count that read code@ as 314% of its 41.5M budget slice, forcing
+  // autoswitch + pick_account to cry wolf while live sessions kept serving.
+  //
+  // Fix: ccusage `blocks` gives the TRUE rolling-window token counts but no
+  // per-account split; `session` gives the per-account split but lifetime totals.
+  // Anchor the two: scale each account's windowed sum by
+  // (true-windowed-limit-relevant / sum-of-account-windowed-sums), capped at 1 so
+  // we only ever scale DOWN. This preserves the relative per-account distribution
+  // (the account that dominated the window still reads highest) while pinning the
+  // AGGREGATE to ground truth. Fails safe: if blocks are unreadable or the maths
+  // is degenerate, the factor is 1 and behaviour is exactly as before (never
+  // worse). Doctrine: patterns/usage-5h-measure-must-exclude-cache-read-tokens-
+  // 2026-06-21 (extended: exclude lifetime-into-window inflation too).
+  function blockLimitRelevant(b) {
+    const tc = (b && b.tokenCounts) || {}
+    const input = Number(tc.inputTokens) || 0
+    const output = Number(tc.outputTokens) || 0
+    const cacheCreate = Number(tc.cacheCreationInputTokens || tc.cacheCreationTokens) || 0
+    const cacheRead = Number(tc.cacheReadInputTokens || tc.cacheReadTokens) || 0
+    return input + output + cacheCreate + cacheRead * CACHE_READ_WEIGHT
+  }
+  function normaliseToWindowTruth(field, trueWindowedTotal) {
+    if (!(trueWindowedTotal > 0)) return { factor: 1, applied: false }
+    let sumAcct = 0
+    for (const acct of KNOWN_ACCOUNTS) sumAcct += accounts[acct][field] || 0
+    if (!(sumAcct > trueWindowedTotal)) return { factor: 1, applied: false }  // already within truth
+    const factor = trueWindowedTotal / sumAcct
+    for (const acct of KNOWN_ACCOUNTS) accounts[acct][field] = Math.round((accounts[acct][field] || 0) * factor)
+    return { factor: factor, applied: true, sumAcct: sumAcct, trueWindowedTotal: trueWindowedTotal }
+  }
+  try {
+    // True 5h window = the active (non-gap) block's limit-relevant tokens.
+    let trueWindowed5h = 0
+    for (const b of blocks) { if (b.isActive && !b.isGap) { trueWindowed5h = blockLimitRelevant(b); break } }
+    // True weekly window = limit-relevant summed over every block starting in the last 7d.
+    let trueWindowedWeekly = 0
+    for (const b of blocks) {
+      if (b.isGap) continue
+      const st = b.startTime ? new Date(b.startTime).getTime() : 0
+      if (st >= weekStartMs) trueWindowedWeekly += blockLimitRelevant(b)
+    }
+    const n5 = normaliseToWindowTruth('tokens_5h', trueWindowed5h)
+    const nw = normaliseToWindowTruth('tokens_weekly', trueWindowedWeekly)
+    if (n5.applied || nw.applied) {
+      process.stderr.write('[usage] window-truth normalise: 5h factor=' +
+        (n5.factor).toFixed(3) + ' (sum ' + Math.round((n5.sumAcct || 0) / 1e6) + 'M -> truth ' +
+        Math.round(trueWindowed5h / 1e6) + 'M), weekly factor=' + (nw.factor).toFixed(3) + '\n')
+    }
+  } catch (e) {
+    process.stderr.write('[usage] window-truth normalise skipped (fail-safe to raw sums): ' + e.message + '\n')
+  }
+
   // Compute headroom scores
   for (const acct of KNOWN_ACCOUNTS) {
     const a = accounts[acct]
