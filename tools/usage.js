@@ -738,11 +738,29 @@ function computeAlerts() {
     if (!a) continue
     if (a.headroom_score < HEADROOM_WARNING_FRACTION) lowAccounts.push({ account: acct, headroom_score: a.headroom_score })
   }
+  // A pin on a starved account is always wrong: it silently defeats the
+  // autoswitch while the whole worker fleet stalls on the capped account
+  // (2026-07-17: a bare 18-day-old pin held the fleet on code@ at zero 5h
+  // headroom; workers leased, never bound, and rows failed as stale leases).
+  // Surface it loudly so the poller/canaries can escalate instead of the
+  // fleet discovering it by starvation. Doctrine:
+  // patterns/auto-switch-defeated-by-stale-disable-and-drifted-cap-2026-06-19.md
+  let pinned_account_starved = null
+  try {
+    const fs = require('fs')
+    const pinPath = require('path').join(process.env.HOME || '/Users/ecodia', '.ecodiaos/coordination/usage/account-pin')
+    if (fs.existsSync(pinPath)) {
+      const pinned = fs.readFileSync(pinPath, 'utf8').trim()
+      const pa = state.accounts[pinned]
+      if (pa && pa.headroom_score === 0) pinned_account_starved = { account: pinned, pin_path: pinPath }
+    }
+  } catch (_) { /* alert computation must never throw */ }
   return {
     current_account_low: !!lowAccounts.find(x => x.account === current),
     all_low: lowAccounts.length === KNOWN_ACCOUNTS.length,
     accounts_low: lowAccounts,
     threshold: HEADROOM_WARNING_FRACTION,
+    pinned_account_starved,
   }
 }
 
