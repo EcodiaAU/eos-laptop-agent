@@ -87,18 +87,28 @@ async function expire(db, requestId, notify) {
   return { id: a.id, expired: true }
 }
 
-module.exports = { request, approve, escalate, expire, deadlineFrom, armTask }
+// Real delivery. Tate is reachable by iMessage (text-tate.js: pure osascript, zero budget,
+// works under any cap) - the canonical Tate channel, NOT Twilio. Helen is on ANDROID so
+// iMessage cannot reach her; her channel is the Friend app push once paired, SMS only as a
+// fallback if the comms Twilio path is healthy. Never a silent swallow.
+const { execFileSync } = require('child_process')
+async function notifyDefault(target, msg) {
+  if (target === 'tate') {
+    try {
+      execFileSync('node', ['/Users/ecodia/.code/ecodiaos/backend/imessage-agent/text-tate.js', '--from', 'vault-approval', msg], { stdio: 'ignore' })
+      return { via: 'imessage' }
+    } catch (e) { console.log(`[notify:tate iMessage FAILED: ${e.message}] ${msg}`); return { via: 'failed' } }
+  }
+  console.log(`\n>>> NOTIFY HELEN (Android - Friend app push once paired; SMS fallback if comms healthy):\n${msg}\n`)
+  return { via: 'surfaced' }
+}
+
+module.exports = { request, approve, escalate, expire, deadlineFrom, armTask, notifyDefault }
 
 if (require.main === module) {
   const [cmd, a1, a2] = process.argv.slice(2)
   const db = lib.db()
-  // The reliable SMS path is the ecodia-comms MCP (send_sms / sms_tate), which the CC tab
-  // running this task holds. So we EMIT the notification for the tab to send rather than
-  // silently no-op through a missing CLI. Never a silent swallow.
-  const PHONE = { helen: '+61416117941', tate: '+61404247153' }
-  const smsNotify = async (target, msg) => {
-    console.log(`\n>>> SEND SMS via ecodia-comms send_sms to ${PHONE[target] || target}:\n${msg}\n`)
-  }
+  const smsNotify = notifyDefault
   ;(async () => {
     if (cmd === 'escalate') console.log(JSON.stringify(await escalate(db, a1, smsNotify), null, 2))
     else if (cmd === 'expire') console.log(JSON.stringify(await expire(db, a1, smsNotify), null, 2))

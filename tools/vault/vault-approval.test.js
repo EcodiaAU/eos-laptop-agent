@@ -33,7 +33,7 @@ async function armedTask(id, kind) {
     const wake = await armedTask(r1.id, 'wake')
     assert.ok(wake, 'a wake task was armed')
     assert.ok(wake.prompt.includes('update the ledger'), 'the wake carries the task continuation so I resume it')
-    assert.ok(wake.prompt.includes('--pull'), 'the wake tells me to pull the returned data first')
+    assert.ok(wake.prompt.includes('vault-pull.js'), 'the wake tells me to pull the returned data first')
 
     // ---- Path 2: request -> escalate(Helen) -> expire ----
     const r2 = await request(db, { service: 'tate-google', action: 'SSO login', urgency: 'normal', continuation: 'Finish the SSO login flow.' }, notify)
