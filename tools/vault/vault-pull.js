@@ -51,6 +51,18 @@ async function pull(db) {
   const out = []
   for (const row of rows) {
     const msg = row.payload || {}
+    // App Attest rows carry their own Apple attestation (not our result signature); verify
+    // the attestation and record the attested key, then consume.
+    if (row.type === 'attest') {
+      let r = { id: row.id, type: 'attest' }
+      try {
+        const { verifyAttestation } = require('./vault-attest.js')
+        r.attest = await verifyAttestation(db, { keyId: msg.keyId, attestation: msg.attestation, challenge: msg.challenge, bindPubX963: msg.bindPubX963 })
+        r.action = 'attested'
+      } catch (e) { r.action = 'attestation-rejected'; r.error = e.message }
+      await db`UPDATE public.vault_inbox SET consumed_at = now(), sig_verified = ${r.action === 'attested'}, note = ${r.action} WHERE id = ${row.id}`
+      out.push(r); continue
+    }
     const ok = verify(msg)
     let result = { id: row.id, type: row.type, sigVerified: ok }
     if (!ok) {
