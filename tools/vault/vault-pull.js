@@ -51,6 +51,18 @@ async function pull(db) {
   const out = []
   for (const row of rows) {
     const msg = row.payload || {}
+    // Enroll rows carry a sealed credential blob (ciphertext only the phone can open); they
+    // are not signed. Store the blob via the enroll store, then consume.
+    if (row.type === 'enroll') {
+      let r = { id: row.id, type: 'enroll' }
+      try {
+        const { store } = require('./enroll.js')
+        r.stored = store(JSON.stringify({ ...msg, type: 'enroll' }))
+        r.action = 'enrolled'
+      } catch (e) { r.action = 'enroll-failed'; r.error = e.message }
+      await db`UPDATE public.vault_inbox SET consumed_at = now(), note = ${r.action} WHERE id = ${row.id}`
+      out.push(r); continue
+    }
     // App Attest rows carry their own Apple attestation (not our result signature); verify
     // the attestation and record the attested key, then consume.
     if (row.type === 'attest') {
