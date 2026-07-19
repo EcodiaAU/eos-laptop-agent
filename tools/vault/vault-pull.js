@@ -1,0 +1,76 @@
+'use strict'
+// tools/vault/vault-pull.js - the Mac conductor end of the phone->host relay. Reads
+// unconsumed rows from public.vault_inbox (written by the vault-ingest edge function),
+// AUTHORITATIVELY verifies each Secure Enclave signature here on the Mac against the
+// paired key (the relay is not trusted; the signature is), applies verified bank results
+// to the persisted ledger, and marks every row consumed. An unsigned or bad-signature
+// row is consumed as rejected (garbage-collected), never acted on.
+//
+//   node vault-pull.js            pull + apply once
+// Env overrides (for tests, so the real pairing/ledger are never touched):
+//   VAULT_PAIRING=<path>   pairing json (default ~/PRIVATE/ecodia-creds/vault/phone-pairing.json)
+//   VAULT_LEDGER=<path>    ledger json  (default ~/PRIVATE/ecodia-creds/vault/bank-ledger.json)
+const fs = require('fs')
+const path = require('path')
+const os = require('os')
+const crypto = require('crypto')
+const { spkiFromX963, canonical } = require('./inbox.js')
+const { createLedger } = require('./bank-ledger.js')
+
+const VDIR = path.join(os.homedir(), 'PRIVATE', 'ecodia-creds', 'vault')
+const PAIRING = process.env.VAULT_PAIRING || path.join(VDIR, 'phone-pairing.json')
+const LEDGER = process.env.VAULT_LEDGER || path.join(VDIR, 'bank-ledger.json')
+
+function loadJson(f, dflt) { try { return JSON.parse(fs.readFileSync(f, 'utf8')) } catch (_e) { return dflt } }
+function saveJson(f, o) { fs.mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 }); fs.writeFileSync(f, JSON.stringify(o, null, 2), { mode: 0o600 }) }
+
+// Authoritative verify: does this message carry a valid signature from the paired phone?
+function verify(msg) {
+  const pairing = loadJson(PAIRING, null)
+  if (!pairing || !pairing.signing || !msg.sig) return false
+  try {
+    const key = crypto.createPublicKey({ key: spkiFromX963(Buffer.from(pairing.signing, 'base64')), format: 'der', type: 'spki' })
+    return crypto.verify(null, canonical(msg), { key, dsaEncoding: 'der' }, Buffer.from(msg.sig, 'base64'))
+  } catch (_e) { return false }
+}
+
+// Apply a verified bank-statement result to the persisted ledger.
+function applyBankResult(msg) {
+  const state = loadJson(LEDGER, { startingBalance: 0, transactions: [] })
+  const L = createLedger({ startingBalance: state.startingBalance, transactions: state.transactions })
+  const applied = L.applyScrape(Array.isArray(msg.transactions) ? msg.transactions : [])
+  const snap = L.snapshot()
+  saveJson(LEDGER, { startingBalance: snap.startingBalance, transactions: snap.transactions, updatedAt: new Date().toISOString() })
+  const rec = msg.balance != null ? L.reconcile(msg.balance) : null
+  return { added: applied.added, skipped: applied.skipped, runningBalance: applied.runningBalance, reconcile: rec }
+}
+
+async function pull(db) {
+  const rows = await db`SELECT id, type, payload FROM public.vault_inbox WHERE consumed_at IS NULL ORDER BY created_at`
+  const out = []
+  for (const row of rows) {
+    const msg = row.payload || {}
+    const ok = verify(msg)
+    let result = { id: row.id, type: row.type, sigVerified: ok }
+    if (!ok) {
+      result.action = 'rejected (bad or missing signature)'
+    } else if (row.type === 'result' && (msg.kind === 'bank-statement' || msg.service === 'bank')) {
+      result.action = 'applied-to-ledger'
+      result.ledger = applyBankResult(msg)
+    } else {
+      result.action = 'stored'
+    }
+    await db`UPDATE public.vault_inbox SET consumed_at = now(), sig_verified = ${ok}, note = ${result.action} WHERE id = ${row.id}`
+    out.push(result)
+  }
+  return out
+}
+
+module.exports = { pull, verify, applyBankResult }
+
+if (require.main === module) {
+  const lib = require('/Users/ecodia/.code/ecodiaos/backend/continuity/lib.cjs')
+  const db = lib.db()
+  pull(db).then(out => { console.log(JSON.stringify({ pulled: out.length, results: out }, null, 2)); process.exit(0) })
+    .catch(e => { console.error('ERR', e.message); process.exit(1) })
+}
