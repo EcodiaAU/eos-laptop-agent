@@ -14,7 +14,7 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
-const { spkiFromX963, canonical } = require('./inbox.js')
+const { spkiFromX963, canonical, valueBound } = require('./inbox.js')
 const { createLedger } = require('./bank-ledger.js')
 
 const VDIR = path.join(os.homedir(), 'PRIVATE', 'ecodia-creds', 'vault')
@@ -30,7 +30,8 @@ function verify(msg) {
   if (!pairing || !pairing.signing || !msg.sig) return false
   try {
     const key = crypto.createPublicKey({ key: spkiFromX963(Buffer.from(pairing.signing, 'base64')), format: 'der', type: 'spki' })
-    return crypto.verify(null, canonical(msg), { key, dsaEncoding: 'der' }, Buffer.from(msg.sig, 'base64'))
+    const sigOk = crypto.verify(null, canonical(msg), { key, dsaEncoding: 'der' }, Buffer.from(msg.sig, 'base64'))
+    return sigOk && valueBound(msg)   // a swapped value (hash mismatch) fails even with a valid sig
   } catch (_e) { return false }
 }
 

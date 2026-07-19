@@ -31,8 +31,8 @@ function handle(pathname, body) {
     }
     return { status: 404, json: { error: 'unknown vault path: ' + pathname } }
   } catch (e) {
-    // a signature failure is an auth failure (401), not a malformed request (400)
-    const status = /signature/i.test(e.message) ? 401 : 400
+    // a signature OR value-binding failure is an integrity/auth failure (401)
+    const status = /signature|not bound/i.test(e.message) ? 401 : 400
     return { status, json: { error: e.message } }
   }
 }

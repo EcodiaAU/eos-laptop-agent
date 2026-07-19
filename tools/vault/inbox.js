@@ -37,9 +37,20 @@ function spkiFromX963(x963) {
 }
 
 function canonical(msg) {
-  // sign over everything except the signature field, key-sorted for determinism.
-  const { sig, ...rest } = msg
+  // Sign over everything except the signature AND the free-text `value`. The value is bound
+  // by its hash (`valueSha256`, hex, ASCII-safe) which STAYS in the canonical, so the signed
+  // bytes never contain arbitrary scraped text - eliminating any JSON-escaping divergence
+  // between the phone's serializer and this one. Key-sorted for determinism.
+  const { sig, value, ...rest } = msg
   return Buffer.from(JSON.stringify(rest, Object.keys(rest).sort()))
+}
+
+// A value-bearing message must carry a matching valueSha256, or the value is unsigned and
+// could be swapped. Absent value = nothing to bind. This is checked alongside the signature.
+function valueBound(msg) {
+  if (msg.value == null) return true
+  if (!msg.valueSha256) return false
+  return crypto.createHash('sha256').update(String(msg.value)).digest('hex') === msg.valueSha256
 }
 
 function receive(json) {
@@ -48,6 +59,7 @@ function receive(json) {
   let sigOk = null
   if (msg.sig) sigOk = verifySig(canonical(msg), msg.sig)
   if (sigOk === false) throw new Error('signature INVALID - message rejected (not from the paired phone)')
+  if (sigOk && !valueBound(msg)) throw new Error('value not bound by valueSha256 - message rejected (value could be swapped)')
   const box = load(INBOX) || { messages: [] }
   box.messages.push({ ...msg, sigVerified: sigOk, receivedAt: new Date().toISOString() })
   save(box)
@@ -60,7 +72,7 @@ function read(type) {
   return msgs
 }
 
-module.exports = { spkiFromX963, canonical, verifySig, receive, read }
+module.exports = { spkiFromX963, canonical, verifySig, receive, read, valueBound }
 
 if (require.main === module) {
   const [cmd, a1] = process.argv.slice(2)

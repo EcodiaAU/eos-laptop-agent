@@ -34,16 +34,17 @@ function post(port, pathname, body) {
   const srv = channel.serve(8791)
   await new Promise(r => setTimeout(r, 150))
 
-  // 1. A genuine phone-signed result: the phone scraped the balance and signed it.
-  const msg = { type: 'result', service: 'bank', field: 'balance', value: '4231.07', ts: '2026-07-19' }
+  // 1. A genuine phone-signed result: the phone scraped the balance, hash-bound the value, signed it.
+  const msg = { type: 'result', service: 'bank', field: 'balance', value: '4231.07', valueSha256: crypto.createHash('sha256').update('4231.07').digest('hex'), ts: '2026-07-19' }
   const sig = crypto.sign(null, canonical(msg), { key: privateKey, dsaEncoding: 'der' }).toString('base64')
   let r = await post(8791, '/vault/result', { ...msg, sig })
   assert.strictEqual(r.status, 200, 'signed result accepted')
   assert.strictEqual(r.json.sigVerified, true, 'signature verified by paired phone')
 
-  // 2. A tampered result (value changed, old signature) must be rejected.
+  // 2. A tampered value (old sig + old hash) must be rejected - the sig excludes value, so the
+  // HASH BINDING is what catches the swap. Integrity failure -> 401.
   r = await post(8791, '/vault/result', { ...msg, value: '999999.00', sig })
-  assert.strictEqual(r.status, 401, 'tampered result rejected')
+  assert.strictEqual(r.status, 401, 'tampered value rejected by hash binding')
 
   // 3. An enrollment blob stores (ciphertext only; host cannot open it).
   r = await post(8791, '/vault/enroll', { service: 'demo', origin: 'https://x.test', username: 'u', blob: 'AAAA' })
