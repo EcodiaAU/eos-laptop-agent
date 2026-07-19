@@ -60,6 +60,15 @@ async function pull(db) {
     } else {
       result.action = 'stored'
     }
+    // If this verified result answers a pending approval, mark it approved (arms the WAKE
+    // that re-opens the conductor with the task continuation - so an approval that lands
+    // hours later resumes the task instead of it dying while I was asleep).
+    if (ok && msg.requestId) {
+      try {
+        const { approve } = require('./vault-approval.js')
+        result.approval = await approve(db, msg.requestId, msg.approvedBy || 'tate')
+      } catch (e) { result.approvalError = e.message }
+    }
     await db`UPDATE public.vault_inbox SET consumed_at = now(), sig_verified = ${ok}, note = ${result.action} WHERE id = ${row.id}`
     out.push(result)
   }
