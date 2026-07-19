@@ -26,7 +26,7 @@ function store(json) {
 
 function toUrlB64(b64) { return b64.replace(/\+/g, '-').replace(/\//g, '_') }
 
-function loginLink(service, uSel, pSel, sSel, submit) {
+function loginLink(service, uSel, pSel, sSel, submit, opts = {}) {
   const all = load()
   const key = String(service).toLowerCase().replace(/[\s_]+/g, '-')
   const e = all[key]
@@ -38,6 +38,11 @@ function loginLink(service, uSel, pSel, sSel, submit) {
     sSel: sSel || 'button[type=submit],input[type=submit]',
     submit: (submit == null ? '1' : String(submit)),
   })
+  // Approval + scrape-return: if a requestId + scrapeSel are given, the phone will scrape
+  // ONLY that field after login, sign it, and POST it back to answer the approval.
+  if (opts.requestId) params.set('requestId', opts.requestId)
+  if (opts.scrapeSel) params.set('scrapeSel', opts.scrapeSel)
+  params.set('service', e.service || service)
   return 'eosvault://login?' + params.toString()
 }
 
