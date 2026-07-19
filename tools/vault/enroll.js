@@ -41,10 +41,14 @@ function loginLink(service, uSel, pSel, sSel, submit) {
   return 'eosvault://login?' + params.toString()
 }
 
-const [cmd, a1, a2, a3, a4, a5] = process.argv.slice(2)
-try {
-  if (cmd === 'store') console.log(JSON.stringify(store(a1), null, 2))
-  else if (cmd === 'login') console.log(loginLink(a1, a2, a3, a4, a5))
-  else if (cmd === 'list') { const all = load(); console.log(Object.values(all).map(e => `${e.service} | ${e.origin} | ${e.username} | enrolled ${e.enrolledAt}`).join('\n') || '(none enrolled)') }
-  else console.log('usage: enroll.js store <json> | login <service> [uSel pSel sSel submit] | list')
-} catch (e) { console.error('ERR', e.message); process.exit(1) }
+module.exports = { store, loginLink, load }
+
+if (require.main === module) {
+  const [cmd, a1, a2, a3, a4, a5] = process.argv.slice(2)
+  try {
+    if (cmd === 'store') console.log(JSON.stringify(store(a1), null, 2))
+    else if (cmd === 'login') console.log(loginLink(a1, a2, a3, a4, a5))
+    else if (cmd === 'list') { const all = load(); console.log(Object.values(all).map(e => `${e.service} | ${e.origin} | ${e.username} | enrolled ${e.enrolledAt}`).join('\n') || '(none enrolled)') }
+    else console.log('usage: enroll.js store <json> | login <service> [uSel pSel sSel submit] | list')
+  } catch (e) { console.error('ERR', e.message); process.exit(1) }
+}
