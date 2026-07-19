@@ -32,11 +32,15 @@ async function armTask(db, name, prompt, whenIso, priority) {
            VALUES ('delayed', ${name}, ${prompt}, ${whenIso}, ${whenIso}, 'active', 1, 'inherit_fork', ${priority || 3})`
 }
 
-async function request(db, { service, action, urgency = 'normal', continuation }, notify, now = new Date()) {
+async function request(db, { service, action, urgency = 'normal', continuation, replyTo }, notify, now = new Date()) {
   if (!service || !action || !continuation) throw new Error('request needs {service, action, continuation}')
   const primary = deadlineFrom(now, urgency)
-  const row = (await db`INSERT INTO public.vault_approvals (service, action, urgency, continuation, primary_deadline)
-                        VALUES (${service}, ${action}, ${urgency}, ${continuation}, ${primary.toISOString()}) RETURNING id`)[0]
+  // replyTo = the coord topic of the session that should resume when approved. Default the
+  // persistent conductor, so an approved result lands in the live chat, not a fresh tab. A
+  // scheduled worker passes its own tab inbox topic.
+  const reply = replyTo || 'chat.conductor.inbox'
+  const row = (await db`INSERT INTO public.vault_approvals (service, action, urgency, continuation, primary_deadline, reply_to)
+                        VALUES (${service}, ${action}, ${urgency}, ${continuation}, ${primary.toISOString()}, ${reply}) RETURNING id`)[0]
   await notify('tate', `Approval needed: ${action} for ${service} (${urgency}). Open Friend to approve. ref ${row.id.slice(0, 8)}`)
   // arm the escalation-to-Helen timer at the primary deadline
   await armTask(db, `cowork.vault-escalate.${row.id}`,
@@ -45,20 +49,46 @@ async function request(db, { service, action, urgency = 'normal', continuation }
   return { id: row.id, primary_deadline: primary.toISOString() }
 }
 
-// Called by the puller when a signed approval result lands. Marks approved + arms the WAKE.
+// Inject a continuation into the RUNNING conductor session via the coord inbox (the same
+// path inbound SMS/Telegram use to land as a turn - reflex/coord, no new tab). Returns true
+// if the coord server accepted the write. Best-effort; the deadman wake is the fallback.
+async function injectToConductor(topic, body) {
+  const fs = require('fs')
+  let token = ''
+  try { token = ((fs.readFileSync('/Users/ecodia/.code/eos-laptop-agent/.env', 'utf8').match(/AGENT_TOKEN=(.+)/) || [])[1] || '').trim() } catch (_e) {}
+  const payload = JSON.stringify({ tool: 'coord.send_message', params: { to: topic, body } })
+  return await new Promise((resolve) => {
+    const req = require('http').request({ host: '127.0.0.1', port: 7456, path: '/api/tool', method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + token, 'content-length': Buffer.byteLength(payload) } },
+      (res) => { let s = ''; res.on('data', c => s += c); res.on('end', () => resolve(res.statusCode === 200 && !/error/i.test(s))) })
+    req.on('error', () => resolve(false)); req.write(payload); req.end()
+  })
+}
+
+// Called by the puller when a signed approval result lands. Marks approved, then INJECTS the
+// continuation into the running session that requested it (no new tab); a deadman new-tab wake
+// is armed only as a fallback for when that session has already ended.
 async function approve(db, requestId, by = 'tate', now = new Date()) {
-  const rows = await db`SELECT id, service, action, continuation, status FROM public.vault_approvals WHERE id = ${requestId}`
+  const rows = await db`SELECT id, service, action, continuation, status, reply_to FROM public.vault_approvals WHERE id = ${requestId}`
   if (!rows.length) throw new Error('no such approval ' + requestId)
   const a = rows[0]
   if (a.status === 'approved') return { id: a.id, already: true }
   await db`UPDATE public.vault_approvals SET status='approved', approver=${by}, resolved_at=now() WHERE id=${requestId}`
-  // WAKE: re-open the conductor ~1 min from now with the task's continuation, so I resume.
-  const wakeAt = new Date(now.getTime() + 60_000).toISOString()
   const PULL_TOOL = APPROVAL_TOOL.replace('vault-approval.js', 'vault-pull.js')
+  const cont = `A vault approval was APPROVED by ${by} (${a.action} for ${a.service}). First run: node ${PULL_TOOL} to apply the returned data. Then CONTINUE:\n\n${a.continuation}\n\nWhen done, mark it handled so the fallback wake stands down: node ${APPROVAL_TOOL} handled ${a.id}`
+
+  // PRIMARY: inject into the running session that requested this (default = the conductor).
+  const topic = a.reply_to || 'chat.conductor.inbox'
+  const injected = await injectToConductor(topic, { type: 'done', task_id: a.id, summary: `vault approval approved: ${a.action} for ${a.service}`, text: cont })
+
+  // FALLBACK: a deadman new-tab wake. It stands down if the running session handled the inject
+  // (handled_in_session=true); it only re-opens a fresh tab when the session was already gone.
+  // Give an injected session longer before the deadman checks (it needs time to act).
+  const wakeAt = new Date(now.getTime() + (injected ? 8 : 1) * 60_000).toISOString()
   await armTask(db, `cowork.vault-wake.${a.id}`,
-    `A vault approval you were waiting on was APPROVED by ${by} (${a.action} for ${a.service}). First run: node ${PULL_TOOL}  to apply the signed data the phone returned. Then CONTINUE this task:\n\n${a.continuation}`,
+    `Vault approval ${a.id.slice(0, 8)} follow-up. FIRST check whether the running session already handled it:\n  node -e "const l=require('/Users/ecodia/.code/ecodiaos/backend/continuity/lib.cjs');const db=l.db();db\\\`SELECT handled_in_session h FROM public.vault_approvals WHERE id='${a.id}'\\\`.then(r=>{console.log(r[0]&&r[0].h?'HANDLED':'UNHANDLED');process.exit(0)})"\nIf it prints HANDLED, this was already done in the live session - run coord.close_my_tab and STOP. If UNHANDLED, continue: run node ${PULL_TOOL} then:\n\n${a.continuation}`,
     wakeAt, 1)
-  return { id: a.id, approved_by: by, wake_at: wakeAt }
+  return { id: a.id, approved_by: by, injected, wake_at: wakeAt }
 }
 
 // Fired by the escalation timer at the primary deadline. Only acts if still pending.
@@ -74,6 +104,14 @@ async function escalate(db, requestId, notify, now = new Date()) {
     `A vault approval escalated to the fallback approver may now be expired. Run: node ${APPROVAL_TOOL} expire ${a.id}  and follow its output.`,
     fb.toISOString(), 2)
   return { id: a.id, escalated_to: 'helen', fallback_deadline: fb.toISOString() }
+}
+
+// The live session calls this once it has resumed + finished the continuation, so the deadman
+// new-tab wake stands down instead of re-doing the work in a fresh tab.
+async function markHandled(db, requestId) {
+  await db`UPDATE public.vault_approvals SET handled_in_session = true WHERE id = ${requestId}`
+  await db`UPDATE os_scheduled_tasks SET status='cancelled', archived_at=now() WHERE name = ${'cowork.vault-wake.' + requestId} AND status='active'`
+  return { id: requestId, handled: true }
 }
 
 // Fired by the fallback timer. If still unresolved, expire + tell Tate it lapsed.
@@ -103,7 +141,7 @@ async function notifyDefault(target, msg) {
   return { via: 'surfaced' }
 }
 
-module.exports = { request, approve, escalate, expire, deadlineFrom, armTask, notifyDefault }
+module.exports = { request, approve, escalate, expire, markHandled, injectToConductor, deadlineFrom, armTask, notifyDefault }
 
 if (require.main === module) {
   const [cmd, a1, a2] = process.argv.slice(2)
@@ -113,7 +151,8 @@ if (require.main === module) {
     if (cmd === 'escalate') console.log(JSON.stringify(await escalate(db, a1, smsNotify), null, 2))
     else if (cmd === 'expire') console.log(JSON.stringify(await expire(db, a1, smsNotify), null, 2))
     else if (cmd === 'approve') console.log(JSON.stringify(await approve(db, a1, a2 || 'tate'), null, 2))
-    else console.log('usage: vault-approval.js escalate <id> | expire <id> | approve <id> [by]')
+    else if (cmd === 'handled') console.log(JSON.stringify(await markHandled(db, a1), null, 2))
+    else console.log('usage: vault-approval.js escalate <id> | expire <id> | approve <id> [by] | handled <id>')
     process.exit(0)
   })().catch(e => { console.error('ERR', e.message); process.exit(1) })
 }
