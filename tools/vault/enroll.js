@@ -42,6 +42,7 @@ function loginLink(service, uSel, pSel, sSel, submit, opts = {}) {
   // ONLY that field after login, sign it, and POST it back to answer the approval.
   if (opts.requestId) params.set('requestId', opts.requestId)
   if (opts.scrapeSel) params.set('scrapeSel', opts.scrapeSel)
+  if (opts.manualRead) params.set('manualRead', '1')   // bank/OTP: user taps "Read now" after the code
   params.set('service', e.service || service)
   return 'eosvault://login?' + params.toString()
 }
