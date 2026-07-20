@@ -49,7 +49,7 @@ function signed(msg) {
     assert.strictEqual(r.status, 401, 'wrong ingest secret rejected 401')
 
     // 2. Real secret + a genuine phone-signed bank statement -> 200 + id.
-    const stmt = signed({ type: 'result', service: 'bank', kind: 'bank-statement', transactions: [{ date: '2026-07-19', description: 'Woolworths', amount: -63.40 }], balance: '436.60', ts: '2026-07-19' })
+    const stmt = signed({ type: 'result', service: 'bank', kind: 'bank-statement', transactions: [{ date: '2026-07-19', description: 'Woolworths', amount: -63.40 }], balance: '436.60', ts: new Date().toISOString() })
     r = await postFn(SECRET, { type: 'result', payload: stmt })
     assert.strictEqual(r.status, 200, 'signed statement accepted by the live function')
     assert.ok(r.json.id, 'function returned a row id')

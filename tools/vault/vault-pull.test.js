@@ -40,7 +40,7 @@ function signed(msg) {
         { date: '2026-07-18', description: 'Coles', amount: -42.10 },
         { date: '2026-07-18', description: 'Salary', amount: 2500.00 },
       ],
-      balance: '3457.90', ts: '2026-07-19',
+      balance: '3457.90', ts: new Date().toISOString(),
     })
     let r = await db`INSERT INTO public.vault_inbox (type, payload) VALUES ('result', ${db.json(stmt)}) RETURNING id`
     ids.push(r[0].id)

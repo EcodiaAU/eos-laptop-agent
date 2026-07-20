@@ -51,6 +51,24 @@ async function pairedKeyIsAttested(db) {
   } catch (_e) { return false }
 }
 
+// Freshness: the signed `ts` (inside the canonical, so an attacker cannot change it without
+// breaking the signature) must be recent - a captured old result cannot be replayed later.
+// ts-less messages skip this (dedup-by-sig still applies). Rejects future-dated too.
+function isFresh(msg, maxAgeMin = 15) {
+  if (!msg.ts) return true
+  const t = Date.parse(msg.ts)
+  if (Number.isNaN(t)) return true
+  const now = Date.now()
+  return (now - t) <= maxAgeMin * 60_000 && t <= now + 5 * 60_000
+}
+
+// Replay: has this EXACT signature already been consumed? An identical re-post is a replay.
+async function sigAlreadySeen(db, sig, thisId) {
+  if (!sig) return false
+  const r = await db`SELECT 1 FROM public.vault_inbox WHERE payload->>'sig' = ${sig} AND consumed_at IS NOT NULL AND id != ${thisId} LIMIT 1`
+  return r.length > 0
+}
+
 // Apply a verified bank-statement result to the persisted ledger.
 function applyBankResult(msg) {
   const state = loadJson(LEDGER, { startingBalance: 0, transactions: [] })
@@ -96,12 +114,19 @@ async function pull(db) {
       out.push(r); continue
     }
     const sigOk = verify(msg)
-    const ok = sigOk && attested   // trusted only if the signature is valid AND the key is attested hardware
+    const fresh = isFresh(msg)
+    const replay = sigOk ? await sigAlreadySeen(db, msg.sig, row.id) : false
+    // trusted only if: valid signature AND attested hardware AND fresh AND not a replay
+    const ok = sigOk && attested && fresh && !replay
     let result = { id: row.id, type: row.type, sigVerified: sigOk, attested }
     if (!sigOk) {
       result.action = 'rejected (bad or missing signature)'
     } else if (!attested) {
       result.action = 'rejected (paired key not App-Attested genuine hardware)'
+    } else if (!fresh) {
+      result.action = 'rejected (stale - signed ts too old or future-dated)'
+    } else if (replay) {
+      result.action = 'rejected (replay - this signature was already consumed)'
     } else if (row.type === 'result' && (msg.kind === 'bank-statement' || msg.service === 'bank')) {
       result.action = 'applied-to-ledger'
       result.ledger = applyBankResult(msg)
@@ -123,7 +148,7 @@ async function pull(db) {
   return out
 }
 
-module.exports = { pull, verify, applyBankResult, pairedKeyIsAttested }
+module.exports = { pull, verify, applyBankResult, pairedKeyIsAttested, isFresh, sigAlreadySeen }
 
 if (require.main === module) {
   const lib = require('/Users/ecodia/.code/ecodiaos/backend/continuity/lib.cjs')
