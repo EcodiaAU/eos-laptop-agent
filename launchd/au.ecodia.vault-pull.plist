@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>au.ecodia.vault-pull</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/ecodia/.code/eos-laptop-agent/tools/vault/vault-pull.js</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/ecodia/.code/eos-laptop-agent</string>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/ecodia/Library/Logs/ecodiaos/vault-pull.log</string>
+  <key>StandardErrorPath</key><string>/Users/ecodia/Library/Logs/ecodiaos/vault-pull.log</string>
+</dict></plist>
