@@ -130,6 +130,18 @@ async function pull(db) {
     } else if (row.type === 'result' && (msg.kind === 'bank-statement' || msg.service === 'bank')) {
       result.action = 'applied-to-ledger'
       result.ledger = applyBankResult(msg)
+    } else if (row.type === 'session') {
+      // SESSION TRANSFER: the phone logged into a Mac-SSO origin (tate@ Google),
+      // captured its WKHTTPCookieStore cookies, sealed them to the host recipient
+      // pubkey, signed, and POSTed. Only reached when the full trust gate passed
+      // (sig + attest + fresh + !replay) - a transferred session is at least as
+      // sensitive as a bank result. Open the sealed bundle + inject into canonical
+      // Chrome so the Mac is logged in. Host gets a REVOCABLE session, never the pw.
+      try {
+        const { applySession } = require('./vault-session.js')
+        result.session = await applySession(msg)
+        result.action = 'session-injected'
+      } catch (e) { result.action = 'session-inject-failed: ' + e.message }
     } else {
       result.action = 'stored'
     }
