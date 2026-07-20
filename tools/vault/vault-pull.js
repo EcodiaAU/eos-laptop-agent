@@ -35,6 +35,22 @@ function verify(msg) {
   } catch (_e) { return false }
 }
 
+// App Attest ENFORCEMENT: the paired signing key is only trusted if Apple attested it is a
+// genuine Secure-Enclave key on a real device running our app. Without this, a software
+// impostor key paired through a compromised step would pass signature verification. The bind
+// requires a vault_attested_keys row whose bound_signing_x963 equals the paired signing key
+// (i.e. the App Attest ceremony committed to THIS exact key), with a real App Attest aaguid.
+async function pairedKeyIsAttested(db) {
+  const pairing = loadJson(PAIRING, null)
+  if (!pairing || !pairing.signing) return false
+  if (process.env.VAULT_SKIP_ATTEST === '1') return true   // tests inject their own pairing
+  try {
+    const r = await db`SELECT 1 FROM public.vault_attested_keys
+                       WHERE bound_signing_x963 = ${pairing.signing} AND aaguid IN ('appattest', 'appattestdevelop') LIMIT 1`
+    return r.length > 0
+  } catch (_e) { return false }
+}
+
 // Apply a verified bank-statement result to the persisted ledger.
 function applyBankResult(msg) {
   const state = loadJson(LEDGER, { startingBalance: 0, transactions: [] })
@@ -49,6 +65,10 @@ function applyBankResult(msg) {
 async function pull(db) {
   const rows = await db`SELECT id, type, payload FROM public.vault_inbox WHERE consumed_at IS NULL ORDER BY created_at`
   const out = []
+  // App Attest is a PRECONDITION for trusting any signed result: the paired key must be proven
+  // genuine Secure-Enclave hardware. Computed once per pull. (enroll + attest rows are exempt -
+  // attest is how a key BECOMES trusted; enroll is ciphertext the host cannot use anyway.)
+  const attested = await pairedKeyIsAttested(db)
   for (const row of rows) {
     const msg = row.payload || {}
     // Enroll rows carry a sealed credential blob (ciphertext only the phone can open); they
@@ -75,10 +95,13 @@ async function pull(db) {
       await db`UPDATE public.vault_inbox SET consumed_at = now(), sig_verified = ${r.action === 'attested'}, note = ${r.action} WHERE id = ${row.id}`
       out.push(r); continue
     }
-    const ok = verify(msg)
-    let result = { id: row.id, type: row.type, sigVerified: ok }
-    if (!ok) {
+    const sigOk = verify(msg)
+    const ok = sigOk && attested   // trusted only if the signature is valid AND the key is attested hardware
+    let result = { id: row.id, type: row.type, sigVerified: sigOk, attested }
+    if (!sigOk) {
       result.action = 'rejected (bad or missing signature)'
+    } else if (!attested) {
+      result.action = 'rejected (paired key not App-Attested genuine hardware)'
     } else if (row.type === 'result' && (msg.kind === 'bank-statement' || msg.service === 'bank')) {
       result.action = 'applied-to-ledger'
       result.ledger = applyBankResult(msg)
@@ -100,7 +123,7 @@ async function pull(db) {
   return out
 }
 
-module.exports = { pull, verify, applyBankResult }
+module.exports = { pull, verify, applyBankResult, pairedKeyIsAttested }
 
 if (require.main === module) {
   const lib = require('/Users/ecodia/.code/ecodiaos/backend/continuity/lib.cjs')

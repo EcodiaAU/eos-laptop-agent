@@ -2,6 +2,7 @@
 // E2E against the REAL substrate vault_inbox table, but with a throwaway pairing + ledger
 // (env overrides) so the real ones are never touched. Inserts rows the way the edge
 // function would, runs the puller, asserts verify+apply+reject, then deletes the test rows.
+process.env.VAULT_SKIP_ATTEST = '1'
 const assert = require('assert')
 const crypto = require('crypto')
 const fs = require('fs')

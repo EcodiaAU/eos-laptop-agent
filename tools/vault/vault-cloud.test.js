@@ -2,6 +2,7 @@
 // LIVE cloud E2E: posts through the deployed vault-ingest edge function, then pulls +
 // applies on the Mac. Throwaway pairing/ledger so nothing real is touched; cleans up its
 // row. Reads the ingest secret from disk at runtime (never embeds/prints it).
+process.env.VAULT_SKIP_ATTEST = '1'
 const assert = require('assert')
 const crypto = require('crypto')
 const fs = require('fs')
