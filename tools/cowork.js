@@ -969,23 +969,28 @@ async function kill_worker(params) {
           + '|exact=' + (exactLabel || 'null')
           + '|fp=' + (fingerprintReason || (tab_handle.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + tab_handle.viewColumn
-      } else if (foundExact.active === true) {
-        // 2026-07-21 conductor / active-tab close guard (kill_worker). The prior
-        // 2026-07-21 fix added the active-tab belt to cleanup_orphan_workers (7-min
-        // cadence) but NOT here, so kill_worker's tier-(d) autotitle-fingerprint
-        // match (and any label/tabIndex tier) could still resolve to the conductor's
-        // LIVE tab and close it. kill_worker fires on EVERY worker completion
-        // (scheduler.markComplete -> completionPass every 5s), on EVERY signal_bound
-        // -timeout orphan (dispatchOne, ~90s), and is replayed in bursts on agent
-        // restart - the 5s-90s cadence behind the "conductor closes every ~1 min"
-        // report. A just-completed / orphaned worker's process has already exited
-        // and its tab sits backgrounded; it is NEVER the focused (active) tab. So
-        // the active tab is always either the conductor Tate is typing in or a live
-        // worker mid-task - refusing to close it can only ever spare a live session.
-        // Leaking a cosmetic ghost tab is strictly preferable to killing Tate's chat.
-        // Doctrine: coord-kill-worker-needs-active-tab-guard-like-cleanup-2026-07-21.
-        refused = 'active_tab_protected:matchedBy=' + matchedBy + '|label=' + foundExact.label
-        try { process.stderr.write('[coord] kill_worker SKIPPED active tab (conductor or live worker, never a dead orphan): label="' + foundExact.label + '" matchedBy=' + matchedBy + ' tab_id=' + tab_id + '\n') } catch (e2) {}
+      } else {
+        // 2026-07-21 close-safety guard (kill_worker), THIRD + complete fix.
+        // The prior two 2026-07-21 fixes added an ACTIVE-tab belt here and in
+        // cleanup, but that belt spares only the ONE focused tab. Tate keeps many
+        // backgrounded human chats ("Ecodia Site", "DayCrew", ...) and the tier-(d)
+        // autotitle-fingerprint match resolves an ecodia-site worker's brief tokens
+        // onto the backgrounded "Ecodia Site" chat (hits>=2, cov=1.0, decisive) and
+        // closes it. kill_worker fires on EVERY completion / orphan (5-90s) -> the
+        // "conductor closes every ~1 min" report. The complete fix: a close may
+        // fire ONLY on a POSITIVE worker identity (sentinel / confirmed tabIndex /
+        // exact spawn label). A fuzzy fingerprint match can never OS-close - it
+        // cannot tell an autotitled dead worker from a topic-named human chat.
+        // Belts: active tab, registered-conductor label, fuzzy-refusal. Better
+        // leak a ghost tab than close Tate's live chat.
+        // Doctrine: coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
+        const closeGuard = require('./tab-close-guard')
+        let conductorRow = null
+        try { conductorRow = coord._loadConductorRegistration ? coord._loadConductorRegistration() : null } catch (e2) {}
+        const decision = closeGuard.evaluateClose(matchedBy, foundExact, conductorRow)
+        if (!decision.allow) {
+          refused = decision.reason + ':matchedBy=' + matchedBy + '|label=' + foundExact.label
+          try { process.stderr.write('[coord] kill_worker REFUSED close (' + decision.reason + '): label="' + foundExact.label + '" matchedBy=' + matchedBy + ' tab_id=' + tab_id + '\n') } catch (e3) {}
       } else {
         // 2026-06-25 multi-close fix (mirrors coord.close_my_tab). ALWAYS send
         // the CURRENT index of the matched tab. foundExact came from the fresh
@@ -1011,6 +1016,7 @@ async function kill_worker(params) {
         const closeResult = await ide.tabs_close(closeReq)
         const inner = (closeResult && closeResult.result) || closeResult || {}
         closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+        }
       }
     }
   } catch (e) {
@@ -1202,35 +1208,27 @@ async function cleanup_orphan_workers(params) {
       continue
     }
 
-    // 2026-07-21 conductor / active-tab close guard. Even after a positive
-    // match, refuse to close a tab that is currently ACTIVE (focused). The
-    // focused CC chat tab is either the conductor Tate is working in or a live
-    // worker mid-task - NEVER a dead orphan whose process has already exited.
-    // A dead worker's tab sits backgrounded; it is never the active tab. This is
-    // the decisive belt against the collateral conductor-close the 2026-07-21
-    // brief was raised for: a stale fingerprint / tabIndex collision that would
-    // otherwise land on the live conductor. Leaking a cosmetic ghost orphan tab
-    // is strictly preferable to killing Tate's session.
-    if (match.active === true) {
-      try { process.stderr.write('[coord-cleanup] skipped ACTIVE tab (conductor or live worker, never a dead orphan): label="' + match.label + '" vc=' + vc + ' strategy=' + strategy + '\n') } catch (e) {}
-      results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'active_tab_protected', label: match.label, strategy: strategy, viewColumn: vc })
+    // 2026-07-21 close-safety guard (cleanup_orphan_workers), THIRD + complete
+    // fix. Route the resolved match through the shared positive-identity guard.
+    // It refuses three ways, in precedence: (1) the ACTIVE (focused) tab - never
+    // a dead orphan; (2) the registered-conductor label (teeth once title_match
+    // is a real string); (3) THE load-bearing belt - any FUZZY autotitle-
+    // fingerprint match (strategy 'autotitle_fingerprint'), which provably cannot
+    // tell an autotitled dead-worker tab from Tate's topic-named human chats
+    // ("Ecodia Site" vs an ecodia-site worker brief). Positive tiers
+    // (tabIndex / sentinel_prefix) still close, so genuine leaked worker tabs are
+    // still reclaimed. Leaking a cosmetic ghost tab beats closing Tate's chat.
+    // Doctrine: coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
+    let conductorRowForGuard = null
+    try {
+      const coordMod = require('./coord')
+      conductorRowForGuard = coordMod._loadConductorRegistration && coordMod._loadConductorRegistration()
+    } catch (e) {}
+    const closeDecision = require('./tab-close-guard').evaluateClose(strategy, match, conductorRowForGuard)
+    if (!closeDecision.allow) {
+      try { process.stderr.write('[coord-cleanup] REFUSED close (' + closeDecision.reason + '): label="' + match.label + '" vc=' + vc + ' strategy=' + strategy + '\n') } catch (e) {}
+      results.push({ tab_id: worker.tab_id, action: 'leak', reason: closeDecision.reason, label: match.label, strategy: strategy, viewColumn: vc })
       continue
-    }
-    // Also refuse if the matched tab is attributable to the registered conductor
-    // by label (registration may carry a title_match once the conductor records
-    // one; empty string never matches so this is a no-op until then).
-    if (conductorTabId) {
-      let conductorLabel = null
-      try {
-        const coordMod = require('./coord')
-        const c = coordMod._loadConductorRegistration && coordMod._loadConductorRegistration()
-        if (c && c.title_match && String(c.title_match).trim()) conductorLabel = String(c.title_match).trim()
-      } catch (e) {}
-      if (conductorLabel && match.label && match.label === conductorLabel) {
-        try { process.stderr.write('[coord-cleanup] skipped registered conductor tab by label="' + match.label + '" vc=' + vc + '\n') } catch (e) {}
-        results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'conductor_label_protected', label: match.label, strategy: strategy, viewColumn: vc })
-        continue
-      }
     }
 
     if (dry_run) {

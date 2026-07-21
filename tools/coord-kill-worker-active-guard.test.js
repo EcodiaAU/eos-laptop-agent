@@ -56,6 +56,48 @@ const assert = (cond, msg) => { if (cond) { console.log('  PASS: ' + msg) } else
   assert(r2.closed === true, 'backgrounded orphan tab IS closed (guard is targeted, not a blanket refuse)')
   assert(closeCalls === 1, 'ide.tabs_close fired exactly once for the dead orphan (got ' + closeCalls + ')')
 
+  // ── 2026-07-21 THIRD FIX regression: fuzzy autotitle-fingerprint must NEVER close ──
+  // This is the failure the two prior 2026-07-21 fixes MISSED. Tate keeps many
+  // BACKGROUNDED human-named chats ("Ecodia Site"). A completing ecodia-site
+  // worker's autotitle_fingerprint (tokens ecodia/site/rebuild) scores that chat
+  // hits=2 cov=1.0 and, before this fix, closed it - every 5-90s. The active-tab
+  // belt does NOT catch it because the human chat is backgrounded. A positive-id
+  // guard must refuse the fuzzy match. OLD CODE (active-only belt): closes it
+  // (active=false) -> test FAILS. NEW CODE: refuses -> test PASSES.
+  const writeFuzzyWorker = (tab) => fs.writeFileSync(path.join(WORKERS_DIR, tab + '.json'), JSON.stringify({
+    tab_id: tab, terminated_at: new Date().toISOString(),
+    tab_handle: {
+      viewType: CC_VT, viewColumn: 1, tabIndex: 0,
+      // sentinel + spawn label that will NOT match the live human chat, forcing
+      // resolution down to the fuzzy fingerprint tier (d).
+      sentinel_prefix: 'EOS-W-ecodiasite', label: 'EOS-W-ecodiasite rebuild the ecodia site',
+      autotitle_fingerprint: { v: 1, tokens: ['ecodia', 'site', 'rebuild', 'homepage', 'hero'] },
+    },
+  }, null, 2))
+  // Live window: ONE backgrounded human chat "Ecodia Site" (no sentinel) that
+  // the fingerprint scores decisively. This is Tate's live ecodia.au chat.
+  ide.tabs = async () => ({ groups: [ { viewColumn: 1, tabs: [
+    { viewType: CC_VT, viewColumn: 1, index: 0, label: 'Ecodia Site', active: false },
+  ] } ] })
+  writeFuzzyWorker('tab_ecodiasite'); closeCalls = 0
+  const r3 = await cowork.kill_worker({ tab_id: 'tab_ecodiasite' })
+  assert(r3.closed === false, 'fuzzy fingerprint match on a backgrounded human chat is NOT closed')
+  assert(/fuzzy_fingerprint_refused/.test(r3.refused || ''), 'refused reason is fuzzy_fingerprint_refused (got ' + r3.refused + ')')
+  assert(closeCalls === 0, 'ide.tabs_close was NOT invoked for the fuzzy human-chat match (got ' + closeCalls + ')')
+
+  // Case 4: a genuine worker tab STILL carrying its sentinel, backgrounded, next
+  // to the human chat -> positive sentinel tier closes it (fuzzy-refusal does not
+  // over-block the real cleanup path).
+  writeWorker('tab_worker1')
+  ide.tabs = async () => ({ groups: [ { viewColumn: 1, tabs: [
+    { viewType: CC_VT, viewColumn: 1, index: 0, label: 'Ecodia Site', active: false },
+    { viewType: CC_VT, viewColumn: 1, index: 1, label: SENT + ' audit', active: false },
+  ] } ] })
+  closeCalls = 0
+  const r4 = await cowork.kill_worker({ tab_id: 'tab_worker1' })
+  assert(r4.closed === true, 'positive sentinel-matched backgrounded worker STILL closes (no over-block)')
+  assert(closeCalls === 1, 'ide.tabs_close fired once for the positively-identified worker (got ' + closeCalls + ')')
+
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }) } catch (e) {}
   if (fails === 0) { console.log('ALL TESTS PASSED'); process.exit(0) } else { console.log(fails + ' TEST(S) FAILED'); process.exit(1) }
 })()

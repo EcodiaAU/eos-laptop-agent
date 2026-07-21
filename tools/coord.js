@@ -873,6 +873,21 @@ async function close_my_tab(params, ctx) {
           + '|exact=' + (exactLabel || 'null')
           + '|fp=' + (fingerprintReason || (stored.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ': [' + candLabels + '])'
+      } else if (!require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor).allow) {
+        // 2026-07-21 close-safety guard (close_my_tab), THIRD + complete fix.
+        // Even a worker's OWN self-close must never fire on a FUZZY autotitle-
+        // fingerprint match: if the worker's own tab already autotitled and its
+        // brief tokens collide with one of Tate's topic-named human chats
+        // ("Ecodia Site"), tier (d) could resolve onto that chat and close it
+        // instead of the worker's own tab. Positive tiers (sentinel / confirmed
+        // tabIndex / exact spawn label) still close the worker's own tab. The
+        // shared guard also refuses the active tab and the registered-conductor
+        // label as belts. Better leak the worker's own ghost tab than close
+        // Tate's chat. Doctrine: coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
+        const decision = require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor)
+        refused = decision.reason + ':matchedBy=' + matchedBy + '|label=' + foundExact.label
+        close_strategy = 'refused:' + decision.reason + ':' + matchedBy
+        try { process.stderr.write('[coord] close_my_tab REFUSED (' + decision.reason + '): label="' + foundExact.label + '" matchedBy=' + matchedBy + '\n') } catch (e) {}
       } else {
         // Compose close request. 2026-06-25 multi-close fix: ALWAYS send the
         // CURRENT index of the matched tab, regardless of which tier (a/b/c/d)
@@ -1269,6 +1284,28 @@ async function register_conductor(params, ctx) {
   const ide_pid = params.ide_pid || null
   const ide_bridge_port = params.ide_bridge_port || null
   const workspace_root = params.workspace_root || null
+
+  // 2026-07-21: capture a REAL title_match on Mac. window.foreground() (above)
+  // is a Corazon/Windows path and returns nothing usable here, so title_match
+  // was stored as "" - which made the conductor_label_protected belt in the tab
+  // close paths a permanent no-op. Probe the conductor's own IDE bridge for the
+  // ACTIVE Claude Code chat tab label and store that as title_match. It names
+  // the tab Tate is focused in, giving the label-belt teeth (belt-and-suspenders
+  // with the active-tab and fuzzy-refusal belts; the load-bearing protection for
+  // Tate's OTHER backgrounded chats is the fuzzy-refusal in tab-close-guard).
+  // Doctrine: coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
+  if ((!title_match || !String(title_match).trim()) && ide_bridge_port) {
+    try {
+      const ide = require('./ide')
+      const tr = await ide.tabs({ ide_port: ide_bridge_port })
+      const groups = (tr && (tr.groups || (tr.result && tr.result.groups))) || []
+      const CC_VT = 'mainThreadWebview-claudeVSCodePanel'
+      for (const g of groups) {
+        const act = (g.tabs || []).find(t => t.active && t.viewType === CC_VT)
+        if (act && act.label) { title_match = String(act.label); break }
+      }
+    } catch (e) {}
+  }
 
   const existing = loadConductorRegistration()
   let prior_conductor_tab_id = null
