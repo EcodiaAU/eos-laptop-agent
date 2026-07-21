@@ -969,6 +969,23 @@ async function kill_worker(params) {
           + '|exact=' + (exactLabel || 'null')
           + '|fp=' + (fingerprintReason || (tab_handle.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + tab_handle.viewColumn
+      } else if (foundExact.active === true) {
+        // 2026-07-21 conductor / active-tab close guard (kill_worker). The prior
+        // 2026-07-21 fix added the active-tab belt to cleanup_orphan_workers (7-min
+        // cadence) but NOT here, so kill_worker's tier-(d) autotitle-fingerprint
+        // match (and any label/tabIndex tier) could still resolve to the conductor's
+        // LIVE tab and close it. kill_worker fires on EVERY worker completion
+        // (scheduler.markComplete -> completionPass every 5s), on EVERY signal_bound
+        // -timeout orphan (dispatchOne, ~90s), and is replayed in bursts on agent
+        // restart - the 5s-90s cadence behind the "conductor closes every ~1 min"
+        // report. A just-completed / orphaned worker's process has already exited
+        // and its tab sits backgrounded; it is NEVER the focused (active) tab. So
+        // the active tab is always either the conductor Tate is typing in or a live
+        // worker mid-task - refusing to close it can only ever spare a live session.
+        // Leaking a cosmetic ghost tab is strictly preferable to killing Tate's chat.
+        // Doctrine: coord-kill-worker-needs-active-tab-guard-like-cleanup-2026-07-21.
+        refused = 'active_tab_protected:matchedBy=' + matchedBy + '|label=' + foundExact.label
+        try { process.stderr.write('[coord] kill_worker SKIPPED active tab (conductor or live worker, never a dead orphan): label="' + foundExact.label + '" matchedBy=' + matchedBy + ' tab_id=' + tab_id + '\n') } catch (e2) {}
       } else {
         // 2026-06-25 multi-close fix (mirrors coord.close_my_tab). ALWAYS send
         // the CURRENT index of the matched tab. foundExact came from the fresh
