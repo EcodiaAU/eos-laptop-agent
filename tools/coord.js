@@ -1124,7 +1124,23 @@ function sweepStaleWorkers() {
   let marked = 0
   let unlinked = 0
   let purged = 0
+  // 2026-07-21 conductor-exemption. The interactive conductor tab registers via
+  // register_conductor and emits conductor_heartbeat, NOT a coord WORKER
+  // heartbeat. If a row bearing the conductor's tab_id ever lands in the worker
+  // map (stray register-worker, replayed row, tab_id reuse), the stale-heartbeat
+  // sweep below would mark it terminated + unlink its .spawned marker every
+  // cycle, which the downstream cleanup_orphan_workers close path can then turn
+  // into a real IDE-tab close of the live conductor. A registered conductor is
+  // NEVER a stale worker. Read the registered conductor tab_id once and skip it.
+  // Doctrine: coord-sweep-must-exempt-registered-conductor-tab-2026-07-21,
+  //           grace-timer-must-not-kill-chat-session.
+  let conductorTabId = null
+  try { const c = loadConductorRegistration(); if (c && c.tab_id) conductorTabId = c.tab_id } catch (e) {}
   for (const [tab_id, w] of workers.entries()) {
+    if (conductorTabId && tab_id === conductorTabId) {
+      try { process.stderr.write('[coord-sweep] skipped registered conductor tab ' + tab_id + ' (never a stale worker)\n') } catch (e) {}
+      continue
+    }
     if (w.terminated_at) {
       // Already terminated - ensure .spawned is gone too (cheap idempotent op).
       try {

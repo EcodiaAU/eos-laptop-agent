@@ -1037,6 +1037,24 @@ async function cleanup_orphan_workers(params) {
   const CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
   const cutoffMs = Date.now() - max_age_days * 86_400_000
 
+  // 2026-07-21 conductor-exemption. The interactive conductor tab is NEVER a
+  // dispatched worker and must never be closed by this orphan sweep. Two vectors
+  // to guard: (a) a stray worker row bearing the conductor's tab_id (defensive
+  // candidate exclusion), and (b) collateral tab-close where a tabIndex /
+  // fingerprint / label match resolves to the conductor's LIVE IDE tab. The
+  // 2026-06-25 + 2026-07-17 fixes narrowed the match paths, but the only fully
+  // robust guard is to refuse to close a tab that is (i) the currently-focused
+  // (active) CC chat tab - which is either the conductor Tate is typing in or a
+  // live worker mid-task, never a dead orphan - or (ii) attributable to the
+  // registered conductor identity. Load the conductor tab_id once.
+  // Doctrine: coord-sweep-must-exempt-registered-conductor-tab-2026-07-21.
+  let conductorTabId = null
+  try {
+    const coordMod = require('./coord')
+    const c = coordMod._loadConductorRegistration && coordMod._loadConductorRegistration()
+    if (c && c.tab_id) conductorTabId = c.tab_id
+  } catch (e) {}
+
   // Load candidate orphans from registry
   let files = []
   try { files = fs.readdirSync(WORKERS_DIR).filter(f => f.endsWith('.json')) } catch (e) {}
@@ -1045,6 +1063,11 @@ async function cleanup_orphan_workers(params) {
     const filePath = path.join(WORKERS_DIR, f)
     try {
       const w = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+      // Defensive: a row carrying the conductor's tab_id is not a worker orphan.
+      if (conductorTabId && w.tab_id === conductorTabId) {
+        try { process.stderr.write('[coord-cleanup] skipped registered conductor tab ' + w.tab_id + ' (never a worker orphan)\n') } catch (e2) {}
+        continue
+      }
       if (!w.terminated_at) continue
       if (w.closed_tab_ok === true) continue
       const ts = Date.parse(w.terminated_at)
@@ -1160,6 +1183,37 @@ async function cleanup_orphan_workers(params) {
                      tabIndex: ti, sentinel: sp, viewColumn: vc,
                      candidates_in_col: cands.length })
       continue
+    }
+
+    // 2026-07-21 conductor / active-tab close guard. Even after a positive
+    // match, refuse to close a tab that is currently ACTIVE (focused). The
+    // focused CC chat tab is either the conductor Tate is working in or a live
+    // worker mid-task - NEVER a dead orphan whose process has already exited.
+    // A dead worker's tab sits backgrounded; it is never the active tab. This is
+    // the decisive belt against the collateral conductor-close the 2026-07-21
+    // brief was raised for: a stale fingerprint / tabIndex collision that would
+    // otherwise land on the live conductor. Leaking a cosmetic ghost orphan tab
+    // is strictly preferable to killing Tate's session.
+    if (match.active === true) {
+      try { process.stderr.write('[coord-cleanup] skipped ACTIVE tab (conductor or live worker, never a dead orphan): label="' + match.label + '" vc=' + vc + ' strategy=' + strategy + '\n') } catch (e) {}
+      results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'active_tab_protected', label: match.label, strategy: strategy, viewColumn: vc })
+      continue
+    }
+    // Also refuse if the matched tab is attributable to the registered conductor
+    // by label (registration may carry a title_match once the conductor records
+    // one; empty string never matches so this is a no-op until then).
+    if (conductorTabId) {
+      let conductorLabel = null
+      try {
+        const coordMod = require('./coord')
+        const c = coordMod._loadConductorRegistration && coordMod._loadConductorRegistration()
+        if (c && c.title_match && String(c.title_match).trim()) conductorLabel = String(c.title_match).trim()
+      } catch (e) {}
+      if (conductorLabel && match.label && match.label === conductorLabel) {
+        try { process.stderr.write('[coord-cleanup] skipped registered conductor tab by label="' + match.label + '" vc=' + vc + '\n') } catch (e) {}
+        results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'conductor_label_protected', label: match.label, strategy: strategy, viewColumn: vc })
+        continue
+      }
     }
 
     if (dry_run) {
