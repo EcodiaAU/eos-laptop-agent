@@ -39,10 +39,63 @@ const guard = require('./tab-close-guard')
 })()
 
 // The active belt still fires (focused tab is never a dead orphan), and takes
-// precedence over even a positive strategy.
+// precedence over even a positive strategy - on the SWEEP paths, which pass no
+// opts (kill_worker, cleanup_orphan_workers). This is the 2026-07-21 belt and
+// the self-close exception below must not widen it.
 ;(() => {
   const d = guard.evaluateClose('sentinel_prefix:EOS-W-x', { label: 'EOS-W-x work', active: true }, null)
   assert(d.allow === false && d.reason === 'active_tab_protected', 'active tab is refused even on a positive strategy')
+})()
+
+// ── Self-close exception (2026-07-22) ───────────────────────────────────────
+// coord.close_my_tab passes { selfClose: true }. A worker self-closing is ALWAYS
+// the active tab (it just made a tool call to get there), so the unconditional
+// belt above made close_my_tab impossible and leaked every worker tab. The
+// exception is narrow: POSITIVE strategy only, conductor + fuzzy belts intact.
+
+// The leak case that motivated this: positive + active + selfClose -> ALLOW.
+// Both tiers that real workers were refused on, on 2026-07-22.
+;(() => {
+  const d = guard.evaluateClose('sentinel_prefix:EOS-W-x', { label: 'EOS-W-x work', active: true }, null, { selfClose: true })
+  assert(d.allow === true, 'self-close on sentinel_prefix closes its own active tab (96655d81 leak)')
+})()
+;(() => {
+  const d = guard.evaluateClose('tabIndex+sentinel:5', { label: 'EOS-W-x work', active: true }, null, { selfClose: true })
+  assert(d.allow === true, 'self-close on tabIndex+sentinel closes its own active tab (00c3b66f leak)')
+})()
+
+// The load-bearing belt is UNTOUCHED by the exception: a fuzzy autotitle match
+// is not a positive identity, so selfClose can never let it OS-close a tab.
+// This is the case that closed Tate's chats on 2026-07-21 - it must stay shut.
+;(() => {
+  const d = guard.evaluateClose('autotitle_fingerprint:hits=2/2,cov=1.00', { label: 'Ecodia Site', active: true }, null, { selfClose: true })
+  assert(d.allow === false, 'self-close NEVER admits a fuzzy match, even on the active tab')
+})()
+;(() => {
+  const d = guard.evaluateClose('autotitle_fingerprint:hits=2/2,cov=1.00', { label: 'Ecodia Site', active: false }, null, { selfClose: true })
+  assert(d.allow === false && d.reason === 'fuzzy_fingerprint_refused_not_positive_id', 'self-close backgrounded fuzzy still refused by belt 3')
+})()
+
+// The conductor belt survives the exception: a worker must never close the
+// registered conductor tab, even claiming a positive self-close.
+;(() => {
+  const d = guard.evaluateClose('exact_label:Ecodia Site', { label: 'Ecodia Site', active: true }, { title_match: 'Ecodia Site' }, { selfClose: true })
+  assert(d.allow === false && d.reason === 'conductor_label_protected', 'self-close never closes the registered conductor tab')
+})()
+
+// The sweep paths are unchanged by the new arg: absent/false/empty opts all
+// keep the unconditional belt, so kill_worker and cleanup cannot inherit this.
+;(() => {
+  for (const opts of [undefined, null, {}, { selfClose: false }]) {
+    const d = guard.evaluateClose('sentinel_prefix:EOS-W-x', { label: 'EOS-W-x work', active: true }, null, opts)
+    assert(d.allow === false && d.reason === 'active_tab_protected', 'sweep paths keep the unconditional active belt (opts=' + JSON.stringify(opts) + ')')
+  }
+})()
+
+// A backgrounded positive self-close was already allowed and must stay allowed.
+;(() => {
+  const d = guard.evaluateClose('sentinel_prefix:EOS-W-x', { label: 'EOS-W-x work', active: false }, null, { selfClose: true })
+  assert(d.allow === true, 'backgrounded positive self-close still allowed')
 })()
 
 // The conductor-label belt fires once title_match is a real string (backgrounded,

@@ -705,6 +705,14 @@ async function signal_done(params, ctx) {
 // worker is running inside) via the conductor's IDE bridge. Workers cannot
 // access ide.* MCP directly, so coord proxies it. Best-effort - swallows
 // failures rather than killing the worker arc on a transient IDE-bridge hiccup.
+
+// Passed to tab-close-guard.evaluateClose from THIS file only. close_my_tab is
+// the SELF-close path (see the SELF-only note below): the caller IS the tab it
+// asks to close, so "the tab is focused" carries none of the this-is-a-human-
+// chat evidence it carries on the kill_worker / cleanup_orphan_workers sweeps.
+// The guard still requires a POSITIVE identity strategy before honouring it.
+const GUARD_SELF_CLOSE = Object.freeze({ selfClose: true })
+
 async function close_my_tab(params, ctx) {
   ctx = ctx || {}
   if (!ctx.tab_id) {
@@ -873,7 +881,7 @@ async function close_my_tab(params, ctx) {
           + '|exact=' + (exactLabel || 'null')
           + '|fp=' + (fingerprintReason || (stored.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ': [' + candLabels + '])'
-      } else if (!require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor).allow) {
+      } else if (!require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor, GUARD_SELF_CLOSE).allow) {
         // 2026-07-21 close-safety guard (close_my_tab), THIRD + complete fix.
         // Even a worker's OWN self-close must never fire on a FUZZY autotitle-
         // fingerprint match: if the worker's own tab already autotitled and its
@@ -884,7 +892,13 @@ async function close_my_tab(params, ctx) {
         // shared guard also refuses the active tab and the registered-conductor
         // label as belts. Better leak the worker's own ghost tab than close
         // Tate's chat. Doctrine: coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
-        const decision = require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor)
+        //
+        // 2026-07-22: this path passes GUARD_SELF_CLOSE so the guard's active-tab
+        // belt admits a POSITIVE self-close. Without it the belt refused every
+        // close_my_tab (the caller is always the focused tab, having just made a
+        // tool call) and every worker tab leaked. Fuzzy matches are still refused
+        // by the guard's belt 3, so the paragraph above still holds verbatim.
+        const decision = require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor, GUARD_SELF_CLOSE)
         refused = decision.reason + ':matchedBy=' + matchedBy + '|label=' + foundExact.label
         close_strategy = 'refused:' + decision.reason + ':' + matchedBy
         try { process.stderr.write('[coord] close_my_tab REFUSED (' + decision.reason + '): label="' + foundExact.label + '" matchedBy=' + matchedBy + '\n') } catch (e) {}
