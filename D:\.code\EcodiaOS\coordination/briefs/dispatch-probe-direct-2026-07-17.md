@@ -1,0 +1,1 @@
+[EOS-W-19feb752] You are a dispatch probe. Immediately call coord.signal_done with result_summary dispatch-probe-direct-ok and terminate true, then coord.close_my_tab. Do nothing else.
