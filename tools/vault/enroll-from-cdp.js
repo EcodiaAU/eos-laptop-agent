@@ -81,12 +81,35 @@ async function main() {
   const store = createSeedStore({ keystore: ks, dbPath: VAULT_DB })
   const page = await connect()
   try {
-    // 1. reveal the setup key if it is behind a toggle
-    await page.evaluate(`(() => { const el=[...document.querySelectorAll('button,summary,a')].find(e=>/setup key|can't scan|unable to scan|enter this/i.test(e.innerText||'')); if(el) el.click(); return true })()`)
+    // 1. reveal the setup key if it is behind a toggle. NOTE the apostrophe class:
+    // Google renders "Can’t scan it?" with a CURLY apostrophe (U+2019), so a regex
+    // written with a straight quote never matches and the key is never revealed
+    // (cost a real retry 2026-07-24). Match on "scan" and allow either apostrophe.
+    await page.evaluate(`(() => { const el=[...document.querySelectorAll('button,summary,a,div,center,span')].find(e=>/setup key|can[''’]?t scan|unable to scan|scan it\\?|enter this/i.test(e.innerText||'')); if(el) el.click(); return true })()`)
     await new Promise(r => setTimeout(r, 1200))
     let got = await page.evaluate(EXTRACT)
     if (got.kind === 'none') { await new Promise(r => setTimeout(r, 1500)); got = await page.evaluate(EXTRACT) }
-    if (got.kind === 'none') throw new Error('no otpauth URI or base32 setup key found in the DOM')
+    // 1b. QR-ONLY vendors (Google): the setup key may never appear as DOM text at all -
+    // the only carrier is the QR <img>, whose otpauth:// URI holds the secret. Decode it
+    // IN THE PAGE with Chrome's built-in BarcodeDetector, so the secret reaches only this
+    // process and never the DOM-text scan (nor any transcript). Origin 2026-07-24: code@
+    // Google authenticator enrolment, where every DOM-text strategy above returned none.
+    if (got.kind === 'none') {
+      const uri = await page.evaluate(`(async () => {
+        try {
+          if (!('BarcodeDetector' in window)) return null;
+          const img=[...document.querySelectorAll('img')].find(i=>/^data:image\\/(png|jpeg)/.test(i.src||'')) ||
+                    [...document.querySelectorAll('img')].find(i=>/qr/i.test(i.alt||''));
+          if(!img) return null;
+          const bmp=await createImageBitmap(await (await fetch(img.src)).blob());
+          const codes=await new BarcodeDetector({formats:['qr_code']}).detect(bmp);
+          const v = codes.length ? (codes[0].rawValue||'') : '';
+          return /^otpauth:\\/\\//.test(v) ? v : null;
+        } catch (e) { return null }
+      })()`)
+      if (uri) got = { kind: 'otpauth', value: uri }
+    }
+    if (got.kind === 'none') throw new Error('no otpauth URI or base32 setup key found in the DOM (and no decodable QR)')
 
     // 2. seal into the Enclave + persist. The secret exists only in THIS process.
     // Fingerprint (sha256/8) lets the operator confirm a seed ROTATED without ever

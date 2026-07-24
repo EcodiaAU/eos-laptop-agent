@@ -698,6 +698,20 @@ function _extractSecretFromMirror(raw, credField) {
 // canonical local store) is tried first; a `creds.<x>` key that has no mirror
 // falls back to the live kv_store read via tools/proposed/kv.js.
 // Doctrine: kv-read-creds-helper-and-doctrine-2026-06-08.
+// kv_store holds creds as jsonb, and read_creds can hand back the RAW JSON encoding:
+// a string that still carries its surrounding double quotes. Filling that verbatim
+// types `"secret"` WITH the quotes and the vendor rejects it as a wrong password.
+// Origin 2026-07-24: the code@ Google sign-in filled 26 chars for a 24-char password
+// and Google rejected it three times before a filled-length probe caught the quotes.
+function _unwrapJsonString(s) {
+  if (typeof s !== 'string') return s
+  const t = s.trim()
+  if (t.length >= 2 && t[0] === '"' && t[t.length - 1] === '"') {
+    try { const p = JSON.parse(t); if (typeof p === 'string') return p } catch (_e) { /* not JSON - use raw */ }
+  }
+  return s
+}
+
 async function resolveCredValue(credKey, credField) {
   if (!credKey || typeof credKey !== 'string') throw new Error('credKey (string) required')
   if (/[\/\\]/.test(credKey) && !credKey.endsWith('.json')) {
@@ -718,7 +732,7 @@ async function resolveCredValue(credKey, credField) {
     if (kv && typeof kv.read_creds === 'function') {
       const res = await kv.read_creds({ key: credKey })
       if (res && res.found) {
-        if (typeof res.value === 'string') return res.value
+        if (typeof res.value === 'string') return _unwrapJsonString(res.value)
         if (res.value && typeof res.value === 'object') return _extractSecretFromMirror(JSON.stringify(res.value), credField)
       }
     }
