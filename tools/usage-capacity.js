@@ -12,9 +12,17 @@
 // token capacity means capacity for Tate's development, not licence for the cron fleet to
 // spend it. This tool reports; it never throttles.
 //
+// It probes the vendor LIVE by default rather than reading the poller's cached file. That
+// cache is up to 12 minutes old by design, which is fine for the switch decision (it has a
+// projection term and a ground-truth backstop) but wrong here: this question is asked
+// interactively, rarely, and its entire value is being right at the moment you ask. First
+// run of this tool showed the cache at 57% while the vendor said 60%, a 3-point gap worth
+// about 1.2M tokens. Pass --cached to read the file instead (free, no request).
+//
 // Usage:
 //   node tools/usage-capacity.js                 # can the LIVE account take a normal job
 //   node tools/usage-capacity.js --points 8      # need ~8 percentage points of 5h headroom
+//   node tools/usage-capacity.js --cached        # skip the live probe, read accounts.json
 //   node tools/usage-capacity.js --json          # machine-readable
 //   node tools/usage-capacity.js --selftest
 //
@@ -179,9 +187,37 @@ if (require.main === module) {
   else {
     const i = process.argv.indexOf('--points')
     const points = i > -1 ? Number(process.argv[i + 1]) : undefined
-    const state = require('./usage')._readAccountsState() || {}
-    const a = assess(state, { points })
-    console.log(process.argv.includes('--json') ? JSON.stringify(a, null, 1) : render(a))
-    process.exitCode = a.verdict === 'go' ? 0 : a.verdict === 'switch_first' ? 3 : 1
+    ;(async () => {
+      const state = require('./usage')._readAccountsState() || {}
+      let source = 'cached'
+      if (!process.argv.includes('--cached')) {
+        // Probe every enabled account live, then assess. A probe failure falls back to the
+        // cached row for that account rather than dropping it: a request that did not land
+        // is not evidence an account is full.
+        try {
+          const usageReal = require('./usage-real')
+          const registry = require('./accounts-registry')
+          const live = usageReal._currentLiveShort()
+          state.accounts = state.accounts || {}
+          for (const short of registry.enabled()) {
+            const email = short + '@ecodia.au'
+            const row = state.accounts[email] || (state.accounts[email] = {})
+            const res = await usageReal.probeAccount(short, {
+              prior: row.real || {}, liveShort: live, registryRow: registry.get(short) || {},
+            })
+            if (res && res.probe_status === 'ok') {
+              row.real = res
+              Object.assign(row, usageReal.computeEffective(row, email === state.active_account, Date.now()))
+            }
+          }
+          source = 'live'
+        } catch (e) { source = 'cached (live probe failed)' }
+      }
+      const a = assess(state, { points })
+      a.source = source
+      console.log(process.argv.includes('--json') ? JSON.stringify(a, null, 1)
+        : render(a) + '\n\n  reading: ' + source)
+      process.exitCode = a.verdict === 'go' ? 0 : a.verdict === 'switch_first' ? 3 : 1
+    })()
   }
 }
