@@ -28,7 +28,7 @@ const RPC_ERR = Object.freeze({
 const TOOLS = Object.freeze([
   {
     name: 'coord.send_message',
-    description: 'Send a message to an inbox topic. to = "chat.<tab_id>.inbox" | "chat.conductor.inbox" | etc. body = arbitrary JSON object. Returns {message_id, created_at}.',
+    description: 'Send a message to an inbox topic. to = "chat.<tab_id>.inbox" | "chat.conductor.inbox" | etc. body = arbitrary JSON object. Returns {message_id, created_at}. Delivery: a message whose body.type === "chat" is ALSO pushed as a live turn into the target chat\'s tab (position-addressed injection) and the result carries a `delivery` field; set body.deliver:"queue" to force inbox-only. All other body types (done/progress/bound/etc) are inbox-only, unchanged. For chat-to-chat coordination prefer coord.message_chat, which is the ergonomic wrapper.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -40,6 +40,28 @@ const TOOLS = Object.freeze([
       required: ['to', 'body'],
       additionalProperties: true,
     },
+  },
+  {
+    name: 'coord.message_chat',
+    description: 'Push a message straight into ANOTHER live Claude Code chat as a new turn - the way chats coordinate on shared work without either side polling an inbox. `to` accepts a full address ("chat.conductor.inbox" | "chat.<worker_tab_id>.inbox" | "chat.label:<slug>.inbox"), the word "conductor", a worker tab_id, or a live tab label / substring (e.g. "Studio"). The message is persisted to the durable inbox AND injected as a turn into the target tab; if the target is mid-turn, ambiguous, gone, or over the rate limit it stays inbox-queued (delivery.ok=false with a reason) and the recipient can still read it. The receiving chat sees your text framed with a reply address so it can push straight back via coord.message_chat. Use coord.list_channels first to see who is live. Injection steals focus, so this is an away/night capability by default (kill-switch env COORD_CHAT_INJECT=0). Returns {ok, to_address, reply_to_address, message_id, delivery}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Target chat: full chat.*.inbox address, "conductor", a worker tab_id, or a live tab label / substring.' },
+        text: { type: 'string', description: 'The message to land as a turn in the target chat.' },
+        from_label: { type: 'string', description: 'How you want to be named to the recipient (e.g. "Chambers chat"). Defaults to your tab identity.' },
+        from_address: { type: 'string', description: 'The address the recipient should reply to. Defaults to your own inbox (worker) or the conductor. Set this so a peer chat can reply directly to you.' },
+        task_id: { type: 'string', description: 'Optional task correlation id.' },
+        in_reply_to: { type: 'string', description: 'Optional id of the coord message this replies to.' },
+      },
+      required: ['to', 'text'],
+      additionalProperties: true,
+    },
+  },
+  {
+    name: 'coord.list_channels',
+    description: 'List every live, addressable Claude Code chat (the coordination directory). Each entry: {address, label, kind: conductor|worker|chat, active, addressable, task_id?, worker_status?}. Use the `address` with coord.message_chat to push a turn into that chat. `addressable:false` means the tab is generic-labelled or its address collides with another tab, so it cannot be uniquely targeted yet (name the chat to fix). Returns {ok, count, channels[], your_address, inject_enabled}.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: true },
   },
   {
     name: 'coord.read_inbox',
@@ -130,7 +152,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.verify_paste',
-    description: 'Fetch the canonical brief from disk for your task_id. The brief that was pasted into your chat may be truncated by a clipboard race under memory pressure — this tool returns the audit-file version that the dispatcher wrote BEFORE the paste, so it cannot be corrupted by paste-side issues. Call this FIRST on every dispatched worker. Treat the returned brief_body as source-of-truth. Returns {ok, task_id, tab_id, brief_file, brief_size_bytes, brief_sha256, brief_body, registered_at, parent_conductor_tab_id}.',
+    description: 'Fetch the canonical brief from disk for your task_id. The brief that was pasted into your chat may be truncated by a clipboard race under memory pressure - this tool returns the audit-file version that the dispatcher wrote BEFORE the paste, so it cannot be corrupted by paste-side issues. Call this FIRST on every dispatched worker. Treat the returned brief_body as source-of-truth. Returns {ok, task_id, tab_id, brief_file, brief_size_bytes, brief_sha256, brief_body, registered_at, parent_conductor_tab_id}.',
     inputSchema: {
       type: 'object',
       properties: {
