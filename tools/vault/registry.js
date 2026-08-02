@@ -50,8 +50,20 @@ function resolveService(service, rows) {
 }
 
 // Accounts on these identities are crown-jewel GATED regardless of stored tier.
-// tate@ Google + Bank Australia are the only GATED accounts per Tate 2026-07-17.
-const GATED_ACCOUNT_HINTS = ['tate@ecodia.au', 'bankaust', 'bank australia', 'bankaustralia']
+//
+// Bank Australia is the only one left (Tate 2026-08-02). tate@ Google was GATED from
+// 2026-07-17 until Tate ungated it for the account-switch rebuild: tate@ is one of the
+// three live Claude Max accounts, and a headless switch onto it has to satisfy a Google
+// 2FA prompt with no human present. Leaving it GATED meant the tate@ leg could only ever
+// fall back to a phone push, which is exactly the "wait for Tate" stall the rebuild
+// exists to remove. Money movement was never the exposure here; Bank Australia holds
+// that and stays gated.
+//
+// This widens what an attacker who reaches mint.js can obtain, so the compensating
+// controls stay in force: seeds live sealed in the Secure Enclave, mint.js prints only
+// six digits, enrollment is presence-bound, and the registry is still default-DENY on
+// zero-or-ambiguous matches.
+const GATED_ACCOUNT_HINTS = ['bankaust', 'bank australia', 'bankaustralia']
 function isGatedDomainAccount(account) {
   if (typeof account !== 'string') return false
   const a = account.trim().toLowerCase()

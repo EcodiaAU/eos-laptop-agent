@@ -17,8 +17,10 @@
 // authenticator prompt on canonical Chrome (9222).
 //
 // SECURITY: routes through registry.resolveService, so it inherits the tier
-// model unchanged - it mints OPEN seeds only and REFUSES GATED (tate@ Google,
-// Bank Australia) and EXCLUDED, regardless of what the caller types. It prints
+// model unchanged - it mints OPEN seeds only and REFUSES GATED (Bank Australia)
+// and EXCLUDED, regardless of what the caller types. (tate@ Google was GATED
+// until 2026-08-02; Tate ungated it so the headless account switch can satisfy
+// its 2FA prompt unattended.) It prints
 // ONLY the code (never the seed, never the otpauth secret). This is the
 // interactive-conductor path; the hardened daemon (submit-2fa.js) that fills a
 // verified tab and never returns a code remains the automated path.
@@ -68,7 +70,7 @@ function main() {
   const r = registry.resolveService(service, rows)
   if (!r.ok) {
     return die('[vault mint] refused "' + service + '": ' + r.reason +
-      '\n  (GATED accounts - tate@ Google, Bank Australia - are login-only + Tate-gated by design.)' +
+      '\n  (GATED accounts - Bank Australia - are login-only + Tate-gated by design.)' +
       '\nenrolled OPEN services:\n' + (listOpen(store) || '  (none)'))
   }
   if (r.tier !== 'OPEN') {
