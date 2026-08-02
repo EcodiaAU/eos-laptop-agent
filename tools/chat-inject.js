@@ -181,17 +181,14 @@ async function injectTurn(opts) {
   const submitOnly = opts.submitOnly === true
   const steps = []
 
-  // Cross-process mutex. No other injector (coord, iMessage router, a worker)
-  // may touch the shared focus/clipboard while we select -> verify -> paste ->
-  // submit. Without this, a concurrent inject steals focus mid-sequence and our
-  // paste lands in its tab. If we cannot get the lock, we do NOT inject - the
-  // caller leaves the message in the durable inbox instead of racing.
+  // Cross-process mutex so a coord push and a routed text (or a worker inject)
+  // cannot fight over the one focus/clipboard. This is the sound half of the
+  // 2026-08-03 hardening and it stays. If we cannot get the lock, we do NOT
+  // inject - the caller keeps the message in the durable inbox.
   const lock = await injectLock.acquire({ who: 'chat-inject', timeoutMs: opts.lockTimeoutMs || 9000 })
   if (!lock.ok) {
     return { ok: false, reason: 'inject_lock_' + (lock.reason || 'busy'), held_by: lock.held_by }
   }
-
-  const maxAttempts = opts.maxAttempts || 3
 
   try {
     // 1. Clipboard (focusless). Skipped in submitOnly mode. Set once.
@@ -200,33 +197,27 @@ async function injectTurn(opts) {
       steps.push('clipboard')
     }
 
-    // 2. Get the target tab FOCUSED and CONFIRMED, with retries. The whole
-    // focus sequence (raise group -> select by index -> focus input -> bring VS
-    // Code forward -> settle) is one attempt, re-verified at the end. A single
-    // stray focus change (Tate clicking another tab, a slow activate) fails the
-    // verify; we retry rather than misroute or give up. Only when the target is
-    // CONFIRMED active do we move to the keystrokes. If every attempt loses the
-    // race, we ABORT (never blind-paste) and the caller keeps the inbox copy.
-    let ready = false
-    let activeInstead = null
-    for (let attempt = 0; attempt < maxAttempts && !ready; attempt++) {
-      const fg = focusGroupCmd(viewColumn)
-      if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(140) }
-      if (index >= 0 && index < 40) {
-        await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (index + 1) }).catch(() => {})
-        await sleep(150)
-      }
-      await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
-      await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
-      await sleep(settleMs)
-      const chk = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
-      if (chk.ok) { ready = true; steps.push('focused@' + attempt) }
-      else { activeInstead = chk.active_label; steps.push('miss@' + attempt + ':' + (chk.active_label || '?')) }
+    // 2. Select the target tab, focus its input, bring VS Code forward, settle.
+    // No focus-verify: the bridge's active-tab signal is only trustworthy while
+    // VS Code is foreground, which is NOT the case when a push runs in the
+    // background/away - exactly when it matters. A verify keyed on it aborted
+    // EVERY away inject (proven 2026-08-03 on the iMessage twin, which this
+    // mirrors), silently disabling delivery. The lock removes injector-vs-
+    // injector races; the only residual misroute is when Tate is actively
+    // viewing another tab, which he flagged as not worth battling (he is right
+    // there, and it lands in a real chat either way). Route directly.
+    // Doctrine: injection-must-verify-target-focused-never-blind-paste-2026-08-03.
+    const fg = focusGroupCmd(viewColumn)
+    if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(150) }
+    if (index >= 0 && index < 40) {
+      await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (index + 1) }).catch(() => {})
+      await sleep(150)
     }
-    if (!ready) {
-      // Confirmed we could NOT land on the target after retries. Abort clean.
-      return { ok: false, reason: 'target_not_focusable', label: resolvedLabel, active_instead: activeInstead, attempts: maxAttempts, steps }
-    }
+    await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
+    steps.push('select')
+    await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
+    steps.push('activate')
+    await sleep(settleMs)
 
     // 3. Paste (Cmd+V). Skipped in submitOnly mode.
     if (!submitOnly) {
@@ -235,26 +226,17 @@ async function injectTurn(opts) {
       if (pasteRes && pasteRes.ok === false) {
         return { ok: false, reason: 'paste_keystroke_failed', steps, detail: pasteRes }
       }
-      await sleep(250)
+      await sleep(300)
     }
 
-    // 4. FINAL verify right before the Return. If focus slipped in the paste
-    // window, do NOT press Return (a stray Return would submit the wrong tab).
-    // The text is already sitting in the CORRECT target input, so this is a safe
-    // partial: nothing landed in the wrong chat.
-    const chkSubmit = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
-    if (!chkSubmit.ok) {
-      return { ok: false, reason: 'lost_focus_pre_submit', label: resolvedLabel, active_instead: chkSubmit.active_label, pasted: !submitOnly, steps }
-    }
-
-    // 5. Submit (Return = key code 36).
+    // 4. Submit (Return = key code 36).
     const submitRes = await applescript.keystroke({ key: 36 })
     steps.push('submit')
     if (submitRes && submitRes.ok === false) {
       return { ok: false, reason: 'submit_keystroke_failed', steps, detail: submitRes }
     }
 
-    return { ok: true, verified: true, label: resolvedLabel, viewColumn, index, steps }
+    return { ok: true, label: resolvedLabel, viewColumn, index, steps }
   } catch (e) {
     return { ok: false, reason: 'inject_threw', error: e.message, steps }
   } finally {
