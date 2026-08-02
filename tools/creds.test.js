@@ -145,31 +145,36 @@ async function test(name, fn) {
     }
   })
 
-  await test('rotate_to throws on unknown account', async () => {
-    let threw = false
-    try {
-      await creds.rotate_to('eve')
-    } catch (e) {
-      threw = true
-      if (!e.message.includes('unknown account')) throw new Error('wrong error: ' + e.message)
-    }
-    if (!threw) throw new Error('should have thrown')
+  // rotate_to is TOMBSTONED as of 2026-08-02: snapshot-to-Keychain writes are banned and
+  // switching is a full OAuth re-login (scripts/switch-run.js). These two cases used to
+  // assert that it THREW on a bad input; the contract is now that it never switches
+  // anything and returns a pointer at the real path. It returns rather than throws so a
+  // missed caller degrades to a no-op instead of taking a daemon down mid-poll.
+
+  await test('rotate_to is tombstoned: it never rotates, whatever it is asked', async () => {
+    const r = await creds.rotate_to('eve')
+    if (!r.tombstoned) throw new Error('expected a tombstone response')
+    if (!r.no_rotation) throw new Error('a tombstoned rotate_to must report no_rotation')
+    if (!/account-switch\.sh/.test(r.use || '')) throw new Error('the tombstone must name the real switch path')
   })
 
-  await test('rotate_to throws on missing per-account file', async () => {
+  await test('rotate_to touches nothing even with a missing per-account file', async () => {
     const tatePath = path.join(process.env.CREDS_DIR, 'tate.json')
     const backup = fs.readFileSync(tatePath)
+    const before = creds.current_account()
     fs.unlinkSync(tatePath)
-    let threw = false
     try {
-      await creds.rotate_to('tate')
-    } catch (e) {
-      threw = true
-      if (!e.message.includes('not found')) throw new Error('wrong error: ' + e.message)
+      const r = await creds.rotate_to('tate')
+      if (!r.tombstoned) throw new Error('expected a tombstone response')
+      if (creds.current_account() !== before) throw new Error('the live account moved: a tombstone must be inert')
     } finally {
       fs.writeFileSync(tatePath, backup)
     }
-    if (!threw) throw new Error('should have thrown')
+  })
+
+  await test('rotate_to keeps the current-process no-op contract (callers rely on it not throwing)', async () => {
+    const r = await creds.rotate_to({ account: 'current-process' })
+    if (!r.no_rotation || r.current !== 'current-process') throw new Error('current-process contract broken: ' + JSON.stringify(r))
   })
 
   // ── current_account tests ────────────────────────────────────────────────
@@ -210,18 +215,25 @@ async function test(name, fn) {
 
   // ── regression guard ─────────────────────────────────────────────────────
 
-  await test('ACCOUNT PIN: rotate_to refuses any non-pinned account even with force (2026-06-29)', async () => {
+  // THE PIN MOVED (2026-08-02). It used to be enforced inside rotate_to, described as the
+  // single force-proof chokepoint because rotate_to owned the only writeKeychain call
+  // site. That stopped being true once account-switch.sh started writing the Keychain
+  // directly via `claude auth login`, which is why the pin had to be re-implemented in
+  // the shell wrapper as a second, differently-parsed check. rotate_to is now tombstoned
+  // and switch-run.js PREFLIGHT is the one chokepoint, using the shared parsePin so both
+  // pin formats mean the same thing everywhere. The pin's own behaviour is asserted in
+  // tools/switch-core.js --selftest (legacy string, JSON, expired, and pin-names-target).
+  // What matters HERE is only that rotate_to can no longer move the live account at all,
+  // pin or no pin.
+  await test('ACCOUNT PIN: rotate_to cannot move the live account under any input (enforcement moved to switch-run PREFLIGHT)', async () => {
     const pinPath = creds._accountPinPath()
     fs.mkdirSync(require("path").dirname(pinPath), { recursive: true })
     fs.writeFileSync(pinPath, "code")
+    const before = creds.current_account()
     try {
-      const r = await creds.rotate_to({ account: "money", force: true })
-      if (r.reason !== "account_pinned" || r.pinned_to !== "code" || r.refused !== "money") {
-        throw new Error("pin did not refuse forced money switch: " + JSON.stringify(r))
-      }
-      // pinned account itself is allowed (no-op / write)
-      const ok = await creds.rotate_to({ account: "code" })
-      if (ok.reason === "account_pinned") throw new Error("pin wrongly blocked the pinned account")
+      const forced = await creds.rotate_to({ account: "money", force: true })
+      if (!forced.tombstoned) throw new Error("force did not hit the tombstone: " + JSON.stringify(forced))
+      if (creds.current_account() !== before) throw new Error("the live account moved despite the tombstone")
     } finally { try { fs.unlinkSync(pinPath) } catch (_) {} }
   })
 

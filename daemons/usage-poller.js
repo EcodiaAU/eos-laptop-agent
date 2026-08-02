@@ -18,7 +18,7 @@
 
 const path = require('path')
 const fs = require('fs')
-const { spawnSync } = require('child_process')
+const { spawn, spawnSync } = require('child_process')
 
 const AGENT_ROOT = path.resolve(__dirname, '..')
 const usage = require(path.join(AGENT_ROOT, 'tools', 'usage'))
@@ -34,6 +34,7 @@ const POLL_INITIAL_DELAY_MS = Number(process.env.POLL_INITIAL_DELAY_MS) || 5_000
 const usageCfg = require(path.join(AGENT_ROOT, 'tools', 'usage-config'))
 const usageReal = require(path.join(AGENT_ROOT, 'tools', 'usage-real'))
 const accountsRegistry = require(path.join(AGENT_ROOT, 'tools', 'accounts-registry'))
+const ACCOUNT_SWITCH_SH = path.join(AGENT_ROOT, 'scripts', 'account-switch.sh')
 const _COORD_ROOT = usageCfg.PATHS.COORD_ROOT
 const HEARTBEAT_FILE = usageCfg.PATHS.HEARTBEAT_FILE
 
@@ -161,36 +162,61 @@ function agentTool(tool, params) {
 
 function capAutoSwitch() {
   try {
-    // Fast cap-switch path (every poll, ~5min). Uses the SAME honest decision as
-    // the 25-min cron: account-cap-decide.js (cache-read-EXCLUDED usage via
-    // tools/usage, calibrated caps, rotatable-snapshot gate, and a no-usable-target
-    // SMS fired inside the module). Single source of truth - no second heuristic.
-    // The prior path read cache-inflated ccusage b.totalTokens / cap and so crossed
-    // 80% almost immediately, scheduling a FALSE OAuth-switch chat every 5h block
-    // (2026-06-21). Execution is now creds.rotate_to: instant + headless, safe
-    // because the cred-refresher keeps all snapshots fresh (it was NOT safe when
-    // snapshots rotted, hence the old heavyweight OAuth-CC-chat). rotate_to is its
-    // own dedupe + guard: no-ops when already on target, DEFERS under active worker
-    // tabs (never clobbers a mid-flight Keychain), refuses a stale snapshot, skips
-    // disabled accounts. The 25-min cron remains the robust backstop (a worker can
-    // force / re-login if rotate_to keeps deferring).
+    // Decide, then hand off to the ONE sanctioned switch path.
+    //
+    // EXECUTION CHANGED 2026-08-02: this used to call creds.rotate_to, which writes a
+    // stored snapshot into the Keychain. backend/CLAUDE.md had already banned that for
+    // moving the live conductor, and the reason is structural: the Keychain holds one
+    // identity and Anthropic refresh tokens are single-use, so a non-live snapshot is
+    // usually a spent token. rotate_to therefore either refused (the stale-source guard)
+    // or installed a dead lineage. account-switch.sh performs a full OAuth re-login and
+    // mints fresh tokens, so it needs no snapshot at all.
+    //
+    // DETACHED, never spawnSync. A switch leg can legitimately run for minutes (the
+    // money@ magic-link wait alone is bounded at 12), and a synchronous call would stall
+    // this daemon's whole event loop: the 60-second cap watch, the probe tick and the
+    // heartbeat all stop, and the heartbeat canary then reports a dead poller during
+    // exactly the window a switch is in flight. The exit handler below reads the real
+    // result; "launched" is never recorded as success.
+    if (switchInFlight()) return
     const decideR = spawnSync(process.execPath, [path.join(AGENT_ROOT, 'tools', 'account-cap-decide.js')], { encoding: 'utf8', timeout: 25000 })
     let d = null
     try { d = JSON.parse(decideR.stdout) } catch (_) { return }
-    if (!d || !d.shouldSwitch || !d.target) return  // hold / no-usable-target (SMS handled in the module)
+    if (!d || !d.shouldSwitch || !d.target) return  // hold / no-usable-target (alerting lives in the module)
 
     const targetShort = String(d.target).split('@')[0]
-    const rot = agentTool('creds.rotate_to', { account: targetShort })
-    const status = !rot ? 'agent_unreachable'
-      : rot.target ? 'switched'
-      : rot.deferred ? ('deferred:' + (rot.reason || 'workers'))
-      : (rot.reason || 'noop')
-    fs.writeFileSync(SWITCH_REQUEST_FILE, JSON.stringify({
-      target: d.target, from: d.live, reason: d.reason, via: 'rotate_to',
-      result: status, raised_at: nowIso(),
-    }), 'utf8')
-    console.log('[' + nowIso() + '] cap-auto-switch: ' + d.live + ' -> ' + d.target + ' via rotate_to (' + status + ')')
+    const logFd = (() => { try { return fs.openSync(usageCfg.PATHS.SWITCH_LOG_FILE, 'a') } catch (e) { return 'ignore' } })()
+    const child = spawn('bash', [ACCOUNT_SWITCH_SH, targetShort], {
+      detached: true, stdio: ['ignore', logFd, logFd],
+      env: Object.assign({}, process.env, { SWITCH_REASON: d.reason || 'cap-auto-switch' }),
+    })
+    child.unref()
+    console.log('[' + nowIso() + '] cap-auto-switch: launching ' + d.live + ' -> ' + d.target + ' (' + d.reason + ')')
+    child.on('exit', (code) => {
+      // switch-run.js owns switch-request.json and swap_history.json; writing them here
+      // too would race its RECORD step and corrupt real-limit-watch's suppression input,
+      // which reads that file. Log the outcome and leave the files to their owner.
+      const verdict = code === 0 ? 'verified'
+        : code === 3 ? 'already_in_progress'
+        : code === 4 ? 'no_op'
+        : 'FAILED(' + code + ')'
+      console.log('[' + nowIso() + '] cap-auto-switch result: ' + d.live + ' -> ' + d.target + ' = ' + verdict +
+        (code === 0 ? '' : ' (see ' + usageCfg.PATHS.SWITCH_LOG_FILE + ')'))
+    })
   } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
+}
+
+// True while a switch holds the lock with a live heartbeat. Age alone would misjudge a
+// slow-but-healthy leg, so a holder counts as gone only when its pid is dead or its
+// heartbeat has stopped moving.
+function switchInFlight() {
+  let lock
+  try { lock = JSON.parse(fs.readFileSync(usageCfg.PATHS.SWITCH_LOCK_FILE, 'utf8')) } catch (e) { return false }
+  if (!lock || !lock.pid) return false
+  try { process.kill(lock.pid, 0) } catch (e) { return false }
+  const beatAt = Date.parse(lock.heartbeat_at || '')
+  if (!isFinite(beatAt)) return true
+  return (Date.now() - beatAt) < 5 * 60 * 1000
 }
 
 // ── TRUE RATE-LIMIT WATCH (ground truth, not prediction) ─────────────────────

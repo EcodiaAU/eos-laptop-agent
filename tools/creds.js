@@ -197,12 +197,32 @@ function buildRealUsageSource() {
       if (!a) return { headroom_minutes: 0, reset_at: null }
       // Convert token headroom to approximate minutes using a 10M tokens/hr estimate.
       // The creds layer only needs a coarse signal; scheduling precision lives in scheduler.js.
-      const headroom_tokens = Math.min(a.remaining_5h || 0, a.remaining_weekly || 0)
-      const TOKENS_PER_MINUTE = 10_000_000 / 60
-      const headroom_minutes = headroom_tokens / TOKENS_PER_MINUTE
-      // reset_at: earlier of the two window resets (conservative)
-      const reset_at = full.polled_at || null
-      return { headroom_minutes: Math.floor(headroom_minutes), reset_at }
+      // MEASURED, not modelled (2026-08-02). This used to divide a token headroom by a
+      // hardcoded 10M tokens/hour, a rate nobody ever calibrated, applied to token
+      // figures derived from caps that were themselves wrong by up to 13x. Minutes now
+      // come from the measured utilization and the observed burn rate, through the one
+      // implementation in usage-real, so every consumer of "minutes left" agrees.
+      //
+      // Its degraded values are load-bearing for the callers below, which compare with >:
+      // Infinity when there is no reading (fail-open, never evict the live account on a
+      // blind moment) and 0 when measured capped or unmeasurable. Returning null here
+      // silently evicted the live account in the 2026-06-25 and 06-29 regressions.
+      let headroom_minutes
+      try {
+        headroom_minutes = require('./usage-real').headroomMinutesFor(a)
+      } catch (e) {
+        const headroom_tokens = Math.min(a.remaining_5h || 0, a.remaining_weekly || 0)
+        headroom_minutes = headroom_tokens / (10_000_000 / 60)
+      }
+      // The real reset instant, when we have one: the earlier of the two windows. The old
+      // code returned polled_at, which is when we last LOOKED, not when anything resets.
+      const real = a.real || {}
+      const resets = [real.resets_at_5h, real.resets_at_7d].filter(Boolean).map(x => Date.parse(x)).filter(isFinite)
+      const reset_at = resets.length ? new Date(Math.min.apply(null, resets)).toISOString() : (full.polled_at || null)
+      return {
+        headroom_minutes: isFinite(headroom_minutes) ? Math.floor(headroom_minutes) : headroom_minutes,
+        reset_at,
+      }
     },
   }
 }
@@ -431,10 +451,51 @@ function readAccountPin() {
 exports._accountPinPath = accountPinPath
 exports._readAccountPin = readAccountPin
 
+// TOMBSTONED 2026-08-02. rotate_to wrote a stored snapshot INTO the machine-wide
+// Keychain, and every defect in this subsystem's history traces back to that one
+// direction of travel:
+//
+//   The Keychain holds exactly one Claude identity and Anthropic refresh tokens are
+//   single-use. Whichever account is live has its snapshot re-seeded from the Keychain;
+//   every other snapshot eventually holds a spent token. So the thing rotate_to installs
+//   is, most of the time, a dead lineage. Its own stale-source guard existed to refuse
+//   exactly that, which is why callers saw endless deferrals rather than switches
+//   (661 blocked attempts in the logs, against 11 successes).
+//
+//   When it did fire, it wrote a frozen blob over a Keychain that Claude Code may have
+//   refreshed seconds earlier, invalidating the live session (2026-06-14).
+//
+//   And it dropped the oauthAccount label, so ~/.claude.json kept naming the previous
+//   account and current_account() reported the account we had just switched away from.
+//
+// The only sanctioned direction now is Keychain -> snapshot (seed_from_live). Switching
+// is scripts/switch-run.js via account-switch.sh: a full OAuth re-login that mints fresh
+// tokens and needs no snapshot at all. backend/CLAUDE.md had already banned rotate_to for
+// moving the live conductor; this makes the ban structural.
+//
+// It returns rather than throws so a missed caller degrades to a no-op with a loud hint
+// instead of taking a daemon down, and the 'current-process' contract is preserved
+// because pick_healthiest_account callers depend on it not throwing.
 exports.rotate_to = async function (accountOrParams) {
-  // Agent dispatcher passes the full params object as the first argument; CLI/test
-  // callers historically pass a bare string. Accept either to avoid a dispatcher
-  // shape mismatch ([object Object] errors).
+  const params = (accountOrParams && typeof accountOrParams === 'object')
+    ? accountOrParams : { account: accountOrParams }
+  if (params.account === 'current-process') {
+    return { previous: exports.current_account(), current: 'current-process', no_rotation: true }
+  }
+  return {
+    tombstoned: true,
+    no_rotation: true,
+    previous: exports.current_account(),
+    requested: params.account || null,
+    use: 'bash eos-laptop-agent/scripts/account-switch.sh <tate|code|money>',
+    reason: 'rotate_to retired 2026-08-02: snapshot-to-Keychain writes are banned. Switching is a full OAuth re-login (switch-run.js), which needs no snapshot.',
+  }
+}
+
+// The original implementation, kept only so its guards remain readable next to the
+// tombstone above and so writeKeychain has a documented manual-recovery caller. Nothing
+// reaches it.
+exports._rotate_to_retired_impl = async function (accountOrParams) {
   const params = (accountOrParams && typeof accountOrParams === 'object')
     ? accountOrParams
     : { account: accountOrParams }
@@ -442,8 +503,6 @@ exports.rotate_to = async function (accountOrParams) {
   const force = !!params.force
   const callerTabId = params.caller_tab_id || null
 
-  // 2026-06-08 Mac-day: when pick_healthiest_account returned 'current-process'
-  // (no cred files available), rotate_to is a no-op.
   if (account === 'current-process') {
     return { previous: exports.current_account(), current: 'current-process', no_rotation: true }
   }

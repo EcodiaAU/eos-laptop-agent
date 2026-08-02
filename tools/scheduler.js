@@ -1753,14 +1753,31 @@ exports.checkCapWarning = async function checkCapWarning() {
   const current = getCreds().current_account()
   if (current === 'unknown') return { skipped: 'no_current_account' }
 
+  // FIXED 2026-08-02. This has run on a 5-minute interval since it was written and has
+  // silently no-oped on every single fire, for three compounding reasons: it indexed
+  // stateResult.state[current] when the shape is {state:{accounts:{...}}}; `current` is a
+  // short name ('code') while the keys are full emails; and it then wanted a
+  // headroom_minutes field that no account row has ever carried. observer_signals has
+  // zero rows to this day. Nothing failed loudly because every path returns a `skipped`
+  // object, which reads exactly like a healthy no-op.
   const usage = getUsageModule()
   const stateResult = await usage.get_usage_state({})
-  const accountState = stateResult && stateResult.state && stateResult.state[current]
-  if (!accountState) return { skipped: 'no_state_for_current' }
+  const canonical = (usage._normalizeAccount && usage._normalizeAccount(current)) || current
+  const accounts = (stateResult && stateResult.state && stateResult.state.accounts) || {}
+  const accountState = accounts[canonical] || accounts[current]
+  if (!accountState) return { skipped: 'no_state_for_current', looked_for: canonical }
 
-  const headroomMin = typeof accountState.headroom_minutes === 'number'
-    ? accountState.headroom_minutes
-    : (typeof accountState.remaining_minutes === 'number' ? accountState.remaining_minutes : null)
+  // Minutes of headroom come from the measured utilization plus the observed burn rate,
+  // via the single implementation in usage-real. Its degraded values are deliberate:
+  // Infinity when there is no reading, so a blind moment never raises a warning, and 0
+  // when an account is measured capped.
+  let headroomMin = null
+  try {
+    headroomMin = require('./usage-real').headroomMinutesFor(accountState)
+  } catch (e) {
+    headroomMin = typeof accountState.headroom_minutes === 'number' ? accountState.headroom_minutes : null
+  }
+  if (headroomMin === Infinity) return { skipped: 'no_usage_reading' }
 
   if (headroomMin === null || headroomMin > HEADROOM_WARN_THRESHOLD_MIN) {
     return { skipped: 'headroom_ample', headroom_min: headroomMin }
@@ -1798,7 +1815,11 @@ exports.checkCapWarning = async function checkCapWarning() {
   await getPool().query(
     `INSERT INTO observer_signals (observer_name, signal_kind, message, fingerprint, priority, created_at)
      VALUES ($1, $2, $3, $4, $5, now())`,
-    ['autonomy-substrate-usage-cap-observer', 'usage_cap_warning', message, fingerprint, 2]
+    // priority 3, NOT 2. observer_signals carries CHECK (priority IN (1,3,5)), so this
+    // insert would have thrown on its very first fire - which is also why the bug above
+    // hid so long: the function never reached this line. Probed against the live
+    // constraint 2026-08-02 (3 accepted, 2 rejected).
+    ['autonomy-substrate-usage-cap-observer', 'usage_cap_warning', message, fingerprint, 3]
   )
 
   _capWarningLast.account = current

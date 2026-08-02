@@ -1442,13 +1442,21 @@ test('checkCapWarning: skips when headroom is ample', async () => {
   scheduler._resetCapWarningLast()
   const stubPool = makeStubPool([])
   scheduler._setPool(stubPool)
+  // REAL SHAPE (2026-08-02). These mocks used to be {state:{tate:{headroom_minutes}}},
+  // which is exactly the shape bug that made checkCapWarning silently no-op on every
+  // fire for months: the live payload is {state:{accounts:{'<email>':{...}}}}, keyed by
+  // full email, and no account row has ever carried headroom_minutes. A mock shaped like
+  // the bug can only ever confirm the bug. Minutes are now derived from measured
+  // utilization and burn rate, so the fixtures state those instead.
   scheduler._setUsageModule({
+    _normalizeAccount: (a) => (String(a).includes('@') ? a : a + '@ecodia.au'),
     get_usage_state: async () => ({
-      state: {
-        tate: { headroom_minutes: 200 },
-        code: { headroom_minutes: 100 },
-        money: { headroom_minutes: 50 }
-      }
+      state: { accounts: {
+        // 20% used, burning 0.4 points/min -> ~200 minutes of headroom
+        'tate@ecodia.au': { utilization_5h_effective: 0.20, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.4, burn_pp_per_min_7d: 0.05 } },
+        'code@ecodia.au': { utilization_5h_effective: 0.50, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.5, burn_pp_per_min_7d: 0.05 } },
+        'money@ecodia.au': { utilization_5h_effective: 0.75, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.5, burn_pp_per_min_7d: 0.05 } },
+      } }
     })
   })
   const result = await scheduler.checkCapWarning()
@@ -1461,12 +1469,14 @@ test('checkCapWarning: fires INSERT when headroom is low + writes observer signa
   const stubPool = makeStubPool([])
   scheduler._setPool(stubPool)
   scheduler._setUsageModule({
+    _normalizeAccount: (a) => (String(a).includes('@') ? a : a + '@ecodia.au'),
     get_usage_state: async () => ({
-      state: {
-        tate: { headroom_minutes: 5 },
-        code: { headroom_minutes: 200 },
-        money: { headroom_minutes: 100 }
-      }
+      state: { accounts: {
+        // 95% used, burning 1 point/min -> ~5 minutes left
+        'tate@ecodia.au': { utilization_5h_effective: 0.95, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 1.0, burn_pp_per_min_7d: 0.05 } },
+        'code@ecodia.au': { utilization_5h_effective: 0.20, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.4, burn_pp_per_min_7d: 0.05 } },
+        'money@ecodia.au': { utilization_5h_effective: 0.50, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.5, burn_pp_per_min_7d: 0.05 } },
+      } }
     })
   })
 
@@ -1479,6 +1489,9 @@ test('checkCapWarning: fires INSERT when headroom is low + writes observer signa
   assert(insertCalls[0].params[1] === 'usage_cap_warning', 'signal_kind set')
   assert(insertCalls[0].params[2].includes('Current account (tate)') && insertCalls[0].params[2].includes('5 minutes'), 'message includes account + headroom')
   assert(insertCalls[0].params[3].startsWith('usage_cap:tate:'), 'fingerprint scoped to account')
+  // observer_signals has CHECK (priority IN (1,3,5)); the old code passed 2, so the very
+  // first real fire would have thrown. Probed against the live constraint 2026-08-02.
+  assert(insertCalls[0].params[4] === 3, 'priority is 3, which the observer_signals CHECK actually permits')
 })
 
 test('checkCapWarning: cooldown prevents double-fire within 1h', async () => {
@@ -1487,12 +1500,14 @@ test('checkCapWarning: cooldown prevents double-fire within 1h', async () => {
   const stubPool = makeStubPool([])
   scheduler._setPool(stubPool)
   scheduler._setUsageModule({
+    _normalizeAccount: (a) => (String(a).includes('@') ? a : a + '@ecodia.au'),
     get_usage_state: async () => ({
-      state: {
-        tate: { headroom_minutes: 5 },
-        code: { headroom_minutes: 200 },
-        money: { headroom_minutes: 100 }
-      }
+      state: { accounts: {
+        // 95% used, burning 1 point/min -> ~5 minutes left
+        'tate@ecodia.au': { utilization_5h_effective: 0.95, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 1.0, burn_pp_per_min_7d: 0.05 } },
+        'code@ecodia.au': { utilization_5h_effective: 0.20, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.4, burn_pp_per_min_7d: 0.05 } },
+        'money@ecodia.au': { utilization_5h_effective: 0.50, utilization_7d_effective: 0.10, estimate: { burn_pp_per_min_5h: 0.5, burn_pp_per_min_7d: 0.05 } },
+      } }
     })
   })
 

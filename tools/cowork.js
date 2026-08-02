@@ -1412,7 +1412,29 @@ function inFlightCriticalCount() {
   return count
 }
 
-async function swap_creds(params, ctx) {
+// TOMBSTONED 2026-08-02. swap_creds was the first of three switch mechanisms and had been
+// dead for months: it targets the Windows-era ~/.ecodia-creds path and
+// ~/.claude/.credentials.json, neither of which is the live identity on this Mac (the
+// Keychain is), and backend/CLAUDE.md has named it dead since June. It was superseded by
+// creds.rotate_to on 2026-06-21, which is itself now retired in favour of a full OAuth
+// re-login via scripts/switch-run.js.
+//
+// Tombstoned rather than deleted because tools/mac-dispatcher.js re-exports it and the
+// laptop-agent's /api/tool autoloader publishes every non-underscore export, so the name
+// is reachable over HTTP: deleting it would leave that route throwing, while this returns
+// a pointer at the real path. Its appendSwapHistory helper stays and is now genuinely
+// used, because switch-run.js finally writes the history file that every reader of it has
+// been reading as [] since it was invented.
+async function swap_creds(params) {
+  return {
+    tombstoned: true,
+    requested: (params && params.account) || null,
+    use: 'bash eos-laptop-agent/scripts/account-switch.sh <tate|code|money>',
+    reason: 'swap_creds retired 2026-08-02: it wrote Windows-era paths that are not the live identity on this host, and snapshot-to-Keychain switching is banned outright.',
+  }
+}
+
+async function _swap_creds_retired_impl(params, ctx) {
   params = params || {}
   const force = !!params.force  // ignore in_critical_section (use with care)
   if (!params.account) throw new Error('account required')

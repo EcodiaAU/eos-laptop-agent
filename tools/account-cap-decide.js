@@ -16,12 +16,49 @@
  *   node account-cap-decide.js --mock '<json>' # decide against an injected state
  */
 
-const SESSION_USED_TRIGGER = 0.80   // 5h cap
-const WEEKLY_USED_TRIGGER = 0.90    // weekly cap
-const TARGET_MAX_USED = 0.50        // a switch target must be under 50% used on both windows
+// Tate 2026-08-02: predict and drain at 90 percent, on BOTH windows.
+//
+// The 90 is only safe alongside the projection term below. Measured busy-period burn is
+// p95 4.13 percentage points per 5-minute probe interval and p99 7.2, so a bare 90 with a
+// 5-minute blind spot is overshot about a fifth of the time. Without projection the floor
+// drops to 0.80. Both numbers live in usage-config.
+const _cfg = (() => { try { return require('./usage-config') } catch (e) { return null } })()
+const T = (_cfg && _cfg.TRIGGERS) || {}
+const SESSION_USED_TRIGGER = T.SWITCH_USED || 0.90
+const WEEKLY_USED_TRIGGER = T.SWITCH_USED || 0.90
+const TARGET_MAX_USED = T.TARGET_MAX_USED || 0.50
+const PROJECTION_HORIZON_MIN = T.PROJECTION_HORIZON_MIN || 20
+const PROJECTION_CEILING = T.PROJECTION_CEILING || 0.98
+const CAPPED_UTIL = T.CAPPED_UTIL || 0.99
 
-function used5h(a) { return 1 - (a.headroom_5h_fraction != null ? a.headroom_5h_fraction : (a.remaining_5h / a.cap_5h)) }
-function usedWeekly(a) { return 1 - (a.headroom_weekly_fraction != null ? a.headroom_weekly_fraction : (a.remaining_weekly / a.cap_weekly)) }
+// PREFER THE MEASURED NUMBER (2026-08-02). utilization_*_effective comes from the vendor's
+// own quota endpoint; the headroom fractions underneath are the ccusage heuristic, which
+// on the day this changed reported code@ at 8.9% of its 5h cap while the vendor reported
+// 100% and capped. The fallback stays for one release so a stale accounts.json still
+// decides something rather than nothing.
+function used5h(a) {
+  if (typeof a.utilization_5h_effective === 'number') return a.utilization_5h_effective
+  return 1 - (a.headroom_5h_fraction != null ? a.headroom_5h_fraction : (a.remaining_5h / a.cap_5h))
+}
+function usedWeekly(a) {
+  if (typeof a.utilization_7d_effective === 'number') return a.utilization_7d_effective
+  return 1 - (a.headroom_weekly_fraction != null ? a.headroom_weekly_fraction : (a.remaining_weekly / a.cap_weekly))
+}
+// Where the number came from, so a decision can say whether it trusted a measurement.
+function usedSource(a) {
+  return (typeof a.utilization_5h_effective === 'number') ? (a.effective_source || 'real') : 'ccusage-fallback'
+}
+// Projection: at the current burn, will this account cross the ceiling before the next
+// few probes? Switching at 90 with no lookahead means switching after the overshoot.
+function projectedOver(a) {
+  const est = a.estimate || {}
+  const b5 = est.burn_pp_per_min_5h || 0
+  const b7 = est.burn_pp_per_min_7d || 0
+  const p5 = used5h(a) + (b5 * PROJECTION_HORIZON_MIN) / 100
+  const p7 = usedWeekly(a) + (b7 * PROJECTION_HORIZON_MIN) / 100
+  return (p5 >= PROJECTION_CEILING || p7 >= PROJECTION_CEILING)
+    ? { over: true, p5, p7 } : { over: false, p5, p7 }
+}
 
 /**
  * pickTarget(state, liveAccount, opts) -> { usable, staleButHealthy }
@@ -37,17 +74,28 @@ function pickTarget(state, liveAccount, opts) {
   opts = opts || {}
   const flaky = new Set(opts.flaky || [])
   const disabled = new Set(opts.disabled || [])
-  const rotatable = opts.rotatable ? new Set(opts.rotatable) : null
   const accounts = (state && state.accounts) || {}
   const headroomTargets = Object.keys(accounts)
     .filter(e => e !== liveAccount && !flaky.has(e) && !disabled.has(e))
+    // An account whose usage we cannot currently measure is not a safe target: we would
+    // be switching blind. It is NOT counted as depleted either - see the caller's
+    // no-target reasoning.
+    .filter(e => !accounts[e].excluded_as_target)
     .map(e => ({ email: e, u5: used5h(accounts[e]), uw: usedWeekly(accounts[e]) }))
     .filter(c => c.u5 < TARGET_MAX_USED && c.uw < TARGET_MAX_USED)
     // highest min-headroom = lowest max-used
     .sort((a, b) => Math.max(a.u5, a.uw) - Math.max(b.u5, b.uw))
-  const usable = rotatable ? headroomTargets.filter(c => rotatable.has(c.email)) : headroomTargets
-  const staleButHealthy = rotatable ? headroomTargets.filter(c => !rotatable.has(c.email)).map(c => c.email) : []
-  return { usable, staleButHealthy }
+
+  // THE ROTATABLE GATE IS GONE (2026-08-02), and its removal is the single change that
+  // un-strands auto-switching. It required a target's SNAPSHOT to be fresh, because the
+  // old switch path wrote that snapshot into the Keychain. But the Keychain holds one
+  // identity and Anthropic refresh tokens are single-use, so every non-live snapshot
+  // rots by design: code@ sat on 484 consecutive invalid_grant failures. usable[] was
+  // therefore empty almost always, and instead of switching, the fleet texted Tate to
+  // re-auth by hand - 43 times in a fortnight. A full OAuth re-login needs no snapshot,
+  // so snapshot freshness is now irrelevant to whether an account can be switched to.
+  // opts.rotatable is accepted and ignored so an old caller cannot resurrect the gate.
+  return { usable: headroomTargets, staleButHealthy: [] }
 }
 
 /**
@@ -76,9 +124,25 @@ function decide(state, liveAccount, opts) {
 
   const liveU5 = used5h(live)
   const liveUW = usedWeekly(live)
-  const triggered = liveU5 >= sTrig || liveUW >= wTrig
+  const atThreshold = liveU5 >= sTrig || liveUW >= wTrig
+
+  // PROJECTION (2026-08-02). Waiting for the threshold means switching AFTER the
+  // overshoot: measured busy-period burn is 4.13 percentage points per 5-minute probe
+  // interval at p95 and 7.2 at p99, so a 90 trigger with a 5-minute blind spot lands
+  // past the cap about a fifth of the time. If the current burn would carry this account
+  // over the ceiling within the horizon, switch now and let the old account drain.
+  const proj = projectedOver(live)
+  const triggered = atThreshold || proj.over
+
   if (!triggered) {
-    return { shouldSwitch: false, reason: `live_comfortable (5h_used=${liveU5.toFixed(2)} weekly_used=${liveUW.toFixed(2)})`, target: null, live: liveAccount, slots }
+    return { shouldSwitch: false, reason: `live_comfortable (5h_used=${liveU5.toFixed(2)} weekly_used=${liveUW.toFixed(2)} source=${usedSource(live)})`, target: null, live: liveAccount, slots }
+  }
+
+  // Never decide on blind data. If the live account has no usable measurement, the
+  // ground-truth cap detector (real-limit-watch, which reads Claude Code's own synthetic
+  // cap message) remains the backstop; guessing here would switch on noise.
+  if (live.effective_source === 'unknown') {
+    return { shouldSwitch: false, reason: 'stale_measurement_hold: no usable usage reading for ' + liveAccount, target: null, live: liveAccount, slots }
   }
 
   // Eligible targets: not live, not flaky/disabled, both windows comfortable.
@@ -89,7 +153,9 @@ function decide(state, liveAccount, opts) {
   // enough for creds.rotate_to (expiresAt > now + 5min, the creds.js stale gate).
   const { usable, staleButHealthy } = pickTarget(state, liveAccount, opts)
 
-  const trigReason = `live ${liveAccount} hit cap (5h_used=${liveU5.toFixed(2)}>=${sTrig} or weekly_used=${liveUW.toFixed(2)}>=${wTrig})`
+  const trigReason = atThreshold
+    ? `live ${liveAccount} hit cap (5h_used=${liveU5.toFixed(2)}>=${sTrig} or weekly_used=${liveUW.toFixed(2)}>=${wTrig}, source=${usedSource(live)})`
+    : `live ${liveAccount} is projected over ${PROJECTION_CEILING} within ${PROJECTION_HORIZON_MIN}min at the current burn (5h ${liveU5.toFixed(2)} -> ${proj.p5.toFixed(2)}, weekly ${liveUW.toFixed(2)} -> ${proj.p7.toFixed(2)}, source=${usedSource(live)})`
   if (!usable.length) {
     // Triggered but cannot switch -> ALERT (the away-safety net). Distinguish
     // "a healthy account exists but its snapshot is stale (re-auth fixes it)"
@@ -114,9 +180,15 @@ function selftest() {
   const A = (h5, hw) => ({ headroom_5h_fraction: h5, headroom_weekly_fraction: hw, cap_5h: 1, cap_weekly: 1, remaining_5h: h5, remaining_weekly: hw })
   const assert = (cond, msg) => { if (!cond) { console.error('FAIL: ' + msg); process.exitCode = 1 } else console.log('ok: ' + msg) }
 
-  // 1. live at 82% 5h used -> switch to healthiest
-  let r = decide({ accounts: { 'money@ecodia.au': A(0.18, 0.5), 'code@ecodia.au': A(1.0, 1.0), 'tate@ecodia.au': A(0.6, 0.0) } }, 'money@ecodia.au')
-  assert(r.shouldSwitch && r.target === 'code@ecodia.au', '82% 5h used -> switch to code@ (healthiest)')
+  // 1. live at 92% 5h used -> switch to healthiest. (The trigger moved 0.80 -> 0.90 on
+  //    2026-08-02, Tate's predict-and-drain call, which is only safe because the
+  //    projection term below fires earlier when the burn rate warrants it.)
+  let r = decide({ accounts: { 'money@ecodia.au': A(0.08, 0.5), 'code@ecodia.au': A(1.0, 1.0), 'tate@ecodia.au': A(0.6, 0.0) } }, 'money@ecodia.au')
+  assert(r.shouldSwitch && r.target === 'code@ecodia.au', '92% 5h used -> switch to code@ (healthiest)')
+
+  // 1b. 82% no longer triggers on its own: that is the drain window Tate asked for.
+  r = decide({ accounts: { 'money@ecodia.au': A(0.18, 0.5), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
+  assert(!r.shouldSwitch, '82% 5h used -> hold (the trigger is 90 now, not 80)')
 
   // 2. live at 91% weekly used -> switch
   r = decide({ accounts: { 'money@ecodia.au': A(0.7, 0.09), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
@@ -126,9 +198,9 @@ function selftest() {
   r = decide({ accounts: { 'money@ecodia.au': A(0.9, 0.9), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
   assert(!r.shouldSwitch, 'live comfortable (10% used) -> hold')
 
-  // 4. exactly 80% 5h used -> switch (>= boundary)
-  r = decide({ accounts: { 'money@ecodia.au': A(0.20, 0.5), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
-  assert(r.shouldSwitch, '80.00% 5h used -> switch (boundary inclusive)')
+  // 4. exactly 90% 5h used -> switch (>= boundary)
+  r = decide({ accounts: { 'money@ecodia.au': A(0.10, 0.5), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
+  assert(r.shouldSwitch, '90.00% 5h used -> switch (boundary inclusive)')
 
   // 5. triggered but no healthy target (all others near cap) -> hold + alert
   r = decide({ accounts: { 'money@ecodia.au': A(0.1, 0.05), 'code@ecodia.au': A(0.3, 0.4), 'tate@ecodia.au': A(0.4, 0.45) } }, 'money@ecodia.au')
@@ -138,21 +210,60 @@ function selftest() {
   r = decide({ accounts: { 'money@ecodia.au': A(0.1, 0.05), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au', { flaky: ['code@ecodia.au'] })
   assert(!r.shouldSwitch, 'flaky target excluded -> hold')
 
-  // 7. triggered, target HAS budget but snapshot STALE (not rotatable) -> hold + alert(re-auth)
-  //    money@ live & near-cap; code@ comfortable but only money@ is rotatable.
+  // 7. INVERTED 2026-08-02. This case used to assert that a healthy target with a stale
+  //    snapshot was NOT usable, and it held while texting Tate to re-auth by hand. That
+  //    gate is deleted: switching is a full OAuth re-login, which needs no snapshot at
+  //    all. A snapshot rots on every non-live account by design (one Keychain,
+  //    single-use refresh tokens), so the gate emptied the target set almost always -
+  //    code@ sat on 484 consecutive invalid_grant failures and the fleet sent 43 texts
+  //    in a fortnight instead of switching. The healthy account must now be switched to.
   r = decide({ accounts: { 'money@ecodia.au': A(0.1, 0.05), 'code@ecodia.au': A(0.9, 0.9) } }, 'money@ecodia.au', { rotatable: ['money@ecodia.au'] })
-  assert(!r.shouldSwitch && r.alert && /STALE/.test(r.reason) && r.staleButHealthy.includes('code@ecodia.au'),
-    'healthy-but-stale target -> hold + alert (this is the 2026-06-21 failure)')
+  assert(r.shouldSwitch && r.target === 'code@ecodia.au' && !r.alert,
+    'a healthy target with a STALE snapshot is switched to (the rotatable gate is gone)')
 
-  // 8. triggered, target healthy AND rotatable -> switch (the fixed happy path)
+  // 8. the same thing with every snapshot fresh: unchanged behaviour, and proof that
+  //    passing opts.rotatable at all no longer alters the outcome either way.
   r = decide({ accounts: { 'money@ecodia.au': A(0.1, 0.05), 'code@ecodia.au': A(0.9, 0.9) } }, 'money@ecodia.au', { rotatable: ['money@ecodia.au', 'code@ecodia.au'] })
-  assert(r.shouldSwitch && r.target === 'code@ecodia.au' && !r.alert, 'healthy + rotatable target -> switch')
+  assert(r.shouldSwitch && r.target === 'code@ecodia.au' && !r.alert, 'healthy target -> switch')
 
   // 9. triggered, NO account has budget -> hold + alert (no stale note)
   r = decide({ accounts: { 'money@ecodia.au': A(0.1, 0.05), 'code@ecodia.au': A(0.3, 0.4) } }, 'money@ecodia.au', { rotatable: ['money@ecodia.au', 'code@ecodia.au'] })
   assert(!r.shouldSwitch && r.alert && /NO account has budget/.test(r.reason), 'no budget anywhere -> hold + alert')
 
-  console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED (9/9)')
+  // 10. THE MEASURED NUMBER WINS. This is the live 2026-08-02 state: the vendor says
+  //     code@ is at 100% of its 5h window and capped, while the ccusage heuristic
+  //     underneath still reports it as the healthiest account in the fleet. If the
+  //     fallback ever wins here, the picker switches into a capped account.
+  const REAL = (u5, u7, legacyH5, legacyH7) => ({
+    utilization_5h_effective: u5, utilization_7d_effective: u7, effective_source: 'real',
+    headroom_5h_fraction: legacyH5, headroom_weekly_fraction: legacyH7,
+    cap_5h: 1, cap_weekly: 1, remaining_5h: legacyH5, remaining_weekly: legacyH7,
+  })
+  r = decide({
+    accounts: {
+      'tate@ecodia.au': REAL(0.95, 0.53, 0.58, 0.84),
+      'code@ecodia.au': REAL(1.00, 0.20, 0.84, 0.84),   // legacy says healthiest, vendor says CAPPED
+      'money@ecodia.au': REAL(0.00, 1.00, 0.56, 0.73),  // legacy says fine, vendor says CAPPED
+    },
+  }, 'tate@ecodia.au')
+  assert(r.shouldSwitch === false && r.alert,
+    'both alternates measured capped -> hold and alert, never switch into one (the live 2026-08-02 state)')
+  assert(!/code@/.test(String(r.target)), 'the capped account is never offered as a target however good its legacy number looks')
+
+  // 11. Projection: comfortably under the trigger, but burning fast enough to blow
+  //     through the ceiling before the next few probes. Switching at 90 with no
+  //     lookahead means switching after the overshoot, and measured p95 burn is 4.13
+  //     points per 5-minute interval.
+  const burning = Object.assign(REAL(0.80, 0.30, 0.20, 0.70), { estimate: { burn_pp_per_min_5h: 1.5, burn_pp_per_min_7d: 0 } })
+  r = decide({ accounts: { 'money@ecodia.au': burning, 'code@ecodia.au': REAL(0.05, 0.05, 0.95, 0.95) } }, 'money@ecodia.au')
+  assert(r.shouldSwitch && /projected/i.test(r.reason), 'a fast burn triggers early via the projection term, before the ceiling is hit')
+
+  // 12. The same account NOT burning stays put: projection must not fire on a quiet one.
+  const quiet = Object.assign(REAL(0.80, 0.30, 0.20, 0.70), { estimate: { burn_pp_per_min_5h: 0.01, burn_pp_per_min_7d: 0 } })
+  r = decide({ accounts: { 'money@ecodia.au': quiet, 'code@ecodia.au': REAL(0.05, 0.05, 0.95, 0.95) } }, 'money@ecodia.au')
+  assert(!r.shouldSwitch, '80% used but barely burning -> hold, the drain window is the point')
+
+  console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED')
 }
 
 async function liveDecide() {

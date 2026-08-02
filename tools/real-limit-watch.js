@@ -545,8 +545,15 @@ async function selftest() {
       getActiveAccount: () => 'money@ecodia.au',
       agentTool: () => null,
     })
-    assert(res2.action === 'no_target_pending' && res2.staleButHealthy.includes('code@ecodia.au'),
-      'run(dry): real cap + only-stale target -> first scan held by debounce, stale target surfaced')
+    // INVERTED 2026-08-02. This used to assert that a healthy account with a STALE
+    // snapshot was surfaced as unusable (staleButHealthy) and the switch held. That gate
+    // is gone: switching is a full OAuth re-login, which needs no snapshot, and a
+    // snapshot rots on every non-live account by design. The healthy account is now a
+    // usable target, so the first scan is held only by the debounce.
+    assert(!res2.staleButHealthy || res2.staleButHealthy.length === 0,
+      'run(dry): a stale snapshot no longer disqualifies a healthy target (the rotatable gate is gone)')
+    assert(['no_target_pending', 'switch', 'switch_blocked_headroom_contradiction', 'capped_not_live'].includes(res2.action),
+      'run(dry): real cap with a healthy target resolves to a real action, never to a stale-snapshot excuse')
   } finally { try { fs.rmSync(tmp2, { recursive: true, force: true }) } catch (_) {} }
 
   // ── lagging-cap suppression (2026-06-24 inverted-alarm regression) ──────────
