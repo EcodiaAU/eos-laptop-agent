@@ -39,8 +39,10 @@
 
 const ide = require('./ide')
 const applescript = require('./applescript')
+const injectLock = require('./inject-lock')
 
 const CC_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
+const GENERIC_LABEL_RE = /^(claude code|new chat|cursor|chat|untitled)?$/i
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
@@ -110,6 +112,28 @@ async function resolveTabByLabel(label) {
 }
 
 /**
+ * verifyActiveIsTarget(label, viewColumn, index) -> {ok, active_label}. Reads the
+ * LIVE active CC tab and confirms it is the intended target. This is the guard
+ * that makes a misroute impossible: after we select a tab, we do NOT trust that
+ * the select took - we read back which tab is actually active and only paste if
+ * it is the one we meant. A non-generic label is the strong key (survives an
+ * index shift); a generic/absent label falls back to the exact (viewColumn,index)
+ * position. Any mismatch means focus is on the wrong chat - the caller aborts
+ * rather than blind-pasting into it.
+ */
+async function verifyActiveIsTarget(label, viewColumn, index) {
+  let tabs
+  try { tabs = await listChatTabs() } catch (e) { return { ok: false, active_label: null, reason: 'bridge_unreachable' } }
+  const active = tabs.find((t) => t.isActive)
+  if (!active) return { ok: false, active_label: null, reason: 'no_active_tab' }
+  const generic = GENERIC_LABEL_RE.test(String(label || '').trim())
+  if (!generic) {
+    return { ok: active.label === label, active_label: active.label }
+  }
+  return { ok: active.viewColumn === viewColumn && active.index === index, active_label: active.label }
+}
+
+/**
  * injectTurn({label?, viewColumn, index, text, settleMs?, submitOnly?}) -> {ok, ...}
  *
  * Prefer passing `label`: the target tab is re-resolved against live bridge
@@ -157,60 +181,85 @@ async function injectTurn(opts) {
   const submitOnly = opts.submitOnly === true
   const steps = []
 
+  // Cross-process mutex. No other injector (coord, iMessage router, a worker)
+  // may touch the shared focus/clipboard while we select -> verify -> paste ->
+  // submit. Without this, a concurrent inject steals focus mid-sequence and our
+  // paste lands in its tab. If we cannot get the lock, we do NOT inject - the
+  // caller leaves the message in the durable inbox instead of racing.
+  const lock = await injectLock.acquire({ who: 'chat-inject', timeoutMs: opts.lockTimeoutMs || 9000 })
+  if (!lock.ok) {
+    return { ok: false, reason: 'inject_lock_' + (lock.reason || 'busy'), held_by: lock.held_by }
+  }
+
+  const maxAttempts = opts.maxAttempts || 3
+
   try {
-    // 1. Clipboard (focusless). Skipped in submitOnly mode.
+    // 1. Clipboard (focusless). Skipped in submitOnly mode. Set once.
     if (!submitOnly) {
       await ide.clipboard_write({ text: String(text) })
       steps.push('clipboard')
     }
 
-    // 2. Raise the editor group.
-    const fg = focusGroupCmd(viewColumn)
-    if (fg) {
-      await ide.command({ cmd: fg }).catch(() => {})
-      steps.push('focus_group')
-      await sleep(150)
+    // 2. Get the target tab FOCUSED and CONFIRMED, with retries. The whole
+    // focus sequence (raise group -> select by index -> focus input -> bring VS
+    // Code forward -> settle) is one attempt, re-verified at the end. A single
+    // stray focus change (Tate clicking another tab, a slow activate) fails the
+    // verify; we retry rather than misroute or give up. Only when the target is
+    // CONFIRMED active do we move to the keystrokes. If every attempt loses the
+    // race, we ABORT (never blind-paste) and the caller keeps the inbox copy.
+    let ready = false
+    let activeInstead = null
+    for (let attempt = 0; attempt < maxAttempts && !ready; attempt++) {
+      const fg = focusGroupCmd(viewColumn)
+      if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(140) }
+      if (index >= 0 && index < 40) {
+        await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (index + 1) }).catch(() => {})
+        await sleep(150)
+      }
+      await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
+      await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
+      await sleep(settleMs)
+      const chk = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
+      if (chk.ok) { ready = true; steps.push('focused@' + attempt) }
+      else { activeInstead = chk.active_label; steps.push('miss@' + attempt + ':' + (chk.active_label || '?')) }
+    }
+    if (!ready) {
+      // Confirmed we could NOT land on the target after retries. Abort clean.
+      return { ok: false, reason: 'target_not_focusable', label: resolvedLabel, active_instead: activeInstead, attempts: maxAttempts, steps }
     }
 
-    // 3. Activate the tab by index (1-based over the active group).
-    if (index >= 0 && index < 40) {
-      await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (index + 1) }).catch(() => {})
-      steps.push('open_at_index')
-      await sleep(150)
-    }
-
-    // 4. Focus the CC chat input.
-    await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
-    steps.push('cc_focus')
-
-    // 5. Bring VS Code forward (Apple Events activate; gentle).
-    await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
-    steps.push('activate')
-
-    // 6. Settle for populate/focus to land.
-    await sleep(settleMs)
-
-    // 7. Paste (Cmd+V). Skipped in submitOnly mode.
+    // 3. Paste (Cmd+V). Skipped in submitOnly mode.
     if (!submitOnly) {
       const pasteRes = await applescript.keystroke({ key: 'v', cmd: true })
       steps.push('paste')
       if (pasteRes && pasteRes.ok === false) {
         return { ok: false, reason: 'paste_keystroke_failed', steps, detail: pasteRes }
       }
-      await sleep(350)
+      await sleep(250)
     }
 
-    // 8. Submit (Return = key code 36; a bare 'return' string types the word).
+    // 4. FINAL verify right before the Return. If focus slipped in the paste
+    // window, do NOT press Return (a stray Return would submit the wrong tab).
+    // The text is already sitting in the CORRECT target input, so this is a safe
+    // partial: nothing landed in the wrong chat.
+    const chkSubmit = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
+    if (!chkSubmit.ok) {
+      return { ok: false, reason: 'lost_focus_pre_submit', label: resolvedLabel, active_instead: chkSubmit.active_label, pasted: !submitOnly, steps }
+    }
+
+    // 5. Submit (Return = key code 36).
     const submitRes = await applescript.keystroke({ key: 36 })
     steps.push('submit')
     if (submitRes && submitRes.ok === false) {
       return { ok: false, reason: 'submit_keystroke_failed', steps, detail: submitRes }
     }
 
-    return { ok: true, label: resolvedLabel, viewColumn, index, steps }
+    return { ok: true, verified: true, label: resolvedLabel, viewColumn, index, steps }
   } catch (e) {
     return { ok: false, reason: 'inject_threw', error: e.message, steps }
+  } finally {
+    injectLock.release(lock.token)
   }
 }
 
-module.exports = { injectTurn, listChatTabs, resolveTabByLabel, CC_VIEW_TYPE }
+module.exports = { injectTurn, listChatTabs, resolveTabByLabel, verifyActiveIsTarget, CC_VIEW_TYPE }
