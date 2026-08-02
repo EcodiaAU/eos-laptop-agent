@@ -632,10 +632,37 @@ function poll() {
     a.cap_weekly = caps.cap_weekly
   }
 
+  // Preserve the ground-truth probe sub-state. poll() rebuilds `accounts` fresh from
+  // ccusage every tick (see the `const accounts = {}` above), so writing it raw CLOBBERS
+  // the `real` blocks that probeTick folds in via mergeRealBlock - blanking ground truth
+  // for up to a full probe interval each cycle, during which every reader silently falls
+  // back to the ccusage guess. That is the exact Fault-1 inversion the vendor probe
+  // replaced: a weekly-capped money@ reads as ~0.98 headroom for ~2min after every poll,
+  // and the real_samples ring is reset so burn-rate projection stalls at samples_used=0.
+  // mergeRealBlock is shadow-safe and never touches the legacy ccusage/headroom fields;
+  // this is its mirror - the main poll must never touch the probe-owned ones. poll() is
+  // synchronous so no probeTick can interleave, so reading prior here captures every probe
+  // written since the last poll with no lost-update race.
+  // Doctrine: patterns/per-account-usage-truth-is-the-vendor-endpoint-not-local-transcripts-2026-08-02.md
+  const PROBE_OWNED_KEYS = ['real', 'real_samples', 'estimate',
+    'utilization_5h_effective', 'utilization_7d_effective', 'effective_source',
+    'effective_age_s', 'excluded_as_target', 'excluded_reason']
+  const prior = readJsonSafe(ACCOUNTS_FILE, null)
+  if (prior && prior.accounts) {
+    for (const acct of KNOWN_ACCOUNTS) {
+      const priorRow = prior.accounts[acct]
+      if (!priorRow) continue
+      for (const k of PROBE_OWNED_KEYS) {
+        if (priorRow[k] !== undefined) accounts[acct][k] = priorRow[k]
+      }
+    }
+  }
+
   const payload = {
     polled_at: pollTs.toISOString(),
     active_account: getActiveAccount(),
     accounts: accounts,
+    schema: (prior && prior.schema) || undefined,
   }
   atomicWriteJson(ACCOUNTS_FILE, payload)
 

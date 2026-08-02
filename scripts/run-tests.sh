@@ -140,5 +140,8 @@ echo "pass=$passes fail=$fails timeout=$timeouts syntax_broken=$syntax_fails"
 #   tools/scheduler.test.js - one startupCleanup case still asserted the pre-2026-05-29-H2
 #     contract (null the tab handle even when the close failed). Rewritten to pin both
 #     branches of the current contract.
-[ "$fails" = "0" ] && [ "$syntax_broken:-0" = "0" ] 2>/dev/null
+# The exit code IS the gate. (A prior line here referenced an unbound `$syntax_broken`
+# with a malformed `:-0` default and, under `set -u`, aborted the script with exit 1 on
+# EVERY run - green included - so any wrapper keying on the exit code saw perpetual
+# failure. The var is `syntax_fails`; line 144 already uses it correctly.)
 exit $(( (fails > 0 || syntax_fails > 0) ? 1 : 0 ))
