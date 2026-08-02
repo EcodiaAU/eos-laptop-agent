@@ -303,5 +303,9 @@ console.log('\n--- Async parameter validation ---')
   // Summary
   // ---------------------------------------------------------------------------
   console.log(`\n=== ${passed + failed} tests: ${passed} passed, ${failed} failed ===\n`)
-  if (failed > 0) process.exit(1)
+  // EXIT EXPLICITLY on success too. Requiring ./input leaves a live handle behind, so
+  // returning normally left the process alive forever after printing 33/33 (2026-08-02):
+  // green output, no exit code, and any runner that waits on the child wedges. A test
+  // process owns its own termination; do not rely on the loop draining.
+  process.exit(failed > 0 ? 1 : 0)
 })()

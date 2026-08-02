@@ -5,7 +5,9 @@
   "description": "EcodiaOS Laptop Agent - remote machine control service",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "test": "bash scripts/run-tests.sh",
+    "test:quick": "bash scripts/run-tests.sh --quick"
   },
   "dependencies": {
     "cbor": "^10.0.12",

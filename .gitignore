@@ -17,3 +17,9 @@ daemons/state/
 *.log
 .DS_Store
 Thumbs.db
+
+# Runtime artefacts that must never be committed (2026-08-02 account-switch rebuild)
+logs/
+agent-tool-payload.json
+D:\\.code\\EcodiaOS\\coordination/
+tools/vault/*.bak

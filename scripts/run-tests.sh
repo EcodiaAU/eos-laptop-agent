@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# shell-lint-ok
+# run-tests.sh - THE commit gate for eos-laptop-agent. Invoked as `npm test`.
+#
+# WHY THIS EXISTS (2026-08-02, account-switch + usage rebuild stage 0): this repo had
+# no test script, no git hooks and no CI, so "each stage is one revertable commit" had
+# no gate behind it. It also had two live foot-guns that made an ad-hoc `node x.test.js`
+# unsafe:
+#   1. usage.test.js and coord.test.js resolve COORD_ROOT from the environment and
+#      write PRODUCTION ~/.ecodiaos/coordination state when it is unset. A bare test run
+#      would clobber the live accounts/worker substrate.
+#   2. cred-refresher.test.js case 4 spawns the real text-tate.js and TEXTS TATE unless
+#      TEXT_TATE_PATH points at a stub.
+# Every sandbox env below is load-bearing for one of those. Do not "simplify" them away.
+#
+# Also enforces a syntax gate (node --check) over the files the rebuild touches: a file
+# that does not parse is a broken baseline, and the suites would not surface it.
+#
+# Usage: npm test            (syntax gate + all suites)
+#        npm test -- --quick (syntax gate only)
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 2
+ROOT="$(pwd)"
+
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/eos-agent-tests.XXXXXX")"
+# cred-refresher.test.js copies live Keychain material into fixtures - the trap wipes it
+# even on interrupt, so a sandbox never outlives the run.
+cleanup() { rm -rf "$SANDBOX"; }
+trap cleanup EXIT INT TERM
+
+mkdir -p "$SANDBOX/coord" "$SANDBOX/tmp"
+# Stub text-tate: records the call, never sends. cred-refresher.test.js case 4 shells this.
+cat > "$SANDBOX/stub-text-tate.js" <<'STUB'
+console.log('[stub-text-tate] suppressed: ' + process.argv.slice(2).join(' ').slice(0, 120))
+process.exit(0)
+STUB
+
+export COORD_ROOT="$SANDBOX/coord"
+export COORD_DISABLE_SWEEP=1
+export TMPDIR="$SANDBOX/tmp"
+export TEXT_TATE_PATH="$SANDBOX/stub-text-tate.js"
+
+TIMEOUT_S="${TEST_TIMEOUT_S:-120}"
+fails=0; passes=0; timeouts=0
+
+# REDACTION IS MANDATORY, NOT HYGIENE. cred-refresher.test.js seeds its fixtures from the
+# LIVE Keychain, and its assertion messages print the value they compared ("got <token>").
+# A raw failure tail therefore leaks a live-lineage OAuth token into whatever reads this
+# gate's stdout (terminal scrollback, CI log, or an agent transcript). Observed live
+# 2026-08-02. Every suite's output passes through here before it is ever echoed.
+redact() {
+  sed -E \
+    -e 's/sk-ant-[A-Za-z0-9._-]{8,}/sk-ant-<REDACTED>/g' \
+    -e 's/(eyJ[A-Za-z0-9_-]{10,})\.[A-Za-z0-9._-]+/<JWT-REDACTED>/g' \
+    -e 's/(gh[pousr]_)[A-Za-z0-9]{10,}/\1<REDACTED>/g' \
+    -e 's/(refresh_?[Tt]oken"?[: =]+"?)[A-Za-z0-9._-]{12,}/\1<REDACTED>/g' \
+    -e 's/(access_?[Tt]oken"?[: =]+"?)[A-Za-z0-9._-]{12,}/\1<REDACTED>/g'
+}
+
+# node has no built-in per-process timeout; this wrapper bounds a hung suite (input.test.js
+# passes 33/33 but never exits, which would wedge the whole gate).
+#
+# The watchdog MUST have its stdout closed (>/dev/null 2>&1). A command substitution waits
+# for every process holding the pipe, not just the one it is waiting on, so a watchdog that
+# inherits stdout makes EVERY suite take the full TIMEOUT_S even when node exits in 200ms
+# (18 suites x 100s = a 30-minute "hang"). Writing the output to a file instead of capturing
+# it inline keeps the substitution out of the picture entirely.
+run_bounded() {
+  local file="$1" label="$2"
+  local out rc
+  local tmpout="$SANDBOX/out.$$"
+  node "$file" >"$tmpout" 2>&1 &
+  local pid=$!
+  ( sleep "$TIMEOUT_S"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  local watchdog=$!
+  wait "$pid"; rc=$?
+  kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+  out="$(redact < "$tmpout" 2>/dev/null)"; rm -f "$tmpout"
+  if [ "$rc" = "0" ]; then
+    passes=$((passes+1)); echo "  PASS  $label"
+  elif [ "$rc" = "137" ]; then
+    timeouts=$((timeouts+1)); echo "  TIMEOUT($TIMEOUT_S s)  $label"
+  else
+    fails=$((fails+1)); echo "  FAIL($rc)  $label"
+    printf '%s\n' "$out" | tail -12 | sed 's/^/        /'
+  fi
+}
+
+echo "=== syntax gate (node --check) ==="
+SYNTAX_FILES=(
+  tools/usage.js tools/creds.js tools/account-cap-decide.js tools/real-limit-watch.js
+  daemons/usage-poller.js daemons/cred-refresher.js tools/cowork.js routes/mcpCoord.js
+  tools/scheduler.js
+)
+# New rebuild modules are gated too, once they exist.
+for extra in tools/usage-config.js tools/usage-real.js tools/accounts-registry.js \
+             tools/switch-core.js scripts/switch-run.js; do
+  [ -f "$ROOT/$extra" ] && SYNTAX_FILES+=("$extra")
+done
+syntax_fails=0
+for f in "${SYNTAX_FILES[@]}"; do
+  if node --check "$ROOT/$f" 2>/dev/null; then echo "  ok    $f"
+  else echo "  BROKEN $f"; node --check "$ROOT/$f" 2>&1 | head -3 | sed 's/^/        /'; syntax_fails=$((syntax_fails+1)); fi
+done
+[ "${1:-}" = "--quick" ] && { echo "syntax_fails=$syntax_fails (quick mode, suites skipped)"; exit $((syntax_fails > 0)); }
+
+echo "=== selftests ==="
+for s in tools/account-cap-decide.js tools/real-limit-watch.js; do
+  [ -f "$ROOT/$s" ] || continue
+  if out="$(node "$ROOT/$s" --selftest 2>&1 | redact)" ; then passes=$((passes+1)); echo "  PASS  $s --selftest"
+  else fails=$((fails+1)); echo "  FAIL  $s --selftest"; printf '%s\n' "$out" | tail -8 | sed 's/^/        /'; fi
+done
+
+echo "=== suites ==="
+for t in "$ROOT"/tools/*.test.js "$ROOT"/daemons/*.test.js; do
+  [ -f "$t" ] || continue
+  run_bounded "$t" "${t#$ROOT/}"
+done
+
+echo "=== summary ==="
+echo "pass=$passes fail=$fails timeout=$timeouts syntax_broken=$syntax_fails"
+# KNOWN RED BASELINE as of 2026-08-02, after the stage-0 repairs below:
+#   daemons/cred-refresher.test.js - 5/9 fail STRUCTURALLY: the daemon reads the macOS
+#                                  Keychain and a hardcoded ~/.claude.json with no
+#                                  injectable seam, so on darwin its fixtures are ignored
+#                                  and the live account always wins identity. Stage 1 of
+#                                  the account-switch rebuild adds CLAUDE_JSON_PATH + an
+#                                  injectable keychain reader; these go green there.
+# Anything RED beyond that ONE file is a regression this gate must block on.
+#
+# Repaired in stage 0 (were red/misleading, all green now):
+#   tools/usage.test.js + tools/coord.test.js - both hardcoded the Corazon-era
+#     'D:\.code\EcodiaOS\coordination' and proxied fs to reroute it. That isolated nothing
+#     unless the caller exported that exact Windows string: with COORD_ROOT unset they
+#     wrote PRODUCTION substrate, with any other sandbox value they asserted against a
+#     directory the module never wrote. Both now bind process.env.COORD_ROOT to their own
+#     tmpdir before the require.
+#   tools/input.test.js - printed 33/33 then never exited (require('./input') leaves a live
+#     handle), wedging any runner that waits on it. Now exits explicitly.
+#   tools/scheduler.test.js - one startupCleanup case still asserted the pre-2026-05-29-H2
+#     contract (null the tab handle even when the close failed). Rewritten to pin both
+#     branches of the current contract.
+[ "$fails" = "0" ] && [ "$syntax_broken:-0" = "0" ] 2>/dev/null
+exit $(( (fails > 0 || syntax_fails > 0) ? 1 : 0 ))

@@ -16,7 +16,16 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'coord-test-'))
 const FAKE_COORD = path.join(TMP, 'coordination')
 fs.mkdirSync(FAKE_COORD, { recursive: true })
 
-const REAL_COORD = 'D:\\.code\\EcodiaOS\\coordination'
+// coord.js resolves COORD_ROOT from the environment at require time, so binding it to the
+// sandbox here is the actual isolation. Same Corazon-era trap fixed in usage.test.js
+// (2026-08-02): this file used to hardcode 'D:\\.code\\EcodiaOS\\coordination' and proxy fs
+// to reroute that path, which only isolated anything if the caller happened to export the
+// same Windows string as COORD_ROOT. With COORD_ROOT unset on this Mac, coord.js bound
+// ~/.ecodiaos/coordination and the tests wrote PRODUCTION worker rows; with any other
+// sandbox value the assertions read from a directory coord.js never wrote (ENOENT on the
+// signal_bound read-back). The fs proxy below stays as a no-op safety mapper.
+process.env.COORD_ROOT = FAKE_COORD
+const REAL_COORD = FAKE_COORD
 
 const realReadFileSync = fs.readFileSync
 const realWriteFileSync = fs.writeFileSync

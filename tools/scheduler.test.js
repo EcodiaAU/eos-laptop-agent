@@ -1329,9 +1329,16 @@ test('dispatchWatchdogTick: releases a wedged pass and leaves a healthy one alon
   assert(scheduler._dispatchWatchdogState().wedgeResets === 1, 'wedge reset counted')
 })
 
-// ── Task 3.4: startupCleanup tolerates close_tab errors ──────────────────────
+// ── Task 3.4: startupCleanup close_tab contract ──────────────────────────────
+//
+// This pair asserts the 2026-05-29 H2 contract, which INVERTED the original one:
+// dispatched_tab_id is nulled only when the close actually succeeded. A failed close
+// means the tab may still be live, and the id is the only handle cleanup_orphan_workers
+// has to target it, so nulling it on failure orphans a real tab forever. The old single
+// test still asserted the pre-H2 behaviour ("nulls it despite the error") and had been
+// failing red against correct code; rewritten 2026-08-02 to pin both branches.
 
-test('startupCleanup: tolerates close_tab errors and still nulls dispatched_tab_id', async () => {
+test('startupCleanup: tolerates a close_tab error and RETAINS dispatched_tab_id', async () => {
   const pool = makeStubPool([{ id: 'task-startup-1', dispatched_tab_id: 'tab_old_123' }])
   scheduler._setPool(pool)
 
@@ -1349,7 +1356,22 @@ test('startupCleanup: tolerates close_tab errors and still nulls dispatched_tab_
 
   assert(!threw, 'startupCleanup: no throw despite kill_worker error')
   const nullUpdate = pool._queries.find(q => q.sql.includes('dispatched_tab_id = NULL'))
-  assert(!!nullUpdate, 'startupCleanup: dispatched_tab_id nulled despite close_tab error')
+  assert(!nullUpdate, 'startupCleanup: handle RETAINED when close failed (H2) so the orphan sweep can still target the tab')
+})
+
+test('startupCleanup: nulls dispatched_tab_id when the close SUCCEEDS', async () => {
+  const pool = makeStubPool([{ id: 'task-startup-2', dispatched_tab_id: 'tab_old_456' }])
+  scheduler._setPool(pool)
+
+  scheduler._setDispatcher({
+    kill_worker: async () => ({ closed: true }),
+    dispatch_worker: async () => ({})
+  })
+
+  await scheduler.startupCleanup()
+
+  const nullUpdate = pool._queries.find(q => q.sql.includes('dispatched_tab_id = NULL'))
+  assert(!!nullUpdate, 'startupCleanup: dispatched_tab_id nulled after a confirmed close')
 })
 
 // ── SCHEDULER_ENABLED default off ─────────────────────────────────────────────

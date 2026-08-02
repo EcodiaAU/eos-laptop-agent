@@ -16,9 +16,21 @@ const FAKE_COORD = path.join(TMP, 'coordination')
 fs.mkdirSync(path.join(FAKE_COORD, 'usage'), { recursive: true })
 fs.mkdirSync(path.join(FAKE_COORD, 'workers'), { recursive: true })
 
-// Monkey-patch the COORD_ROOT before usage.js binds it. The cleanest way is
-// to swap process.cwd / a constant; easier path: write to the real default
-// substrate but in our own keys. For purity we proxy file ops:
+// Bind usage.js to the sandbox the honest way: usage.js resolves COORD_ROOT from the
+// environment at require time, so setting it here (before line 49's require) is all the
+// isolation this test needs.
+//
+// This REPLACED a Corazon-era trap (2026-08-02): the file used to hardcode
+// REAL_COORD = 'D:\\.code\\EcodiaOS\\coordination' and proxy fs so that path rerouted
+// into the sandbox. That only isolated anything when the caller happened to export the
+// same Windows string as COORD_ROOT. Run on this Mac with COORD_ROOT unset, usage.js
+// bound ~/.ecodiaos/coordination, the proxy matched nothing, and the test WROTE
+// PRODUCTION accounts.json/flaky.json. Run with any other sandbox path, seedState wrote
+// to a directory usage.js never read and the assertions failed on undefined. The fs proxy
+// is kept only as a belt-and-braces no-op mapper for any lingering absolute reference.
+process.env.COORD_ROOT = FAKE_COORD
+
+// Monkey-patch any lingering absolute path before usage.js binds it:
 const realReadFileSync = fs.readFileSync
 const realWriteFileSync = fs.writeFileSync
 const realMkdirSync = fs.mkdirSync
@@ -27,7 +39,9 @@ const realAppendFileSync = fs.appendFileSync
 const realReaddirSync = fs.readdirSync
 const realStatSync = fs.statSync
 
-const REAL_COORD = 'D:\\.code\\EcodiaOS\\coordination'
+// The path usage.js actually binds (now the sandbox). seedState and the direct
+// flaky.json writes below go through this, so they land where usage.js reads.
+const REAL_COORD = FAKE_COORD
 function reroute(p) {
   if (typeof p !== 'string') return p
   if (p.startsWith(REAL_COORD)) return p.replace(REAL_COORD, FAKE_COORD)
