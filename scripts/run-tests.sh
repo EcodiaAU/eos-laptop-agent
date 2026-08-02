@@ -119,16 +119,16 @@ done
 
 echo "=== summary ==="
 echo "pass=$passes fail=$fails timeout=$timeouts syntax_broken=$syntax_fails"
-# KNOWN RED BASELINE as of 2026-08-02, after the stage-0 repairs below:
-#   daemons/cred-refresher.test.js - 5/9 fail STRUCTURALLY: the daemon reads the macOS
-#                                  Keychain and a hardcoded ~/.claude.json with no
-#                                  injectable seam, so on darwin its fixtures are ignored
-#                                  and the live account always wins identity. Stage 1 of
-#                                  the account-switch rebuild adds CLAUDE_JSON_PATH + an
-#                                  injectable keychain reader; these go green there.
-# Anything RED beyond that ONE file is a regression this gate must block on.
+# BASELINE as of 2026-08-02 stage 1: FULLY GREEN. Any red is a regression - there is no
+# longer a known-failing file to wave through.
 #
-# Repaired in stage 0 (were red/misleading, all green now):
+# Repaired on the way here (each was red or actively misleading):
+#   daemons/cred-refresher.test.js - was 5/9 red STRUCTURALLY. The daemon reads the macOS
+#     Keychain first and a hardcoded ~/.claude.json, so on darwin the real live account
+#     always beat the fixtures and results depended on which account the operator happened
+#     to be on. Fixed with an injectable keychain reader plus CLAUDE_JSON_PATH, and the
+#     suite now pins COORD_ROOT/SWITCH_LOCK_FILE itself so it is hermetic. Grew to 12
+#     cases covering oauthAccount preservation, dead-snapshot skip, and switch-lock skip.
 #   tools/usage.test.js + tools/coord.test.js - both hardcoded the Corazon-era
 #     'D:\.code\EcodiaOS\coordination' and proxied fs to reroute it. That isolated nothing
 #     unless the caller exported that exact Windows string: with COORD_ROOT unset they

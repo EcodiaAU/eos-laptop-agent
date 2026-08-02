@@ -124,16 +124,38 @@ exports.applyOauthAccount = applyOauthAccount
 const ACCOUNTS = ['tate', 'code', 'money']
 
 // Accounts the operator has flagged as paused/unaffordable. pick_healthiest_account
-// will never select them; rotate_to refuses to rotate to them. Set via env var
-// ACCOUNTS_DISABLED as a comma-separated short-name list. Origin: 2026-06-11
-// code@ plan paused.
-const DISABLED_ACCOUNTS = new Set(
-  (process.env.ACCOUNTS_DISABLED || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-)
+// will never select them; rotate_to refuses to rotate to them.
+//
+// SOURCE CHANGED 2026-08-02: this used to parse process.env.ACCOUNTS_DISABLED, which was
+// defined in FOUR places at once (eos-laptop-agent/.env plus three launchd plists). The
+// plist won for daemons and .env won for a manual run, so the same account could read
+// enabled or disabled depending on which process asked, and the flag carried no expiry.
+// tate@ was disabled 2026-06-22 for a paused subscription, the subscription came back,
+// and the flag stayed for six weeks with nothing to re-check it. Roster truth now lives
+// in ONE file, with a reason and an expiry on every disable: tools/accounts-registry.js.
+//
+// Cached for 30s because this is read on hot paths; short enough that an operator edit
+// takes effect within a poll cycle.
+const accountsRegistry = require('./accounts-registry')
+let _disabledCache = { at: 0, set: new Set() }
+function disabledAccounts() {
+  const now = Date.now()
+  if (now - _disabledCache.at < 30000) return _disabledCache.set
+  let set = new Set()
+  try {
+    set = new Set(accountsRegistry.disabledEmails().map(s => String(s).split('@')[0]))
+  } catch (e) {
+    // A roster read must never take the switch path down with it. Empty set means nothing
+    // is disabled, matching the registry's own fail-open posture.
+    set = new Set()
+  }
+  _disabledCache = { at: now, set }
+  return set
+}
+// A live view, so the existing DISABLED_ACCOUNTS.has(x) call sites need no edit.
+const DISABLED_ACCOUNTS = { has: (a) => disabledAccounts().has(String(a || '').split('@')[0]) }
 exports._DISABLED_ACCOUNTS = DISABLED_ACCOUNTS
+exports._disabledAccounts = disabledAccounts
 
 // ── AllAccountsCappedError ────────────────────────────────────────────────────
 

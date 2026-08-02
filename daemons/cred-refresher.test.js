@@ -26,6 +26,19 @@ process.env.OAUTH_CLIENT_ID  = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 process.env.OAUTH_USER_AGENT = 'claude-cli-refresher/1.0 (eos-laptop-agent)'
 // OAUTH_REFRESH_URL will be set to stub server before requiring the module
 
+// HERMETIC IDENTITY (2026-08-02). The daemon resolves "which account is live" from
+// ~/.claude.json's oauthAccount label. Left pointing at the real file, these tests
+// inherited whichever account happened to be live on the machine: when that was code@,
+// the code@ cases were treated as the protected live session and skipped their OAuth
+// call, so "stub server never received a request" was a fact about the operator's laptop
+// rather than about the daemon. Point it at a path inside the sandbox that does not
+// exist, so no account is live unless a test says so.
+process.env.CLAUDE_JSON_PATH = path.join(TMP, 'claude.json')
+// Same reasoning for the roster and the switch lock: a test must not read the operator's
+// live registry or be paused by a real in-flight switch.
+process.env.COORD_ROOT = path.join(TMP, 'coordination')
+process.env.SWITCH_LOCK_FILE = path.join(TMP, 'coordination', 'usage', 'switch.lock')
+
 // ── helper: create a per-account JSON file ────────────────────────────────────
 
 function writeAccountFile(account, overrides) {
@@ -41,6 +54,12 @@ function writeAccountFile(account, overrides) {
   }
   if (overrides && overrides.claudeAiOauth) {
     Object.assign(base.claudeAiOauth, overrides.claudeAiOauth)
+  }
+  // Carry any OTHER top-level key through (oauthAccount above all). The helper used to
+  // copy claudeAiOauth alone and silently drop the rest, so a fixture asking for an
+  // identity label got a file without one and the assertion failed against correct code.
+  for (const [k, v] of Object.entries(overrides || {})) {
+    if (k !== 'claudeAiOauth') base[k] = v
   }
   fs.writeFileSync(path.join(CREDS_DIR, account + '.json'), JSON.stringify(base, null, 2))
   return base
@@ -442,13 +461,113 @@ function readBody(req) {
     if (saved.claudeAiOauth.accessToken !== 'AT-AFTER-CC-REFRESH') throw new Error('backup not self-healed from live (got ' + saved.claudeAiOauth.accessToken + ')')
   })
 
+  // ── TEST 10: the oauthAccount label survives a sync-from-live ─────────────
+  //
+  // Every snapshot write used to emit bare { claudeAiOauth }, dropping the identity
+  // label seed_from_live had captured. creds.applyOauthAccount then had nothing to
+  // restore after a rotate, so ~/.claude.json kept naming the PREVIOUS account and
+  // current_account() reported the account we had just switched away from once the
+  // token-match window lapsed. That is the entire "the switch did not stick" symptom.
+
+  await test('preserves oauthAccount across a sync-from-live (the label-strip defect)', async () => {
+    const account = 'tate'
+    const liveFile = path.join(CREDS_DIR, '_live.json')
+    fs.writeFileSync(liveFile, JSON.stringify({ claudeAiOauth: { accessToken: 'AT-live-NEW2', refreshToken: 'RT-shared2', expiresAt: Date.now() + 8 * 3600 * 1000, scopes: ['x'], subscriptionType: 'max', rateLimitTier: 'standard' } }))
+    writeAccountFile(account, {
+      claudeAiOauth: { accessToken: 'AT-backup-OLD2', refreshToken: 'RT-shared2', expiresAt: Date.now() + 60 * 1000 },
+      oauthAccount: { emailAddress: 'tate@ecodia.au', accountUuid: 'uuid-tate' },
+    })
+    process.env.CLAUDE_CREDENTIALS_PATH = liveFile
+
+    const { srv, port } = await startStubServer(async (req, res) => { res.writeHead(500); res.end('{}') })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port
+    const refresher = freshRequire()
+    await refresher.refresh_account(account)
+    await stopStubServer(srv)
+    delete process.env.CLAUDE_CREDENTIALS_PATH
+
+    const saved = readAccountFile(account)
+    if (saved.claudeAiOauth.accessToken !== 'AT-live-NEW2') throw new Error('sync did not happen')
+    if (!saved.oauthAccount || saved.oauthAccount.emailAddress !== 'tate@ecodia.au') {
+      throw new Error('oauthAccount was STRIPPED by the sync - the label-strip defect is back')
+    }
+  })
+
+  // ── TEST 11: a dead snapshot stops being retried ──────────────────────────
+  //
+  // code@ reached 484 consecutive invalid_grant failures because a spent single-use
+  // refresh token was retried every 30 minutes forever. None of those calls could have
+  // succeeded, and each one texted Tate on a 6h cooldown (41 of 43 texts in a fortnight).
+
+  await test('marks a dead snapshot and stops retrying it until the file changes', async () => {
+    const account = 'money'
+    const liveFile = path.join(CREDS_DIR, '_live.json')
+    fs.writeFileSync(liveFile, JSON.stringify({ claudeAiOauth: { accessToken: 'AT-someone-else', refreshToken: 'RT-someone-else', expiresAt: Date.now() + 8 * 3600 * 1000 } }))
+    process.env.CLAUDE_CREDENTIALS_PATH = liveFile
+    writeAccountFile(account, { claudeAiOauth: { accessToken: 'AT-dead', refreshToken: 'RT-spent', expiresAt: Date.now() + 60 * 1000 } })
+
+    let hits = 0
+    const { srv, port } = await startStubServer(async (req, res) => { hits++; res.writeHead(400); res.end(JSON.stringify({ error: 'invalid_grant' })) })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port
+    const refresher = freshRequire()
+
+    // Three failures reach the escalation threshold and mark the snapshot dead.
+    for (let i = 0; i < 3; i++) { try { await refresher.refresh_account(account) } catch (_) {} }
+    const hitsAtDeath = hits
+    // Further passes must not touch the network at all.
+    for (let i = 0; i < 5; i++) { try { await refresher.refresh_account(account) } catch (_) {} }
+    await stopStubServer(srv)
+    delete process.env.CLAUDE_CREDENTIALS_PATH
+
+    if (hits !== hitsAtDeath) throw new Error('kept retrying a dead snapshot: ' + hitsAtDeath + ' -> ' + hits + ' OAuth calls')
+    if (!refresher._snapshotIsDeadAndUnchanged(account)) throw new Error('snapshot was not marked dead')
+
+    // Re-seeding the file (what a switch does) clears the mark.
+    writeAccountFile(account, { claudeAiOauth: { accessToken: 'AT-fresh', refreshToken: 'RT-fresh', expiresAt: Date.now() + 8 * 3600 * 1000 } })
+    const later = Date.now() / 1000 + 5
+    fs.utimesSync(path.join(CREDS_DIR, account + '.json'), later, later)
+    if (refresher._snapshotIsDeadAndUnchanged(account)) throw new Error('a re-seeded snapshot must clear the dead mark')
+  })
+
+  // ── TEST 12: a pass is skipped while a switch holds the lock ──────────────
+  //
+  // Mid-switch the Keychain holds the INCOMING account while ~/.claude.json may still
+  // name the outgoing one. A refresh pass in that window syncs the new lineage into the
+  // old account's snapshot - one file impersonating another (the 2026-06-22 clobber).
+
+  await test('skips the whole pass while a switch holds the lock', async () => {
+    const lockDir = path.join(CREDS_DIR, '_cooord', 'usage')
+    fs.mkdirSync(lockDir, { recursive: true })
+    const lockFile = path.join(lockDir, 'switch.lock')
+    process.env.SWITCH_LOCK_FILE = lockFile
+
+    // A live holder: our own pid, heartbeat now.
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, stage: 'LOGIN_CLI', heartbeat_at: new Date().toISOString() }))
+    let r = freshRequire()
+    if (!r._switchInFlight()) throw new Error('a live lock holder with a fresh heartbeat must read as in-flight')
+
+    // A stale heartbeat means the holder is wedged, not working.
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, stage: 'LOGIN_CLI', heartbeat_at: new Date(Date.now() - 6 * 60 * 1000).toISOString() }))
+    r = freshRequire()
+    if (r._switchInFlight()) throw new Error('a heartbeat older than 5min must not hold the refresher off')
+
+    // A dead pid never blocks, however fresh the heartbeat looks.
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, stage: 'LOGIN_CLI', heartbeat_at: new Date().toISOString() }))
+    r = freshRequire()
+    if (r._switchInFlight()) throw new Error('a dead holder pid must not hold the refresher off')
+
+    fs.unlinkSync(lockFile)
+    r = freshRequire()
+    if (r._switchInFlight()) throw new Error('no lock file means no switch in flight')
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
     console.error('\n' + failures + ' test(s) FAILED')
     process.exit(1)
   } else {
-    console.log('\nALL TESTS PASSED (' + 9 + ' tests)')
+    console.log('\nALL TESTS PASSED (' + 12 + ' tests)')
     process.exit(0)
   }
 
@@ -461,5 +580,12 @@ function readBody(req) {
 function freshRequire() {
   const modulePath = require.resolve('./cred-refresher')
   delete require.cache[modulePath]
-  return require('./cred-refresher')
+  const m = require('./cred-refresher')
+  // NEUTRALISE THE REAL KEYCHAIN (2026-08-02). On darwin readLiveCredentials reads the
+  // Keychain FIRST and only falls back to CLAUDE_CREDENTIALS_PATH when that read fails,
+  // so on this Mac the real live account always beat every fixture and five of these
+  // nine cases failed for reasons that had nothing to do with the code under test. With
+  // the reader returning null, the file fixture each test writes is what "live" means.
+  if (m._setKeychainReader) m._setKeychainReader(() => null)
+  return m
 }

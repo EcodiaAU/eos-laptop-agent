@@ -170,9 +170,14 @@ async function liveDecide() {
   try { const creds = require('./creds'); live = creds.current_account && creds.current_account() } catch (e) {}
   if (!live || live === 'unknown') live = state.active_account || null
   const liveEmail = live && live.includes('@') ? live : (live ? live + '@ecodia.au' : null)
-  // Exclude disabled accounts (env) and currently-flaky accounts from targets.
-  const disabled = (process.env.ACCOUNTS_DISABLED || '').split(',').map(s => s.trim()).filter(Boolean)
-    .map(s => s.includes('@') ? s : s + '@ecodia.au')
+  // Exclude disabled and currently-flaky accounts from targets. Roster comes from the
+  // registry as of 2026-08-02, not process.env.ACCOUNTS_DISABLED: the env var lived in
+  // four places that drifted apart, and a disable with no expiry kept a re-subscribed
+  // tate@ out of the target set for six weeks while this very function texted Tate that
+  // it had nowhere to switch.
+  const disabled = (() => {
+    try { return require('./accounts-registry').disabledEmails() } catch (e) { return [] }
+  })().map(s => s.includes('@') ? s : s + '@ecodia.au')
 
   // rotatable = snapshots fresh enough for creds.rotate_to (expiresAt > now+5min,
   // matching STALE_THRESHOLD_MS in creds.js). A target with budget but a stale

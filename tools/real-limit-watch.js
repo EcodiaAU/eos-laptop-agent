@@ -303,8 +303,13 @@ async function run(opts) {
   const cappedEmail = resolveCappedAccount(hit.sessions, sessionsJson, liveEmail)
 
   const decideMod = require('./account-cap-decide')
-  const disabled = (opts.disabled || (process.env.ACCOUNTS_DISABLED || '').split(',').map(s => s.trim()).filter(Boolean))
-    .map(s => s.includes('@') ? s : s + '@ecodia.au')
+  // Roster from the registry, not process.env.ACCOUNTS_DISABLED (2026-08-02). The env
+  // var existed in four drifting places with no expiry, which is how a re-subscribed
+  // tate@ stayed excluded for six weeks. opts.disabled still wins so the selftests can
+  // inject a roster without touching disk.
+  const disabled = (opts.disabled || (() => {
+    try { return require('./accounts-registry').disabledEmails() } catch (e) { return [] }
+  })()).map(s => s.includes('@') ? s : s + '@ecodia.au')
   const { usable, staleButHealthy } = decideMod.pickTarget(
     accountsState, liveEmail, { disabled, rotatable: rotatableEmails(accountsState.accounts, credsDir, nowMs) })
 
