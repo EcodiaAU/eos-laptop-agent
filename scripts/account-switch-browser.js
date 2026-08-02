@@ -59,11 +59,39 @@ async function focusless(page) {
   } catch (_e) {}
 }
 
-// Read the Google password IN-PROCESS (never argv/stdout). Bare JSON string.
+// Read the Google password IN-PROCESS (never argv/stdout).
+//
+// The mirrors are NOT consistently encoded: code@'s is a JSON string ("pw"), tate@'s is
+// raw text. The old JSON.parse-only reader returned null for tate@, which reads exactly
+// like a missing mirror and aborted the leg. Worse, a JSON.parse SyntaxError quotes its
+// input, so a naive error path can print the password; on 2026-08-02 one did. Accept both
+// shapes and never let a parse failure carry content.
 function password() {
-  const p = PW_MIRROR[TARGET]
+  const p = process.env.PW_MIRROR_PATH || PW_MIRROR[TARGET]
   if (!p || !fs.existsSync(p)) return null
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_e) { return null }
+  let raw
+  try { raw = fs.readFileSync(p, 'utf8') } catch (_e) { return null }
+  try { const j = JSON.parse(raw); if (typeof j === 'string' && j.length) return j } catch (_e) { /* raw form below */ }
+  const bare = raw.replace(/\r?\n$/, '')
+  return bare.length ? bare : null
+}
+
+// Mint a TOTP code for this account from the vault. The vault seals seeds in the Secure
+// Enclave and mint.js prints only six digits, so nothing here ever holds the seed.
+//
+// Before this existed, driveGoogle's 2FA branch just slept, so a Google challenge could
+// only ever be resolved by Tate tapping his phone - the exact human dependency this whole
+// rebuild removes. Returns null when the account has no enrolled seed, in which case the
+// caller falls back to waiting for a phone approval.
+function mintTotp() {
+  const service = process.env.TOTP_SERVICE || (TARGET === 'code' ? 'google-code' : TARGET === 'tate' ? 'google-tate' : null)
+  if (!service) return null
+  try {
+    const out = execSync('node /Users/ecodia/.code/eos-laptop-agent/tools/vault/mint.js ' + service,
+      { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] })
+    const m = String(out).trim().match(/\b(\d{6})\b/)
+    return m ? m[1] : null
+  } catch (_e) { return null }
 }
 
 // State read against any claude.ai / Google page.
@@ -177,7 +205,34 @@ async function driveGoogle(gp) {
     } catch (e) { if (gp.isClosed && gp.isClosed()) return true; log('google read err', e.message); await sleep(800); continue }
 
     log('google[' + i + ']', st.head)
-    if (st.twofa) { log('WAITING_2FA - approve on iPhone (tate@)'); await sleep(3000); continue }
+    if (st.twofa) {
+      // TOTP FIRST, phone approval only as a fallback (2026-08-02). This branch used to
+      // sleep and nothing else, so an unattended switch stalled here until its 40
+      // iterations ran out (~2 minutes) and then reported EXHAUSTED. If the challenge is
+      // a code entry and this account has an enrolled vault seed, fill it ourselves.
+      const codeBox = await gp.evaluate(() => {
+        const i = document.querySelector('input[type=tel],input[name=totpPin],input[autocomplete="one-time-code"],input[type=text][aria-label*="code" i]')
+        if (!i) return null
+        const r = i.getBoundingClientRect()
+        if (!r.width || !r.height) return null
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 }
+      }).catch(() => null)
+      if (codeBox) {
+        const code = mintTotp()
+        if (code) {
+          log('2FA code prompt - filling from the vault')
+          await gp.mouse.click(codeBox.x, codeBox.y); await sleep(150)
+          await gp.keyboard.type(code, { delay: 40 })
+          await gp.keyboard.press('Enter')
+          await sleep(4000)
+          continue
+        }
+        log('2FA code prompt but no enrolled seed for ' + TARGET + ' - falling back to phone approval')
+      }
+      log('WAITING_2FA - needs an approval tap on the phone')
+      await sleep(3000)
+      continue
+    }
     if (st.pwHere && st.pwrect) {
       const pw = password()
       if (!pw) { log('NO_PASSWORD_MIRROR for ' + TARGET); return false }
@@ -218,7 +273,24 @@ async function waitForGooglePopup(browser, knownIds) {
 async function run() {
   const browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:' + PORT, defaultViewport: null })
   const pages = await browser.pages()
-  let page = pages.find(p => /claude\.(ai|com)\/oauth|platform\.claude/.test(p.url())) || pages[pages.length - 1]
+
+  // TAB HIJACK FIX (2026-08-02). This used to fall back to pages[pages.length - 1] when
+  // no OAuth tab was open, then NAVIGATE that tab to the consent URL. The canonical
+  // Chrome profile is where every logged-in vendor console lives, so "the last tab" was
+  // routinely a live Play Console or a Gmail window, yanked away from whatever it was
+  // doing. Reuse a genuine OAuth tab if one exists; otherwise open our OWN and close it
+  // on the way out.
+  let page = pages.find(p => /claude\.(ai|com)\/oauth|platform\.claude/.test(p.url()))
+  let ownedTab = false
+  if (!page) {
+    page = await browser.newPage()
+    ownedTab = true
+    log('opened a dedicated OAuth tab (never navigating an existing one)')
+  }
+  const closeOwned = async () => {
+    if (!ownedTab || !page) return
+    try { if (!page.isClosed()) await page.close() } catch (e) {}
+  }
   await focusless(page)
   await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
   await sleep(3500)
@@ -231,6 +303,7 @@ async function run() {
     if (st.authCode) {
       fs.writeFileSync(CODE_FILE, st.authCode + '\n')
       log('AUTH_CODE_WRITTEN -> ' + CODE_FILE)
+      await closeOwned()
       await browser.disconnect()
       return 0
     }
@@ -305,6 +378,7 @@ async function run() {
     await sleep(1500)
   }
   log('EXHAUSTED without writing code')
+  await closeOwned()
   await browser.disconnect()
   return 1
 }

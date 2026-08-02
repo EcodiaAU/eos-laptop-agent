@@ -105,7 +105,7 @@ done
 [ "${1:-}" = "--quick" ] && { echo "syntax_fails=$syntax_fails (quick mode, suites skipped)"; exit $((syntax_fails > 0)); }
 
 echo "=== selftests ==="
-for s in tools/account-cap-decide.js tools/real-limit-watch.js; do
+for s in tools/account-cap-decide.js tools/real-limit-watch.js tools/usage-real.js tools/switch-core.js; do
   [ -f "$ROOT/$s" ] || continue
   if out="$(node "$ROOT/$s" --selftest 2>&1 | redact)" ; then passes=$((passes+1)); echo "  PASS  $s --selftest"
   else fails=$((fails+1)); echo "  FAIL  $s --selftest"; printf '%s\n' "$out" | tail -8 | sed 's/^/        /'; fi
