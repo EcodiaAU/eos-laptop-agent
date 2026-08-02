@@ -40,10 +40,10 @@ const HEARTBEAT_FILE = usageCfg.PATHS.HEARTBEAT_FILE
 
 // ── ground-truth probe tick ──────────────────────────────────────────────────
 // Asks the vendor what each account's utilization actually is, staggered so the three
-// accounts never fire together. SHADOW MODE while USAGE_REAL_DECIDES is unset: the
-// readings are written into accounts.json under each account's `real` block and logged,
-// but every decision still runs on the legacy numbers. Flipping the flag is a separate,
-// deliberate step after the readings have been watched for a day.
+// accounts never fire together (~36 requests/hour across the fleet). Results land in
+// accounts.json under each account's `real` block, plus the derived
+// utilization_*_effective fields the decision path reads. USAGE_REAL_PROBE=0 disables
+// probing entirely, which drops every consumer back to the ccusage fallback.
 const PROBE_TICK_MS = Number(process.env.PROBE_TICK_MS) || 60 * 1000
 const REAL_PROBE_ENABLED = process.env.USAGE_REAL_PROBE !== '0'
 let _probeInFlight = false
@@ -279,8 +279,14 @@ async function main() {
   if (REAL_PROBE_ENABLED) {
     probeTick()
     setInterval(probeTick, PROBE_TICK_MS)
+    // Say what is actually true. As of the stage-4 cutover the decision path
+    // (account-cap-decide, real-limit-watch, creds, checkCapWarning) reads
+    // utilization_*_effective straight out of accounts.json whenever a probe has written
+    // it, with the ccusage numbers only as a fallback. There is no separate "deciding"
+    // switch to flip, and a startup line claiming shadow mode would have someone reading
+    // these logs believe the old numbers were still in charge.
     console.log('[' + nowIso() + '] usage ground-truth probe armed, tick=' + PROBE_TICK_MS +
-      'ms, deciding=' + (process.env.USAGE_REAL_DECIDES === '1' ? 'YES' : 'no (shadow)'))
+      'ms - measured utilization DECIDES (ccusage is the fallback when a probe is missing)')
   }
 }
 
