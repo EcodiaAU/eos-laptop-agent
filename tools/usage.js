@@ -672,6 +672,48 @@ function readAccountsState() {
   return readJsonSafe(ACCOUNTS_FILE, null)
 }
 
+// mergeRealBlock - fold one ground-truth probe result into accounts.json.
+//
+// SHADOW-SAFE BY CONSTRUCTION (2026-08-02): it writes ONLY the per-account `real` block,
+// a small ring of recent readings for the burn-rate calculation, and derived
+// utilization_*_effective fields. It never touches the legacy decision fields
+// (headroom_score, remaining_*, tokens_*), so while the probe is in shadow mode the old
+// picker keeps seeing exactly the inputs it saw yesterday and the shadow phase measures
+// something rather than quietly changing behaviour under itself.
+const REAL_SAMPLE_RING = 12
+function mergeRealBlock(email, real) {
+  ensureDirs()
+  const state = readJsonSafe(ACCOUNTS_FILE, null) || { accounts: {} }
+  state.accounts = state.accounts || {}
+  const row = state.accounts[email] || (state.accounts[email] = {})
+  row.real = real
+
+  if (real && real.probe_status === 'ok' && typeof real.utilization_5h === 'number') {
+    const ring = Array.isArray(row.real_samples) ? row.real_samples : []
+    ring.push({
+      probed_at: real.probed_at,
+      utilization_5h: real.utilization_5h,
+      utilization_7d: real.utilization_7d,
+      resets_at_5h: real.resets_at_5h,
+    })
+    row.real_samples = ring.slice(-REAL_SAMPLE_RING)
+    try {
+      const usageReal = require('./usage-real')
+      row.estimate = Object.assign({}, row.estimate, usageReal.burnRates(row.real_samples))
+    } catch (e) {}
+  }
+
+  try {
+    const usageReal = require('./usage-real')
+    const isLive = (state.active_account || '') === email
+    Object.assign(row, usageReal.computeEffective(row, isLive, Date.now()))
+  } catch (e) {}
+
+  state.schema = 2
+  atomicWriteJson(ACCOUNTS_FILE, state)
+  return row
+}
+
 // ── flaky-account tracking (Component 4) ─────────────────────────────────
 //
 // When dispatch_worker fails on account X after recovery attempts, we record
@@ -892,6 +934,7 @@ module.exports = {
   _liveAccountFromClaudeConfig: liveAccountFromClaudeConfig,
   _setActiveAccount: setActiveAccount,
   _readAccountsState: readAccountsState,
+  _mergeRealBlock: mergeRealBlock,
   _computeAlerts: computeAlerts,
   _pickAccount: pickAccount,
   _markFlaky: markFlaky,

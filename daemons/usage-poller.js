@@ -25,12 +25,85 @@ const usage = require(path.join(AGENT_ROOT, 'tools', 'usage'))
 
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 5 * 60 * 1000
 const POLL_INITIAL_DELAY_MS = Number(process.env.POLL_INITIAL_DELAY_MS) || 5_000
-const _COORD_ROOT = process.env.COORD_ROOT || (
-  process.platform === 'win32'
-    ? 'D:\\.code\\EcodiaOS\\coordination'
-    : '/Users/ecodia/.code/ecodiaos/coordination'
-)
-const HEARTBEAT_FILE = path.join(_COORD_ROOT, 'usage', 'poller.heartbeat')
+// COORD_ROOT comes from the shared config now (2026-08-02). This file used to carry its
+// own fallback of /Users/ecodia/.code/ecodiaos/coordination, a path that does not exist,
+// while usage.js, coord.js, real-limit-watch.js and account-cap-decide.js all defaulted
+// to ~/.ecodiaos/coordination. Only the plist env masked the split, so a bootout without
+// that env would have written the heartbeat and switch-request into a ghost directory
+// while accounts.json carried on at the real path.
+const usageCfg = require(path.join(AGENT_ROOT, 'tools', 'usage-config'))
+const usageReal = require(path.join(AGENT_ROOT, 'tools', 'usage-real'))
+const accountsRegistry = require(path.join(AGENT_ROOT, 'tools', 'accounts-registry'))
+const _COORD_ROOT = usageCfg.PATHS.COORD_ROOT
+const HEARTBEAT_FILE = usageCfg.PATHS.HEARTBEAT_FILE
+
+// ── ground-truth probe tick ──────────────────────────────────────────────────
+// Asks the vendor what each account's utilization actually is, staggered so the three
+// accounts never fire together. SHADOW MODE while USAGE_REAL_DECIDES is unset: the
+// readings are written into accounts.json under each account's `real` block and logged,
+// but every decision still runs on the legacy numbers. Flipping the flag is a separate,
+// deliberate step after the readings have been watched for a day.
+const PROBE_TICK_MS = Number(process.env.PROBE_TICK_MS) || 60 * 1000
+const REAL_PROBE_ENABLED = process.env.USAGE_REAL_PROBE !== '0'
+let _probeInFlight = false
+
+async function probeTick() {
+  if (!REAL_PROBE_ENABLED || _probeInFlight) return
+  _probeInFlight = true
+  try {
+    const state = usage._readAccountsState ? (usage._readAccountsState() || {}) : {}
+    const accounts = state.accounts || {}
+    const nowMs = Date.now()
+    const live = usageReal._currentLiveShort()
+    const roster = accountsRegistry.enabled()
+    // probeDue works in short names; accounts.json is keyed by email.
+    const byShort = {}
+    for (const short of roster) byShort[short] = accounts[short + '@ecodia.au'] || {}
+    const due = usageReal.probeDue(byShort, nowMs, { order: roster })
+    for (const short of due) {
+      const email = short + '@ecodia.au'
+      const row = accounts[email] || {}
+      const regRow = accountsRegistry.get(short) || {}
+      const res = await usageReal.probeAccount(short, {
+        prior: row.real || {},
+        nowMs: Date.now(),
+        liveShort: live,
+        registryRow: regRow,
+        verifyIdentity: !((row.real || {}).identity_verified_at),
+        onIdentity: (s, ids) => { try { accountsRegistry.setIdentity(s, ids, { by: 'usage-poller' }) } catch (e) {} },
+      })
+      usage._mergeRealBlock(email, res)
+      if (res.probe_status !== 'ok') {
+        console.log('[' + nowIso() + '] probe ' + short + ': ' + res.probe_status)
+      }
+    }
+  } catch (e) {
+    console.error('[probe-tick] ' + (e && e.message || e))
+  } finally {
+    _probeInFlight = false
+  }
+}
+
+// probeSummary - per-account probe age + status, carried on the heartbeat so a canary can
+// tell "the poller is alive" from "the poller is alive but blind". Silence in a measuring
+// system reads identical to health unless the measurement itself is measured.
+function probeSummary() {
+  try {
+    const state = usage._readAccountsState() || {}
+    const out = {}
+    for (const [email, row] of Object.entries(state.accounts || {})) {
+      const real = row.real || {}
+      out[email] = {
+        status: real.probe_status || 'never',
+        age_s: real.probed_at ? Math.round((Date.now() - Date.parse(real.probed_at)) / 1000) : null,
+        util_5h: real.utilization_5h != null ? Math.round(real.utilization_5h * 100) : null,
+        util_7d: real.utilization_7d != null ? Math.round(real.utilization_7d * 100) : null,
+        capped: !!real.capped,
+      }
+    }
+    return out
+  } catch (e) { return {} }
+}
 
 function nowIso() { return new Date().toISOString() }
 
@@ -54,10 +127,12 @@ function writeHeartbeat(payload) {
 // account reality), it holds silently. It NEVER texts Tate. Defensive: never
 // throws, never blocks the poll. Calibrated from Tate's live reading 2026-06-14
 // (54% at ~397M tokens -> ~735M real 5h limit).
-const CAP_5H_TOKENS = Number(process.env.CAPS_5H_TOKENS) || 735_000_000
+// (CAP_5H_TOKENS and SWITCH_TRIGGER_PCT deleted 2026-08-02. Both were assigned here and
+// never read: capAutoSwitch delegates the whole decision to account-cap-decide.js. They
+// looked exactly like live tuning knobs while carrying 735M and 0.80 against a live cap
+// of 41.5M, so anyone calibrating from this file read a number 17.7x off.)
 const CCUSAGE_CLI_JS = process.env.CCUSAGE_CLI_JS || '/opt/homebrew/lib/node_modules/ccusage/dist/cli.js'
 const SWITCH_REQUEST_FILE = path.join(_COORD_ROOT, 'usage', 'switch-request.json')
-const SWITCH_TRIGGER_PCT = 0.80   // raise the switch request at 80% of the 5h block
 
 function readJsonSafe(p, fb) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return fb } }
 
@@ -154,7 +229,7 @@ async function runOnePoll() {
       }
     }
     console.log('[' + nowIso() + '] poll OK in ' + elapsed + 'ms', JSON.stringify(summary))
-    writeHeartbeat({ ok: true, elapsed_ms: elapsed, summary: summary })
+    writeHeartbeat({ ok: true, elapsed_ms: elapsed, summary: summary, probe: probeSummary() })
     capAutoSwitch()
   } catch (e) {
     const elapsed = Date.now() - t0
@@ -173,6 +248,14 @@ async function main() {
   realLimitWatch()
   setInterval(realLimitWatch, REAL_LIMIT_WATCH_INTERVAL_MS)
   console.log('[' + nowIso() + '] real-limit-watch armed, interval=' + REAL_LIMIT_WATCH_INTERVAL_MS + 'ms')
+  // Ground-truth probe. The tick is 60s but each account is only probed on its own
+  // stagger slot, so the vendor sees ~36 requests/hour across the fleet.
+  if (REAL_PROBE_ENABLED) {
+    probeTick()
+    setInterval(probeTick, PROBE_TICK_MS)
+    console.log('[' + nowIso() + '] usage ground-truth probe armed, tick=' + PROBE_TICK_MS +
+      'ms, deciding=' + (process.env.USAGE_REAL_DECIDES === '1' ? 'YES' : 'no (shadow)'))
+  }
 }
 
 main().catch(e => { console.error('fatal: ' + (e && e.stack || e)); process.exit(1) })
