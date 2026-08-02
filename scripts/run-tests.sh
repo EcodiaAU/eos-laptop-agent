@@ -94,7 +94,7 @@ SYNTAX_FILES=(
 )
 # New rebuild modules are gated too, once they exist.
 for extra in tools/usage-config.js tools/usage-real.js tools/accounts-registry.js \
-             tools/switch-core.js scripts/switch-run.js; do
+             tools/switch-core.js tools/usage-capacity.js scripts/switch-run.js; do
   [ -f "$ROOT/$extra" ] && SYNTAX_FILES+=("$extra")
 done
 syntax_fails=0
@@ -105,7 +105,7 @@ done
 [ "${1:-}" = "--quick" ] && { echo "syntax_fails=$syntax_fails (quick mode, suites skipped)"; exit $((syntax_fails > 0)); }
 
 echo "=== selftests ==="
-for s in tools/account-cap-decide.js tools/real-limit-watch.js tools/usage-real.js tools/switch-core.js; do
+for s in tools/account-cap-decide.js tools/real-limit-watch.js tools/usage-real.js tools/switch-core.js tools/usage-capacity.js; do
   [ -f "$ROOT/$s" ] || continue
   if out="$(node "$ROOT/$s" --selftest 2>&1 | redact)" ; then passes=$((passes+1)); echo "  PASS  $s --selftest"
   else fails=$((fails+1)); echo "  FAIL  $s --selftest"; printf '%s\n' "$out" | tail -8 | sed 's/^/        /'; fi
