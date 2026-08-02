@@ -189,8 +189,11 @@ async function defaultKvWriter(key, value) {
   const supabaseUrl = process.env.SUPABASE_URL
   const serviceKey  = process.env.SUPABASE_SERVICE_KEY
   if (!supabaseUrl || !serviceKey) {
-    console.warn('[cred-refresher] SUPABASE_URL or SUPABASE_SERVICE_KEY not set - kv_store escalation skipped')
-    return
+    // Return an explicit skip so the caller does not log a write that never happened.
+    // This daemon's env carries no SUPABASE_URL/SUPABASE_SERVICE_KEY, so this path is
+    // always taken: the durable dead-account signal is the registry markSnapshot, and
+    // the kv escalation is legacy. Returning undefined here read to the caller as success.
+    return false
   }
 
   const body = JSON.stringify({ key, value, updated_at: new Date().toISOString() })
@@ -218,7 +221,7 @@ async function defaultKvWriter(key, value) {
       res.on('data', c => { data += c })
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve()
+          resolve(true)
         } else {
           reject(new Error('kv_store upsert failed: HTTP ' + res.statusCode + ' ' + data))
         }
@@ -568,8 +571,12 @@ async function handleFailure(account, reason) {
       escalated_at:         new Date().toISOString(),
     }
     try {
-      await _kvWriter(key, value)
-      console.error('[cred-refresher] escalated ' + account + ' failure to kv_store key ' + key)
+      const wrote = await _kvWriter(key, value)
+      if (wrote === false) {
+        console.error('[cred-refresher] kv escalation for ' + account + ' skipped (kv unconfigured); registry dead-mark is the durable signal')
+      } else {
+        console.error('[cred-refresher] escalated ' + account + ' failure to kv_store key ' + key)
+      }
     } catch (kvErr) {
       console.error('[cred-refresher] kv_store escalation itself failed: ' + kvErr.message)
     }
