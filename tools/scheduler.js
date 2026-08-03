@@ -917,10 +917,28 @@ exports.dispatchOne = async function dispatchOne(row) {
     }
 
     // 3. Dispatch worker.
+    // Give the worker chat a PLAIN-LANGUAGE tab title from the task's own name
+    // (e.g. "cowork.chambers-fi-arc-33" -> "chambers fi arc 33"), so Claude Code
+    // titles the tab readably instead of [EOS-W-<hex>]. That makes the tab useful
+    // in the IDE, useful as the iMessage reply prefix, and routable by topic. The
+    // dispatcher still stamps the sentinel + fingerprint for the close path, so
+    // this only changes the human-facing name, not how the tab is closed.
+    const workerName = (function () {
+      const n = String((row && row.name) || '')
+        .replace(/^cowork\./, '')
+        .replace(/[._\-]+/g, ' ')
+        .replace(/[^A-Za-z0-9 ]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 40)
+        .trim()
+      return n || undefined
+    })()
     const dispatcher = getDispatcher()
     const result = await dispatcher.dispatch_worker({
       brief: brief,
       task_id: String(row.id),
+      worker_name: workerName,
       ide: 'stable',
       // Set ack timeout to 0 so dispatch_worker returns immediately.
       // We do our own signal_bound wait below inside the launch-lock.
