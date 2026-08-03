@@ -567,19 +567,58 @@ function isChatDeliver(msg) {
 // boolean guard that ALSO catches a just-spawned worker whose row is not yet
 // fingerprint-cached, via its `[EOS-W-...]` sentinel prefix (the default; a
 // custom worker_name sentinel is only caught once its row is cached).
+// Claude Code truncates a chat tab TITLE to 24 visible chars + a trailing '…'
+// (U+2026) in the tab bar, and the IDE bridge returns that RENDERED title. So a
+// worker spawned "[studio nuance data collections]" (33 chars) appears live as
+// "[studio nuance data coll…". Every stored-full-name-vs-live-label comparison
+// must be truncation-aware or it silently never matches: leaked tabs that never
+// close, and injection that falls back to a stale index (the wrong-tab bug).
+// Doctrine: cc-truncates-tab-title-24-chars-resolution-must-be-truncation-aware-2026-08-03.
+const CC_TITLE_ELLIPSIS = '…'
+function _isTruncatedLabel(s) { return typeof s === 'string' && s.endsWith(CC_TITLE_ELLIPSIS) }
+function _visiblePrefix(s) { return _isTruncatedLabel(s) ? s.slice(0, -1) : s }
+// Does live tab label `live` (possibly CC-truncated) correspond to the
+// deliberately-set full name `full` (a sentinel_prefix / spawn label)? Exact for
+// short names; truncation-prefix for long ones. NEVER a loose arbitrary prefix -
+// the visible prefix must be long enough to be an identity, not a stub.
+const _MIN_TRUNC_PREFIX = 6
+function _labelMatchesStored(live, full) {
+  if (!live || !full) return false
+  if (live === full) return true
+  if (_isTruncatedLabel(live)) {
+    const vis = _visiblePrefix(live)
+    if (vis.length < _MIN_TRUNC_PREFIX) return false
+    return full.startsWith(vis)
+  }
+  return false
+}
+
 function _liveWorkerRows() {
   const rows = []
   for (const [, w] of workers.entries()) {
     if (w.terminated_at) continue
-    if (w.tab_handle && w.tab_handle.autotitle_fingerprint) rows.push(w)
+    const th = w.tab_handle
+    if (th && (th.autotitle_fingerprint || th.sentinel_prefix)) rows.push(w)
   }
   return rows
 }
+// Which registered worker IS this live tab. Deterministic truncation-aware
+// sentinel match FIRST (a deliberately-set name is a stronger identity than a
+// fuzzy brief fingerprint), uniqueness-gated so a collision refuses rather than
+// guesses; then the fingerprint tier for fully re-titled tabs.
 function _matchWorkerRow(tab, liveWorkers) {
-  if (!_ttm) return null
   const rows = liveWorkers || _liveWorkerRows()
+  const sentinelHits = rows.filter((w) => {
+    const th = w.tab_handle || {}
+    if (th.viewColumn != null && th.viewColumn !== tab.viewColumn) return false
+    return _labelMatchesStored(tab.label, th.sentinel_prefix)
+  })
+  if (sentinelHits.length === 1) return sentinelHits[0]
+  if (sentinelHits.length > 1) return null  // ambiguous truncation collision: refuse
+  if (!_ttm) return null
   for (const w of rows) {
     const th = w.tab_handle
+    if (!th || !th.autotitle_fingerprint) continue
     if (th.viewColumn != null && th.viewColumn !== tab.viewColumn) continue
     const r = _ttm.pickByFingerprint([tab], th.autotitle_fingerprint, th.sentinel_prefix || null)
     if (r && r.match) return w
@@ -639,7 +678,14 @@ async function resolveLiveTargetTab(topic) {
   if (w && w.tab_handle) {
     const th = w.tab_handle
     let picked = null
-    if (_ttm && th.autotitle_fingerprint) {
+    // Truncation-aware sentinel match FIRST (deterministic, uniqueness-gated):
+    // CC renders the live label shorter than the stored sentinel.
+    if (th.sentinel_prefix) {
+      const pool = tabs.filter((t) => th.viewColumn == null || t.viewColumn === th.viewColumn)
+      const sHits = (pool.length ? pool : tabs).filter((t) => _labelMatchesStored(t.label, th.sentinel_prefix))
+      if (sHits.length === 1) picked = sHits[0]
+    }
+    if (!picked && _ttm && th.autotitle_fingerprint) {
       const pool = tabs.filter((t) => th.viewColumn == null || t.viewColumn === th.viewColumn)
       const r = _ttm.pickByFingerprint(pool.length ? pool : tabs, th.autotitle_fingerprint, th.sentinel_prefix || null)
       if (r && r.match) picked = r.match
@@ -647,7 +693,7 @@ async function resolveLiveTargetTab(topic) {
     if (!picked) {
       const lab = th.label && !isGenericLabelStr(th.label) ? th.label
         : (th.label_at_spawn && !isGenericLabelStr(th.label_at_spawn) ? th.label_at_spawn : null)
-      if (lab) { const hits = tabs.filter((t) => t.label === lab); if (hits.length === 1) picked = hits[0] }
+      if (lab) { const hits = tabs.filter((t) => _labelMatchesStored(t.label, lab)); if (hits.length === 1) picked = hits[0] }
     }
     if (picked) return Object.assign({ ok: true, kind: 'worker' }, _pos(picked))
     return { ok: false, kind: 'worker', reason: 'worker_tab_unresolved' }
@@ -1185,8 +1231,12 @@ async function close_my_tab(params, ctx) {
       if (group && storedTabIndex != null) {
         const tabAtIndex = (group.tabs || [])[storedTabIndex]
         if (tabAtIndex && tabAtIndex.viewType === CC_CHAT_VIEW_TYPE) {
-          const labelMatch = exactLabel && !isGenericLabel(exactLabel) && tabAtIndex.label === exactLabel
-          const sentinelMatch = sentinelPrefix && tabAtIndex.label && tabAtIndex.label.startsWith(sentinelPrefix)
+          // Truncation-aware: CC renders "[slice worker checkin 2026 08 03]" as
+          // "[slice worker checkin 20…", so the live label is SHORTER than the
+          // stored sentinel and label.startsWith(sentinel) can never be true.
+          // _labelMatchesStored compares in the correct direction.
+          const labelMatch = exactLabel && !isGenericLabel(exactLabel) && _labelMatchesStored(tabAtIndex.label, exactLabel)
+          const sentinelMatch = _labelMatchesStored(tabAtIndex.label, sentinelPrefix)
           if (labelMatch || sentinelMatch) {
             foundExact = tabAtIndex
             matchedBy = 'tabIndex+' + (sentinelMatch ? 'sentinel' : 'label') + ':' + storedTabIndex
@@ -1194,17 +1244,19 @@ async function close_my_tab(params, ctx) {
         }
       }
 
-      // (b) sentinel_prefix match
+      // (b) sentinel_prefix match (truncation-aware, uniqueness-gated). A
+      // truncation collision (2+ candidates share the visible prefix) REFUSES
+      // here and falls through - better leak than wrong-close.
       if (!foundExact && sentinelPrefix) {
-        const hit = candidates.find(t => t.label && t.label.startsWith(sentinelPrefix))
-        if (hit) { foundExact = hit; matchedBy = 'sentinel_prefix:' + sentinelPrefix }
+        const hits = candidates.filter(t => _labelMatchesStored(t.label, sentinelPrefix))
+        if (hits.length === 1) { foundExact = hits[0]; matchedBy = 'sentinel_trunc:' + sentinelPrefix }
       }
 
-      // (c) exact_label match (legacy fallback) - NEVER on the generic default
-      // label, which matches every untitled tab including the conductor.
+      // (c) exact_label match (legacy fallback, truncation-aware) - NEVER on the
+      // generic default label, which matches every untitled tab incl the conductor.
       if (!foundExact && exactLabel && !isGenericLabel(exactLabel)) {
-        const hit = candidates.find(t => t.label === exactLabel)
-        if (hit) { foundExact = hit; matchedBy = 'exact_label:' + exactLabel }
+        const hits = candidates.filter(t => _labelMatchesStored(t.label, exactLabel))
+        if (hits.length === 1) { foundExact = hits[0]; matchedBy = 'exact_label:' + exactLabel }
       }
 
       // (d) auto-title fingerprint match. 2026-06-22. The sentinel + spawn label
@@ -1868,6 +1920,9 @@ module.exports = {
   _touchHeartbeatForTab: _touchHeartbeatForTab,
   // Chat-to-chat push-delivery internals (exposed for tests).
   _isChatDeliver: isChatDeliver,
+  _labelMatchesStored: _labelMatchesStored,
+  _isTruncatedLabel: _isTruncatedLabel,
+  _matchWorkerRow: _matchWorkerRow,
   _labelSlug: labelSlug,
   _chatTopicMid: chatTopicMid,
   _addressForLabel: addressForLabel,

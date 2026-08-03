@@ -60,6 +60,39 @@ ok('framing has NO em-dash (char-level ban)', framed.indexOf(String.fromCharCode
 const oneWay = coord._buildChatInjectionText({ id: 'M2', from: 'x', body: { type: 'chat', text: 'fyi' } })
 ok('framing degrades to one-way notice without reply addr', oneWay.indexOf('One-way coord notice') !== -1)
 
+// retry-ok
+// ── CC 24-char title truncation awareness ─────────────────────────────────
+// The bridge returns titles truncated to 24 chars + '…', so a full spawn name
+// never exact-matches its live label. These guard the resolution primitive.
+ok('trunc: detects the ellipsis label', coord._isTruncatedLabel('[slice worker checkin 20…') === true)
+ok('trunc: exact match for short labels', coord._labelMatchesStored('Studio', 'Studio') === true)
+ok('trunc: live-truncated matches stored full name',
+  coord._labelMatchesStored('[slice worker checkin 20…', '[slice worker checkin 2026 08 03]') === true)
+ok('trunc: rejects an unrelated stored name',
+  coord._labelMatchesStored('[studio nuance data coll…', '[slice worker checkin 2026 08 03]') === false)
+ok('trunc: rejects a too-short visible prefix (stub, <6 chars)',
+  coord._labelMatchesStored('[a…', '[abc def ghij]') === false)
+ok('trunc: a non-truncated differing label is NOT a loose-prefix match',
+  coord._labelMatchesStored('[slice worker]', '[slice worker checkin 2026]') === false)
+
+// _matchWorkerRow: truncation-aware sentinel match, uniqueness-gated (collision
+// refuses rather than guesses). liveWorkers passed directly so no registry setup.
+const wRow = (tab_id, sentinel, vc) => ({ tab_id, terminated_at: null, tab_handle: { sentinel_prefix: sentinel, viewColumn: vc } })
+{
+  const truncTab = { label: '[slice worker checkin 20…', viewColumn: 1, index: 4 }
+  const one = coord._matchWorkerRow(truncTab, [wRow('tab_A', '[slice worker checkin 2026 08 03]', 1)])
+  ok('matchWorkerRow: truncated live tab resolves to its worker via sentinel', one && one.tab_id === 'tab_A')
+
+  const collide = coord._matchWorkerRow(truncTab, [
+    wRow('tab_A', '[slice worker checkin 2026 08 03a]', 1),
+    wRow('tab_B', '[slice worker checkin 2026 08 03b]', 1),
+  ])
+  ok('matchWorkerRow: truncation collision REFUSES (no wrong-match)', collide === null)
+
+  const none = coord._matchWorkerRow({ label: 'Chambers', viewColumn: 1, index: 9 }, [wRow('tab_A', '[slice worker checkin 2026 08 03]', 1)])
+  ok('matchWorkerRow: unrelated tab does not match a worker', none === null)
+}
+
 // ── resolveLiveTargetTab branches with a stubbed live tab list ────────────
 // Stub the injection module's listChatTabs so resolution is deterministic.
 const chatInject = require('./chat-inject')
