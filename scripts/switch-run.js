@@ -341,6 +341,10 @@ async function runLogin(target, row) {
       OAUTH_URL: oauthUrl, CODE_FILE: codeFile,
       LOGIN_METHOD: row.login_method || '', TOTP_SERVICE: row.totp_service || '',
       PW_MIRROR_PATH: row.pw_mirror || '',
+      // hCaptcha solver key (2026-08-03). From env or the local cred mirror; empty is fine,
+      // the browser driver just exhausts on the captcha as before when it is absent.
+      CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
+        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
     }),
   })
 

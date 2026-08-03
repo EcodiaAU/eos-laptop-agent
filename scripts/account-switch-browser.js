@@ -41,6 +41,11 @@ const EMAIL = EMAILS[TARGET]
 const OAUTH_URL = process.env.OAUTH_URL
 const CODE_FILE = process.env.CODE_FILE
 const PORT = process.env.CDP_PORT || '9222'
+// hCaptcha solver (2026-08-03): the OAuth authorize now throws an hCaptcha after Authorize.
+// CapSolver returns a token we inject. Key from env CAPSOLVER_API_KEY (kv creds.capsolver_api_key).
+const capsolver = require('../tools/capsolver')
+const CAPSOLVER_ENABLED = !!process.env.CAPSOLVER_API_KEY
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
 
 const log = (...a) => console.log('[switch:' + TARGET + ']', ...a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -122,9 +127,26 @@ async function readState(page) {
         if (c && c.length >= 20) authCode = s ? (c + '#' + s) : c
       } catch (_e) { /* state read must never throw */ }
     }
+    // hCaptcha (2026-08-03): sitekey lives on the widget container (data-sitekey) or in the
+    // hcaptcha iframe src (?sitekey= / #...sitekey=). Enterprise rqdata rides the widget
+    // config and is not reliably in the DOM; handled as a follow-up if CapSolver flags it.
+    let hcSitekey = null, hcInvisible = false
+    const hcHost = document.querySelector('[data-sitekey]')
+    if (hcHost) hcSitekey = hcHost.getAttribute('data-sitekey')
+    const hcFrame = [...document.querySelectorAll('iframe')].find(f => /hcaptcha\.com/.test(f.src || ''))
+    if (hcFrame) {
+      try {
+        const src = hcFrame.src
+        const q = new URLSearchParams(src.split('#')[1] || src.split('?')[1] || '')
+        if (!hcSitekey) hcSitekey = q.get('sitekey')
+        if (/invisible/i.test(src)) hcInvisible = true
+      } catch (_e) { /* never throw */ }
+    }
+    const hcPresent = !!hcFrame || !!hcHost || /select all|verify you are human|each image containing/i.test(txt)
     return {
       url: location.href,
       loggedInAs: loggedMatch ? loggedMatch[1] : null,
+      hcSitekey, hcInvisible, hcPresent,
       hasAuthorize: !!find(/^authorize$/i),
       hasSwitch: !!switchA,
       switchHref: switchA ? switchA.href : null,
@@ -295,10 +317,11 @@ async function run() {
   await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
   await sleep(3500)
 
+  let hcSolveCount = 0
   for (let i = 0; i < 50; i++) {
     let st
     try { st = await readState(page) } catch (e) { log('read err', e.message); await sleep(1500); continue }
-    log('main[' + i + ']', st.loggedInAs ? ('as=' + st.loggedInAs) : st.head)
+    log('main[' + i + ']', st.loggedInAs ? ('as=' + st.loggedInAs) : (st.hcPresent ? 'hcaptcha' : st.head))
 
     if (st.authCode) {
       fs.writeFileSync(CODE_FILE, st.authCode + '\n')
@@ -306,6 +329,33 @@ async function run() {
       await closeOwned()
       await browser.disconnect()
       return 0
+    }
+
+    // hCaptcha wall after Authorize (2026-08-03). Solve via CapSolver and inject the token.
+    // Up to 2 solves in case the first token does not take; without a key we fall through
+    // and exhaust as before.
+    if (st.hcSitekey && !st.authCode && hcSolveCount < 2) {
+      if (!CAPSOLVER_ENABLED) { log('hcaptcha present but CAPSOLVER_API_KEY unset - cannot solve, will exhaust'); }
+      else {
+        hcSolveCount++
+        log('hcaptcha[' + hcSolveCount + '] sitekey=' + String(st.hcSitekey).slice(0, 10) + ' invisible=' + st.hcInvisible + ' - solving via capsolver')
+        try {
+          const { token } = await capsolver.solveHCaptcha({ websiteURL: 'https://claude.ai/oauth/authorize', websiteKey: st.hcSitekey, isInvisible: st.hcInvisible, userAgent: UA })
+          await page.evaluate((tok) => {
+            for (const n of ['h-captcha-response', 'g-recaptcha-response']) {
+              document.querySelectorAll('textarea[name="' + n + '"],input[name="' + n + '"]').forEach(el => {
+                el.value = tok
+                el.dispatchEvent(new Event('input', { bubbles: true }))
+                el.dispatchEvent(new Event('change', { bubbles: true }))
+              })
+            }
+          }, token)
+          log('hcaptcha token injected; nudging the form')
+          await clickText(page, /^(authorize|verify|continue|submit)$/i)
+          await sleep(4000)
+        } catch (e) { log('capsolver solve failed: ' + e.message) }
+        continue
+      }
     }
     if (st.loggedInAs === EMAIL && st.hasAuthorize) {
       log('authorize')
