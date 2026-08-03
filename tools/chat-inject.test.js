@@ -83,9 +83,36 @@ async function withTabs(tabs, fn) {
       const amb = await coord._resolveLiveTargetTab('chat.label:nope.inbox')
       ok('label target with no live tab refuses', amb.ok === false && amb.reason === 'label_no_live_tab')
 
-      // conductor falls back to the single active tab when title_match is a worker sentinel
+      // conductor falls back to the single active NON-WORKER tab
       const c = await coord._resolveLiveTargetTab('chat.conductor.inbox')
-      ok('conductor resolves to the single active tab', c.ok === true && c.label === 'Chambers CH')
+      ok('conductor resolves to the single active human tab', c.ok === true && c.label === 'Chambers CH')
+    },
+  )
+
+  // U3 fail-safe: when the only active tab is a dispatched worker ([EOS-W-...]),
+  // `conductor` must NOT resolve to it. It refuses so the message stays queued
+  // and the human sees it via the conductor-inbox peek, instead of a worker
+  // silently consuming it. This is the root-cause guard against conductor
+  // staleness misrouting into a running worker while Tate is away.
+  await withTabs(
+    [
+      { label: '[EOS-W-3d7212fc] <dispatched build>', viewColumn: 1, index: 0, isActive: true, viewType: 'mainThreadWebview-claudeVSCodePanel' },
+    ],
+    async () => {
+      const r = await coord._resolveLiveTargetTab('chat.conductor.inbox')
+      ok('conductor refuses when only active tab is a worker', r.ok === false && r.reason === 'conductor_unresolved_worker_active')
+    },
+  )
+
+  // A live human tab active alongside a worker tab still resolves to the human.
+  await withTabs(
+    [
+      { label: '[EOS-W-3d7212fc] <dispatched build>', viewColumn: 1, index: 0, isActive: false, viewType: 'mainThreadWebview-claudeVSCodePanel' },
+      { label: 'Co-Exist Invoice', viewColumn: 1, index: 1, isActive: true, viewType: 'mainThreadWebview-claudeVSCodePanel' },
+    ],
+    async () => {
+      const r = await coord._resolveLiveTargetTab('chat.conductor.inbox')
+      ok('conductor resolves to the human tab beside a worker', r.ok === true && r.label === 'Co-Exist Invoice')
     },
   )
 

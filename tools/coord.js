@@ -558,6 +558,39 @@ function isChatDeliver(msg) {
   return true
 }
 
+// ── worker-tab identification (shared by list_channels + conductor resolve) ──
+// A dispatched worker runs as a fresh CC chat tab in the SAME workspace as the
+// human conductor, so cwd/env cannot tell them apart. The only durable signal is
+// the tab-title fingerprint captured at spawn (autotitle_fingerprint +
+// sentinel_prefix). _matchWorkerRow answers "which registered worker IS this
+// live tab" via the proven fingerprint matcher; _looksLikeWorkerTab is the
+// boolean guard that ALSO catches a just-spawned worker whose row is not yet
+// fingerprint-cached, via its `[EOS-W-...]` sentinel prefix (the default; a
+// custom worker_name sentinel is only caught once its row is cached).
+function _liveWorkerRows() {
+  const rows = []
+  for (const [, w] of workers.entries()) {
+    if (w.terminated_at) continue
+    if (w.tab_handle && w.tab_handle.autotitle_fingerprint) rows.push(w)
+  }
+  return rows
+}
+function _matchWorkerRow(tab, liveWorkers) {
+  if (!_ttm) return null
+  const rows = liveWorkers || _liveWorkerRows()
+  for (const w of rows) {
+    const th = w.tab_handle
+    if (th.viewColumn != null && th.viewColumn !== tab.viewColumn) continue
+    const r = _ttm.pickByFingerprint([tab], th.autotitle_fingerprint, th.sentinel_prefix || null)
+    if (r && r.match) return w
+  }
+  return null
+}
+function _looksLikeWorkerTab(tab, liveWorkers) {
+  if (_matchWorkerRow(tab, liveWorkers)) return true
+  return String(tab.label || '').startsWith('[EOS-W-')
+}
+
 // Resolve an inbox topic to the LIVE {label, viewColumn, index} of its chat tab.
 // conductor -> the conductor's active CC tab; label:<slug> -> the unique tab
 // whose label slugs to <slug>; a worker tab_id -> the proven fingerprint match
@@ -578,9 +611,21 @@ async function resolveLiveTargetTab(topic) {
       const exact = tabs.filter((t) => t.label === tm)
       if (exact.length === 1) return Object.assign({ ok: true, kind: 'conductor' }, _pos(exact[0]))
     }
+    // Active-tab fallback, but NEVER resolve `conductor` to a dispatched worker
+    // tab. When Tate is away, the sole active tab is often a running worker; the
+    // old fallback misrouted `to:"conductor"` straight into it. Excluding workers
+    // makes it fail SAFE - unresolved -> the message stays inbox-queued and the
+    // human sees it via the conductor-inbox peek on their next turn, instead of
+    // being silently consumed by a worker. Root cause of the U3 staleness.
+    // Doctrine: [[coord-chat-to-chat-push-delivery-2026-08-02]].
+    const liveWorkers = _liveWorkerRows()
     const active = tabs.filter((t) => t.isActive)
-    if (active.length === 1) return Object.assign({ ok: true, kind: 'conductor' }, _pos(active[0]))
-    return { ok: false, kind: 'conductor', reason: active.length > 1 ? 'conductor_ambiguous_active' : 'conductor_unresolved' }
+    const activeHuman = active.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
+    if (activeHuman.length === 1) return Object.assign({ ok: true, kind: 'conductor' }, _pos(activeHuman[0]))
+    if (active.length >= 1 && activeHuman.length === 0) {
+      return { ok: false, kind: 'conductor', reason: 'conductor_unresolved_worker_active' }
+    }
+    return { ok: false, kind: 'conductor', reason: activeHuman.length > 1 ? 'conductor_ambiguous_active' : 'conductor_unresolved' }
   }
 
   if (mid.indexOf('label:') === 0) {
@@ -770,25 +815,13 @@ async function list_channels(params, ctx) {
 
   const conductor = loadConductorRegistration()
   const conductorLabel = conductor && conductor.title_match ? String(conductor.title_match) : ''
-  const liveWorkers = []
-  for (const [, w] of workers.entries()) {
-    if (w.terminated_at) continue
-    if (w.tab_handle && w.tab_handle.autotitle_fingerprint) liveWorkers.push(w)
-  }
+  const liveWorkers = _liveWorkerRows()
 
   const out = []
   for (const t of tabs) {
     const label = t.label || ''
     const generic = isGenericLabelStr(label)
-    let workerMatch = null
-    if (_ttm) {
-      for (const w of liveWorkers) {
-        const th = w.tab_handle
-        if (th.viewColumn != null && th.viewColumn !== t.viewColumn) continue
-        const r = _ttm.pickByFingerprint([t], th.autotitle_fingerprint, th.sentinel_prefix || null)
-        if (r && r.match) { workerMatch = w; break }
-      }
-    }
+    const workerMatch = _matchWorkerRow(t, liveWorkers)
     const isConductorTab = !!t.isActive && !!conductor &&
       (!conductorLabel || label === conductorLabel || conductorLabel.startsWith('['))
     let kind = 'chat', address
