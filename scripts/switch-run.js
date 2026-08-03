@@ -345,6 +345,8 @@ async function runLogin(target, row) {
       // the browser driver just exhausts on the captcha as before when it is absent.
       CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
         (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
+      TWOCAPTCHA_API_KEY: process.env.TWOCAPTCHA_API_KEY ||
+        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
     }),
   })
 

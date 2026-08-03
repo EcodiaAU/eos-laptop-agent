@@ -44,7 +44,12 @@ const PORT = process.env.CDP_PORT || '9222'
 // hCaptcha solver (2026-08-03): the OAuth authorize now throws an hCaptcha after Authorize.
 // CapSolver returns a token we inject. Key from env CAPSOLVER_API_KEY (kv creds.capsolver_api_key).
 const capsolver = require('../tools/capsolver')
-const CAPSOLVER_ENABLED = !!process.env.CAPSOLVER_API_KEY
+const twocaptcha = require('../tools/twocaptcha')
+// Prefer 2Captcha (human solvers) when its key is present - CapSolver refused Anthropic's
+// hCaptcha 2026-08-03. Falls back to CapSolver otherwise.
+const SOLVER = process.env.TWOCAPTCHA_API_KEY ? twocaptcha : capsolver
+const SOLVER_NAME = process.env.TWOCAPTCHA_API_KEY ? '2captcha' : 'capsolver'
+const CAPSOLVER_ENABLED = !!(process.env.CAPSOLVER_API_KEY || process.env.TWOCAPTCHA_API_KEY)
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
 
 const log = (...a) => console.log('[switch:' + TARGET + ']', ...a)
@@ -133,16 +138,21 @@ async function readState(page) {
     let hcSitekey = null, hcInvisible = false
     const hcHost = document.querySelector('[data-sitekey]')
     if (hcHost) hcSitekey = hcHost.getAttribute('data-sitekey')
-    const hcFrame = [...document.querySelectorAll('iframe')].find(f => /hcaptcha\.com/.test(f.src || ''))
-    if (hcFrame) {
+    const hcFrames = [...document.querySelectorAll('iframe')].filter(f => /hcaptcha\.com/.test(f.src || ''))
+    for (const f of hcFrames) {
       try {
-        const src = hcFrame.src
-        const q = new URLSearchParams(src.split('#')[1] || src.split('?')[1] || '')
-        if (!hcSitekey) hcSitekey = q.get('sitekey')
+        const src = f.src
+        const q = new URLSearchParams((src.split('#')[1] || '') + '&' + (src.split('?')[1] || ''))
+        const sk = q.get('sitekey'); if (sk && !hcSitekey) hcSitekey = sk
         if (/invisible/i.test(src)) hcInvisible = true
       } catch (_e) { /* never throw */ }
     }
-    const hcPresent = !!hcFrame || !!hcHost || /select all|verify you are human|each image containing/i.test(txt)
+    const hcPresent = hcFrames.length > 0 || !!hcHost || /select all|verify you are human|each image containing/i.test(txt)
+    // claude.ai OAuth uses a FIXED invisible hCaptcha (verified live 2026-08-03). The sitekey
+    // rides in a nested cross-origin challenge iframe the top document cannot always read, and
+    // the checkbox-invisible frame carries no sitekey, so extraction returns null and the solve
+    // never fires. Fall back to the known key so CapSolver is invoked.
+    if (hcPresent && !hcSitekey) { hcSitekey = 'a8086506-2036-46f4-ae50-00d8be805efa'; hcInvisible = true }
     return {
       url: location.href,
       loggedInAs: loggedMatch ? loggedMatch[1] : null,
@@ -331,16 +341,18 @@ async function run() {
       return 0
     }
 
-    // hCaptcha wall after Authorize (2026-08-03). Solve via CapSolver and inject the token.
-    // Up to 2 solves in case the first token does not take; without a key we fall through
-    // and exhaust as before.
-    if (st.hcSitekey && !st.authCode && hcSolveCount < 2) {
-      if (!CAPSOLVER_ENABLED) { log('hcaptcha present but CAPSOLVER_API_KEY unset - cannot solve, will exhaust'); }
-      else {
+    // hCaptcha wall (2026-08-03). CRITICAL: the captcha overlay hides the "Logged in as"
+    // text, so loggedInAs reads null. If we fall through, the Continue-with-Google branch
+    // fires and RE-RUNS the whole login, landing back on the same captcha - the infinite
+    // loop Tate caught. So when a captcha is present it is a HARD STOP: solve it, or if we
+    // cannot yet (sitekey not extracted, or no key), HOLD. Never fall through to a login
+    // branch while a captcha is up.
+    if (st.hcPresent && !st.authCode) {
+      if (st.hcSitekey && CAPSOLVER_ENABLED && hcSolveCount < 3) {
         hcSolveCount++
-        log('hcaptcha[' + hcSolveCount + '] sitekey=' + String(st.hcSitekey).slice(0, 10) + ' invisible=' + st.hcInvisible + ' - solving via capsolver')
+        log('hcaptcha[' + hcSolveCount + '] sitekey=' + String(st.hcSitekey).slice(0, 10) + ' invisible=' + st.hcInvisible + ' - solving via ' + SOLVER_NAME + (st.hcRqdata ? ' (rqdata)' : ''))
         try {
-          const { token } = await capsolver.solveHCaptcha({ websiteURL: 'https://claude.ai/oauth/authorize', websiteKey: st.hcSitekey, isInvisible: st.hcInvisible, userAgent: UA })
+          const { token } = await SOLVER.solveHCaptcha({ websiteURL: 'https://claude.ai/oauth/authorize', websiteKey: st.hcSitekey, isInvisible: st.hcInvisible, rqdata: st.hcRqdata || undefined, userAgent: UA })
           await page.evaluate((tok) => {
             for (const n of ['h-captcha-response', 'g-recaptcha-response']) {
               document.querySelectorAll('textarea[name="' + n + '"],input[name="' + n + '"]').forEach(el => {
@@ -354,8 +366,11 @@ async function run() {
           await clickText(page, /^(authorize|verify|continue|submit)$/i)
           await sleep(4000)
         } catch (e) { log('capsolver solve failed: ' + e.message) }
-        continue
+      } else {
+        log('hcaptcha present, HOLDING (sitekey=' + (st.hcSitekey ? 'yes' : 'no') + ' key=' + CAPSOLVER_ENABLED + ' solves=' + hcSolveCount + ') - not restarting login')
+        await sleep(3000)
       }
+      continue
     }
     if (st.loggedInAs === EMAIL && st.hasAuthorize) {
       log('authorize')
