@@ -80,6 +80,190 @@ function applyBankResult(msg) {
   return { added: applied.added, skipped: applied.skipped, runningBalance: applied.runningBalance, reconcile: rec }
 }
 
+// ---- Phase 1 bank-feed bridge: BA phone-vault body -> public.staged_transactions ----
+// The phone scrapes the BA online-banking account+history page as a FLATTENED text blob and
+// posts it as the signed `value` (kind:'field'), NOT as a structured `transactions` array.
+// applyBankResult only consumes msg.transactions, so a verified BA read fed the JSON ledger
+// nothing AND staged_transactions nothing - the world-model actuals engine ran on pre-27-Jul
+// data. This normaliser parses the blob per account and lands rows in staged_transactions
+// using the EXACT dedup key + count-topup of budget/import-ba-csv.cjs, keyed on
+// (source_account, occurred_at, description, amount_cents), so a later CSV import of the same
+// transactions dedups against these and never double-counts (the single critical hazard).
+// import-ba-csv's dedup is INLINE (not a shared export) and lives on the budget Management-API
+// `sql/lit` client; here we replicate it identically on the postgres tagged-template `db`.
+
+const BA_ACCOUNT_MAP = {
+  '12579148': 'ba_ecodia',          // Commercial Access (Ecodia Pty Ltd)
+  '12579151': 'ba_ecodia_savings',  // Commercial Saver
+  '12566110': 'ba_personal',        // Tate Everyday
+  '12566111': 'ba_personal_savings', // Tate Saver
+}
+
+// Same transfer test import-ba-csv.cjs uses.
+const BA_TRANSFER_RE = /Transfer to SAV|Received from SAV|Transfer from/i
+
+// Direction is derived from BA's DESCRIPTION wording, NEVER the scraped dash count: the
+// online-banking text uses '--$' for internal transfers, '-$' for card purchases AND for
+// credited "Received from" rows, and plain '$' for Osko credits - so a single '-' prefixes
+// both a debit (card) and a credit (received-from), making the dash unreliable. signChars is
+// only a last-resort tiebreaker for wording the explicit rules do not recognise.
+function baDirectionSign(descr, signChars) {
+  const d = (descr || '').trim()
+  const OUT = /^transfer to\b|^visa\b|^visa-|osko payment to\b|^eftpos\b|^bpay\b|direct debit|^withdrawal\b|^atm\b|^purchase\b/i
+  const IN = /received from\b|osko payment from\b|^deposit\b|^interest\b|^salary\b|refund\b|direct credit\b|^credit\b/i
+  if (OUT.test(d)) return -1
+  if (IN.test(d)) return 1
+  if (signChars === '--') return -1                     // double dash = internal transfer OUT
+  if (signChars === '+' || signChars === '') return 1   // explicit plus / no dash = credit IN
+  return -1                                             // lone unknown '-' -> treat as debit
+}
+
+// Does this value blob look like a BA account+history body (vs some other scraped field)?
+function looksLikeBaBody(value) {
+  return /Bank Australia|DateDescriptionAmount|Acc 1256|Acc 1257/i.test(String(value || ''))
+}
+
+function isBankResult(msg) {
+  return msg.kind === 'bank-statement' || /bank/i.test(msg.service || '') || (msg.value != null && looksLikeBaBody(msg.value))
+}
+
+// Parse the flattened BA multi-account body into normalised rows.
+// Each account section carries an `Acc <number>` header line; its transactions follow a
+// `DateDescriptionAmount` marker, one per line shaped `DD/MM/YYYY<description>[--|-|+]$<amount>`.
+// $0.00 "Insufficient funds #51" rows are FAILED debits: captured (real dunning signal) with
+// amount_cents 0 so they never move a balance.
+function parseBaBody(value) {
+  const lines = String(value || '').split(/\r?\n/)
+  const rowRe = /^(\d{2})\/(\d{2})\/(\d{4})(.+?)(--|-|\+)?\$([\d,]+\.\d{2})\s*$/
+  const accRe = /^Acc\s+(\d{6,12})\s*$/
+  const availRe = /^Avail\.\s+\$([\d,]+\.\d{2})\s*$/
+  const currRe = /^Curr\.\s+\$([\d,]+\.\d{2})\s*$/
+  const cents = (s) => Math.round(parseFloat(s.replace(/,/g, '')) * 100)
+  let currentAccount = null
+  const rows = []
+  const balances = {}   // source_account -> { curr_cents, avail_cents } (first-seen per account)
+  const unmapped = new Set()
+  for (const raw of lines) {
+    const line = raw.trim()
+    const am = line.match(accRe)
+    if (am) {
+      currentAccount = BA_ACCOUNT_MAP[am[1]] || null
+      if (!currentAccount) unmapped.add(am[1])
+      continue
+    }
+    if (currentAccount) {
+      const av = line.match(availRe)
+      if (av) { (balances[currentAccount] ||= {}); if (balances[currentAccount].avail_cents == null) balances[currentAccount].avail_cents = cents(av[1]); continue }
+      const cu = line.match(currRe)
+      if (cu) { (balances[currentAccount] ||= {}); if (balances[currentAccount].curr_cents == null) balances[currentAccount].curr_cents = cents(cu[1]); continue }
+    }
+    const m = line.match(rowRe)
+    if (!m) continue
+    if (!currentAccount) continue
+    const [, dd, mm, yyyy, descrRaw, signChars, amountRaw] = m
+    const occurred = `${yyyy}-${mm}-${dd}`
+    const magnitude = Math.round(parseFloat(amountRaw.replace(/[$,]/g, '')) * 100)
+    const descr = descrRaw.trim()
+    const isDecline = magnitude === 0
+    const amt = isDecline ? 0 : baDirectionSign(descr, signChars || '') * magnitude
+    rows.push({ source_account: currentAccount, occurred, cents: amt, descr, isDecline })
+  }
+  return { rows, balances, unmapped: [...unmapped] }
+}
+
+// Record each account's CURRENT (Curr.) balance into bank_reconciliation, the substrate the
+// world-model brief + survival sim read as "cash truth". Mirrors the balance-recording step
+// import-ba-csv.cjs performs on every import (bank_balance = statement current balance, NOT
+// available - consistent with the existing CSV-derived rows), but idempotent: a NOT-EXISTS
+// guard on (account_code, as_of_date, phone-vault provenance) means re-running the same read
+// adds zero rows. Available + uncleared are carried in the note for the current-vs-available
+// gap (e.g. an inbound transfer sitting as a pending hold).
+async function recordBalances(db, balances, asOfDate) {
+  const out = {}
+  for (const [account, b] of Object.entries(balances)) {
+    if (b.curr_cents == null) continue
+    const avail = b.avail_cents == null ? null : b.avail_cents
+    const uncleared = avail == null ? null : b.curr_cents - avail
+    const note = `phone-vault-feed ${asOfDate} via vault-pull.js normaliser: current ${(b.curr_cents / 100).toFixed(2)}`
+      + (avail == null ? '' : `, available ${(avail / 100).toFixed(2)}${uncleared ? `, uncleared ${(uncleared / 100).toFixed(2)}` : ''}`)
+    const res = await db`INSERT INTO public.bank_reconciliation
+      (id, account_code, as_of_date, bank_balance, ledger_balance, difference, status, notes)
+      SELECT gen_random_uuid(), ${account}, ${asOfDate}, ${b.curr_cents}, 0, 0, 'reconciled', ${note}
+      WHERE NOT EXISTS (SELECT 1 FROM public.bank_reconciliation
+        WHERE account_code = ${account} AND as_of_date = ${asOfDate} AND notes LIKE 'phone-vault-feed%')
+      RETURNING id`
+    out[account] = { curr_cents: b.curr_cents, avail_cents: avail, recorded: res.length > 0 }
+  }
+  return out
+}
+
+// Land parsed BA rows into staged_transactions. Replicates import-ba-csv.cjs's grouping +
+// count-topup EXACTLY: group identical (account,date,amount,desc) rows so a genuine second
+// identical charge in one window is kept, while a re-scrape of the same window adds nothing.
+async function normaliseBankValueToStaged(db, value, asOfDate) {
+  const { rows, balances, unmapped } = parseBaBody(value)
+  const groups = new Map()
+  for (const r of rows) {
+    const key = `${r.source_account}|${r.occurred}|${r.cents}|${r.descr}`
+    if (!groups.has(key)) groups.set(key, { ...r, n: 0 })
+    groups.get(key).n++
+  }
+  const stats = {}
+  const bump = (a) => (stats[a] = stats[a] || { parsed: 0, inserted: 0, dupSkipped: 0, declines: 0 })
+  for (const r of rows) { const s = bump(r.source_account); s.parsed++; if (r.isDecline) s.declines++ }
+  for (const g of groups.values()) {
+    const s = bump(g.source_account)
+    const existing = await db`SELECT count(*)::int n FROM public.staged_transactions
+      WHERE source_account = ${g.source_account} AND occurred_at = ${g.occurred}
+        AND amount_cents = ${g.cents} AND description = ${g.descr}`
+    const have = Number(existing[0].n)
+    const need = g.n - have
+    s.dupSkipped += Math.min(g.n, have)
+    const isTransfer = BA_TRANSFER_RE.test(g.descr)
+    const isPersonal = g.source_account.includes('personal')
+    for (let k = 0; k < need; k++) {
+      const occIdx = have + k + 1
+      // md5 input is import-ba-csv.cjs's exact key shape (source_account|occurred|descr|cents||occIdx).
+      // Only the id/source_ref PREFIX differs (bankvault_ / ba-vault-) so provenance is visible;
+      // id/source_ref are NOT part of the dedup key, so this cannot cause a cross-path double-count.
+      const h = crypto.createHash('md5').update(`${g.source_account}|${g.occurred}|${g.descr}|${g.cents}` + occIdx).digest('hex')
+      const id = 'bankvault_' + h.slice(0, 18)
+      const sourceRef = 'ba-vault-' + h.slice(0, 16)
+      await db`INSERT INTO public.staged_transactions
+        (id, source, source_ref, occurred_at, amount_cents, description, status, source_account, is_personal, is_transfer)
+        VALUES (${id}, 'bank_australia', ${sourceRef}, ${g.occurred}, ${g.cents}, ${g.descr}, 'pending',
+                ${g.source_account}, ${isPersonal}, ${isTransfer})`
+      s.inserted++
+    }
+  }
+  // Refresh cash-truth balances (idempotent). as_of defaults to today if the read carried no ts.
+  const asOf = asOfDate || new Date().toISOString().slice(0, 10)
+  const balancesRecorded = await recordBalances(db, balances, asOf)
+  return { stats, balances: balancesRecorded, asOf, unmapped, totalParsed: rows.length }
+}
+
+// The read's own date (signed `ts`, Brisbane-agnostic - a date is a date) is the as-of for the
+// balances; falls back to today for a ts-less read.
+function readDate(msg) {
+  const t = msg && msg.ts ? Date.parse(msg.ts) : NaN
+  return Number.isNaN(t) ? new Date().toISOString().slice(0, 10) : new Date(t).toISOString().slice(0, 10)
+}
+
+// Backfill: re-run the normaliser over already-consumed, signature-verified inbox rows for a
+// given requestId. Idempotent (the count-topup dedups + NOT-EXISTS balance guard), so
+// re-running is a no-op.
+async function backfillStaged(db, requestId) {
+  const rows = await db`SELECT id, payload FROM public.vault_inbox
+    WHERE payload->>'requestId' = ${requestId} AND sig_verified = true ORDER BY created_at`
+  const out = []
+  for (const row of rows) {
+    const msg = row.payload || {}
+    if (!msg.value || !looksLikeBaBody(msg.value)) { out.push({ id: row.id, skipped: 'no-ba-body' }); continue }
+    out.push({ id: row.id, staged: await normaliseBankValueToStaged(db, msg.value, readDate(msg)) })
+  }
+  return out
+}
+
 async function pull(db) {
   const rows = await db`SELECT id, type, payload FROM public.vault_inbox WHERE consumed_at IS NULL ORDER BY created_at`
   const out = []
@@ -127,9 +311,15 @@ async function pull(db) {
       result.action = 'rejected (stale - signed ts too old or future-dated)'
     } else if (replay) {
       result.action = 'rejected (replay - this signature was already consumed)'
-    } else if (row.type === 'result' && (msg.kind === 'bank-statement' || msg.service === 'bank')) {
-      result.action = 'applied-to-ledger'
-      result.ledger = applyBankResult(msg)
+    } else if (row.type === 'result' && isBankResult(msg)) {
+      // Structured transactions -> JSON ledger (unchanged). Flattened body `value` -> the
+      // Phase 1 staged_transactions bridge. A read can carry either or both.
+      if (Array.isArray(msg.transactions) && msg.transactions.length) result.ledger = applyBankResult(msg)
+      if (msg.value != null && looksLikeBaBody(msg.value)) {
+        try { result.staged = await normaliseBankValueToStaged(db, msg.value, readDate(msg)) }
+        catch (e) { result.stagedError = e.message }
+      }
+      result.action = result.ledger ? 'applied-to-ledger' : (result.staged ? 'normalised-to-staged' : 'bank-result-no-op')
     } else if (row.type === 'session') {
       // SESSION TRANSFER: the phone logged into a Mac-SSO origin (tate@ Google),
       // captured its WKHTTPCookieStore cookies, sealed them to the host recipient
@@ -160,11 +350,22 @@ async function pull(db) {
   return out
 }
 
-module.exports = { pull, verify, applyBankResult, pairedKeyIsAttested, isFresh, sigAlreadySeen }
+module.exports = {
+  pull, verify, applyBankResult, pairedKeyIsAttested, isFresh, sigAlreadySeen,
+  // Phase 1 bank-feed bridge
+  parseBaBody, baDirectionSign, looksLikeBaBody, isBankResult, normaliseBankValueToStaged, recordBalances, backfillStaged, readDate, BA_ACCOUNT_MAP,
+}
 
 if (require.main === module) {
   const lib = require('/Users/ecodia/.code/ecodiaos/backend/continuity/lib.cjs')
   const db = lib.db()
-  pull(db).then(out => { console.log(JSON.stringify({ pulled: out.length, results: out }, null, 2)); process.exit(0) })
-    .catch(e => { console.error('ERR', e.message); process.exit(1) })
+  const [cmd, arg] = process.argv.slice(2)
+  if (cmd === 'backfill') {
+    if (!arg) { console.error('usage: node vault-pull.js backfill <requestId>'); process.exit(2) }
+    backfillStaged(db, arg).then(out => { console.log(JSON.stringify({ backfill: arg, results: out }, null, 2)); process.exit(0) })
+      .catch(e => { console.error('ERR', e.message); process.exit(1) })
+  } else {
+    pull(db).then(out => { console.log(JSON.stringify({ pulled: out.length, results: out }, null, 2)); process.exit(0) })
+      .catch(e => { console.error('ERR', e.message); process.exit(1) })
+  }
 }
