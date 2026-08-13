@@ -567,9 +567,10 @@ exports.noteSuccessfulDispatch = function noteSuccessfulDispatch() {
 
 exports.buildBrief = function buildBrief(row) {
   const taskId = row.id || row.task_id || 'unknown'
-  const accountLine = row.actual_account
-    ? 'Account rotated to: ' + row.actual_account + '.'
-    : 'Account: current (no rotation performed).'
+  // No account line in the brief. The scheduler no longer rotates accounts
+  // (2026-06-29 consolidation, see the dispatchOne comment block); it dispatches
+  // on whatever account is already live. A brief that said 'Account rotated to: X'
+  // was therefore always false - nothing was rotated. Removed 2026-08-12 (Tate).
   const orphanHours = Math.round(ORPHAN_TIMEOUT_MS / (60 * 60 * 1000))
 
   const lines = []
@@ -613,8 +614,6 @@ exports.buildBrief = function buildBrief(row) {
     '  { task_id: "' + taskId + '", result_summary: "<brief summary>", status: "success"|"failed", terminate: true }',
     'This updates the task row and (for cron tasks) schedules the next run.',
     '',
-    // Context line.
-    accountLine,
     'If this task has not called signal_done within ' + orphanHours + 'h it will be marked orphaned.',
   )
 
@@ -995,7 +994,23 @@ exports.dispatchOne = async function dispatchOne(row) {
 
     // 2. Build brief with actual_account + worktree_path filled in.
     const rowWithAccount = Object.assign({}, row, { actual_account: account, worktree_path: worktreePath })
-    const brief = exports.buildBrief(rowWithAccount)
+    let brief = exports.buildBrief(rowWithAccount)
+
+    // 2b. Report-back default-on (2026-08-13). ensureReportBackDefault normally
+    // runs in exports.schedule_delayed, but the conductor's schedule_delayed is
+    // an HTTP MCP served REMOTELY (api.admin.ecodia.au), whose scheduler.js does
+    // not carry this logic - so a row inserted via the MCP never gets the default
+    // there. This is the LOCAL dispatch path every leased row flows through (remote
+    // or local insert), so applying it here guarantees the default for interactive
+    // dispatches. Gated to non-cron rows: standing crons stay inbox-only (no wake),
+    // delayed/one_shot rows default to REPORT-BACK: conductor unless the author
+    // opted out with REPORT-BACK: none. Idempotent, so double-application (if the
+    // local insert path also ran it) is a no-op. dispatch_worker then parses the
+    // directive and composeBrief emits the coord.message_chat({to:"conductor"})
+    // wake step. Doctrine: coord-chat-to-chat-push-delivery-2026-08-02.
+    if (row && row.type !== 'cron') {
+      try { brief = ensureReportBackDefault(brief) } catch (e) {}
+    }
 
     // 2c. Dispatch-start lease refresh + pre-spawn reclaim guard.
     // 2026-06-21 lease-aging-in-launch-lock-queue fix (the live 5-6h cron-fleet
@@ -2106,10 +2121,67 @@ function priorityForClass(pc) {
   return 3
 }
 
+// 2026-08-13 (report-back v2). Report-back to the conductor is now the DEFAULT for
+// interactive schedule_delayed rows. A dispatched worker's signal_done is a MACHINE
+// signal that lands in chat.conductor.inbox and NEVER injects a turn, so a chat that
+// scheduled the worker and is idle-waiting is never woken - it sits waiting while the
+// worker acks, finishes, and closes its own tab. The fix is a PUSH: the worker's
+// CLOSING calls coord.message_chat to inject a completion turn back into the conductor
+// chat. The row carries only `prompt` from schedule-time to dispatch-time, so the
+// directive has to live in the prompt text; mac-dispatcher.js dispatch_worker parses
+// `REPORT-BACK: <addr>` and wires composeBrief's CLOSING accordingly.
+//
+// The prior freezeReportBackOrigin FROZE `origin` to a `chat.label:<slug>.inbox`
+// captured from the conductor's title_match. That is REMOVED: title_match is a stale
+// window title, and freezing to any guessed label risks the exact misroute this is
+// meant to end (2026-08-13 incident). The ONE safe+reliable target is the `conductor`
+// keyword, which the sibling coord fix resolves by stored-label/fingerprint and FAILS
+// SAFE to the conductor inbox (never guessing a foreground chat). So every default
+// lands on `conductor`.
+//
+// Rules (applied once, at schedule_delayed time; idempotent on the directive-producing
+// outputs):
+//   - `REPORT-BACK: none` (case-insensitive) -> strip the directive line: explicit
+//       opt-out (belt-and-suspenders: dispatch_worker also drops a `none` it sees).
+//   - explicit `REPORT-BACK: <addr>` where addr is not origin|parent|self|none
+//       -> leave as-is (the author chose a target, e.g. a chat.<...>.inbox).
+//   - `REPORT-BACK: origin|parent|self` OR no directive at all
+//       -> ensure the prompt carries exactly `REPORT-BACK: conductor`.
+// Only schedule_delayed calls this. schedule_cron never does: standing background work
+// is inbox-only, consumed by execute-top / turn-hooks, and must NOT inject a turn into
+// Tate's active chat on every fire. Doctrine: coord-chat-to-chat-push-delivery-2026-08-02.
+function ensureReportBackDefault(prompt) {
+  try {
+    if (typeof prompt !== 'string') return prompt
+    const directiveRe = /^[ \t]*REPORT-BACK:[ \t]*(.+?)[ \t]*$/mi
+    const m = prompt.match(directiveRe)
+    if (m) {
+      const addr = m[1].trim()
+      if (/^none$/i.test(addr)) {
+        // Opt-out: strip the directive line (and the newline it sits on).
+        return prompt.replace(/^[ \t]*REPORT-BACK:[ \t]*none[ \t]*\n?/mi, '')
+      }
+      if (/^(origin|parent|self)$/i.test(addr)) {
+        // Rewrite the keyword to the one safe target. Re-running is a no-op
+        // (the output is `conductor`, which falls through untouched below).
+        return prompt.replace(directiveRe, 'REPORT-BACK: conductor')
+      }
+      // Already `conductor` or an author-chosen explicit target -> untouched.
+      return prompt
+    }
+    // No directive at all -> default ON: append a report-back-to-conductor line.
+    // Re-running matches the appended directive above and returns unchanged.
+    const sep = prompt.endsWith('\n') ? '' : '\n'
+    return prompt + sep + '\nREPORT-BACK: conductor\n'
+  } catch (e) { return prompt }
+}
+exports._ensureReportBackDefault = ensureReportBackDefault  // test seam
+
 exports.schedule_delayed = async function schedule_delayed(params) {
   const p = params || {}
   if (!p.name || typeof p.name !== 'string') throw new Error('name required (string)')
   if (!p.prompt || typeof p.prompt !== 'string') throw new Error('prompt required (string)')
+  const promptFrozen = ensureReportBackDefault(p.prompt)
   const runAt = parseDelay(p.delay)
   const priorityClass = normalisePriorityClass(p.priority_class)
   const priority = priorityForClass(priorityClass)
@@ -2124,7 +2196,7 @@ exports.schedule_delayed = async function schedule_delayed(params) {
   `
   const result = await pool.query(sql, [
     p.name,
-    p.prompt,
+    promptFrozen,
     runAt.toISOString(),
     p.preferred_account || null,
     priority,

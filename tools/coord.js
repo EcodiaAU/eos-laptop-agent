@@ -645,26 +645,39 @@ async function resolveLiveTargetTab(topic) {
   const conductor = loadConductorRegistration()
   const isConductor = mid === 'conductor' || (conductor && conductor.tab_id && mid === conductor.tab_id)
   if (isConductor) {
-    const tm = conductor && conductor.title_match ? String(conductor.title_match) : ''
-    if (tm && !tm.startsWith('[')) {
-      const exact = tabs.filter((t) => t.label === tm)
-      if (exact.length === 1) return Object.assign({ ok: true, kind: 'conductor' }, _pos(exact[0]))
-    }
-    // Active-tab fallback, but NEVER resolve `conductor` to a dispatched worker
-    // tab. When Tate is away, the sole active tab is often a running worker; the
-    // old fallback misrouted `to:"conductor"` straight into it. Excluding workers
-    // makes it fail SAFE - unresolved -> the message stays inbox-queued and the
-    // human sees it via the conductor-inbox peek on their next turn, instead of
-    // being silently consumed by a worker. Root cause of the U3 staleness.
-    // Doctrine: [[coord-chat-to-chat-push-delivery-2026-08-02]].
+    // Conductor addressing v2 (2026-08-13). Resolve `conductor` ONLY by a
+    // reliable identity of the conductor's own CHAT-TAB: (i) its stored label,
+    // captured fresh each turn-start by conductor_heartbeat.py from the live
+    // active chat tab, then (ii) a fingerprint of that label so a CC auto-retitle
+    // between beats still resolves. If neither yields a UNIQUE non-worker tab,
+    // FAIL SAFE: the message stays inbox-queued and the human sees it on their
+    // next conductor-inbox peek. The old "single active human tab" fallback is
+    // DELETED - when Tate was away and the sole active tab was an unrelated human
+    // chat, it resolved `conductor` to THAT chat and misrouted (2 test messages,
+    // 2026-08-13). The root cause was a stored title_match that was an OS WINDOW
+    // title ("Vikki"), matching no chat-tab label, so resolution always fell
+    // through to the foreground-guess. The worker-tab exclusion (never resolve
+    // `conductor` to a dispatched worker) is kept as a hard guard.
+    // Doctrine: [[coord-conductor-addressing-fails-safe-against-worker-tabs-2026-08-03]],
+    //           [[coord-chat-to-chat-push-delivery-2026-08-02]].
     const liveWorkers = _liveWorkerRows()
-    const active = tabs.filter((t) => t.isActive)
-    const activeHuman = active.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
-    if (activeHuman.length === 1) return Object.assign({ ok: true, kind: 'conductor' }, _pos(activeHuman[0]))
-    if (active.length >= 1 && activeHuman.length === 0) {
-      return { ok: false, kind: 'conductor', reason: 'conductor_unresolved_worker_active' }
+    const pool = tabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
+    const tm = conductor && conductor.title_match ? String(conductor.title_match) : ''
+    // (i) exact stored-label match against live non-worker tabs. A stored window-
+    // title sentinel ("[...]") is not a chat-tab label, so it is never matched here.
+    if (tm && !tm.startsWith('[')) {
+      const exact = pool.filter((t) => t.label === tm)
+      if (exact.length === 1) return Object.assign({ ok: true, kind: 'conductor' }, _pos(exact[0]))
+      if (exact.length > 1) return { ok: false, kind: 'conductor', reason: 'conductor_ambiguous_label' }
     }
-    return { ok: false, kind: 'conductor', reason: activeHuman.length > 1 ? 'conductor_ambiguous_active' : 'conductor_unresolved' }
+    // (ii) fingerprint match - uniqueness-gated inside pickByFingerprint, so a
+    // non-decisive field returns null and we fall through to fail-safe.
+    const fp = conductor && conductor.title_fingerprint ? conductor.title_fingerprint : null
+    if (fp && _ttm) {
+      const r = _ttm.pickByFingerprint(pool, fp, null)
+      if (r && r.match) return Object.assign({ ok: true, kind: 'conductor' }, _pos(r.match))
+    }
+    return { ok: false, kind: 'conductor', reason: 'conductor_unresolved' }
   }
 
   if (mid.indexOf('label:') === 0) {
@@ -1680,6 +1693,15 @@ async function register_conductor(params, ctx) {
   // title_match: substring to look up the conductor's window during wake.
   // If not provided, try foreground at register-time as a one-shot probe.
   let title_match = params.title_match || null
+  // 2026-08-13 conductor addressing v2: a fingerprint of the conductor's chat-tab
+  // LABEL so resolution survives a CC auto-retitle (twin of the worker-tab
+  // fingerprint). Computed server-side (below) from title_match when title_match
+  // names a real chat-tab label - guarantees parity with tab-title-match, and the
+  // hook does not have to reimplement the tokenizer. A caller-supplied one wins.
+  let title_fingerprint = params.title_fingerprint || null
+  // Track whether title_match names a live CHAT-TAB label (fingerprintable) or an
+  // OS WINDOW title from window.foreground (NOT a chat label - never fingerprint).
+  let title_is_chat_label = !!params.title_match
   let hwnd = params.hwnd || null
   let exe = params.exe || null
 
@@ -1691,6 +1713,7 @@ async function register_conductor(params, ctx) {
         title_match = fg.title || ''
         hwnd = fg.hwnd
         exe = fg.exe
+        title_is_chat_label = false  // OS window title, not a chat-tab label
       }
     } catch (e) {}
   }
@@ -1722,9 +1745,17 @@ async function register_conductor(params, ctx) {
       const CC_VT = 'mainThreadWebview-claudeVSCodePanel'
       for (const g of groups) {
         const act = (g.tabs || []).find(t => t.active && t.viewType === CC_VT)
-        if (act && act.label) { title_match = String(act.label); break }
+        if (act && act.label) { title_match = String(act.label); title_is_chat_label = true; break }
       }
     } catch (e) {}
+  }
+
+  // Derive the chat-tab-label fingerprint once title_match is settled, but ONLY
+  // when it is a real chat-tab label (param or bridge-probe), never an OS window
+  // title. Skips a "[...]" window sentinel too. See conductor addressing v2.
+  if (!title_fingerprint && title_is_chat_label && title_match &&
+      String(title_match).trim() && !String(title_match).startsWith('[') && _ttm) {
+    try { title_fingerprint = _ttm.computeFingerprint(String(title_match)) } catch (e) {}
   }
 
   const existing = loadConductorRegistration()
@@ -1748,6 +1779,7 @@ async function register_conductor(params, ctx) {
     tab_id: tab_id,
     ide: ide,
     title_match: title_match || '',
+    title_fingerprint: title_fingerprint || null,
     hwnd: hwnd || null,
     exe: exe || null,
     // 2026-05-19 extensions:
@@ -1846,7 +1878,20 @@ async function conductor_heartbeat(params, _ctx) {
   // 2026-05-19: heartbeat may refresh moving fields. Title/hwnd can shift when
   // Tate resizes; ide_pid stable but workspace_root may change if he re-opens
   // a different folder. Accept refresh of any of these.
-  if (params.title_match) conductor.title_match = String(params.title_match)
+  if (params.title_match) {
+    conductor.title_match = String(params.title_match)
+    // 2026-08-13 conductor addressing v2: refresh the fingerprint from the fresh
+    // label every beat so conductor resolution survives a CC auto-retitle. A
+    // caller-supplied fingerprint wins; otherwise derive it from the label
+    // (skipping a "[...]" window sentinel, which is not a chat-tab label).
+    if (params.title_fingerprint) {
+      conductor.title_fingerprint = params.title_fingerprint
+    } else if (_ttm && !String(params.title_match).startsWith('[')) {
+      try { conductor.title_fingerprint = _ttm.computeFingerprint(String(params.title_match)) } catch (e) {}
+    }
+  } else if (params.title_fingerprint) {
+    conductor.title_fingerprint = params.title_fingerprint
+  }
   if (params.hwnd) conductor.hwnd = Number(params.hwnd)
   if (params.exe) conductor.exe = String(params.exe)
   if (params.claude_port) conductor.claude_port = Number(params.claude_port)
