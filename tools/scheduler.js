@@ -559,6 +559,223 @@ exports.noteSuccessfulDispatch = function noteSuccessfulDispatch() {
   _outagePageSent = false
 }
 
+// ── Runaway dispatch circuit breaker (Hunter 4 #7, 2026-08-13) ────────────────
+//
+// Survival-critical. The ONLY pre-existing protection is account-level: the usage
+// poller auto-switches at 90% and the 20B/wk cap is a soft ceiling. Nothing kills a
+// per-RUN runaway. A wedged retry loop, or a self-re-arming chain (continuity-advance-
+// chain has 371 rows accreted), can spawn worker tab after worker tab and drain the
+// whole weekly token budget mid-trip with no per-run brake. Two independent brakes,
+// both set FAR above normal fleet rate so honest multi-worker operation is never
+// falsely frozen, and every count is logged:
+//
+//   1. Rolling-window aggregate breaker. If total dispatches in the last
+//      BREAKER_WINDOW_MS reach BREAKER_MAX_DISPATCHES, FREEZE all new dispatch and
+//      page Tate ONCE. Auto-clears when the window rolls (old timestamps age out
+//      below the cap) or when the operator touches BREAKER_RESET_FILE.
+//   2. Same-name re-dispatch guard. If ONE task name has already dispatched
+//      BREAKER_SAMENAME_MAX times within BREAKER_SAMENAME_WINDOW_MS, QUARANTINE that
+//      row (last_status='paused' - the schedule_pause exclusion leaseDueRows honours)
+//      and page once. The one looping row is stopped; the rest of the fleet flows.
+//
+// Both brakes reuse the delivery-proven _pagerSender seam (text-tate exit-0 confirmed)
+// so a test asserts on the constructed page without ever texting Tate. All thresholds
+// are env-tunable. The decision functions are PURE (in-memory + pager only, no DB) so
+// they unit-test with an injected nowMs; the DB quarantine lives in quarantineRow.
+
+const BREAKER_WINDOW_MS = parseInt(process.env.SCHEDULER_BREAKER_WINDOW_MS, 10) || 60 * 60 * 1000
+const BREAKER_MAX_DISPATCHES = parseInt(process.env.SCHEDULER_BREAKER_MAX_DISPATCHES, 10) || 150
+const BREAKER_SAMENAME_WINDOW_MS = parseInt(process.env.SCHEDULER_BREAKER_SAMENAME_WINDOW_MS, 10) || 10 * 60 * 1000
+const BREAKER_SAMENAME_MAX = parseInt(process.env.SCHEDULER_BREAKER_SAMENAME_MAX, 10) || 5
+const BREAKER_RESET_FILE = process.env.SCHEDULER_BREAKER_RESET_FILE ||
+  '/Users/ecodia/.ecodiaos/coordination/breaker/RESET'
+
+let _dispatchTimes = []            // ms timestamps of recent dispatches (aggregate window)
+let _nameDispatchTimes = new Map() // name -> [ms timestamps] (same-name window)
+let _breakerFrozen = false         // aggregate freeze latch
+let _breakerPageSent = false       // one aggregate page per freeze episode (unlatched on send failure)
+let _quarantinedNames = new Set()  // names paged after quarantine (one page each, per process)
+
+// Drop timestamps older than the window. Returns a new array (or the same one if
+// nothing aged out) so callers can reassign cheaply.
+function _pruneWindow(arr, nowMs, windowMs) {
+  const cutoff = nowMs - windowMs
+  let i = 0
+  while (i < arr.length && arr[i] < cutoff) i++
+  return i > 0 ? arr.slice(i) : arr
+}
+
+// Operator escape hatch: presence of the reset file force-clears the window and
+// unfreezes. Consumed (unlinked) so it is one-shot. All fs access is guarded so a
+// missing dir / permission error can never crash the dispatch pass.
+function _consumeBreakerResetFile() {
+  try {
+    const fs = require('fs')
+    if (fs.existsSync(BREAKER_RESET_FILE)) {
+      try { fs.unlinkSync(BREAKER_RESET_FILE) } catch (_e) {}
+      return true
+    }
+  } catch (_e) {}
+  return false
+}
+
+// Fire one breaker page via the shared, delivery-proven sender. `latched` mirrors
+// the outage pager: on send failure it unlatches _breakerPageSent so the next frozen
+// tick retries (aggregate freeze); the same-name page passes latched=false because
+// the quarantine itself is the real protection and one attempt is enough. Returns the
+// constructed command so tests assert on it without spawning text-tate.js.
+function _fireBreakerPage(msg, latched) {
+  const args = ['--from', 'runaway breaker', msg]
+  _pagerSender(TEXT_TATE_SCRIPT, args, function (err, code) {
+    if (err || code !== 0) {
+      if (latched) _breakerPageSent = false
+      process.stderr.write('[scheduler] BREAKER PAGE send FAILED (code=' + code +
+        (err ? ', err=' + (err.message || err) : '') + ')' +
+        (latched ? '; unlatched, will retry next frozen tick' : '') + '\n')
+    } else {
+      process.stderr.write('[scheduler] BREAKER PAGE delivered (text-tate exit 0)' +
+        (latched ? '; latched for this freeze' : '') + '\n')
+    }
+  })
+  return { command: 'node ' + TEXT_TATE_SCRIPT + ' ' + args.map(a => JSON.stringify(a)).join(' '), args, message: msg }
+}
+
+// Same-name re-dispatch guard (PURE). Prunes the name's window and returns
+// { allow, reason, count }. allow:false means the name has ALREADY dispatched
+// >= BREAKER_SAMENAME_MAX times in the window (a "more than N in M min" loop) and the
+// caller must quarantine the row. Does NOT record the current attempt - the caller
+// records via breakerRecordDispatch only when BOTH brakes allow.
+exports.breakerCheckSameName = function breakerCheckSameName(name, nowMs) {
+  nowMs = (typeof nowMs === 'number') ? nowMs : Date.now()
+  if (!name) return { allow: true, count: 0 }
+  const arr = _pruneWindow(_nameDispatchTimes.get(name) || [], nowMs, BREAKER_SAMENAME_WINDOW_MS)
+  _nameDispatchTimes.set(name, arr)
+  if (arr.length >= BREAKER_SAMENAME_MAX) {
+    return { allow: false, reason: 'same-name-loop', count: arr.length, name }
+  }
+  return { allow: true, count: arr.length, name }
+}
+
+// Rolling-window aggregate breaker (PURE). Honours the operator reset file, prunes the
+// window, and returns { allow, reason, count, page }. allow:false FREEZES dispatch. The
+// first frozen check of an episode fires exactly one page (latched); subsequent frozen
+// checks stay silent until the window rolls back under the cap, which clears the latch.
+exports.breakerCheckAggregate = function breakerCheckAggregate(nowMs) {
+  nowMs = (typeof nowMs === 'number') ? nowMs : Date.now()
+  if (_consumeBreakerResetFile()) {
+    process.stderr.write('[scheduler] BREAKER manual reset file consumed; clearing window + unfreezing\n')
+    _dispatchTimes = []
+    _breakerFrozen = false
+    _breakerPageSent = false
+  }
+  _dispatchTimes = _pruneWindow(_dispatchTimes, nowMs, BREAKER_WINDOW_MS)
+  if (_dispatchTimes.length >= BREAKER_MAX_DISPATCHES) {
+    const firstFreeze = !_breakerFrozen
+    _breakerFrozen = true
+    let page = null
+    if (!_breakerPageSent) {
+      _breakerPageSent = true
+      const windowMin = Math.round(BREAKER_WINDOW_MS / 60000)
+      const msg = 'RUNAWAY DISPATCH BREAKER TRIPPED: ' + _dispatchTimes.length +
+        ' dispatches in the last ' + windowMin + 'min (cap ' + BREAKER_MAX_DISPATCHES +
+        '). New dispatch FROZEN to protect the weekly token budget. Auto-clears when the ' +
+        'window rolls; force-resume by touching ' + BREAKER_RESET_FILE + '. Check for a ' +
+        'wedged retry loop or a self-re-arming chain.'
+      page = _fireBreakerPage(msg, true)
+    }
+    process.stderr.write('[scheduler] BREAKER FROZEN: ' + _dispatchTimes.length +
+      ' dispatches in ' + Math.round(BREAKER_WINDOW_MS / 60000) + 'min >= cap ' +
+      BREAKER_MAX_DISPATCHES + (firstFreeze ? ' (first freeze this episode)' : '') + '\n')
+    return { allow: false, reason: 'window-freeze', count: _dispatchTimes.length, page }
+  }
+  if (_breakerFrozen) {
+    process.stderr.write('[scheduler] BREAKER CLEARED: window rolled to ' + _dispatchTimes.length +
+      ' < cap ' + BREAKER_MAX_DISPATCHES + '; dispatch resumes\n')
+    _breakerFrozen = false
+    _breakerPageSent = false
+  }
+  return { allow: true, count: _dispatchTimes.length }
+}
+
+// Record a dispatch that passed BOTH brakes, into the aggregate and same-name windows.
+exports.breakerRecordDispatch = function breakerRecordDispatch(name, nowMs) {
+  nowMs = (typeof nowMs === 'number') ? nowMs : Date.now()
+  _dispatchTimes = _pruneWindow(_dispatchTimes, nowMs, BREAKER_WINDOW_MS)
+  _dispatchTimes.push(nowMs)
+  const arr = _pruneWindow(_nameDispatchTimes.get(name) || [], nowMs, BREAKER_SAMENAME_WINDOW_MS)
+  arr.push(nowMs)
+  _nameDispatchTimes.set(name, arr)
+  process.stderr.write('[scheduler] breaker: recorded dispatch "' + name + '" (window=' +
+    _dispatchTimes.length + '/' + BREAKER_MAX_DISPATCHES + ', name=' + arr.length + '/' +
+    BREAKER_SAMENAME_MAX + ')\n')
+  return { window: _dispatchTimes.length, name: arr.length }
+}
+
+// Fire exactly one quarantine page for a name (idempotent per process). Best-effort
+// (latched=false) - the DB pause in quarantineRow is the real protection.
+exports.breakerNoteQuarantine = function breakerNoteQuarantine(name, count) {
+  if (_quarantinedNames.has(name)) return null
+  _quarantinedNames.add(name)
+  const windowMin = Math.round(BREAKER_SAMENAME_WINDOW_MS / 60000)
+  const msg = 'RUNAWAY TASK QUARANTINED: "' + name + '" dispatched ' + count +
+    ' times in ' + windowMin + 'min (limit ' + BREAKER_SAMENAME_MAX + '). Row PAUSED ' +
+    '(last_status=paused) to stop the loop and protect the token budget. Resume with ' +
+    'schedule_resume once the cause is fixed.'
+  return _fireBreakerPage(msg, false)
+}
+
+// DB action for the same-name guard: pause the runaway row so leaseDueRows stops
+// picking it, release any lease, and record why. Mirrors schedule_pause's proven
+// last_status='paused' predicate. Separated from dispatchOne so it integration-tests
+// against a stub pool. Never throws to the caller - a DB hiccup here must not crash
+// the dispatch pass (the aggregate breaker is the fleet-wide backstop).
+exports.quarantineRow = async function quarantineRow(pool, row, count) {
+  const reason = 'runaway breaker: same-name re-dispatch guard quarantined this row (' +
+    count + ' dispatches in ' + Math.round(BREAKER_SAMENAME_WINDOW_MS / 60000) +
+    'min); resume with schedule_resume after fixing the loop'
+  try {
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET last_status = 'paused', status = 'active',
+           leased_by = NULL, leased_at = NULL,
+           last_error = $2, updated_at = NOW()
+       WHERE id = $1`,
+      [row.id, reason]
+    )
+    return { ok: true }
+  } catch (e) {
+    process.stderr.write('[scheduler] quarantineRow UPDATE failed for ' + row.id + ': ' +
+      (e && e.message || e) + '\n')
+    return { ok: false, error: (e && e.message) || String(e) }
+  }
+}
+
+exports._getBreakerState = function () {
+  return {
+    dispatchCount: _dispatchTimes.length,
+    frozen: _breakerFrozen,
+    pageSent: _breakerPageSent,
+    quarantined: Array.from(_quarantinedNames),
+    nameCounts: Object.fromEntries(Array.from(_nameDispatchTimes.entries()).map(([k, v]) => [k, v.length])),
+  }
+}
+exports._resetBreakerState = function () {
+  _dispatchTimes = []
+  _nameDispatchTimes = new Map()
+  _breakerFrozen = false
+  _breakerPageSent = false
+  _quarantinedNames = new Set()
+}
+exports._breakerConfig = function () {
+  return {
+    windowMs: BREAKER_WINDOW_MS,
+    maxDispatches: BREAKER_MAX_DISPATCHES,
+    sameNameWindowMs: BREAKER_SAMENAME_WINDOW_MS,
+    sameNameMax: BREAKER_SAMENAME_MAX,
+    resetFile: BREAKER_RESET_FILE,
+  }
+}
+
 // ── buildBrief ───────────────────────────────────────────────────────────────
 //
 // Composes the brief pasted into the spawned CC chat tab. Workers MUST call
@@ -956,6 +1173,50 @@ exports.dispatchOne = async function dispatchOne(row) {
           'lease released without retry\n')
         return
       }
+    }
+
+    // 0b. Runaway circuit breaker (Hunter 4 #7, 2026-08-13). Two brakes checked
+    // under the launch-lock, BEFORE any cred pick / worktree / tab spawn, so a
+    // runaway is stopped before it spends a single token. Like the austerity gate
+    // above, a trip RELEASES the lease without a retry (a freeze/quarantine is
+    // suppression, not a row failure) so cadence and retry budget are untouched.
+    {
+      const nowMs = Date.now()
+      const rowName = row.name || String(row.id)
+
+      // (i) Same-name re-dispatch guard: if THIS name already looped past the limit
+      // in the window, quarantine the row (pause) so it stops re-dispatching, page
+      // once, and skip. Stops the one looping row; the fleet keeps flowing.
+      const sn = exports.breakerCheckSameName(rowName, nowMs)
+      if (!sn.allow) {
+        await exports.quarantineRow(pool, row, sn.count)
+        exports.breakerNoteQuarantine(rowName, sn.count)
+        process.stderr.write('[scheduler] dispatchOne: QUARANTINE ' + row.id + ' (' + rowName +
+          ') - same-name breaker [' + sn.count + ' in ' +
+          Math.round(BREAKER_SAMENAME_WINDOW_MS / 60000) + 'min]; row paused, lease released\n')
+        return
+      }
+
+      // (ii) Rolling-window aggregate breaker: freeze ALL new dispatch when the
+      // fleet-wide dispatch rate reaches the cap.
+      const agg = exports.breakerCheckAggregate(nowMs)
+      if (!agg.allow) {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', leased_by = NULL, leased_at = NULL, updated_at = NOW()
+           WHERE id = $1 AND status = 'dispatching'
+             AND leased_by IS NOT DISTINCT FROM $2`,
+          [row.id, row.leased_by || null]
+        )
+        process.stderr.write('[scheduler] dispatchOne: FROZEN ' + row.id + ' (' + rowName +
+          ') - aggregate breaker [' + agg.count + ' in ' +
+          Math.round(BREAKER_WINDOW_MS / 60000) + 'min >= cap ' + BREAKER_MAX_DISPATCHES +
+          ']; lease released without retry\n')
+        return
+      }
+
+      // Both brakes clear: record this dispatch against both windows.
+      exports.breakerRecordDispatch(rowName, nowMs)
     }
 
     // 1. Dispatch on the account that is ALREADY live. No per-dispatch rotation.
