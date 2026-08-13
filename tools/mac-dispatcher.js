@@ -195,23 +195,19 @@ function composeBrief(opts) {
   // the one address, never the tool-call shape. Origin: 2026-08-13 Tate - a dispatched
   // helper finished a slice of a chat's todo list, closed its tab, and left the
   // originating chat waiting because nothing reported back.
-  // 2026-08-13 SAFETY LOCK. Proactive report-back INJECTION is disabled pending a
-  // real per-tab identity primitive. Live integration testing proved that "conductor"
-  // is a SINGLE global registration slot shared by every CC session, while there are
-  // MANY conductor chats and no stable per-tab identity in the IDE bridge (listChatTabs
-  // exposes only drifting labels; "foreground" equals the conductor only on a genuine
-  // user turn). So injecting a completion turn to "conductor" can wake the WRONG chat
-  // (observed: the slot churned Vikki -> Mac quirks -> Angelica Friend). The SAME root
-  // cause makes close_my_tab / kill_worker fingerprint matching fail. Until the bridge
-  // exposes a stable per-tab id (session_id / claude_port) so a worker can target the
-  // SPECIFIC originating chat, report-back stays inbox-only via signal_done below
-  // (surfaced at the conductor's turn-start), which never misroutes. Re-enable by
-  // restoring the message_chat step once resolveLiveTargetTab can resolve a specific
-  // originating tab by a stable id. Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
-  const REPORT_BACK_INJECT_ENABLED = false
-  const reportBackStep = (report_back && REPORT_BACK_INJECT_ENABLED)
+  // 2026-08-13 per-tab identity v3 (re-enabled after the safety lock). report_back
+  // is now a `session:<id>` address that resolves to the SPECIFIC originating chat
+  // via the chat-tabs registry (conductor_heartbeat anchors each chat by its stable
+  // Claude Code session_id on its own genuine user turns). resolveLiveTargetTab
+  // resolves it by a UNIQUE exact-label match among live non-worker tabs, or FAILS
+  // SAFE to the inbox - so a drifted label or a collision queues rather than
+  // misroutes. There is no shared slot for another session to overwrite, which is
+  // what caused the earlier misroute. injectTurn holds a cross-process focus lock
+  // and focuses the resolved tab by its CURRENT position before pasting. Doctrine:
+  // coord-conductor-addressing-per-tab-identity-2026-08-13.
+  const reportBackStep = report_back
     ? '1. mcp__coord__coord_message_chat({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", to:"' + report_back + '", from_label:"worker ' + task_id + '", text:"[worker done: ' + task_id + '] <one-line result grounded in a probe, + result_pointer to the durable substrate>"})\n' +
-      '   This wakes the chat that scheduled you. Send it BEFORE signal_done, while your result is fresh. If message_chat returns delivery.ok:false it stayed inbox-queued (conductor busy or unresolved) - that is fine, signal_done below is the durable record.\n'
+      '   This wakes the chat that scheduled you (its stable session address). Send it BEFORE signal_done, while your result is fresh. If message_chat returns delivery.ok:false it stayed inbox-queued (that chat was not uniquely resolvable right now) - that is fine, signal_done below is the durable record.\n'
     : ''
   const n = reportBackStep ? { done: 2, close: 3 } : { done: 1, close: 2 }
   const closing =
@@ -263,8 +259,23 @@ async function dispatch_worker(params) {
     const rb = String(report_back).trim()
     if (/^none$/i.test(rb)) {
       report_back = null
+    } else if (/^session:/i.test(rb)) {
+      // Explicit specific-chat target (v3, the reliable path): the dispatching chat
+      // named its own stable session_id. Pass through verbatim.
+      report_back = rb
     } else if (/^(origin|parent|self|conductor)$/i.test(rb)) {
-      report_back = 'conductor'
+      // Default report-back: wake the chat that scheduled this. Resolve to the
+      // most-recently-active anchored chat (the one the user most recently typed
+      // in, which is almost always the dispatcher) as a session:<id> address. If
+      // no chat is anchored yet, DISABLE report-back (null) rather than fall back
+      // to the ambiguous shared conductor slot that caused the 2026-08-13 misroute.
+      // Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+      let sess = null
+      try {
+        const coord = require('./coord')
+        sess = coord._recentActiveSession && coord._recentActiveSession()
+      } catch (e) {}
+      report_back = sess ? ('session:' + sess) : null
     } else {
       report_back = rb
     }

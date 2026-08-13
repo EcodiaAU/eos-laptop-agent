@@ -548,6 +548,153 @@ function chatTopicMid(topic) {
 
 function _pos(t) { return { label: t.label, viewColumn: t.viewColumn, index: t.index } }
 
+// Per-tab identity v3 (2026-08-13). Read a chat's session-anchored tab record
+// (session_id -> {label, viewColumn, index}) written by conductor_heartbeat on
+// that chat's genuine user turns. Keyed by session_id, the one stable per-tab id
+// Claude Code exposes, so a dispatched worker resolves the SPECIFIC originating
+// chat and never collides with another chat over a shared slot. Returns null when
+// the chat was never anchored (safe: resolution then fails to the inbox).
+function _readSessionTab(sessionId) {
+  try {
+    const safe = String(sessionId || '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120)
+    if (!safe) return null
+    const p = path.join(COORD_ROOT, 'chat-tabs', safe + '.json')
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'))
+    return rec && rec.label ? rec : null
+  } catch (e) { return null }
+}
+
+// Resolve one session anchor record to a UNIQUE live non-worker tab: exact label
+// match, or (on a same-truncated-label collision) the one that also sits at the
+// stored viewColumn+index. Returns the live tab or null (retitled / ambiguous).
+function _resolveAnchorToTab(rec, pool) {
+  if (!rec || !rec.label) return null
+  const exact = pool.filter((t) => t.label === rec.label)
+  if (exact.length === 1) return exact[0]
+  if (exact.length > 1) {
+    const byPos = exact.filter((t) => t.viewColumn === rec.viewColumn && t.index === rec.index)
+    return byPos.length === 1 ? byPos[0] : null
+  }
+  return null
+}
+
+// Read every chat anchor record (for the ownership-conflict guard).
+function _allSessionAnchors() {
+  const out = []
+  try {
+    const dir = path.join(COORD_ROOT, 'chat-tabs')
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.json') || f[0] === '_') continue
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))
+        if (rec && rec.label) out.push(rec)
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return out
+}
+
+// Resolve the most-recently-active anchored chat (default-on report-back fallback
+// when a dispatch did not name a specific originating session). Returns the
+// session_id or null.
+function _recentActiveSession() {
+  try {
+    const p = path.join(COORD_ROOT, 'chat-tabs', '_recent_active.json')
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'))
+    return rec && rec.session_id ? rec.session_id : null
+  } catch (e) { return null }
+}
+
+// ── worker self-close via session anchor (T2, 2026-08-14) ────────────────────
+// close_my_tab / kill_worker historically matched the worker tab by a fuzzy
+// autotitle fingerprint that returns no_match/ambiguous often (Tate flagged it),
+// so worker tabs leak and cannot be force-closed. A worker now ALSO anchors its
+// OWN tab by its stable CC session_id on its genuine turns (conductor_heartbeat
+// T2b), keyed by session_id and carrying tab_id + role:"worker". This resolves
+// that anchor to a uniquely-closeable live tab, fail-safe at every step (0 /
+// ambiguous / stale / ownership-conflict / no-unique-remap -> null, caller falls
+// through to the existing fingerprint path: better leak than wrong-close). The
+// worker anchor is only ever written onto a tab positively identified as THIS
+// worker (its own coord address), so this path can never resolve onto a human
+// chat. Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13,
+// vs-code-webview-tabs-have-no-stable-id-pin-label-or-leak-2026-05-28.
+const _WORKER_ANCHOR_MAX_AGE_S = 6 * 3600  // a worker cannot outlive the 6h orphan cap
+const _CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
+
+async function _resolveWorkerAnchorCloseTarget(workerTabId, idePort) {
+  try {
+    if (!workerTabId || !_chatInject) return null
+    // Exactly one fresh worker anchor for THIS worker, or fall through.
+    const mine = _allSessionAnchors().filter(
+      (a) => a && a.role === 'worker' && a.tab_id === workerTabId && a.label
+    )
+    if (mine.length !== 1) return null
+    const rec = mine[0]
+    const nowS = Date.now() / 1000
+    if (!rec.updated_at || (nowS - rec.updated_at) > _WORKER_ANCHOR_MAX_AGE_S) return null
+    // Uniqueness against the LIVE chat tabs (listChatTabs space, same as capture).
+    let liveTabs
+    try { liveTabs = await _chatInject.listChatTabs() } catch (e) { return null }
+    if (!liveTabs || !liveTabs.length) return null
+    const cand = _resolveAnchorToTab(rec, liveTabs)  // exact-label unique / position on collision
+    if (!cand) return null
+    // Ownership-conflict guard: if ANY OTHER anchor resolves to this same live tab,
+    // one is a mis-capture - refuse (safe leak), same guard the session-inject path uses.
+    const conflict = _allSessionAnchors().some((a) => {
+      if (!a || a.session_id === rec.session_id) return false
+      const t = _resolveAnchorToTab(a, liveTabs)
+      return t && t.viewColumn === cand.viewColumn && t.index === cand.index
+    })
+    if (conflict) return null
+    // Remap into the ide.tabs coordinate space (authoritative tabIndex for the
+    // bridge's deterministic single-close path). Match by EXACT label in the same
+    // viewColumn; unique -> use its live index; else fall through.
+    let ide
+    try { ide = require('./ide') } catch (e) { return null }
+    const tabsResult = await ide.tabs({ ide_port: idePort })
+    const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+    let group = null
+    for (const g of groups) { if (g.viewColumn === cand.viewColumn) { group = g; break } }
+    if (!group) return null
+    const ccHits = (group.tabs || []).filter((t) => t.viewType === _CC_CHAT_VIEW_TYPE && t.label === cand.label)
+    if (ccHits.length !== 1) return null
+    return {
+      viewColumn: cand.viewColumn,
+      label: ccHits[0].label,
+      index: ccHits[0].index,
+      active: !!cand.isActive,
+    }
+  } catch (e) { return null }
+}
+
+// Execute a guarded close of a resolved session-anchor target. Runs the shared
+// tab-close-guard (belts: active-tab, conductor-label, fuzzy) then the bridge
+// single-target close. guardCtx is GUARD_SELF_CLOSE for close_my_tab, {} for
+// kill_worker (so an active worker tab is protected the same as the sweep paths).
+async function _closeAnchorTarget(anchorTarget, conductor, guardCtx) {
+  try {
+    if (!anchorTarget) return { closed: false, refused: 'no_anchor_target' }
+    const decision = require('./tab-close-guard').evaluateClose(
+      'session_anchor',
+      { label: anchorTarget.label, index: anchorTarget.index, viewColumn: anchorTarget.viewColumn, active: anchorTarget.active },
+      conductor,
+      guardCtx || undefined
+    )
+    if (!decision.allow) return { closed: false, refused: 'session_anchor_guard_refused:' + decision.reason }
+    const ide = require('./ide')
+    const closeResult = await ide.tabs_close({
+      viewColumn: anchorTarget.viewColumn,
+      viewType: _CC_CHAT_VIEW_TYPE,
+      exactLabel: anchorTarget.label,   // single-target race guard
+      tabIndex: anchorTarget.index,     // live index -> deterministic single close
+      ide_port: conductor.ide_bridge_port,
+    })
+    const inner = (closeResult && closeResult.result) || closeResult || {}
+    const closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+    return { closed, refused: closed ? null : ('session_anchor_close_no_close:' + (inner.refused || 'closed=0')) }
+  } catch (e) { return { closed: false, refused: 'session_anchor_close_threw:' + (e.message || String(e)) } }
+}
+
 // A message pushes (injects a turn) iff it is an explicit chat message that has
 // not opted out of push. Everything else is inbox-only (machine signals, etc).
 function isChatDeliver(msg) {
@@ -680,6 +827,45 @@ async function resolveLiveTargetTab(topic) {
     return { ok: false, kind: 'conductor', reason: 'conductor_unresolved' }
   }
 
+  if (mid.indexOf('session:') === 0) {
+    // Per-tab identity v3. Resolve a SPECIFIC chat by its stable session_id. Read
+    // the chat's anchored record (label captured on its own genuine user turn),
+    // then re-resolve it against the LIVE tabs by a UNIQUE exact-label match among
+    // non-worker tabs. Unique match -> that tab's CURRENT position (so injection
+    // focuses the right tab even if it moved). Ambiguous or no match -> FAIL SAFE
+    // to the inbox (the chat sees it on its next turn). Because each session has
+    // its OWN record, chat A's worker can only ever resolve A's label - there is no
+    // shared slot for another chat to overwrite, which is what caused the 2026-08-13
+    // misroute. Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+    const sessionId = mid.slice('session:'.length)
+    const rec = _readSessionTab(sessionId)
+    if (!rec || !rec.label) return { ok: false, kind: 'session', reason: 'session_unregistered' }
+    const liveWorkers = _liveWorkerRows()
+    const pool = tabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
+    const cand = _resolveAnchorToTab(rec, pool)
+    if (!cand) {
+      // No unique live tab for this anchor: either the chat retitled since capture
+      // (no label match) or two same-labeled tabs neither of which sits at the
+      // stored position. Fail safe to the inbox.
+      const n = pool.filter((t) => t.label === rec.label).length
+      return { ok: false, kind: 'session', reason: n > 1 ? 'session_ambiguous_label' : 'session_unresolved' }
+    }
+    // Ownership-conflict guard (2026-08-13). If ANOTHER session's anchor also
+    // resolves to this SAME live tab, at least one anchor is a mis-capture - a
+    // focus race during a genuine user turn made a chat anchor onto a different
+    // chat's tab (observed live: session a552ba4c anchored onto another chat's
+    // "HOly fuck..." tab, colliding with faa8e205). We cannot tell which anchor is
+    // correct, so REFUSE for both and let the reports fall to their inboxes. This
+    // converts a would-be misroute into a safe queue, the whole point of v3.
+    const conflict = _allSessionAnchors().some((a) => {
+      if (!a || a.session_id === sessionId) return false
+      const t = _resolveAnchorToTab(a, pool)
+      return t && t.viewColumn === cand.viewColumn && t.index === cand.index
+    })
+    if (conflict) return { ok: false, kind: 'session', reason: 'session_ownership_conflict' }
+    return Object.assign({ ok: true, kind: 'session' }, _pos(cand))
+  }
+
   if (mid.indexOf('label:') === 0) {
     const slug = mid.slice(6)
     const hits = tabs.filter((t) => labelSlug(t.label) === slug)
@@ -795,6 +981,12 @@ async function normalizeToAddress(to) {
   if (!to) return null
   if (/^chat\..+\.inbox$/.test(to)) return to
   if (to === 'conductor') return addressForConductor()
+  // Per-tab identity v3 (2026-08-13): session:<id> targets the SPECIFIC chat whose
+  // stable Claude Code session_id is <id>, via the chat-tabs registry that
+  // conductor_heartbeat writes on that chat's genuine user turns. This is how a
+  // dispatched worker wakes the exact chat that scheduled it (never the shared
+  // conductor slot). Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+  if (/^session:/.test(to)) return 'chat.' + to + '.inbox'
   if (/^tab_/.test(to) && loadWorkerRegistry(to)) return addressForWorker(to)
   try {
     if (_chatInject) {
@@ -1164,6 +1356,23 @@ async function close_my_tab(params, ctx) {
 
   const stored = workers.has(ctx.tab_id) ? workers.get(ctx.tab_id).tab_handle : null
 
+  // Tier 0 (T2, 2026-08-14): session anchor. The worker anchored its OWN tab by
+  // its stable CC session_id on its genuine turns (conductor_heartbeat T2b) - a
+  // POSITIVE, non-fuzzy identity, stronger than the autotitle fingerprint that
+  // frequently returns no_match/ambiguous. Resolve it uniquely (exact-label +
+  // position + ownership-conflict guard, all fail-safe) and close THAT through the
+  // shared close guard. Not uniquely resolvable -> `closed` stays false and the
+  // existing tab_handle path below runs UNCHANGED (additional primary signal, not
+  // a replacement). Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+  try {
+    const anchorTarget = await _resolveWorkerAnchorCloseTarget(ctx.tab_id, conductor.ide_bridge_port)
+    if (anchorTarget) {
+      const res = await _closeAnchorTarget(anchorTarget, conductor, GUARD_SELF_CLOSE)
+      if (res.closed) { closed = true; close_strategy = 'session_anchor' }
+      else if (res.refused) { try { process.stderr.write('[coord] close_my_tab session_anchor not-closed: ' + res.refused + '\n') } catch (e) {} }
+    }
+  } catch (e) { /* fall through to the existing tab_handle path */ }
+
   // 2026-05-28 patch v3 (STRICT). Earlier versions had an active-tab fallback
   // that closed whatever Tate happened to be focused on at close time -
   // because CC chats auto-retitle from first message content, the stored
@@ -1182,7 +1391,7 @@ async function close_my_tab(params, ctx) {
   //
   // Doctrine: cowork-kill-worker-tab-handle-from-foreground-after-spawn-
   // is-unsafe-2026-05-28.md + this patch's new pattern (TODO).
-  try {
+  if (!closed) try {
     if (!stored || stored.viewType !== CC_CHAT_VIEW_TYPE || stored.viewColumn == null) {
       refused = 'no_stored_tab_handle_or_incomplete:' + JSON.stringify(stored || null).slice(0, 200)
     } else {
@@ -1502,7 +1711,28 @@ async function kill_worker(params, ctx) {
   let closed = false
   let refused = null
   let error = null
-  try {
+  let strategy = null
+
+  // Tier 0 (T2, 2026-08-14): session anchor. If the worker anchored its OWN tab
+  // (conductor_heartbeat T2b), resolve+close it here by captured label+position -
+  // the primary signal for the no_match/ambiguous cases the fingerprint path
+  // misses. kill_worker passes NO selfClose, so the shared guard's active-tab belt
+  // protects a focused tab (a conductor kill must never close the focused human
+  // chat), the conductor-label belt protects the conductor, and only a POSITIVE
+  // strategy closes. Not uniquely resolvable -> fall through to cowork.kill_worker
+  // unchanged. Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+  if (conductorRow && conductorRow.ide_bridge_port) {
+    try {
+      const anchorTarget = await _resolveWorkerAnchorCloseTarget(target_tab_id, conductorRow.ide_bridge_port)
+      if (anchorTarget) {
+        const res = await _closeAnchorTarget(anchorTarget, conductorRow, {})
+        if (res.closed) { closed = true; strategy = 'session_anchor' }
+        else if (res.refused) { refused = res.refused }
+      }
+    } catch (e) { /* fall through to cowork delegation */ }
+  }
+
+  if (!closed) try {
     const cowork = require('./cowork')
     const res = await cowork.kill_worker({ tab_id: target_tab_id })
     closed = !!(res && res.closed)
@@ -1526,6 +1756,7 @@ async function kill_worker(params, ctx) {
     error: error,
     killed_by: killed_by,
     reason: reason,
+    strategy: strategy,
   }
 }
 
@@ -1976,4 +2207,9 @@ module.exports = {
   _resolveLiveTargetTab: resolveLiveTargetTab,
   _normalizeToAddress: normalizeToAddress,
   _pushInject: pushInject,
+  _readSessionTab: _readSessionTab,
+  _recentActiveSession: _recentActiveSession,
+  _resolveWorkerAnchorCloseTarget: _resolveWorkerAnchorCloseTarget,
+  _closeAnchorTarget: _closeAnchorTarget,
+  _allSessionAnchors: _allSessionAnchors,
 }
