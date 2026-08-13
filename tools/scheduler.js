@@ -457,20 +457,46 @@ const TEXT_TATE_SCRIPT = process.env.SCHEDULER_TEXT_TATE_SCRIPT ||
 let _consecutiveTransientDefers = 0
 let _outagePageSent = false
 
-// Default sender: fire-and-forget text-tate.js via node, no shell (args array so
-// the message can never be shell-interpreted). Overridable for tests so the unit
-// harness asserts on the CONSTRUCTED command without ever texting Tate.
-let _pagerSender = function defaultPagerSender(scriptPath, args) {
+// Default sender: spawn text-tate.js via node, no shell (args array so the message
+// can never be shell-interpreted). Overridable for tests so the unit harness asserts
+// on the CONSTRUCTED command without ever texting Tate.
+//
+// 2026-08-13 delivery-proven (Hunter 3 #3): NOT detached/unref any more - we wait for
+// the exit code and report it via done(err, code) so the caller can retry a FAILED
+// send instead of latching a page that never landed. text-tate.js exits fast (pure
+// osascript); a 30s watchdog treats a hung send as a failure so a wedged sender can
+// never leave the outage silently un-paged. This runs inside the long-lived daemon,
+// so waiting on a sub-second child is free (the crash-loop pager in index.js stays
+// detached because ITS boot process may exit immediately).
+let _pagerSender = function defaultPagerSender(scriptPath, args, done) {
+  let settled = false
+  const finish = (err, code) => {
+    if (settled) return
+    settled = true
+    if (typeof done === 'function') { try { done(err, code) } catch (_e) {} }
+  }
   try {
     const child = require('child_process').spawn('node', [scriptPath, ...args], {
-      detached: true, stdio: 'ignore',
+      stdio: 'ignore',
     })
+    const watchdog = setTimeout(() => {
+      process.stderr.write('[scheduler] outage pager timed out (30s); treating as failed\n')
+      try { child.kill('SIGKILL') } catch (_e) {}
+      finish(new Error('pager send timed out'), null)
+    }, 30000)
+    if (watchdog.unref) watchdog.unref()
     child.on('error', (e) => {
       process.stderr.write('[scheduler] outage pager spawn error: ' + (e && e.message || e) + '\n')
+      clearTimeout(watchdog)
+      finish(e, null)
     })
-    child.unref()
+    child.on('exit', (code) => {
+      clearTimeout(watchdog)
+      finish(null, code)
+    })
   } catch (e) {
     process.stderr.write('[scheduler] outage pager send error: ' + (e && e.message || e) + '\n')
+    finish(e, null)
   }
 }
 exports._setPagerSender = function (fn) { _pagerSender = fn }  // test seam
@@ -489,6 +515,13 @@ exports._resetOutageState = function () {
 exports.noteTransientDefer = function noteTransientDefer(errMsg) {
   _consecutiveTransientDefers += 1
   if (_consecutiveTransientDefers >= OUTAGE_PAGE_THRESHOLD && !_outagePageSent) {
+    // Latch OPTIMISTICALLY so a burst of defers during the in-flight send does not
+    // fire a second page. But this is provisional: if text-tate.js does not exit 0,
+    // the done callback UNLATCHES so the next 5min defer tick retries. Only a
+    // confirmed exit-0 keeps the latch, preserving one-page-per-outage on success.
+    // 2026-08-13 delivery-proven (Hunter 3 #3): the old code latched unconditionally
+    // before a fire-and-forget spawn, so a broken send path meant the outage was
+    // never reported and never retried.
     _outagePageSent = true
     const msg = 'DISPATCH OUTAGE: no live IDE for ' + _consecutiveTransientDefers +
       ' consecutive dispatch attempts (~' + (_consecutiveTransientDefers * 5) +
@@ -496,7 +529,18 @@ exports.noteTransientDefer = function noteTransientDefer(errMsg) {
       'Last error: ' + String(errMsg || '').slice(0, 120) +
       '. Reopen VSCode / the conductor to resume dispatch.'
     const args = ['--from', 'scheduler watchdog', msg]
-    _pagerSender(TEXT_TATE_SCRIPT, args)
+    _pagerSender(TEXT_TATE_SCRIPT, args, function (err, code) {
+      if (err || code !== 0) {
+        // Send did not confirm delivery: unlatch so the next defer retries. Guard
+        // against clobbering a latch that a successful dispatch already cleared
+        // (noteSuccessfulDispatch resets both) - unlatching then is harmless.
+        _outagePageSent = false
+        process.stderr.write('[scheduler] OUTAGE PAGE send FAILED (code=' +
+          code + (err ? ', err=' + (err.message || err) : '') + '); unlatched, will retry next defer\n')
+      } else {
+        process.stderr.write('[scheduler] OUTAGE PAGE delivered (text-tate exit 0); latched for this outage\n')
+      }
+    })
     process.stderr.write('[scheduler] OUTAGE PAGE fired after ' +
       _consecutiveTransientDefers + ' consecutive transient defers\n')
     return { command: 'node ' + TEXT_TATE_SCRIPT + ' ' + args.map(a => JSON.stringify(a)).join(' '), args, message: msg }

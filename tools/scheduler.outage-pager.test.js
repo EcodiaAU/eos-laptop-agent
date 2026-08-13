@@ -105,5 +105,51 @@ ok('single transient blip then recovery never pages', () => {
   assert.strictEqual(sent.length, 0, 'isolated blips separated by success never reach the threshold')
 })
 
+// ── 7. retry-on-fail: a NON-ZERO text-tate exit unlatches so the next defer retries
+//      (2026-08-13 delivery-proven, Hunter 3 #3). The old code latched before a
+//      fire-and-forget spawn, so a broken send path meant the outage was NEVER
+//      re-reported. Now the latch only sticks on a confirmed exit 0.
+ok('failed send (exit non-zero) unlatches and re-pages on the next defer', () => {
+  reset()
+  let calls = 0
+  // Sender that reports a FAILED send (exit code 1) synchronously.
+  scheduler._setPagerSender((scriptPath, args, done) => { calls++; if (done) done(null, 1) })
+  // Cross the threshold: pages once, but the send fails -> latch cleared.
+  for (let i = 0; i < 3; i++) scheduler.noteTransientDefer('no IDE instances registered')
+  assert.strictEqual(calls, 1, 'one send attempt at threshold')
+  assert.strictEqual(scheduler._getOutageState().sent, false, 'failed send leaves latch UNSET (retryable)')
+  // Next defer must retry the page (latch was cleared).
+  scheduler.noteTransientDefer('still no IDE')
+  assert.strictEqual(calls, 2, 'a failed page is retried on the next defer')
+  assert.strictEqual(scheduler._getOutageState().sent, false, 'still unset after another failure')
+})
+
+// ── 8. success (exit 0) latches: exactly one page per outage, no retry ─────────
+ok('successful send (exit 0) latches; no re-page while the outage persists', () => {
+  reset()
+  let calls = 0
+  scheduler._setPagerSender((scriptPath, args, done) => { calls++; if (done) done(null, 0) })
+  for (let i = 0; i < 3; i++) scheduler.noteTransientDefer('no IDE instances registered')
+  assert.strictEqual(calls, 1, 'one send at threshold')
+  assert.strictEqual(scheduler._getOutageState().sent, true, 'confirmed exit-0 KEEPS the latch')
+  // Ten more defers in the SAME outage: no further send.
+  for (let i = 0; i < 10; i++) scheduler.noteTransientDefer('ETIMEDOUT')
+  assert.strictEqual(calls, 1, 'exit-0 latch means exactly one page per outage')
+})
+
+// ── 9. a spawn ERROR (done(err)) is treated as a failed send (retryable) ──────
+ok('spawn error unlatches like a non-zero exit', () => {
+  reset()
+  let calls = 0
+  scheduler._setPagerSender((scriptPath, args, done) => { calls++; if (done) done(new Error('ENOENT'), null) })
+  for (let i = 0; i < 3; i++) scheduler.noteTransientDefer('no IDE')
+  assert.strictEqual(scheduler._getOutageState().sent, false, 'spawn error leaves latch unset')
+  scheduler.noteTransientDefer('no IDE')
+  assert.strictEqual(calls, 2, 'retried after spawn error')
+})
+
+// Restore the recorder sender for any later additions.
+scheduler._setPagerSender((scriptPath, args) => { sent.push({ scriptPath, args }) })
+
 console.log(failures === 0 ? '\nALL PASS' : '\n' + failures + ' FAILED')
 process.exit(failures === 0 ? 0 : 1)

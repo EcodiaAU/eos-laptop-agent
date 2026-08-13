@@ -13,6 +13,22 @@ const os = require('os')
 const fs = require('fs')
 const path = require('path')
 
+// ── crash-loop detector (2026-08-13 survival hardening) ──────────────────────
+// Runs FIRST, before the risky tool autoload, so a boot that later dies mid-load
+// is still counted. If N boots land in a short window (launchd respawning a
+// failing boot every ~10s), fire ONE rate-limited page to Tate. Wrapped so the
+// detector can never itself crash boot. See lib/crash-loop-detector.js.
+try {
+  const { recordBootAndDetect } = require('./lib/crash-loop-detector')
+  const logDir = path.join(__dirname, 'logs')
+  recordBootAndDetect({
+    historyPath: path.join(logDir, 'boot-history.json'),
+    stampPath: path.join(logDir, 'crashloop-page.stamp'),
+  })
+} catch (e) {
+  console.error('[boot] crash-loop detector skipped (non-fatal):', e && e.message || e)
+}
+
 const app = express()
 const PORT = process.env.AGENT_PORT || 7456
 const TOKEN = process.env.AGENT_TOKEN || ''
@@ -35,23 +51,13 @@ function auth(req, res, next) {
   res.status(401).json({ error: 'Unauthorized' })
 }
 
-const tools = {}
+// Fault-tolerant tool autoload (2026-08-13): each tool file is required inside a
+// per-file try/catch, so one bad file is skipped + logged instead of crashing
+// boot into a silent launchd respawn loop. The test/harness skip filter is
+// preserved inside the helper. See lib/tool-autoload.js.
 const toolDir = path.join(__dirname, 'tools')
-for (const file of fs.readdirSync(toolDir)) {
-  if (!file.endsWith('.js')) continue
-  // Skip test/harness files - they run assertions and call process.exit() at load
-  // (no require.main guard), which kills the server mid-autoload. Match BOTH the
-  // suffix conventions (*.test.js / *.spec.js / *.bench.js / *.integration.js) AND
-  // the `test-` prefix convention: tools/test-tab-title-match.js slipped the old
-  // suffix-only filter, ran its suite at require(), printed "7 passed" and exited
-  // before app.listen - the agent was down ~5h on 2026-06-22 (no API, no cron).
-  if (/(^test-|\.(test|spec|bench|integration)\.js$)/.test(file)) continue
-  const mod = require(path.join(toolDir, file))
-  const moduleName = path.basename(file, '.js')
-  for (const [name, fn] of Object.entries(mod)) {
-    tools[`${moduleName}.${name}`] = fn
-  }
-}
+const { loadTools } = require('./lib/tool-autoload')
+const { tools, failed: toolLoadFailures } = loadTools({ toolDir, logger: console })
 
 app.get('/api/health', (_req, res) => {
   // 2026-07-17: surface the scheduler dispatch-loop liveness so an external probe
@@ -76,6 +82,9 @@ app.get('/api/health', (_req, res) => {
     },
     hostname: os.hostname(),
     scheduler_health,
+    // 2026-08-13: expose skipped tool files so a canary can see a DEGRADED boot
+    // (agent up, but one tool failed to load) rather than only up/down.
+    tool_load_failures: (toolLoadFailures || []).map(f => f.file),
   })
 })
 
@@ -227,9 +236,13 @@ function startCaffeinate() {
   }
 }
 
-app.listen(PORT, () => {
+function onListening() {
   console.log(`EcodiaOS Laptop Agent running on :${PORT}`)
   console.log(`Tools loaded: ${Object.keys(tools).join(', ')}`)
+  if (toolLoadFailures && toolLoadFailures.length) {
+    console.error(`Tools SKIPPED (${toolLoadFailures.length}, agent still up): ` +
+      toolLoadFailures.map(f => f.file).join(', '))
+  }
   console.log(`Auth: ${TOKEN ? 'enabled' : 'DISABLED (set AGENT_TOKEN)'}`)
 
   // Hold the idle-sleep assertion for the agent's whole lifetime (darwin only).
@@ -255,4 +268,66 @@ app.listen(PORT, () => {
       console.error('Scheduler failed to start:', e.message)
     }
   }
-})
+}
+
+// ── EADDRINUSE handling (2026-08-13 survival hardening) ──────────────────────
+// Without this, a stale/zombie prior instance holding :7456 makes app.listen throw
+// an uncaught error -> process exit -> launchd (KeepAlive + ThrottleInterval=10)
+// respawns every ~10s FOREVER, silent, same shape as the bad-require crash-loop.
+// Handle it: try ONCE to reap a stale prior laptop-agent listener that is OUR node
+// index.js, then rebind; if the port is still held (or held by a foreign process we
+// must not kill), exit with a DISTINCT code (3) so the plist log + the fleet canary
+// can alert, instead of the failure being invisible. Handoff: Hunter 4 #1.
+const EXIT_PORT_HELD = 3
+let _rebindAttempted = false
+
+// Return the pid we reaped, or null. Only ever kills a process that is clearly OUR
+// laptop-agent (a node process running index.js). Never kills a foreign holder.
+function reapStaleListener(port) {
+  try {
+    const { execSync } = require('child_process')
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null || true`,
+      { encoding: 'utf8', timeout: 5000 }).trim()
+    if (!out) return null
+    const pids = out.split(/\s+/).map(s => parseInt(s, 10)).filter(n => n && n !== process.pid)
+    for (const pid of pids) {
+      let cmd = ''
+      try { cmd = execSync(`ps -o command= -p ${pid} 2>/dev/null || true`, { encoding: 'utf8', timeout: 5000 }).trim() } catch (_e) {}
+      const looksLikeAgent = /\bnode\b/.test(cmd) && /index\.js/.test(cmd)
+      if (looksLikeAgent) {
+        try { process.kill(pid, 'SIGTERM'); return pid } catch (_e) { return null }
+      }
+      console.error(`[listen] :${port} held by pid ${pid} (${cmd || 'unknown'}) which is NOT our agent; leaving it.`)
+    }
+    return null
+  } catch (e) {
+    console.error('[listen] stale-listener reap probe failed:', e && e.message || e)
+    return null
+  }
+}
+
+function startServer() {
+  const server = app.listen(PORT, onListening)
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`[listen] :${PORT} already in use (EADDRINUSE).`)
+      if (!_rebindAttempted) {
+        _rebindAttempted = true
+        const reaped = reapStaleListener(PORT)
+        if (reaped) {
+          console.error(`[listen] reaped stale prior listener (pid ${reaped}); retrying bind in 1s`)
+          setTimeout(startServer, 1000)
+          return
+        }
+      }
+      console.error(`[listen] could not bind :${PORT}; exiting ${EXIT_PORT_HELD} so launchd/canary can alert (not a silent 10s respawn).`)
+      process.exit(EXIT_PORT_HELD)
+    } else {
+      console.error('[listen] fatal server error:', err && err.message || err)
+      process.exit(1)
+    }
+  })
+  return server
+}
+
+startServer()
