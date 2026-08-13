@@ -25,6 +25,23 @@ function ok(name, cond) {
   else { passed++; console.log('ok - ' + name) }
 }
 
+// Conductor addressing v2 (2026-08-13) resolves `conductor` from the registered
+// conductor row on disk (title_match / title_fingerprint), NOT from a "single
+// active human tab" heuristic. These helpers seed / clear that registration in
+// the sandboxed COORD_ROOT so the resolver reads a deterministic identity, the
+// same mechanism register_conductor / conductor_heartbeat write in production.
+function seedConductor(reg) {
+  const dir = path.join(tmpRoot, 'conductors')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'current.json'), JSON.stringify(reg || {}))
+}
+function clearConductor() {
+  const dir = path.join(tmpRoot, 'conductors')
+  for (const f of ['current.json', 'default.json']) {
+    try { fs.unlinkSync(path.join(dir, f)) } catch (e) {}
+  }
+}
+
 // ── addressing round-trips ────────────────────────────────────────────────
 ok('labelSlug lowercases + hyphenates', coord._labelSlug('Chambers CH arc 26!') === 'chambers-ch-arc-26')
 ok('labelSlug trims edge separators', coord._labelSlug('  Studio  ') === 'studio')
@@ -116,36 +133,62 @@ async function withTabs(tabs, fn) {
       const amb = await coord._resolveLiveTargetTab('chat.label:nope.inbox')
       ok('label target with no live tab refuses', amb.ok === false && amb.reason === 'label_no_live_tab')
 
-      // conductor falls back to the single active NON-WORKER tab
+      // conductor addressing v2: with a registered conductor whose title_match is
+      // a live non-worker tab label, `conductor` resolves to that unique tab
+      // (the deleted v1 "single active human tab" fallback is gone).
+      seedConductor({ tab_id: 'conductor', title_match: 'Chambers CH', title_fingerprint: null, in_turn: false })
       const c = await coord._resolveLiveTargetTab('chat.conductor.inbox')
-      ok('conductor resolves to the single active human tab', c.ok === true && c.label === 'Chambers CH')
+      clearConductor()
+      ok('conductor resolves to the registered non-worker tab by title_match', c.ok === true && c.label === 'Chambers CH')
     },
   )
 
-  // U3 fail-safe: when the only active tab is a dispatched worker ([EOS-W-...]),
-  // `conductor` must NOT resolve to it. It refuses so the message stays queued
-  // and the human sees it via the conductor-inbox peek, instead of a worker
-  // silently consuming it. This is the root-cause guard against conductor
-  // staleness misrouting into a running worker while Tate is away.
+  // v2 fail-safe: `conductor` must NEVER resolve to a dispatched worker
+  // ([EOS-W-...]); worker tabs are excluded from the resolution pool. With the
+  // registered title_match matching no live NON-worker tab, resolution fails safe
+  // (conductor_unresolved) so the message stays inbox-queued and the human sees it
+  // via the conductor-inbox peek, instead of a worker silently consuming it. This
+  // is the root-cause guard against conductor staleness misrouting into a running
+  // worker while Tate is away.
   await withTabs(
     [
       { label: '[EOS-W-3d7212fc] <dispatched build>', viewColumn: 1, index: 0, isActive: true, viewType: 'mainThreadWebview-claudeVSCodePanel' },
     ],
     async () => {
+      seedConductor({ tab_id: 'conductor', title_match: 'Conductor Chat', title_fingerprint: null, in_turn: false })
       const r = await coord._resolveLiveTargetTab('chat.conductor.inbox')
-      ok('conductor refuses when only active tab is a worker', r.ok === false && r.reason === 'conductor_unresolved_worker_active')
+      clearConductor()
+      ok('conductor never resolves to a worker tab (fails safe, unresolved)', r.ok === false && r.reason === 'conductor_unresolved')
     },
   )
 
-  // A live human tab active alongside a worker tab still resolves to the human.
+  // A live non-worker tab whose label matches the registered title_match resolves
+  // to it even when a worker tab is also live (worker excluded from the pool).
   await withTabs(
     [
       { label: '[EOS-W-3d7212fc] <dispatched build>', viewColumn: 1, index: 0, isActive: false, viewType: 'mainThreadWebview-claudeVSCodePanel' },
       { label: 'Co-Exist Invoice', viewColumn: 1, index: 1, isActive: true, viewType: 'mainThreadWebview-claudeVSCodePanel' },
     ],
     async () => {
+      seedConductor({ tab_id: 'conductor', title_match: 'Co-Exist Invoice', title_fingerprint: null, in_turn: false })
       const r = await coord._resolveLiveTargetTab('chat.conductor.inbox')
-      ok('conductor resolves to the human tab beside a worker', r.ok === true && r.label === 'Co-Exist Invoice')
+      clearConductor()
+      ok('conductor resolves to the registered non-worker tab beside a worker', r.ok === true && r.label === 'Co-Exist Invoice')
+    },
+  )
+
+  // v2 ambiguity guard: when the registered title_match matches MORE than one live
+  // non-worker tab, refuse rather than guess (conductor_ambiguous_label).
+  await withTabs(
+    [
+      { label: 'Ops', viewColumn: 1, index: 0, isActive: true, viewType: 'mainThreadWebview-claudeVSCodePanel' },
+      { label: 'Ops', viewColumn: 2, index: 0, isActive: false, viewType: 'mainThreadWebview-claudeVSCodePanel' },
+    ],
+    async () => {
+      seedConductor({ tab_id: 'conductor', title_match: 'Ops', title_fingerprint: null, in_turn: false })
+      const r = await coord._resolveLiveTargetTab('chat.conductor.inbox')
+      clearConductor()
+      ok('conductor refuses an ambiguous title_match (2 live tabs)', r.ok === false && r.reason === 'conductor_ambiguous_label')
     },
   )
 
