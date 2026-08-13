@@ -189,10 +189,51 @@ app.post('/api/scheduler/manual_chat', auth, async (req, res) => {
 
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
+// ── caffeinate assertion (darwin, bound to agent lifetime) ───────────────────
+//
+// 2026-08-13 survival hardening (Tate overseas from ~2026-09-24). The laptop-agent
+// plist carries NO caffeinate wrapper, and its KeepAlive only restarts on EXIT,
+// not when the OS idle-sleeps and freezes the Node event loop (every setInterval
+// in scheduler.start stops ticking; dispatch + recovery go dark). Doctrine:
+// launchd-git-push-jobs-need-caffeinate-or-sleep-kills-fleet. Idle-sleep is
+// currently disabled on this host, but this makes the no-idle-sleep guarantee
+// STANDING and self-documenting, and survives a host settings drift.
+//
+// We spawn `caffeinate -i -w <this-pid>`: the -i idle assertion is held for as
+// long as caffeinate runs, and -w binds it to THIS process's pid so caffeinate
+// exits and releases the assertion the moment the agent dies - even on SIGKILL,
+// where a JS exit handler would never run. Bound to lifetime by construction, no
+// tracking/teardown to get wrong. (Critical-battery hibernate still overrides any
+// assertion; keep the host on AC. That residual is unchanged.)
+let _caffeinateChild = null
+function startCaffeinate() {
+  if (process.platform !== 'darwin') return
+  try {
+    const child = require('child_process').spawn(
+      '/usr/bin/caffeinate', ['-i', '-w', String(process.pid)],
+      { stdio: 'ignore', detached: false }
+    )
+    _caffeinateChild = child
+    child.on('error', (e) => {
+      console.error('[caffeinate] spawn error (sleep guarantee not held):', e && e.message || e)
+    })
+    child.on('exit', (code, sig) => {
+      console.log(`[caffeinate] assertion released (exit code=${code} sig=${sig})`)
+    })
+    child.unref()
+    console.log(`[caffeinate] idle-sleep assertion held for pid ${process.pid} (caffeinate pid ${child.pid})`)
+  } catch (e) {
+    console.error('[caffeinate] failed to start (sleep guarantee not held):', e && e.message || e)
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`EcodiaOS Laptop Agent running on :${PORT}`)
   console.log(`Tools loaded: ${Object.keys(tools).join(', ')}`)
   console.log(`Auth: ${TOKEN ? 'enabled' : 'DISABLED (set AGENT_TOKEN)'}`)
+
+  // Hold the idle-sleep assertion for the agent's whole lifetime (darwin only).
+  startCaffeinate()
 
   // Autonomy substrate scheduler (Phase 3). Off by default - requires explicit
   // SCHEDULER_ENABLED=true + DATABASE_URL. Do NOT flip on until: (a) agent

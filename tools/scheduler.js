@@ -436,6 +436,85 @@ exports._launchLock = { acquire: launchLockAcquire }
 const _inFlightDispatchIds = new Set()
 exports._inFlightDispatchIds = _inFlightDispatchIds  // test seam / introspection
 
+// ── dispatch-outage pager ────────────────────────────────────────────────────
+//
+// 2026-08-13 survival-critical resilience (Tate overseas from ~2026-09-24). When
+// VSCode is dead, every dispatch hits the transient-IDE-bridge path below and
+// defers 5min FOREVER with no retry increment, no failed mark, and no alert.
+// scheduler-health only writes into the NEXT CC session, which never starts when
+// the conductor is dead, so the outage is totally silent and ALL scheduled work
+// stalls unseen. The imessage-agent has its own launchd KeepAlive and survives,
+// so text-tate.js is the one channel that still reaches Tate when the IDE is gone.
+//
+// Track consecutive transient-bridge defers on the dispatch path. When N in a row
+// (default 3, about 15min at the 5min defer cadence) fire EXACTLY ONE page, then
+// latch so we never spam. The counter + latch reset on the first successful
+// dispatch (a spawned worker tab = the bridge is alive again), so a fresh outage
+// pages again. Doctrine: mac-unattended-resilience-conductor-survival-2026-08-13.
+const OUTAGE_PAGE_THRESHOLD = parseInt(process.env.SCHEDULER_OUTAGE_PAGE_THRESHOLD, 10) || 3
+const TEXT_TATE_SCRIPT = process.env.SCHEDULER_TEXT_TATE_SCRIPT ||
+  '/Users/ecodia/.code/ecodiaos/backend/imessage-agent/text-tate.js'
+let _consecutiveTransientDefers = 0
+let _outagePageSent = false
+
+// Default sender: fire-and-forget text-tate.js via node, no shell (args array so
+// the message can never be shell-interpreted). Overridable for tests so the unit
+// harness asserts on the CONSTRUCTED command without ever texting Tate.
+let _pagerSender = function defaultPagerSender(scriptPath, args) {
+  try {
+    const child = require('child_process').spawn('node', [scriptPath, ...args], {
+      detached: true, stdio: 'ignore',
+    })
+    child.on('error', (e) => {
+      process.stderr.write('[scheduler] outage pager spawn error: ' + (e && e.message || e) + '\n')
+    })
+    child.unref()
+  } catch (e) {
+    process.stderr.write('[scheduler] outage pager send error: ' + (e && e.message || e) + '\n')
+  }
+}
+exports._setPagerSender = function (fn) { _pagerSender = fn }  // test seam
+exports._getOutageState = function () {
+  return { consecutive: _consecutiveTransientDefers, sent: _outagePageSent }
+}
+exports._resetOutageState = function () {
+  _consecutiveTransientDefers = 0
+  _outagePageSent = false
+}
+
+// Called from the transient-bridge defer branch. Increments the consecutive
+// counter and, once it crosses the threshold and no page has been sent for THIS
+// outage, constructs + fires exactly one page. Returns the constructed command
+// (or null when no page fired) so tests can assert on it.
+exports.noteTransientDefer = function noteTransientDefer(errMsg) {
+  _consecutiveTransientDefers += 1
+  if (_consecutiveTransientDefers >= OUTAGE_PAGE_THRESHOLD && !_outagePageSent) {
+    _outagePageSent = true
+    const msg = 'DISPATCH OUTAGE: no live IDE for ' + _consecutiveTransientDefers +
+      ' consecutive dispatch attempts (~' + (_consecutiveTransientDefers * 5) +
+      'min). All scheduled work is STALLED (transient IDE-bridge, deferring 5min). ' +
+      'Last error: ' + String(errMsg || '').slice(0, 120) +
+      '. Reopen VSCode / the conductor to resume dispatch.'
+    const args = ['--from', 'scheduler watchdog', msg]
+    _pagerSender(TEXT_TATE_SCRIPT, args)
+    process.stderr.write('[scheduler] OUTAGE PAGE fired after ' +
+      _consecutiveTransientDefers + ' consecutive transient defers\n')
+    return { command: 'node ' + TEXT_TATE_SCRIPT + ' ' + args.map(a => JSON.stringify(a)).join(' '), args, message: msg }
+  }
+  return null
+}
+
+// Called at the successful-dispatch point (a worker tab was spawned, so the IDE
+// bridge is alive). Resets the outage tracker so a later outage pages afresh.
+exports.noteSuccessfulDispatch = function noteSuccessfulDispatch() {
+  if (_consecutiveTransientDefers !== 0 || _outagePageSent) {
+    process.stderr.write('[scheduler] dispatch recovered; clearing outage tracker (was ' +
+      _consecutiveTransientDefers + ' defers, paged=' + _outagePageSent + ')\n')
+  }
+  _consecutiveTransientDefers = 0
+  _outagePageSent = false
+}
+
 // ── buildBrief ───────────────────────────────────────────────────────────────
 //
 // Composes the brief pasted into the spawned CC chat tab. Workers MUST call
@@ -1002,6 +1081,13 @@ exports.dispatchOne = async function dispatchOne(row) {
 
     tabId = result.tab_id
 
+    // Dispatch reached a spawned worker tab: the IDE bridge is alive. Clear any
+    // in-progress transient-outage tracking so a later outage pages afresh
+    // (2026-08-13 dispatch-outage pager). Placed here, not after the bound wait,
+    // because a tab spawn already proves the bridge; a bound timeout on a live
+    // bridge is a different (worker-side) failure and must not re-arm the pager.
+    exports.noteSuccessfulDispatch()
+
     // 4. Wait for signal_bound (inside launch-lock).
     // Poll coord inbox for a message with body.type==='bound' && body.task_id === row.id
     const taskIdStr = String(row.id)
@@ -1168,6 +1254,13 @@ exports.dispatchOne = async function dispatchOne(row) {
         )
       } catch (pgErr) {
         process.stderr.write('[scheduler] transient-bridge defer pg error: ' + pgErr.message + '\n')
+      }
+      // 2026-08-13 dispatch-outage pager. Count this defer; page Tate exactly
+      // once when the outage has persisted N consecutive defers (~15min). The
+      // page fire is independent of the pg update above so a DB blip cannot
+      // suppress the alert. Rate-limited + latched inside noteTransientDefer.
+      try { exports.noteTransientDefer(errMsg) } catch (pgErr) {
+        process.stderr.write('[scheduler] outage pager note error: ' + pgErr.message + '\n')
       }
     } else {
       try {
