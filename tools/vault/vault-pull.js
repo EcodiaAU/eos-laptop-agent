@@ -327,13 +327,28 @@ async function importBankCsv(db, csvText, sourceAccount, asOfDate) {
     throw new Error(`bank-csv: unknown/absent source_account "${sourceAccount}" (need one of ${BA_CSV_ACCOUNTS.join(', ')})`)
   }
   const { rows, liveBalance, liveBalanceDate, declineEvents } = parseBaCsvRows(csvText, sourceAccount)
+  // The CSV is the AUTHORITATIVE full-fidelity record (signed amount + running balance) for the
+  // range it covers. Supersede FIRST: delete any Phase-1 phone-SCRAPE rows (ba-vault-) inside that
+  // range BEFORE staging, so the CSV becomes the sole record for [lo,hi]. Order matters: the scrape
+  // collapsed whitespace and left a trailing dash artifact, so its dedup key never matches the
+  // padded CSV and the overlap double-counts; but if a scrape row DID byte-match, staging first
+  // would dedup-SKIP the CSV insert and then the delete would drop the txn entirely. Deleting
+  // in-range is lossless (BA's export is complete for its range). Origin: ba_personal double-count 2026-08-14.
+  let supersededScrapeRows = 0
+  const occ = rows.map(r => r.occurred).filter(Boolean).sort()
+  if (occ.length) {
+    const del = await db`DELETE FROM public.staged_transactions
+      WHERE source_account = ${sourceAccount} AND source_ref LIKE 'ba-vault-%'
+        AND occurred_at >= ${occ[0]} AND occurred_at <= ${occ[occ.length - 1]}`
+    supersededScrapeRows = del.count || 0
+  }
   const stats = await stageGroupedBaRows(db, rows, { idPrefix: 'bacsv_', refPrefix: 'ba-phonecsv-' })
   let balances = {}
   if (liveBalance != null) {
     const asOf = liveBalanceDate || asOfDate || new Date().toISOString().slice(0, 10)
     balances = await recordBalances(db, { [sourceAccount]: { curr_cents: liveBalance } }, asOf)
   }
-  return { account: sourceAccount, stats, declineEvents, liveBalance, liveBalanceDate, balances, totalStaged: rows.length }
+  return { account: sourceAccount, stats, declineEvents, liveBalance, liveBalanceDate, balances, totalStaged: rows.length, supersededScrapeRows }
 }
 
 // The read's own date (signed `ts`, Brisbane-agnostic - a date is a date) is the as-of for the
