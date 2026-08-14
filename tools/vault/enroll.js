@@ -51,6 +51,16 @@ function loginLink(service, uSel, pSel, sSel, submit, opts = {}) {
     if (!opts.recipient) throw new Error('captureSession needs a recipient pubkey (host session-recipient publicX963B64)')
     params.set('recip', toUrlB64(opts.recipient))   // standard-b64 pubkey -> b64url for the URL
   }
+  // BANK-FEED (Phase 2): one login captures ALL BA accounts. No per-account tag needed - the phone
+  // reads the on-screen account number per download and the host attributes each CSV.
+  if (opts.bankFeed) {
+    params.set('capture', 'download')
+    params.set('bankfeed', '1')
+  } else if (opts.captureDownload) {
+    // Legacy single-account capture: user drives to ONE account's export; tag it explicitly.
+    params.set('capture', 'download')
+    if (opts.account) params.set('account', opts.account)
+  }
   params.set('service', e.service || service)
   return 'eosvault://login?' + params.toString()
 }

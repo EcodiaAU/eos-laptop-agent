@@ -41,7 +41,12 @@ function canonical(msg) {
   // by its hash (`valueSha256`, hex, ASCII-safe) which STAYS in the canonical, so the signed
   // bytes never contain arbitrary scraped text - eliminating any JSON-escaping divergence
   // between the phone's serializer and this one. Key-sorted for determinism.
-  const { sig, value, ...rest } = msg
+  // `pageContext` (a bank statement page's scraped free text, used for account attribution)
+  // is bound by `pageContextSha256` (hex, ASCII-safe) which STAYS in the canonical, for the
+  // same reason `value` is: keep arbitrary scraped text out of the signed bytes so the phone's
+  // and this serializer's escaping can never diverge. Stripping an absent key is a no-op, so
+  // every pre-existing message type is unaffected.
+  const { sig, value, pageContext, ...rest } = msg
   return Buffer.from(JSON.stringify(rest, Object.keys(rest).sort()))
 }
 

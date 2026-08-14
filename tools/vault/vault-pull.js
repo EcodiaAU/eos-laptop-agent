@@ -99,6 +99,28 @@ const BA_ACCOUNT_MAP = {
   '12566111': 'ba_personal_savings', // Tate Saver
 }
 
+// Attribute a captured BA CSV (kind:'bank-csv') to a source_account. BA names every export
+// StatementCsv.csv and the CSV body has NO account column, so attribution comes from the driver:
+//   1. an explicit valid msg.account - a legacy per-account link, OR the phone's own confident
+//      local resolve from the on-screen account number (bankfeed).
+//   2. else the hash-bound pageContext (the statement page text the phone read at download time):
+//      attribute ONLY when EXACTLY one known BA account number appears. Zero or many -> null.
+// NEVER guess: a wrong tag silently corrupts the world-model cash truth, so an unresolved CSV is
+// captured-but-flagged (left for triage with its pageContext intact), never mis-imported.
+// pageContext is bound by pageContextSha256 (inside the signed canonical), so a message that
+// already passed the signature gate carries exactly the text the phone signed; we recompute to be explicit.
+function resolveBankCsvAccount(msg) {
+  if (msg.account && BA_CSV_ACCOUNTS.includes(msg.account)) return { account: msg.account, via: 'tag' }
+  const ctx = String(msg.pageContext || '')
+  if (!ctx) return { account: null, via: 'no account tag, no pageContext' }
+  if (msg.pageContextSha256 && crypto.createHash('sha256').update(ctx).digest('hex') !== msg.pageContextSha256) {
+    return { account: null, via: 'pageContext hash mismatch' }
+  }
+  const hits = Object.keys(BA_ACCOUNT_MAP).filter(num => ctx.includes(num))
+  if (hits.length === 1) return { account: BA_ACCOUNT_MAP[hits[0]], via: 'pageContext:' + hits[0] }
+  return { account: null, via: hits.length ? `ambiguous (${hits.length} account numbers on page)` : 'no known account number on page' }
+}
+
 // Same transfer test import-ba-csv.cjs uses.
 const BA_TRANSFER_RE = /Transfer to SAV|Received from SAV|Transfer from/i
 
@@ -426,9 +448,19 @@ async function pull(db) {
       // same parser + shared count-topup as import-ba-csv.cjs. Idempotent against the Phase 1
       // phone-scrape rows already staged (identical dedup key), so no double-count.
       try {
-        const csvText = Buffer.from(String(msg.value || ''), 'base64').toString('utf8')
-        result.staged = await importBankCsv(db, csvText, msg.account, readDate(msg))
-        result.action = 'bank-csv-imported'
+        const att = resolveBankCsvAccount(msg)
+        result.attributedVia = att.via
+        if (!att.account) {
+          // Cannot confidently name the account. NEVER guess - leave the CSV captured-but-unimported
+          // (its base64 value + pageContext stay on the vault_inbox row for triage / manual re-import),
+          // and the daily bank-feed-staleness canary will alarm if an account's feed then goes stale.
+          result.action = 'bank-csv-unattributed'
+        } else {
+          const csvText = Buffer.from(String(msg.value || ''), 'base64').toString('utf8')
+          result.staged = await importBankCsv(db, csvText, att.account, readDate(msg))
+          result.attributedAccount = att.account
+          result.action = 'bank-csv-imported'
+        }
       } catch (e) { result.stagedError = e.message; result.action = 'bank-csv-error' }
     } else if (row.type === 'result' && isBankResult(msg)) {
       // Structured transactions -> JSON ledger (unchanged). Flattened body `value` -> the
@@ -474,7 +506,7 @@ module.exports = {
   // Phase 1 bank-feed bridge
   parseBaBody, baDirectionSign, looksLikeBaBody, isBankResult, normaliseBankValueToStaged, recordBalances, backfillStaged, readDate, BA_ACCOUNT_MAP,
   // Phase 2 phone-delivered CSV import
-  stageGroupedBaRows, parseCsv, parseBaCsvRows, importBankCsv, BA_CSV_ACCOUNTS,
+  stageGroupedBaRows, parseCsv, parseBaCsvRows, importBankCsv, BA_CSV_ACCOUNTS, resolveBankCsvAccount,
 }
 
 if (require.main === module) {
