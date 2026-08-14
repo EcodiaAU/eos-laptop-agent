@@ -36,7 +36,10 @@ function loginLink(service, uSel, pSel, sSel, submit, opts = {}) {
     uSel: uSel || 'input[type=email],input[name=login],#login_field,#username',
     pSel: pSel || 'input[type=password],#password',
     sSel: sSel || 'button[type=submit],input[type=submit]',
-    submit: (submit == null ? '1' : String(submit)),
+    // Normalise to the app's expected '1'/'0' contract. The app reads submit == "1";
+    // passing a truthy string like "true" here silently disabled auto-submit (fields
+    // filled, login never pressed - build 27 on-device 2026-08-14). Default is submit.
+    submit: (submit == null ? '1' : (/^(1|true|yes|on)$/i.test(String(submit).trim()) ? '1' : '0')),
   })
   // Approval + scrape-return: if a requestId + scrapeSel are given, the phone will scrape
   // ONLY that field after login, sign it, and POST it back to answer the approval.
