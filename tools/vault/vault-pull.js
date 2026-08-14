@@ -197,11 +197,19 @@ async function recordBalances(db, balances, asOfDate) {
   return out
 }
 
-// Land parsed BA rows into staged_transactions. Replicates import-ba-csv.cjs's grouping +
-// count-topup EXACTLY: group identical (account,date,amount,desc) rows so a genuine second
-// identical charge in one window is kept, while a re-scrape of the same window adds nothing.
-async function normaliseBankValueToStaged(db, value, asOfDate) {
-  const { rows, balances, unmapped } = parseBaBody(value)
+// SHARED STAGER - the single count-topup + insert loop used by BOTH the phone-scrape body path
+// (normaliseBankValueToStaged) and the phone-delivered CSV path (importBankCsv). Replicates
+// import-ba-csv.cjs's grouping + count-topup EXACTLY: group identical
+// (account,date,amount,desc) rows so a genuine second identical charge in one window is kept,
+// while a re-run of the same window adds nothing. Because ALL THREE feed paths (Tate's manual
+// CSV via import-ba-csv.cjs, the phone scrape, and the phone CSV) key on the IDENTICAL
+// (source_account, occurred_at, amount_cents, description) tuple with the same md5 id input, a
+// transaction that landed via any one of them dedups against the other two - no double-count.
+// The id/source_ref PREFIX (opts.idPrefix / opts.refPrefix) is the ONLY per-path difference; it
+// carries provenance and is NOT part of the dedup key, so it cannot cause a cross-path collision.
+async function stageGroupedBaRows(db, rows, opts = {}) {
+  const idPrefix = opts.idPrefix || 'bankvault_'
+  const refPrefix = opts.refPrefix || 'ba-vault-'
   const groups = new Map()
   for (const r of rows) {
     const key = `${r.source_account}|${r.occurred}|${r.cents}|${r.descr}`
@@ -224,11 +232,9 @@ async function normaliseBankValueToStaged(db, value, asOfDate) {
     for (let k = 0; k < need; k++) {
       const occIdx = have + k + 1
       // md5 input is import-ba-csv.cjs's exact key shape (source_account|occurred|descr|cents||occIdx).
-      // Only the id/source_ref PREFIX differs (bankvault_ / ba-vault-) so provenance is visible;
-      // id/source_ref are NOT part of the dedup key, so this cannot cause a cross-path double-count.
       const h = crypto.createHash('md5').update(`${g.source_account}|${g.occurred}|${g.descr}|${g.cents}` + occIdx).digest('hex')
-      const id = 'bankvault_' + h.slice(0, 18)
-      const sourceRef = 'ba-vault-' + h.slice(0, 16)
+      const id = idPrefix + h.slice(0, 18)
+      const sourceRef = refPrefix + h.slice(0, 16)
       await db`INSERT INTO public.staged_transactions
         (id, source, source_ref, occurred_at, amount_cents, description, status, source_account, is_personal, is_transfer)
         VALUES (${id}, 'bank_australia', ${sourceRef}, ${g.occurred}, ${g.cents}, ${g.descr}, 'pending',
@@ -236,10 +242,98 @@ async function normaliseBankValueToStaged(db, value, asOfDate) {
       s.inserted++
     }
   }
+  return stats
+}
+
+// Land parsed BA phone-scrape rows into staged_transactions via the shared stager, then refresh
+// cash-truth balances (idempotent).
+async function normaliseBankValueToStaged(db, value, asOfDate) {
+  const { rows, balances, unmapped } = parseBaBody(value)
+  const stats = await stageGroupedBaRows(db, rows)   // default bankvault_ / ba-vault- provenance
   // Refresh cash-truth balances (idempotent). as_of defaults to today if the read carried no ts.
   const asOf = asOfDate || new Date().toISOString().slice(0, 10)
   const balancesRecorded = await recordBalances(db, balances, asOf)
   return { stats, balances: balancesRecorded, asOf, unmapped, totalParsed: rows.length }
+}
+
+// ---- Phase 2: BA's OWN full-period CSV export (WKDownload-captured on the phone) ----
+// The phone captures Bank Australia's own statement CSV inside the on-device WKWebView and POSTs
+// it base64-encoded as the signed `value` with kind:'bank-csv' + account:'<source_account>'. This
+// is the IDENTICAL file format budget/import-ba-csv.cjs already parses (signed Amount + running
+// Balance), so we import it through the SAME parser shape + the SAME shared stager, and it dedups
+// idempotently against the Phase 1 phone-scrape rows already in staged_transactions.
+
+// parseCsv - copied VERBATIM from budget/import-ba-csv.cjs (that module runs main() on require,
+// so it cannot be imported; keep this in sync if the canonical parser ever changes).
+function parseCsv(text) {
+  const rows = []
+  let cur = [], field = '', inQ = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (inQ) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++ }
+      else if (c === '"') inQ = false
+      else field += c
+    } else if (c === '"') inQ = true
+    else if (c === ',') { cur.push(field); field = '' }
+    else if (c === '\n' || c === '\r') {
+      if (field !== '' || cur.length) { cur.push(field); rows.push(cur); cur = []; field = '' }
+      if (c === '\r' && text[i + 1] === '\n') i++
+    } else field += c
+  }
+  if (field !== '' || cur.length) { cur.push(field); rows.push(cur) }
+  return rows
+}
+
+const BA_CSV_ACCOUNTS = ['ba_ecodia', 'ba_personal', 'ba_ecodia_savings', 'ba_personal_savings']
+
+// Parse a BA statement CSV into the SAME row shape the shared stager consumes. Mirrors
+// import-ba-csv.cjs's field handling EXACTLY: header check on 'Transaction Description',
+// occurred_at = Entered Date (col 1), descr = col 2, signed amount from col 3 (the CSV Amount is
+// already signed, so NO baDirectionSign is needed - the export is authoritative), running Balance
+// from col 4. $0.00 "Insufficient funds" rows are decline evidence and are NOT staged (matching
+// import-ba-csv.cjs, which skips them), only counted.
+function parseBaCsvRows(text, sourceAccount) {
+  const parsed = parseCsv(String(text || ''))
+  const header = parsed.shift()
+  if (!header || !header.join(',').includes('Transaction Description')) {
+    throw new Error('not a BA statement CSV (header mismatch): ' + (header ? header.join(',') : '(empty)'))
+  }
+  const rows = []
+  let liveBalance = null, liveBalanceDate = null, declineEvents = 0
+  for (const r of parsed) {
+    if (r.length < 5) continue
+    const [, entered, descr, amountRaw, balanceRaw] = r
+    const dm = String(entered).match(/(\d{2})\/(\d{2})\/(\d{4})/)
+    if (!dm) continue
+    const occurred = `${dm[3]}-${dm[2]}-${dm[1]}`
+    const cents = Math.round(parseFloat(String(amountRaw).replace(/[$,]/g, '')) * 100)
+    if (liveBalance === null && balanceRaw) {
+      liveBalance = Math.round(parseFloat(String(balanceRaw).replace(/[$,]/g, '')) * 100)
+      liveBalanceDate = occurred
+    }
+    if (cents === 0) { if (String(descr).includes('Insufficient funds')) declineEvents++; continue }
+    rows.push({ source_account: sourceAccount, occurred, cents, descr: String(descr).trim(), isDecline: false })
+  }
+  return { rows, liveBalance, liveBalanceDate, declineEvents }
+}
+
+// Import a phone-delivered BA CSV. Verifies nothing here (the caller has already SE-verified the
+// signature); parses + stages through the shared count-topup, then records the running Balance as
+// cash-truth (idempotent). Distinct provenance prefix (bacsv_/ba-phonecsv-) so a phone-delivered
+// CSV is visible in the id, without affecting the dedup key.
+async function importBankCsv(db, csvText, sourceAccount, asOfDate) {
+  if (!BA_CSV_ACCOUNTS.includes(sourceAccount)) {
+    throw new Error(`bank-csv: unknown/absent source_account "${sourceAccount}" (need one of ${BA_CSV_ACCOUNTS.join(', ')})`)
+  }
+  const { rows, liveBalance, liveBalanceDate, declineEvents } = parseBaCsvRows(csvText, sourceAccount)
+  const stats = await stageGroupedBaRows(db, rows, { idPrefix: 'bacsv_', refPrefix: 'ba-phonecsv-' })
+  let balances = {}
+  if (liveBalance != null) {
+    const asOf = liveBalanceDate || asOfDate || new Date().toISOString().slice(0, 10)
+    balances = await recordBalances(db, { [sourceAccount]: { curr_cents: liveBalance } }, asOf)
+  }
+  return { account: sourceAccount, stats, declineEvents, liveBalance, liveBalanceDate, balances, totalStaged: rows.length }
 }
 
 // The read's own date (signed `ts`, Brisbane-agnostic - a date is a date) is the as-of for the
@@ -311,6 +405,16 @@ async function pull(db) {
       result.action = 'rejected (stale - signed ts too old or future-dated)'
     } else if (replay) {
       result.action = 'rejected (replay - this signature was already consumed)'
+    } else if (row.type === 'result' && msg.kind === 'bank-csv') {
+      // Phase 2: the phone captured Bank Australia's OWN full-period CSV export (WKDownload) and
+      // POSTed it base64 in `value`, tagged with the source_account. Decode, import through the
+      // same parser + shared count-topup as import-ba-csv.cjs. Idempotent against the Phase 1
+      // phone-scrape rows already staged (identical dedup key), so no double-count.
+      try {
+        const csvText = Buffer.from(String(msg.value || ''), 'base64').toString('utf8')
+        result.staged = await importBankCsv(db, csvText, msg.account, readDate(msg))
+        result.action = 'bank-csv-imported'
+      } catch (e) { result.stagedError = e.message; result.action = 'bank-csv-error' }
     } else if (row.type === 'result' && isBankResult(msg)) {
       // Structured transactions -> JSON ledger (unchanged). Flattened body `value` -> the
       // Phase 1 staged_transactions bridge. A read can carry either or both.
@@ -354,6 +458,8 @@ module.exports = {
   pull, verify, applyBankResult, pairedKeyIsAttested, isFresh, sigAlreadySeen,
   // Phase 1 bank-feed bridge
   parseBaBody, baDirectionSign, looksLikeBaBody, isBankResult, normaliseBankValueToStaged, recordBalances, backfillStaged, readDate, BA_ACCOUNT_MAP,
+  // Phase 2 phone-delivered CSV import
+  stageGroupedBaRows, parseCsv, parseBaCsvRows, importBankCsv, BA_CSV_ACCOUNTS,
 }
 
 if (require.main === module) {
