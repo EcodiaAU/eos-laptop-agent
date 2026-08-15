@@ -47,11 +47,16 @@ const guard = require('./tab-close-guard')
   assert(d.allow === false && d.reason === 'active_tab_protected', 'active tab is refused even on a positive strategy')
 })()
 
-// ── Self-close exception (2026-07-22) ───────────────────────────────────────
-// coord.close_my_tab passes { selfClose: true }. A worker self-closing is ALWAYS
-// the active tab (it just made a tool call to get there), so the unconditional
-// belt above made close_my_tab impossible and leaked every worker tab. The
-// exception is narrow: POSITIVE strategy only, conductor + fuzzy belts intact.
+// ── Self-close exception (2026-07-22, widened 2026-08-15) ───────────────────
+// coord.close_my_tab passes { selfClose: true }. A worker self-closing is a tab
+// making a tool call, so its focus state says nothing about whether it is a
+// human chat, and the unconditional belt-1 refused every self-close and leaked
+// every worker tab. 2026-07-22 admitted a POSITIVE self-close; 2026-08-15
+// (Tate-authorised full fix) widens the carve-out so self-close ALSO admits the
+// decisive fuzzy tier - CC's improved autotitler strips the spawn sentinel, so
+// the fingerprint is the only surviving resolver, and on self-close the worker's
+// own live tab is the natural top scorer. Belts waived on self-close: 1 (active)
+// and 3 (fuzzy). Belt 2 (conductor label) ALWAYS applies. Sweeps keep both belts.
 
 // The leak case that motivated this: positive + active + selfClose -> ALLOW.
 // Both tiers that real workers were refused on, on 2026-07-22.
@@ -64,20 +69,38 @@ const guard = require('./tab-close-guard')
   assert(d.allow === true, 'self-close on tabIndex+sentinel closes its own active tab (00c3b66f leak)')
 })()
 
-// The load-bearing belt is UNTOUCHED by the exception: a fuzzy autotitle match
-// is not a positive identity, so selfClose can never let it OS-close a tab.
-// This is the case that closed Tate's chats on 2026-07-21 - it must stay shut.
+// 2026-08-15 carve-out: self-close ADMITS the decisive fuzzy tier (the worker's
+// own retitled tab), both active and backgrounded. This is the "Advance away-ops
+// runbook v2" leak - CC autotitled away the spawn sentinel, so only the
+// fingerprint (4/4, cov 1.00) resolved, and the old belt-3 refused it. On
+// self-close the worker's own tab is the top scorer and coord.js tier (d) only
+// forwards a UNIQUE DECISIVE winner, so admitting it here is safe.
 ;(() => {
-  const d = guard.evaluateClose('autotitle_fingerprint:hits=2/2,cov=1.00', { label: 'Ecodia Site', active: true }, null, { selfClose: true })
-  assert(d.allow === false, 'self-close NEVER admits a fuzzy match, even on the active tab')
+  const d = guard.evaluateClose('autotitle_fingerprint:hits=4/4,cov=1.00', { label: 'Advance away-ops runbook v2', active: false }, null, { selfClose: true })
+  assert(d.allow === true, 'self-close admits the decisive fuzzy match on a backgrounded own tab (the leak this fixes)')
 })()
 ;(() => {
-  const d = guard.evaluateClose('autotitle_fingerprint:hits=2/2,cov=1.00', { label: 'Ecodia Site', active: false }, null, { selfClose: true })
-  assert(d.allow === false && d.reason === 'fuzzy_fingerprint_refused_not_positive_id', 'self-close backgrounded fuzzy still refused by belt 3')
+  const d = guard.evaluateClose('autotitle_fingerprint:hits=4/4,cov=1.00', { label: 'Advance away-ops runbook v2', active: true }, null, { selfClose: true })
+  assert(d.allow === true, 'self-close admits the decisive fuzzy match on a foreground own tab too')
 })()
 
-// The conductor belt survives the exception: a worker must never close the
-// registered conductor tab, even claiming a positive self-close.
+// SWEEP paths still hard-ban fuzzy (the 2026-07-21 invariant is UNCHANGED there):
+// the same fuzzy match with no selfClose opts must stay refused.
+;(() => {
+  const d = guard.evaluateClose('autotitle_fingerprint:hits=4/4,cov=1.00', { label: 'Advance away-ops runbook v2', active: false }, null)
+  assert(d.allow === false && d.reason === 'fuzzy_fingerprint_refused_not_positive_id', 'sweep paths STILL refuse the identical fuzzy match (no selfClose)')
+})()
+
+// Belt 2 is the load-bearing safety that SURVIVES the carve-out: a fuzzy
+// self-close that resolves onto the registered conductor's chat must STILL be
+// refused, even though fuzzy is otherwise admitted on self-close. This is the
+// case that would re-close Tate's live chat if the carve-out were unbounded.
+;(() => {
+  const d = guard.evaluateClose('autotitle_fingerprint:hits=2/2,cov=1.00', { label: 'Ecodia Site', active: true }, { title_match: 'Ecodia Site' }, { selfClose: true })
+  assert(d.allow === false && d.reason === 'conductor_label_protected', 'self-close fuzzy onto the conductor label is STILL refused (belt 2 survives)')
+})()
+
+// The conductor belt survives on a positive strategy too (unchanged).
 ;(() => {
   const d = guard.evaluateClose('exact_label:Ecodia Site', { label: 'Ecodia Site', active: true }, { title_match: 'Ecodia Site' }, { selfClose: true })
   assert(d.allow === false && d.reason === 'conductor_label_protected', 'self-close never closes the registered conductor tab')

@@ -1510,22 +1510,24 @@ async function close_my_tab(params, ctx) {
           + '|fp=' + (fingerprintReason || (stored.autotitle_fingerprint ? 'no_match' : 'absent'))
           + '|vc' + stored.viewColumn + ' (candidates=' + candidates.length + ': [' + candLabels + '])'
       } else if (!require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor, GUARD_SELF_CLOSE).allow) {
-        // 2026-07-21 close-safety guard (close_my_tab), THIRD + complete fix.
-        // Even a worker's OWN self-close must never fire on a FUZZY autotitle-
-        // fingerprint match: if the worker's own tab already autotitled and its
-        // brief tokens collide with one of Tate's topic-named human chats
-        // ("Ecodia Site"), tier (d) could resolve onto that chat and close it
-        // instead of the worker's own tab. Positive tiers (sentinel / confirmed
-        // tabIndex / exact spawn label) still close the worker's own tab. The
-        // shared guard also refuses the active tab and the registered-conductor
-        // label as belts. Better leak the worker's own ghost tab than close
-        // Tate's chat. Doctrine: coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
+        // Close-safety guard (close_my_tab). GUARD_SELF_CLOSE marks this the
+        // SELF-close path, where the shared guard (tab-close-guard.js) waives its
+        // active-tab and fuzzy belts but STILL refuses the registered-conductor
+        // label. So the refuse branch here now fires almost exclusively when tier
+        // (d) resolved onto the conductor's own chat (belt 2) - never leak that.
         //
-        // 2026-07-22: this path passes GUARD_SELF_CLOSE so the guard's active-tab
-        // belt admits a POSITIVE self-close. Without it the belt refused every
-        // close_my_tab (the caller is always the focused tab, having just made a
-        // tool call) and every worker tab leaked. Fuzzy matches are still refused
-        // by the guard's belt 3, so the paragraph above still holds verbatim.
+        // 2026-08-15 self-close carve-out (Tate-authorised "full fix"). Once CC's
+        // improved autotitler replaces the spawn sentinel with a clean brief
+        // summary (the common case now), tiers (a)/(b)/(c) all miss and only the
+        // fingerprint resolves. On self-close that is SAFE: the worker is alive,
+        // its own tab is the top scorer for its own brief, and pickByFingerprint
+        // above only returns a UNIQUE DECISIVE winner (any competing match ->
+        // null -> refuse+leak, never wrong-close) with other-worker-sentinel tabs
+        // excluded. The 2026-07-21 dead-worker-vs-human-chat collision cannot
+        // arise here (the worker is calling, so its tab is present). The SWEEP
+        // paths (kill_worker / cleanup) still hard-ban fuzzy. Doctrine:
+        // coord-close-my-tab-self-close-admits-decisive-fuzzy-2026-08-15 over
+        // coord-close-path-must-positive-id-worker-never-fuzzy-close-2026-07-21.
         const decision = require('./tab-close-guard').evaluateClose(matchedBy, foundExact, conductor, GUARD_SELF_CLOSE)
         refused = decision.reason + ':matchedBy=' + matchedBy + '|label=' + foundExact.label
         close_strategy = 'refused:' + decision.reason + ':' + matchedBy
