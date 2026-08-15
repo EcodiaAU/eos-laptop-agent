@@ -65,36 +65,19 @@ try {
 }
 exports._setAusterityCfg = function (c) { _austerityCfg = c } // test seam
 
-// Read the live austerity level from kv_store (same key the lever writes).
-// Returns an integer 1..4, or null on any failure so the caller treats band
-// suppression as unknown and proceeds on the marker alone.
-async function readAusterityLevel(pool) {
-  if (!_austerityCfg) return null
-  try {
-    const r = await pool.query(
-      `SELECT value FROM kv_store WHERE key = $1 LIMIT 1`, [_austerityCfg.KV_KEY])
-    const raw = r.rows[0] && r.rows[0].value
-    if (raw == null) return _austerityCfg.DEFAULT_LEVEL
-    let parsed = raw
-    if (typeof raw === 'string') { try { parsed = JSON.parse(raw) } catch (_) { parsed = raw } }
-    return _austerityCfg.normalizeLevel(
-      typeof parsed === 'object' && parsed ? parsed.level : parsed)
-  } catch (_) { return null }
-}
-exports._readAusterityLevel = readAusterityLevel
-
 // Read the live PRESENCE POSTURE {mode,lean,frozen} from kv_store (the same key
 // the lever writes: POSTURE_KV_KEY = scheduler.presence_posture). Returns a
-// normalized state object, or null when the key is absent / read fails / the cfg
-// predstring cannot decide - the caller then falls back to the legacy level gate.
+// normalized state object, or null when the key is absent / read fails - the
+// caller then proceeds on the austerity_paused marker alone.
 // This is the dispatch-time twin of the lever's OWN suppression predicate: the
-// 2026-08-11 presence taper writes austerity_paused markers from decidePosture(),
-// so the dispatch gate MUST also use decidePosture() or the two diverge and any
-// row the two taxonomies classify differently (legacy band 'cosmetic' vs presence
-// group 'always_on'/'compliance') gets leased-then-skipped forever. That is
-// exactly what stranded 11 always-on/compliance crons (neo4j-maintenance,
-// self-evolution, decision-quality-pass, the two *-review compliance rows ...)
-// from Jun 2026 to 2026-08-12 - leased every 30s, blocked at dispatch, never run.
+// presence taper writes austerity_paused markers from decidePosture(), so the
+// dispatch gate MUST also use decidePosture() or the two diverge and any row the
+// two classify differently gets leased-then-skipped forever. That is exactly what
+// stranded 11 always-on/compliance crons (neo4j-maintenance, self-evolution,
+// decision-quality-pass, the two *-review compliance rows ...) from Jun 2026 to
+// 2026-08-12 - leased every 30s, blocked at dispatch, never run. The legacy
+// numeric-level gate this used to fall back to was removed 2026-08-15 (posture is
+// the single austerity vocabulary now).
 // Doctrine: austerity-gate-needs-dispatch-time-twin-not-just-lease-time
 //         + scheduler-presence-mode-taper-2026-08-11.
 async function readAusterityPosture(pool) {
@@ -1130,16 +1113,13 @@ exports.dispatchOne = async function dispatchOne(row) {
       // or band table absent) leaves bandSuppressed false -> proceed on the marker.
       let bandSuppressed = false
       if (_austerityCfg && g && g.type === 'cron') {
-        // Presence model FIRST (single-source with the lever's marker predicate).
-        // Only if the posture key is missing/unreadable do we fall back to the
-        // legacy band>level gate, so a markerless suppressed cron is still caught
-        // by SOME gate. See readAusterityPosture for why this must not diverge.
+        // Posture is the single-source suppression predicate (same one the lever
+        // writes markers from). If the posture key is missing/unreadable we leave
+        // bandSuppressed false and proceed on the austerity_paused marker alone.
+        // See readAusterityPosture for why this must not diverge from the lever.
         const posture = await readAusterityPosture(pool)
         if (posture != null) {
           bandSuppressed = _austerityCfg.decidePosture(g.name, posture).suppressed
-        } else {
-          const lvl = await readAusterityLevel(pool)
-          if (lvl != null) bandSuppressed = _austerityCfg.decideAusterity(g.name, lvl).suppressed
         }
       }
       // Fire ONLY on the explicit suppression signals. A missing read (g

@@ -370,29 +370,30 @@ test('dispatchOne: SKIPs an austerity_paused row - no dispatch, lease released, 
   credsModule.rotate_to = origRotate
 })
 
-// ── 2026-07-15 band-aware austerity gate: marker-less suppressed cron is caught ─
-// The `set <N>` lever is a POINT-IN-TIME snapshot, so a cron created OR re-
-// registered after it is suppressed-by-band yet carries austerity_paused=false
-// (registration upserts reset the marker to its column DEFAULT). A marker-only
-// gate is blind to it - 20 such crons fired past L4 on 2026-07-15, incl
-// status-board-execute-top cascading worker-tab spawns. dispatchOne must compute
-// the band live from (name -> band, live kv level) and SKIP regardless of the
-// marker. Cron-only: one-shots have no band and still fire at L4 by design.
-test('dispatchOne: SKIPs a marker-less cron suppressed by band>level - no dispatch, lease released', async () => {
-  // Custom pool: guard SELECT returns a marker-FALSE cron row; kv_store SELECT
-  // returns level 4. Everything else mirrors makeStubPool's UPDATE handling.
+// ── 2026-07-15 posture-aware austerity gate: marker-less suppressed cron is caught ─
+// The lever is a POINT-IN-TIME snapshot, so a cron created OR re-registered after
+// it is suppressed-by-posture yet carries austerity_paused=false (registration
+// upserts reset the marker to its column DEFAULT). A marker-only gate is blind to
+// it - 20 such crons fired past a freeze on 2026-07-15, incl status-board-execute-
+// top cascading worker-tab spawns. dispatchOne must compute suppression live from
+// (name -> group, live kv posture) via decidePosture and SKIP regardless of the
+// marker. Cron-only: one-shots have no group and still fire by design.
+// (2026-08-15: rewired from the legacy numeric level to the presence posture.)
+test('dispatchOne: SKIPs a marker-less cron suppressed by posture - no dispatch, lease released', async () => {
+  // Custom pool: guard SELECT returns a marker-FALSE business_autonomy cron row;
+  // kv_store SELECT returns a hands-on posture. Else mirrors makeStubPool.
   const queries = []
   const pool = {
     _queries: queries,
     query(sql, params) {
       queries.push({ sql, params: params || [] })
       if (/FROM\s+kv_store/i.test(sql)) {
-        return Promise.resolve({ rows: [{ value: JSON.stringify({ level: 4 }) }], rowCount: 1 })
+        return Promise.resolve({ rows: [{ value: JSON.stringify({ mode: 'hands-on', lean: false, frozen: false }) }], rowCount: 1 })
       }
       if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
         return Promise.resolve({ rows: [{
           austerity_paused: false, status: 'dispatching', archived_at: null,
-          last_status: null, name: 'calendar-watch', type: 'cron',
+          last_status: null, name: 'stripe-event-poll', type: 'cron',
         }], rowCount: 1 })
       }
       if (/UPDATE\s+os_scheduled_tasks\s+SET\s+leased_at = NOW\(\), updated_at = NOW\(\)\s+WHERE/i.test(sql)) {
@@ -404,14 +405,16 @@ test('dispatchOne: SKIPs a marker-less cron suppressed by band>level - no dispat
   scheduler._setPool(pool)
   stubNoopWorktreeFns()
 
-  // Hermetic band table so the test does not depend on the backend repo being
-  // present. calendar-watch is cosmetic -> suppressed at any level >= 2.
+  // Hermetic posture predicate so the test does not depend on the backend repo
+  // being present. stripe-event-poll is business_autonomy -> dark in hands-on.
   const realCfg = (() => { try { return require('/Users/ecodia/.code/ecodiaos/backend/src/config/cronAusterity') } catch (_) { return null } })()
   scheduler._setAusterityCfg({
-    KV_KEY: 'scheduler.austerity_level',
-    DEFAULT_LEVEL: 1,
-    normalizeLevel: (n) => { const x = parseInt(n, 10); return Number.isNaN(x) ? 1 : Math.max(1, Math.min(4, x)) },
-    decideAusterity: (name, lvl) => ({ suppressed: lvl >= 2, band: 'cosmetic' }),
+    POSTURE_KV_KEY: 'scheduler.presence_posture',
+    normalizeState: (s) => ({ mode: (s && s.mode) || 'away', lean: !!(s && s.lean), frozen: !!(s && s.frozen) }),
+    decidePosture: (name, st) => ({
+      suppressed: (st.mode === 'hands-on' && name === 'stripe-event-poll') || st.frozen,
+      group: 'business_autonomy',
+    }),
   })
 
   const origPick = credsModule.pick_healthiest_account
@@ -424,24 +427,24 @@ test('dispatchOne: SKIPs a marker-less cron suppressed by band>level - no dispat
     kill_worker: async () => {},
   })
 
-  const row = makeRow({ id: 'bandless-cron-guard', name: 'calendar-watch', type: 'cron', leased_by: 'lease-y' })
+  const row = makeRow({ id: 'postureless-cron-guard', name: 'stripe-event-poll', type: 'cron', leased_by: 'lease-y' })
 
   let threw = false
-  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [band guard test threw]:', e.message) }
+  try { await scheduler.dispatchOne(row) } catch (e) { threw = true; console.error('  [posture guard test threw]:', e.message) }
 
-  assert(!threw, 'band guard: no throw')
-  assert(dispatched === false, 'band guard: dispatch_worker NOT called for band-suppressed marker-less row')
-  assert(pickCalled === false, 'band guard: cred rotation skipped (guard fires before step 1)')
+  assert(!threw, 'posture guard: no throw')
+  assert(dispatched === false, 'posture guard: dispatch_worker NOT called for posture-suppressed marker-less row')
+  assert(pickCalled === false, 'posture guard: cred rotation skipped (guard fires before step 1)')
   const kvRead = pool._queries.find(q => /FROM\s+kv_store/i.test(q.sql))
-  assert(!!kvRead, 'band guard: live austerity level was read from kv_store')
+  assert(!!kvRead, 'posture guard: live presence posture was read from kv_store')
   const releaseUpdate = pool._queries.find(q =>
     q.sql.includes("status = 'active'") && q.sql.includes('leased_by = NULL') && q.sql.includes('dispatching'))
-  assert(!!releaseUpdate, 'band guard: lease released back to active')
+  assert(!!releaseUpdate, 'posture guard: lease released back to active')
   const failedUpdate = pool._queries.find(q => q.sql.includes("status = 'failed'") || q.sql.includes('retry_count ='))
-  assert(!failedUpdate, 'band guard: markFailed NOT invoked (suppression, not failure)')
+  assert(!failedUpdate, 'posture guard: markFailed NOT invoked (suppression, not failure)')
 
   credsModule.pick_healthiest_account = origPick
-  scheduler._setAusterityCfg(realCfg) // restore real band table for later tests
+  scheduler._setAusterityCfg(realCfg) // restore real predicate for later tests
 })
 
 // ── 2026-06-10 branch-thrash guard: dispatchOne worktree wiring + cleanup ───
