@@ -195,7 +195,11 @@ async function attach(opts) {
 // it in the page context. For multi-statement, wrap in an IIFE.
 async function runJs(opts) {
   opts = opts || {}
-  const js = opts.js
+  // Accept opts.js (canonical) OR opts.script (alias). gui.js wait_for conditions
+  // cdp_ready_state + cdp_eval_truthy call runJs({script:...}); before this both
+  // waits silently returned falsy and timed out because runJs only read opts.js.
+  // Prefer opts.js when both are present. (fix 2026-08-15, cdp-optimization defect 1)
+  const js = opts.js || opts.script
   const timeout = opts.timeout || 5000
   if (typeof js !== 'string' || !js.trim()) throw new Error('js (string) required')
   try {
