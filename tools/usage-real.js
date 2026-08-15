@@ -464,6 +464,46 @@ function headroomMinutesFor(row, nowMs) {
   return Math.min(600, Math.max(0, Math.min(m5, m7)))
 }
 
+// ── canonical "how used is this account?" accessors ────────────────────────────
+//
+// THE ONE PLACE the effective-vs-fallback precedence lives. Prefers the vendor's measured
+// utilization (utilization_*_effective, produced by computeEffective over the real probe);
+// falls back to the ccusage headroom heuristic ONLY when no measurement exists, so a stale
+// accounts.json still decides something rather than nothing. Every picker/alerter reads
+// through these so they can never drift from the auto-switch decider again.
+//
+// The 2026-08-15 bug was exactly this drift: coord.pick_account and the alerts block still
+// read the ccusage headroom fields while account-cap-decide already read the measurement,
+// so the advisory picker ranked a vendor-measured 78%-weekly account as second-healthiest
+// and the alerts block declared "nothing low" while the live account sat at 58% and
+// climbing. Doctrine:
+// per-account-usage-truth-is-the-vendor-endpoint-not-local-transcripts-2026-08-02.
+function used5h(a) {
+  a = a || {}
+  if (typeof a.utilization_5h_effective === 'number') return a.utilization_5h_effective
+  return 1 - (a.headroom_5h_fraction != null ? a.headroom_5h_fraction : (a.remaining_5h / a.cap_5h))
+}
+function usedWeekly(a) {
+  a = a || {}
+  if (typeof a.utilization_7d_effective === 'number') return a.utilization_7d_effective
+  return 1 - (a.headroom_weekly_fraction != null ? a.headroom_weekly_fraction : (a.remaining_weekly / a.cap_weekly))
+}
+// Where the number came from, so a decision can say whether it trusted a measurement.
+function usedSource(a) {
+  a = a || {}
+  return (typeof a.utilization_5h_effective === 'number') ? (a.effective_source || 'real') : 'ccusage-fallback'
+}
+// Effectively capped: the vendor's own capped flag, or a measured window at/over the cap
+// ceiling. This is the never-switch-into-a-capped-account guard (the 2026-08-02 failure).
+// It reads the measured numbers through used5h/usedWeekly, so a rosy ccusage headroom can
+// never hide a real cap.
+function isCapped(a) {
+  a = a || {}
+  if (a.real && a.real.capped) return true
+  const ceil = (cfg.TRIGGERS && cfg.TRIGGERS.CAPPED_UTIL) || 0.99
+  return Math.max(used5h(a), usedWeekly(a)) >= ceil
+}
+
 // ── selftest ─────────────────────────────────────────────────────────────────
 
 function selftest() {
@@ -575,6 +615,7 @@ function selftest() {
 
 module.exports = {
   probeAccount, probeDue, computeEffective, headroomScore, headroomMinutesFor,
+  used5h, usedWeekly, usedSource, isCapped,
   burnRates, verifyTokenIdentity, tokenForAccount,
   _parseUsageBody: parseUsageBody, _setFetch, _setKeychainReader, _secondKey: secondKey,
   _backoffMs: backoffMs, _currentLiveShort: currentLiveShort,

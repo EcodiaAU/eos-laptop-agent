@@ -39,13 +39,13 @@ const path = require('path')
 const os = require('os')
 const { spawnSync } = require('child_process')
 
-// CREATE_NO_WINDOW — required alongside windowsHide under PM2-parented agents
+// CREATE_NO_WINDOW: required alongside windowsHide under PM2-parented agents
 // to fully suppress the Windows console flash. Per
 // ~/ecodiaos/patterns/windows-spawn-must-use-spawnSync-with-create-no-window-not-execSync-with-windowsHide.md
 const CREATE_NO_WINDOW = 0x08000000
 
 // ccusage CLI direct entry. Invoking node.exe + cli.js avoids the cmd.exe
-// /d /s /c shell wrapper and the npx-CLI re-exec — both of those layers were
+// /d /s /c shell wrapper and the npx-CLI re-exec; both of those layers were
 // empirically still flashing a console under PM2 even with CREATE_NO_WINDOW
 // (libuv seems to re-allocate a console for the npm-wrapper child). Falling
 // back to bare-node invocation eliminates the wrappers entirely.
@@ -136,6 +136,10 @@ function getCaps() {
   const cap5h = Number(process.env.CAPS_5H_TOKENS) || DEFAULT_CAP_5H
   const capWeekly = Number(process.env.CAPS_WEEKLY_TOKENS) || DEFAULT_CAP_WEEKLY
   return { cap_5h: cap5h, cap_weekly: capWeekly }
+}
+
+function round4(x) {
+  return (typeof x === 'number' && isFinite(x)) ? Math.round(x * 10000) / 10000 : x
 }
 
 // Limit-relevant token count for a ccusage row. ccusage `totalTokens` is
@@ -787,12 +791,22 @@ function clearFlaky(account) {
 
 // ── account picker ───────────────────────────────────────────────────────
 
-// score(a) = min(remaining_5h, remaining_weekly) * 0.85 - estimated_tokens
-// Excludes accounts in exclude[], accounts marked flaky within FLAKY_TTL_MS,
-// and accounts with no state. Returns best-of-bad-options with negative score
-// + reason flag if no candidate has positive buffered headroom.
+// Rank by VENDOR-MEASURED headroom (2026-08-15 rewrite). The old body scored off
+// remaining_5h/remaining_weekly - the ccusage token estimate - which on 2026-08-02 rated a
+// hard-capped account the healthiest in the fleet, and on 2026-08-15 ranked a
+// vendor-measured 78%-weekly account second-best. Now:
+//   used = usage-real.used5h/usedWeekly (measured utilization first, ccusage only if no
+//          measurement exists), so this picker agrees with the auto-switch decider.
+//   headroom(a) = 1 - max(used_5h, used_weekly)   (the binding window)
+//   score(a)    = (headroom_5h - estimate_as_5h_fraction, and headroom_weekly) buffered 0.85
+// A capped account (usage-real.isCapped) is NEVER offered - the switch-into-capped guard.
+// An account we cannot currently measure (excluded_as_target) is skipped: picking it would
+// be switching blind. Excludes exclude[] and flaky-within-TTL. score is now a 0..1 fraction,
+// not a token count; no programmatic caller keys on its magnitude (advisory tool only).
 function pickAccount(params) {
   params = params || {}
+  const usageReal = require('./usage-real')
+  const caps = getCaps()
   const estimated = Math.max(0, Number(params.estimated_tokens) || 0)
   const exclude = new Set(params.exclude || [])
   const ignoreFlaky = !!params.ignore_flaky  // escape hatch for debugging
@@ -809,6 +823,8 @@ function pickAccount(params) {
 
   const flakySet = ignoreFlaky ? new Set() : activeFlakySet()
   const flakyExcluded = []
+  const capExcluded = []
+  const blindExcluded = []
 
   let best = null
   let bestScore = Number.NEGATIVE_INFINITY
@@ -818,9 +834,35 @@ function pickAccount(params) {
     if (flakySet.has(acct)) { flakyExcluded.push(acct); continue }
     const a = state.accounts[acct]
     if (!a) continue
-    const headroom = Math.min(a.remaining_5h, a.remaining_weekly)
-    const score = headroom * BUFFER_FACTOR - estimated
-    candidates.push({ account: acct, score: score, remaining_5h: a.remaining_5h, remaining_weekly: a.remaining_weekly })
+    const u5 = usageReal.used5h(a)
+    const uw = usageReal.usedWeekly(a)
+    const source = usageReal.usedSource(a)
+    const cap5h = a.cap_5h || caps.cap_5h
+    const capW = a.cap_weekly || caps.cap_weekly
+    // An account we cannot currently measure is not a safe target (switching blind).
+    if (a.excluded_as_target) {
+      blindExcluded.push(acct)
+      candidates.push({ account: acct, score: -1, used_5h: round4(u5), used_weekly: round4(uw), headroom: 0, source, blind: true })
+      continue
+    }
+    // Never offer a capped account (the 2026-08-02 switch-into-capped failure).
+    if (usageReal.isCapped(a)) {
+      capExcluded.push(acct)
+      candidates.push({ account: acct, score: -1, used_5h: round4(u5), used_weekly: round4(uw), headroom: 0, source, capped: true, remaining_5h: 0, remaining_weekly: 0 })
+      continue
+    }
+    const estFrac = cap5h ? estimated / cap5h : 0
+    const headroom5h = Math.max(0, 1 - u5) - estFrac
+    const headroomWeekly = Math.max(0, 1 - uw)
+    const score = Math.min(headroom5h, headroomWeekly) * BUFFER_FACTOR
+    const remaining_5h = Math.round(cap5h * Math.max(0, 1 - u5))
+    const remaining_weekly = Math.round(capW * Math.max(0, 1 - uw))
+    candidates.push({
+      account: acct, score: round4(score),
+      used_5h: round4(u5), used_weekly: round4(uw),
+      headroom: round4(Math.min(1 - u5, 1 - uw)), source,
+      remaining_5h, remaining_weekly,
+    })
     if (score > bestScore) {
       bestScore = score
       best = acct
@@ -833,48 +875,73 @@ function pickAccount(params) {
       score: 0,
       remaining_5h: 0,
       remaining_weekly: 0,
-      reason: flakyExcluded.length === KNOWN_ACCOUNTS.length
-        ? 'all-accounts-flaky-within-cooldown (retry after FLAKY_TTL_MS)'
-        : 'no-eligible-accounts (all excluded or no state)',
+      reason: capExcluded.length
+        ? 'all-accounts-capped-or-unusable (vendor-measured; ' + capExcluded.join(',') + ' capped)'
+        : flakyExcluded.length === KNOWN_ACCOUNTS.length
+          ? 'all-accounts-flaky-within-cooldown (retry after FLAKY_TTL_MS)'
+          : 'no-eligible-accounts (all excluded or no state)',
       candidates: candidates,
       flaky_excluded: flakyExcluded,
+      cap_excluded: capExcluded,
+      blind_excluded: blindExcluded,
     }
   }
 
   const a = state.accounts[best]
+  const bu5 = usageReal.used5h(a)
+  const buw = usageReal.usedWeekly(a)
   return {
     account: best,
-    score: bestScore,
-    remaining_5h: a.remaining_5h,
-    remaining_weekly: a.remaining_weekly,
+    score: round4(bestScore),
+    used_5h: round4(bu5),
+    used_weekly: round4(buw),
+    source: usageReal.usedSource(a),
+    remaining_5h: Math.round((a.cap_5h || caps.cap_5h) * Math.max(0, 1 - bu5)),
+    remaining_weekly: Math.round((a.cap_weekly || caps.cap_weekly) * Math.max(0, 1 - buw)),
     buffer_factor: BUFFER_FACTOR,
     estimated_tokens: estimated,
     polled_at: state.polled_at,
-    reason: bestScore < 0 ? 'best-account-still-insufficient (estimate exceeds buffered headroom)' : 'highest-buffered-headroom',
+    reason: bestScore < 0 ? 'best-account-still-insufficient (estimate exceeds buffered headroom)' : 'highest-measured-headroom',
     candidates: candidates,
     flaky_excluded: flakyExcluded,
+    cap_excluded: capExcluded,
+    blind_excluded: blindExcluded,
   }
 }
 
 // ── alerting ─────────────────────────────────────────────────────────────
 
 // Compute alerts: returns { current_account_low, all_low, accounts_low }
+// Keys off VENDOR-MEASURED headroom (2026-08-15). The old body compared the ccusage
+// headroom_score, so it returned all-clear while the live account sat at 58% and climbing
+// (the measurement it ignored). headroom = 1 - max(measured used_5h, used_weekly).
 function computeAlerts() {
   const state = readAccountsState()
-  if (!state || !state.accounts) return { current_account_low: false, all_low: false, accounts_low: [] }
+  if (!state || !state.accounts) return { current_account_low: false, all_low: false, accounts_low: [], threshold: HEADROOM_WARNING_FRACTION }
+  const usageReal = require('./usage-real')
   const current = state.active_account
   const lowAccounts = []
   for (const acct of KNOWN_ACCOUNTS) {
     const a = state.accounts[acct]
     if (!a) continue
-    if (a.headroom_score < HEADROOM_WARNING_FRACTION) lowAccounts.push({ account: acct, headroom_score: a.headroom_score })
+    const u5 = usageReal.used5h(a)
+    const uw = usageReal.usedWeekly(a)
+    const headroom = 1 - Math.max(u5, uw)
+    if (headroom < HEADROOM_WARNING_FRACTION) {
+      lowAccounts.push({
+        account: acct, headroom_score: round4(headroom),
+        used_5h: round4(u5), used_weekly: round4(uw),
+        source: usageReal.usedSource(a), capped: usageReal.isCapped(a),
+      })
+    }
   }
   // A pin on a starved account is always wrong: it silently defeats the
   // autoswitch while the whole worker fleet stalls on the capped account
   // (2026-07-17: a bare 18-day-old pin held the fleet on code@ at zero 5h
   // headroom; workers leased, never bound, and rows failed as stale leases).
   // Surface it loudly so the poller/canaries can escalate instead of the
-  // fleet discovering it by starvation. Doctrine:
+  // fleet discovering it by starvation. Now keyed on the MEASURED cap
+  // (usage-real.isCapped), not the ccusage headroom_score. Doctrine:
   // patterns/auto-switch-defeated-by-stale-disable-and-drifted-cap-2026-06-19.md
   let pinned_account_starved = null
   try {
@@ -883,7 +950,7 @@ function computeAlerts() {
     if (fs.existsSync(pinPath)) {
       const pinned = fs.readFileSync(pinPath, 'utf8').trim()
       const pa = state.accounts[pinned]
-      if (pa && pa.headroom_score === 0) pinned_account_starved = { account: pinned, pin_path: pinPath }
+      if (pa && usageReal.isCapped(pa)) pinned_account_starved = { account: pinned, pin_path: pinPath }
     }
   } catch (_) { /* alert computation must never throw */ }
   return {
@@ -895,6 +962,40 @@ function computeAlerts() {
   }
 }
 
+// reconciledStateView - derive the served display/decision fields from the VENDOR-MEASURED
+// utilization so coord.get_usage_state can never again ship a `real` block that says 58%
+// alongside a headroom_score that says 95% free (astray-source #1, 2026-08-15). Returns a
+// SHALLOW COPY - never mutates the on-disk state, so raw readers (creds.pick_healthiest via
+// _readAccountsState, the poll prior-merge) keep exactly what they read before. tokens_5h/
+// tokens_weekly are preserved as the raw ccusage between-probe estimate but no longer power
+// any headroom claim; used_5h/used_weekly/headroom_source are added so the measured truth is
+// the prominent field.
+function reconciledStateView(state) {
+  if (!state || !state.accounts) return state
+  const usageReal = require('./usage-real')
+  const caps = getCaps()
+  const out = Object.assign({}, state, { accounts: {} })
+  for (const acct of Object.keys(state.accounts)) {
+    const a = state.accounts[acct]
+    const u5 = usageReal.used5h(a)
+    const uw = usageReal.usedWeekly(a)
+    const cap5h = a.cap_5h || caps.cap_5h
+    const capW = a.cap_weekly || caps.cap_weekly
+    out.accounts[acct] = Object.assign({}, a, {
+      used_5h: round4(u5),
+      used_weekly: round4(uw),
+      headroom_5h_fraction: round4(Math.max(0, 1 - u5)),
+      headroom_weekly_fraction: round4(Math.max(0, 1 - uw)),
+      headroom_score: round4(Math.max(0, 1 - Math.max(u5, uw))),
+      remaining_5h: Math.round(cap5h * Math.max(0, 1 - u5)),
+      remaining_weekly: Math.round(capW * Math.max(0, 1 - uw)),
+      headroom_source: usageReal.usedSource(a),
+      capped: usageReal.isCapped(a),
+    })
+  }
+  return out
+}
+
 // ── tool handlers (MCP-callable) ─────────────────────────────────────────
 
 async function pick_account(params, ctx) {
@@ -902,13 +1003,15 @@ async function pick_account(params, ctx) {
 }
 
 async function get_usage_state(params, ctx) {
-  const state = readAccountsState()
+  const state = reconciledStateView(readAccountsState())
   const alerts = computeAlerts()
   return { state: state, alerts: alerts }
 }
 
 async function poll_now(params, ctx) {
-  return poll()
+  // poll() writes the RAW ccusage snapshot to disk (unchanged); the returned view is
+  // reconciled to the measured truth so the tool output matches get_usage_state.
+  return reconciledStateView(poll())
 }
 
 async function get_active_account(params, ctx) {
@@ -963,6 +1066,7 @@ module.exports = {
   _readAccountsState: readAccountsState,
   _mergeRealBlock: mergeRealBlock,
   _computeAlerts: computeAlerts,
+  _reconciledStateView: reconciledStateView,
   _pickAccount: pickAccount,
   _markFlaky: markFlaky,
   _clearFlaky: clearFlaky,

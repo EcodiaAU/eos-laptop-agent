@@ -137,16 +137,42 @@ r = usage._pickAccount({ estimated_tokens: 80_000_000 })
 assertEq(r.account, 'tate@ecodia.au', 'buffer-aware picker picks tate@ (most headroom)')
 assertTrue(r.score > 0, 'buffer-applied score positive for A')
 
-console.log('TEST 4: estimate exceeds even best account -> still returns it but flags reason')
+console.log('TEST 4: estimate exceeds the only non-capped account -> still returns it, flags reason')
 seedState({
-  'tate@ecodia.au': mkAcct(CAP_5H - 1_000_000, CAP_WEEKLY - 1_000_000),  // 1M remaining
-  'code@ecodia.au': mkAcct(CAP_5H, CAP_WEEKLY),                          // capped
-  'money@ecodia.au': mkAcct(CAP_5H, CAP_WEEKLY),                         // capped
+  'tate@ecodia.au': mkAcct(CAP_5H - 30_000_000, CAP_WEEKLY - 500_000_000),  // 30M 5h room (86% used, NOT capped), weekly fine
+  'code@ecodia.au': mkAcct(CAP_5H, CAP_WEEKLY),                             // capped
+  'money@ecodia.au': mkAcct(CAP_5H, CAP_WEEKLY),                            // capped
 })
-r = usage._pickAccount({ estimated_tokens: 50_000_000 })  // way more than headroom
-assertEq(r.account, 'tate@ecodia.au', 'returns best-of-bad-options')
-assertTrue(r.score < 0, 'score is negative (estimate exceeds buffered headroom)')
+r = usage._pickAccount({ estimated_tokens: 50_000_000 })  // exceeds tate@'s buffered 5h headroom
+assertEq(r.account, 'tate@ecodia.au', 'returns the only non-capped account')
+assertTrue(r.score < 0, 'score is negative (estimate exceeds buffered 5h headroom)')
 assertTrue(r.reason.includes('insufficient'), 'reason flags insufficient')
+
+console.log('TEST 4b: a MEASURED-capped account is never returned (2026-08-02 switch-into-capped guard)')
+// Effective utilization present: the picker MUST honour it over the (rosy) ccusage fields.
+const withReal = (t5, tw, u5, u7) => Object.assign(mkAcct(t5, tw), {
+  utilization_5h_effective: u5, utilization_7d_effective: u7, effective_source: 'real',
+})
+seedState({
+  'tate@ecodia.au': withReal(5_000_000, 30_000_000, 1.00, 0.20),  // ccusage: ~98% free. vendor: 100% 5h -> CAPPED
+  'code@ecodia.au': withReal(5_000_000, 30_000_000, 0.00, 1.00),  // vendor: 100% weekly -> CAPPED
+  'money@ecodia.au': withReal(5_000_000, 30_000_000, 0.10, 0.10), // vendor: healthy
+})
+r = usage._pickAccount({ estimated_tokens: 0 })
+assertEq(r.account, 'money@ecodia.au', 'picks the only vendor-healthy account')
+assertTrue((r.cap_excluded || []).includes('tate@ecodia.au'), 'tate@ (100% 5h measured) excluded as capped despite rosy ccusage')
+assertTrue((r.cap_excluded || []).includes('code@ecodia.au'), 'code@ (100% weekly measured) excluded as capped')
+
+console.log('TEST 4c: measured utilization outranks identical ccusage headroom (the 2026-08-15 bug)')
+seedState({
+  'tate@ecodia.au': withReal(5_000_000, 30_000_000, 0.58, 0.17),  // the live code@ shape: 58/17
+  'code@ecodia.au': withReal(5_000_000, 30_000_000, 0.00, 0.05),  // emptiest by measurement
+  'money@ecodia.au': withReal(5_000_000, 30_000_000, 0.00, 0.80), // 80% weekly by measurement
+})
+r = usage._pickAccount({ estimated_tokens: 0 })
+assertEq(r.account, 'code@ecodia.au', 'ranks by MEASURED util (code@ emptiest), not the identical ccusage headroom')
+assertEq(r.source, 'real', 'the pick reports it used the measured source')
+assertTrue(r.candidates.find(c => c.account === 'money@ecodia.au').used_weekly === 0.8, 'money@ 80% weekly is visible in candidates')
 
 console.log('TEST 5: no state yet (poll never ran) returns null')
 fs.writeFileSync(path.join(REAL_COORD, 'usage', 'accounts.json'), JSON.stringify({}, null, 2))
@@ -240,6 +266,23 @@ assertTrue(f.has('code@ecodia.au'), 'code@ still flaky')
 // Clean up so subsequent test runs start fresh
 usage._clearFlaky('code@ecodia.au')
 usage._clearFlaky('money@ecodia.au')
+
+console.log('TEST 15: get_usage_state reconciles display fields to the measured block; alerts follow it')
+// code@ ccusage says ~98% free; vendor says 58% 5h / 17% weekly. money@ vendor says 85% weekly.
+seedState({
+  'tate@ecodia.au': Object.assign(mkAcct(5_000_000, 30_000_000), { utilization_5h_effective: 0.0, utilization_7d_effective: 0.05, effective_source: 'real' }),
+  'code@ecodia.au': Object.assign(mkAcct(5_000_000, 30_000_000), { utilization_5h_effective: 0.58, utilization_7d_effective: 0.17, effective_source: 'real' }),
+  'money@ecodia.au': Object.assign(mkAcct(5_000_000, 30_000_000), { utilization_5h_effective: 0.0, utilization_7d_effective: 0.85, effective_source: 'real' }),
+}, 'code@ecodia.au')
+const view = usage._reconciledStateView(usage._readAccountsState())
+assertEq(view.accounts['code@ecodia.au'].used_5h, 0.58, 'served used_5h is the MEASURED 0.58, not the ccusage ~0.02')
+assertEq(view.accounts['code@ecodia.au'].headroom_score, 0.42, 'served headroom_score is 1 - max(0.58,0.17) = 0.42')
+assertEq(view.accounts['code@ecodia.au'].headroom_source, 'real', 'headroom_source stamps provenance')
+assertTrue(view.accounts['code@ecodia.au'].tokens_5h === 5_000_000, 'raw ccusage tokens_5h preserved (no longer contradicts headroom)')
+const a15 = usage._computeAlerts()
+assertTrue(!a15.current_account_low, 'current (code@ at 58/17) is NOT low (headroom 0.42 > 0.20)')
+assertTrue(!!a15.accounts_low.find(x => x.account === 'money@ecodia.au'), 'money@ at 85% weekly IS flagged low by measurement')
+assertTrue(!a15.accounts_low.find(x => x.account === 'code@ecodia.au'), 'code@ not flagged low')
 
 // ── summary ──────────────────────────────────────────────────────────────
 

@@ -210,7 +210,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.pick_account',
-    description: 'Select the highest-headroom Claude Max account for the next dispatch. Score: min(remaining_5h, remaining_weekly) * 0.85 - estimated_tokens. Returns {account, score, remaining_5h, remaining_weekly, reason, candidates[]}.',
+    description: 'Select the account with the most VENDOR-MEASURED headroom for the next dispatch. Ranks by 1 - max(measured used_5h, used_weekly) from the OAuth usage endpoint (falls back to the ccusage estimate only when no measurement exists); a capped account is never offered. score is a 0..1 headroom fraction (buffered 0.85, minus the estimate as a 5h fraction), NOT a token count. Returns {account, score, used_5h, used_weekly, source, remaining_5h, remaining_weekly, reason, candidates[], cap_excluded[], flaky_excluded[]}.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -222,7 +222,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.get_usage_state',
-    description: 'Read the latest poll snapshot: per-account 5h tokens, weekly tokens, headroom score, alerts (current-account-low, all-low, threshold). State is updated every ~5min by the usage-poller cron.',
+    description: 'Read the latest usage snapshot. Per-account fields are VENDOR-MEASURED: used_5h, used_weekly (from the OAuth usage endpoint, in real.utilization_5h/7d), headroom_score (1 - max of the two), headroom_source (real|real_aged|estimate|ccusage-fallback), and capped. The measured `real` block is refreshed ~60s; the ccusage tokens_* are a raw between-probe estimate and do NOT drive headroom. alerts (current_account_low, all_low, accounts_low, threshold) key off the measured headroom. READ used_5h/used_weekly, not tokens_*/headroom_5h_fraction from memory.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: true },
   },
   {

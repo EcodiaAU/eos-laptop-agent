@@ -36,18 +36,15 @@ const CAPPED_UTIL = T.CAPPED_UTIL || 0.99
 // on the day this changed reported code@ at 8.9% of its 5h cap while the vendor reported
 // 100% and capped. The fallback stays for one release so a stale accounts.json still
 // decides something rather than nothing.
-function used5h(a) {
-  if (typeof a.utilization_5h_effective === 'number') return a.utilization_5h_effective
-  return 1 - (a.headroom_5h_fraction != null ? a.headroom_5h_fraction : (a.remaining_5h / a.cap_5h))
-}
-function usedWeekly(a) {
-  if (typeof a.utilization_7d_effective === 'number') return a.utilization_7d_effective
-  return 1 - (a.headroom_weekly_fraction != null ? a.headroom_weekly_fraction : (a.remaining_weekly / a.cap_weekly))
-}
-// Where the number came from, so a decision can say whether it trusted a measurement.
-function usedSource(a) {
-  return (typeof a.utilization_5h_effective === 'number') ? (a.effective_source || 'real') : 'ccusage-fallback'
-}
+//
+// These delegate to the ONE canonical implementation in usage-real (2026-08-15) so this
+// decider and coord.pick_account / the alerts block share the exact same effective-vs-
+// fallback precedence and can never drift again - the drift that made the advisory picker
+// rank a vendor-measured 78%-weekly account as second-healthiest. Semantics unchanged.
+const _usageReal = require('./usage-real')
+const used5h = _usageReal.used5h
+const usedWeekly = _usageReal.usedWeekly
+const usedSource = _usageReal.usedSource
 // Projection: at the current burn, will this account cross the ceiling before the next
 // few probes? Switching at 90 with no lookahead means switching after the overshoot.
 function projectedOver(a) {
