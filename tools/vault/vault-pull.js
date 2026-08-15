@@ -59,6 +59,12 @@ async function pairedKeyIsAttested(db) {
 async function healPairingIfClobbered(db) {
   try {
     const fs = require('fs')
+    // Only ever heal the CANONICAL pairing file. A test injects its own throwaway pairing via the
+    // VAULT_PAIRING override (or VAULT_SKIP_ATTEST); healing that from the REAL attested keys would
+    // overwrite the test's key and make its own signature fail to verify - the exact regression this
+    // guards (it reddened vault-pull / vault-replay / vault-attest-enforce E2E after f430470 added
+    // heal). Both env vars are documented test-only overrides; production sets neither, so heal runs.
+    if (process.env.VAULT_PAIRING || process.env.VAULT_SKIP_ATTEST === '1') return false
     const pairing = loadJson(PAIRING, null)
     if (!pairing || !pairing.signing) return false
     const att = await db`SELECT DISTINCT bound_signing_x963 FROM public.vault_attested_keys WHERE aaguid IN ('appattest','appattestdevelop')`
@@ -140,6 +146,33 @@ function resolveBankCsvAccount(msg) {
   const hits = Object.keys(BA_ACCOUNT_MAP).filter(num => ctx.includes(num))
   if (hits.length === 1) return { account: BA_ACCOUNT_MAP[hits[0]], via: 'pageContext:' + hits[0] }
   return { account: null, via: hits.length ? `ambiguous (${hits.length} account numbers on page)` : 'no known account number on page' }
+}
+
+// Merge post-login DOM recon pages into the per-requestId recon file, NEVER clobbering. Two
+// producers land here in ONE pull: the per-capture `navDom` (build 29: the POST-Search page, from
+// each bank-csv message, carrying BA's account picker + export button + selected account) and the
+// session-end kind:'bank-dom-recon' flush (the page-LOAD pages, balances + history-preload). They
+// share a requestId, so both write this file; the bank-csv rows are consumed before the flush row,
+// so a plain writeFileSync in the flush branch would ERASE the richer navDom pages. Merging keeps
+// the RICHEST dump per URL (more elements) - so the post-Search /accounts/history/ page (picker +
+// export) wins over its page-load twin. baseDir is injectable for tests. Returns {file, pages}.
+function mergeReconPages(requestId, incomingPages, baseDir) {
+  const reconDir = baseDir || path.join(os.homedir(), '.local/state/ecodiaos')
+  fs.mkdirSync(reconDir, { recursive: true })
+  const f = path.join(reconDir, `bank-dom-recon-${String(requestId || 'x').replace(/[^\w.-]/g, '_')}.json`)
+  let existing = []
+  try { const p = JSON.parse(fs.readFileSync(f, 'utf8')); if (Array.isArray(p)) existing = p } catch (_e) { /* first write */ }
+  const byUrl = new Map()
+  for (const pg of existing.concat(Array.isArray(incomingPages) ? incomingPages : [incomingPages])) {
+    if (!pg || typeof pg !== 'object' || !pg.url || pg.skip) continue   // skip login-page / malformed entries
+    const n = Array.isArray(pg.els) ? pg.els.length : (pg.elCount || 0)
+    const prev = byUrl.get(pg.url)
+    const pn = prev ? (Array.isArray(prev.els) ? prev.els.length : (prev.elCount || 0)) : -1
+    if (!prev || n >= pn) byUrl.set(pg.url, pg)
+  }
+  const merged = Array.from(byUrl.values())
+  fs.writeFileSync(f, JSON.stringify(merged, null, 2))
+  return { file: f, pages: merged.length }
 }
 
 // Same transfer test import-ba-csv.cjs uses.
@@ -484,19 +517,37 @@ async function pull(db) {
           result.action = 'bank-csv-imported'
         }
       } catch (e) { result.stagedError = e.message; result.action = 'bank-csv-error' }
+      // BUILD 29: the phone also captured the POST-Search page's nav-DOM (`navDom`: BA's account
+      // picker + export button + selected account), bound by navDomSha256. Merge it into the
+      // requestId's recon file so the next build can author the autonomous nav + confirm the picker->
+      // account mapping. Runs regardless of the import outcome (an UNATTRIBUTED CSV still yields a
+      // useful DOM map, and the picker is exactly what disambiguates attribution). Hash-verified;
+      // skipped on mismatch. Never lets a recon failure disturb the already-recorded import result.
+      try {
+        if (msg.navDom != null && String(msg.navDom) !== '') {
+          const nav = String(msg.navDom)
+          if (msg.navDomSha256 && crypto.createHash('sha256').update(nav).digest('hex') !== msg.navDomSha256) {
+            result.navDom = 'hash-mismatch-skipped'
+          } else {
+            const m = mergeReconPages(msg.requestId, JSON.parse(nav))   // navDom is ONE page object, RAW JSON
+            result.navDomReconFile = m.file
+            result.navDomReconPages = m.pages
+          }
+        }
+      } catch (e) { result.navDom = 'navdom-merge-error: ' + e.message }
     } else if (row.type === 'result' && msg.kind === 'bank-dom-recon') {
       // RECON (build 28): the phone mapped the nav/interactive elements of each post-login BA page
       // (no transaction rows) so the NEXT build can drive hamburger -> accounts -> history -> export
-      // autonomously. Write the map to a file for authoring the nav selectors; the row keeps the
-      // value in payload regardless.
+      // autonomously. MERGE (not overwrite) into the requestId's recon file so a flush that lands
+      // AFTER the bank-csv navDom pages cannot erase them - mergeReconPages keeps the richest per URL.
       try {
-        const reconDir = require('path').join(require('os').homedir(), '.local/state/ecodiaos')
-        require('fs').mkdirSync(reconDir, { recursive: true })
-        const f = require('path').join(reconDir, `bank-dom-recon-${(msg.requestId || 'x').replace(/[^\w.-]/g, '_')}.json`)
-        // recon `value` is RAW JSON (the phone does not base64 it, unlike the CSV path); write as-is.
-        require('fs').writeFileSync(f, String(msg.value || ''))
-        result.reconFile = f
-        result.reconPages = msg.pageCount || null
+        // recon `value` is RAW JSON (the phone does not base64 it, unlike the CSV path): a JSON array
+        // of page maps. Parse tolerantly; a single object is wrapped.
+        let pages = []
+        try { const p = JSON.parse(String(msg.value || '[]')); pages = Array.isArray(p) ? p : [p] } catch (_e) { pages = [] }
+        const m = mergeReconPages(msg.requestId, pages)
+        result.reconFile = m.file
+        result.reconPages = m.pages
         result.action = 'bank-dom-recon-stored'
       } catch (e) { result.action = 'bank-dom-recon-error: ' + e.message }
     } else if (row.type === 'result' && isBankResult(msg)) {
@@ -544,6 +595,8 @@ module.exports = {
   parseBaBody, baDirectionSign, looksLikeBaBody, isBankResult, normaliseBankValueToStaged, recordBalances, backfillStaged, readDate, BA_ACCOUNT_MAP,
   // Phase 2 phone-delivered CSV import
   stageGroupedBaRows, parseCsv, parseBaCsvRows, importBankCsv, BA_CSV_ACCOUNTS, resolveBankCsvAccount,
+  // Build 29 post-Search DOM recon merge (no-clobber, richest-per-URL)
+  mergeReconPages,
 }
 
 if (require.main === module) {
