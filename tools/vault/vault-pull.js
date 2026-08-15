@@ -126,20 +126,47 @@ const BA_ACCOUNT_MAP = {
   '12566111': 'ba_personal_savings', // Tate Saver
 }
 
+// Build 29 recon (2026-08-15) proved BA's statement page carries the SELECTED account as a HIDDEN
+// <input> whose value is the 8-digit account number, and the navDom element map lands that value in
+// el.text. That hidden field is the reliable attribution key: on Tate's build-29 pass exactly one BA
+// number (12566110) appeared as an element value, while the VISIBLE pageContext listed three numbers
+// (ambiguous). Match an element whose text is EXACTLY a known BA account number (whole-value match,
+// so a transaction description containing digits cannot false-positive); require exactly one distinct.
+function accountFromNavDom(navDom) {
+  if (!navDom) return null
+  let parsed
+  try { parsed = JSON.parse(String(navDom)) } catch (_e) { return null }
+  const pages = Array.isArray(parsed) ? parsed : [parsed]
+  const nums = new Set()
+  for (const pg of pages) {
+    for (const el of (pg && Array.isArray(pg.els) ? pg.els : [])) {
+      const v = String((el && el.text) || '').trim()
+      if (Object.prototype.hasOwnProperty.call(BA_ACCOUNT_MAP, v)) nums.add(v)
+    }
+  }
+  return nums.size === 1 ? BA_ACCOUNT_MAP[[...nums][0]] : null
+}
+
 // Attribute a captured BA CSV (kind:'bank-csv') to a source_account. BA names every export
 // StatementCsv.csv and the CSV body has NO account column, so attribution comes from the driver:
 //   1. an explicit valid msg.account - a legacy per-account link, OR the phone's own confident
 //      local resolve from the on-screen account number (bankfeed).
-//   2. else the hash-bound pageContext (the statement page text the phone read at download time):
+//   2. else the hash-bound navDom hidden account field (build 29): deterministic, single account.
+//   3. else the hash-bound pageContext (the statement page text the phone read at download time):
 //      attribute ONLY when EXACTLY one known BA account number appears. Zero or many -> null.
 // NEVER guess: a wrong tag silently corrupts the world-model cash truth, so an unresolved CSV is
-// captured-but-flagged (left for triage with its pageContext intact), never mis-imported.
-// pageContext is bound by pageContextSha256 (inside the signed canonical), so a message that
-// already passed the signature gate carries exactly the text the phone signed; we recompute to be explicit.
+// captured-but-flagged (left for triage with its context intact), never mis-imported.
+// pageContext/navDom are bound by their *Sha256 (inside the signed canonical), so a message that
+// already passed the signature gate carries exactly what the phone signed; we recompute to be explicit.
 function resolveBankCsvAccount(msg) {
   if (msg.account && BA_CSV_ACCOUNTS.includes(msg.account)) return { account: msg.account, via: 'tag' }
+  const nd = String(msg.navDom || '')
+  if (nd && (!msg.navDomSha256 || crypto.createHash('sha256').update(nd).digest('hex') === msg.navDomSha256)) {
+    const a = accountFromNavDom(nd)
+    if (a) return { account: a, via: 'navDom-hidden-account-field' }
+  }
   const ctx = String(msg.pageContext || '')
-  if (!ctx) return { account: null, via: 'no account tag, no pageContext' }
+  if (!ctx) return { account: null, via: 'no account tag, no navDom account, no pageContext' }
   if (msg.pageContextSha256 && crypto.createHash('sha256').update(ctx).digest('hex') !== msg.pageContextSha256) {
     return { account: null, via: 'pageContext hash mismatch' }
   }
@@ -595,8 +622,8 @@ module.exports = {
   parseBaBody, baDirectionSign, looksLikeBaBody, isBankResult, normaliseBankValueToStaged, recordBalances, backfillStaged, readDate, BA_ACCOUNT_MAP,
   // Phase 2 phone-delivered CSV import
   stageGroupedBaRows, parseCsv, parseBaCsvRows, importBankCsv, BA_CSV_ACCOUNTS, resolveBankCsvAccount,
-  // Build 29 post-Search DOM recon merge (no-clobber, richest-per-URL)
-  mergeReconPages,
+  // Build 29 post-Search DOM recon merge (no-clobber, richest-per-URL) + navDom hidden-field attribution
+  mergeReconPages, accountFromNavDom,
 }
 
 if (require.main === module) {

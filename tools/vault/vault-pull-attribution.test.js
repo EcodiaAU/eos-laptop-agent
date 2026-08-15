@@ -70,5 +70,52 @@ for (const num of Object.keys(BA_ACCOUNT_MAP)) {
   eq(BA_CSV_ACCOUNTS.includes(r.account), true, `${r.account} is importable`)
 }
 
-if (fail === 0) console.log(`vault-pull attribution unit: ${pass}/${pass} - tag precedence, per-account resolve, ambiguity->null, hash integrity, invalid-tag fallthrough`)
+// ---- Build 29: navDom hidden-account-field attribution (the reliable key when pageContext is ambiguous). retry-ok ----
+const nav = (nums) => JSON.stringify({ url: 'https://digital.bankaust.com.au/accounts/history/', els:
+  [{ tag: 'BUTTON', id: 'qs-submit', text: 'Search' }].concat(nums.map(n => ({ tag: 'INPUT', type: 'hidden', text: n }))) })
+
+// 10. navDom carrying exactly one BA account number (a hidden input value) -> resolves
+{
+  const nd = nav(['12566110'])
+  const r = resolveBankCsvAccount({ account: '', navDom: nd, navDomSha256: sha(nd) })
+  eq(r.account, 'ba_personal', 'navDom single hidden account -> ba_personal')
+  eq(r.via, 'navDom-hidden-account-field', 'via names navDom')
+}
+
+// 11. THE build-29 case: navDom (1 account) WINS over an ambiguous pageContext (3 account numbers)
+{
+  const nd = nav(['12566110'])
+  const ctx = `Everyday 12566110 ... Saver 12566111 ... Commercial 12579148 ...`
+  const r = resolveBankCsvAccount({ account: '', navDom: nd, navDomSha256: sha(nd), pageContext: ctx, pageContextSha256: sha(ctx) })
+  eq(r.account, 'ba_personal', 'navDom beats ambiguous pageContext')
+}
+
+// 12. a valid explicit tag STILL beats navDom (precedence unchanged)
+{
+  const nd = nav(['12566110'])
+  eq(resolveBankCsvAccount({ account: 'ba_ecodia', navDom: nd, navDomSha256: sha(nd) }).account, 'ba_ecodia', 'tag beats navDom')
+}
+
+// 13. navDom hash MISMATCH is ignored -> falls through to pageContext
+{
+  const nd = nav(['12566110'])
+  const ctx = page('12579151')
+  const r = resolveBankCsvAccount({ account: '', navDom: nd, navDomSha256: 'deadbeef', pageContext: ctx, pageContextSha256: sha(ctx) })
+  eq(r.account, 'ba_ecodia_savings', 'tampered navDom ignored, pageContext used')
+}
+
+// 14. navDom with MULTIPLE distinct BA numbers -> not trusted (ambiguous) -> falls through
+{
+  const nd = nav(['12566110', '12579148'])
+  const ctx = page('12566111')
+  eq(resolveBankCsvAccount({ account: '', navDom: nd, navDomSha256: sha(nd), pageContext: ctx, pageContextSha256: sha(ctx) }).account, 'ba_personal_savings', 'ambiguous navDom falls through to pageContext')
+}
+
+// 15. navDom with NO account number -> null when nothing else resolves
+{
+  const nd = JSON.stringify({ url: 'x', els: [{ tag: 'BUTTON', text: 'Search' }] })
+  eq(resolveBankCsvAccount({ account: '', navDom: nd, navDomSha256: sha(nd) }).account, null, 'navDom with no account -> null')
+}
+
+if (fail === 0) console.log(`vault-pull attribution unit: ${pass}/${pass} - tag precedence, navDom hidden-field (beats ambiguous pageContext, hash-gated), per-account resolve, ambiguity->null, hash integrity, invalid-tag fallthrough`)
 else { console.error(`vault-pull attribution unit: ${fail} FAILED (${pass} passed)`); process.exit(1) }
