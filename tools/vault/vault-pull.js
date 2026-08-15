@@ -51,6 +51,27 @@ async function pairedKeyIsAttested(db) {
   } catch (_e) { return false }
 }
 
+// Self-heal a clobbered pairing file. App Attest is the source of truth for which signing key is
+// genuine Secure-Enclave hardware (the ceremony binds the exact key). If phone-pairing.json's
+// signing key is NOT among the attested keys - e.g. a re-pair/enroll overwrote it with a wrong
+// key, which silently REJECTED every valid capture on 2026-08-15 - restore it from the attested
+// key. Only heals when the attested key is unambiguous (exactly one distinct value); never guesses.
+async function healPairingIfClobbered(db) {
+  try {
+    const fs = require('fs')
+    const pairing = loadJson(PAIRING, null)
+    if (!pairing || !pairing.signing) return false
+    const att = await db`SELECT DISTINCT bound_signing_x963 FROM public.vault_attested_keys WHERE aaguid IN ('appattest','appattestdevelop')`
+    const distinct = att.map(a => a.bound_signing_x963)
+    if (distinct.length !== 1) return false                       // none or ambiguous: do not touch
+    if (distinct[0] === pairing.signing) return false             // already correct
+    fs.copyFileSync(PAIRING, PAIRING + '.clobber-bak-' + Date.now())
+    pairing.signing = distinct[0]
+    fs.writeFileSync(PAIRING, JSON.stringify(pairing, null, 2), { mode: 0o600 })
+    return true
+  } catch (_e) { return false }
+}
+
 // Freshness: the signed `ts` (inside the canonical, so an attacker cannot change it without
 // breaking the signature) must be recent - a captured old result cannot be replayed later.
 // ts-less messages skip this (dedup-by-sig still applies). Rejects future-dated too.
@@ -401,6 +422,7 @@ async function pull(db) {
   // App Attest is a PRECONDITION for trusting any signed result: the paired key must be proven
   // genuine Secure-Enclave hardware. Computed once per pull. (enroll + attest rows are exempt -
   // attest is how a key BECOMES trusted; enroll is ciphertext the host cannot use anyway.)
+  if (rows.length) await healPairingIfClobbered(db)   // restore a re-pair-clobbered signing key before verifying
   const attested = await pairedKeyIsAttested(db)
   for (const row of rows) {
     const msg = row.payload || {}
@@ -471,7 +493,8 @@ async function pull(db) {
         const reconDir = require('path').join(require('os').homedir(), '.local/state/ecodiaos')
         require('fs').mkdirSync(reconDir, { recursive: true })
         const f = require('path').join(reconDir, `bank-dom-recon-${(msg.requestId || 'x').replace(/[^\w.-]/g, '_')}.json`)
-        require('fs').writeFileSync(f, Buffer.from(String(msg.value || ''), 'base64').toString('utf8'))
+        // recon `value` is RAW JSON (the phone does not base64 it, unlike the CSV path); write as-is.
+        require('fs').writeFileSync(f, String(msg.value || ''))
         result.reconFile = f
         result.reconPages = msg.pageCount || null
         result.action = 'bank-dom-recon-stored'
