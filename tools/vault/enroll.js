@@ -64,6 +64,9 @@ function loginLink(service, uSel, pSel, sSel, submit, opts = {}) {
     params.set('capture', 'download')
     if (opts.account) params.set('account', opts.account)
   }
+  // RECON: passively map each post-login page's nav controls, posted once at session end, so the
+  // next build can drive hamburger -> accounts -> history -> export autonomously.
+  if (opts.recon) params.set('recon', '1')
   params.set('service', e.service || service)
   return 'eosvault://login?' + params.toString()
 }

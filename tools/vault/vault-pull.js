@@ -462,6 +462,20 @@ async function pull(db) {
           result.action = 'bank-csv-imported'
         }
       } catch (e) { result.stagedError = e.message; result.action = 'bank-csv-error' }
+    } else if (row.type === 'result' && msg.kind === 'bank-dom-recon') {
+      // RECON (build 28): the phone mapped the nav/interactive elements of each post-login BA page
+      // (no transaction rows) so the NEXT build can drive hamburger -> accounts -> history -> export
+      // autonomously. Write the map to a file for authoring the nav selectors; the row keeps the
+      // value in payload regardless.
+      try {
+        const reconDir = require('path').join(require('os').homedir(), '.local/state/ecodiaos')
+        require('fs').mkdirSync(reconDir, { recursive: true })
+        const f = require('path').join(reconDir, `bank-dom-recon-${(msg.requestId || 'x').replace(/[^\w.-]/g, '_')}.json`)
+        require('fs').writeFileSync(f, Buffer.from(String(msg.value || ''), 'base64').toString('utf8'))
+        result.reconFile = f
+        result.reconPages = msg.pageCount || null
+        result.action = 'bank-dom-recon-stored'
+      } catch (e) { result.action = 'bank-dom-recon-error: ' + e.message }
     } else if (row.type === 'result' && isBankResult(msg)) {
       // Structured transactions -> JSON ledger (unchanged). Flattened body `value` -> the
       // Phase 1 staged_transactions bridge. A read can carry either or both.
