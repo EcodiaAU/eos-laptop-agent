@@ -212,6 +212,14 @@ function composeBrief(opts) {
   const n = reportBackStep ? { done: 2, close: 3 } : { done: 1, close: 2 }
   const closing =
     'CLOSING (mandatory at exit):\n' +
+    'TEARDOWN FIRST - close what you opened. Before signal_done, kill any dev server\n' +
+    'YOU started (kill -9 the pids), tear down any headless/CDP browser context you\n' +
+    'launched (NEVER the canonical Chrome singleton on :9222), and shut down any\n' +
+    'simulator you booted (xcrun simctl shutdown all). A worker that leaks these to\n' +
+    'launchd risks OOMing the Mac, which crashes the Claude Code tabs and kills the\n' +
+    'scheduler. The worker-teardown-hygiene-gate BLOCKS signal_done once if you still\n' +
+    'own a running dev server or booted sim; the mac-resource-guard reaper is the\n' +
+    'backstop. Doctrine: worker-teardown-discipline-close-what-you-opened-2026-08-16.\n' +
     reportBackStep +
     n.done + '. mcp__coord__coord_signal_done({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", task_id:"' + task_id + '", status:"success"|"failed", result_summary:"...", terminate:true})\n' +
     n.close + '. mcp__coord__coord_close_my_tab({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"})\n' +
