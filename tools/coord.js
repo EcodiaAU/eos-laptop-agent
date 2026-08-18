@@ -1915,6 +1915,33 @@ async function verify_paste(params, ctx) {
 
 // ── conductor wake tools ─────────────────────────────────────────────────
 
+// A conductor's title_match is the human chat-tab LABEL (e.g. "Autonomy",
+// "DayCrew", "Ecodia Site"). It is NEVER a dispatched worker's identity string:
+//   - a worker dispatch sentinel: "[social engagement engine]", "[status board execute top]"
+//   - a multi-line brief captured before CC autotitled the tab
+//   - a raw "<dispatched role=\"worker\" .../>" header
+// Those shapes leak into title_match when a worker tab is momentarily mis-tagged
+// as the conductor (CC autotitle stripped its sentinel so _matchWorkerRow missed,
+// or a viewColumn race) and the heartbeat hook captured that tab's own label.
+// Storing one POISONS every title_match consumer:
+//   - tab-close-guard belt 2 then refuses that worker's OWN positive sentinel
+//     self-close (conductor_label_protected), so its tab leaks - the 2026-08-18
+//     report: matchedBy=sentinel_trunc:[status board execute top] / tabIndex+sentinel:5.
+//   - list_channels tags EVERY active tab conductor (the conductorLabel.startsWith('[')
+//     fallback at line ~1077), so report-back routing misfires.
+// The codebase already recognises "[...]" as a non-chat-label (it refuses to
+// fingerprint it at register/heartbeat) - this is the same recognition applied at
+// the WRITE, so the poison never lands. Fail-safe: a rejected write keeps the last
+// good label. Doctrine: coord-conductor-title-match-rejects-worker-sentinel-2026-08-18.
+function isWorkerShapedLabel(s) {
+  const v = String(s == null ? '' : s)
+  if (!v) return false
+  if (v.charAt(0) === '[') return true            // worker dispatch sentinel
+  if (v.indexOf('\n') !== -1) return true          // multi-line brief, not a tab label
+  if (v.indexOf('<dispatched') !== -1) return true // raw dispatch header
+  return false
+}
+
 async function register_conductor(params, ctx) {
   params = params || {}
   ctx = ctx || {}
@@ -1992,6 +2019,16 @@ async function register_conductor(params, ctx) {
   }
 
   const existing = loadConductorRegistration()
+  // Reject a worker-shaped title_match before it can poison the slot (see
+  // isWorkerShapedLabel). Keep the last good human chat-tab label instead of
+  // storing a "[worker sentinel]" that would refuse that worker's own self-close.
+  if (isWorkerShapedLabel(title_match)) {
+    const priorGood = (existing && existing.title_match && !isWorkerShapedLabel(existing.title_match))
+      ? String(existing.title_match) : ''
+    title_match = priorGood
+    title_fingerprint = priorGood ? (existing.title_fingerprint || null) : null
+    title_is_chat_label = !!priorGood
+  }
   let prior_conductor_tab_id = null
   let took_over = false
   if (existing && claude_port && existing.claude_port && existing.claude_port !== claude_port) {
@@ -2111,7 +2148,7 @@ async function conductor_heartbeat(params, _ctx) {
   // 2026-05-19: heartbeat may refresh moving fields. Title/hwnd can shift when
   // Tate resizes; ide_pid stable but workspace_root may change if he re-opens
   // a different folder. Accept refresh of any of these.
-  if (params.title_match) {
+  if (params.title_match && !isWorkerShapedLabel(params.title_match)) {
     conductor.title_match = String(params.title_match)
     // 2026-08-13 conductor addressing v2: refresh the fingerprint from the fresh
     // label every beat so conductor resolution survives a CC auto-retitle. A

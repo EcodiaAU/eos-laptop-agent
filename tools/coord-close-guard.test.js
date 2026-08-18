@@ -158,6 +158,42 @@ const coord = require('./coord.js')
   assert(res.conductor.title_match === 'theres like 1cm room lef…',
     'register_conductor captured the ACTIVE CC tab label as title_match (got "' + res.conductor.title_match + '")')
 
+  // ── Part 3: title_match rejects worker-sentinel-shaped values ──────────────
+  // Root cause of the 2026-08-18 leaked-tab report: a worker's "[...]" dispatch
+  // sentinel leaked into conductor.title_match, and tab-close-guard belt 2 then
+  // refused that worker's OWN positive sentinel self-close. The write chokepoint
+  // (register_conductor + conductor_heartbeat) must never store a worker-shaped
+  // label. Doctrine: coord-conductor-title-match-rejects-worker-sentinel-2026-08-18.
+
+  // Baseline: a real human label persists (set via heartbeat).
+  await coord.conductor_heartbeat({ title_match: 'Autonomy' })
+  let st = await coord.get_conductor_state({})
+  assert(st.conductor.title_match === 'Autonomy', 'heartbeat stores a real human chat-tab label')
+
+  // A "[worker sentinel]" heartbeat is IGNORED - the good label survives.
+  await coord.conductor_heartbeat({ title_match: '[status board execute top]' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.title_match === 'Autonomy',
+    'heartbeat REJECTS a "[...]" worker sentinel, keeps the last good label (got "' + st.conductor.title_match + '")')
+
+  // A multi-line brief and a raw dispatch header are also rejected.
+  await coord.conductor_heartbeat({ title_match: '[infra health pulse]\n<dispatched role="worker" .../>' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.title_match === 'Autonomy', 'heartbeat REJECTS a multi-line "[...]\\n<dispatched" brief')
+
+  // register_conductor with a "[...]" param keeps the prior good label rather than poisoning.
+  const reg2 = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 45955, ide_pid: 87491,
+    title_match: '[social engagement engine]',
+  })
+  assert(reg2.conductor.title_match === 'Autonomy',
+    'register_conductor REJECTS a "[...]" title_match, keeps the prior good label (got "' + reg2.conductor.title_match + '")')
+
+  // A legitimate human label still updates the slot (the belt has teeth for real labels).
+  await coord.conductor_heartbeat({ title_match: 'DayCrew' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.title_match === 'DayCrew', 'heartbeat still accepts a new legitimate human label')
+
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }) } catch (e) {}
   if (fails === 0) { console.log('ALL TESTS PASSED'); process.exit(0) } else { console.log(fails + ' TEST(S) FAILED'); process.exit(1) }
 })()
