@@ -225,7 +225,58 @@ function composeBrief(opts) {
     n.close + '. mcp__coord__coord_close_my_tab({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"})\n' +
     'Without close_my_tab as your final tool call, every worker tab accumulates in the IDE.\n'
 
-  return [header, '', identity, '', verifyFirst, '', standDown, '', taskBlock, '', closing].join('\n')
+  // 2026-08-18 (self-continuation, Tate mandate). The terminal state of a worker
+  // is NOT "done". A worker that finishes step one of a multi-step project, or ships
+  // a one-step job it never independently proved, and then closes, is the turn-death
+  // that kills a project during the away window: nothing reprompts it. So EVERY
+  // dispatch now carries the decision by construction (same rationale as standDown:
+  // a clause each author must remember is a clause missing exactly when the fleet is
+  // busiest). A worker ends in one of two states: a VERIFIED CLOSE (whole scope done
+  // AND independently probed this run) or an ARMED SUCCESSOR chat (the next step, or,
+  // the default even for one-step work, an independent verification pass). The successor
+  // brief carries this clause verbatim so thoroughness compounds across the chain instead
+  // of decaying to the minimum. Workers MAY schedule a SINGLE successor of their own work
+  // line (this is not the banned parallel fan-out; it is the one successor Tate explicitly
+  // blessed 2026-08-18). Enforced by successor-arm-gate.py.
+  // Doctrine: [[self-continuation-is-the-default-terminal-state-2026-08-18]].
+  const selfContinuation =
+    'SELF-CONTINUATION (decide your terminal state BEFORE you signal_done):\n' +
+    'Your run does not end in "done". It ends in one of two states, and closing\n' +
+    'without choosing is the exact failure this clause exists to stop:\n' +
+    '  (A) VERIFIED CLOSE. The WHOLE scope is complete AND you independently proved it\n' +
+    '      on the real deployed surface THIS run with a discriminating probe (the\n' +
+    '      authed-role query, a CDP shot vs the live url, a test that exercises the real\n' +
+    '      path, a build/deploy id). Only then put the token verified-close in your\n' +
+    '      signal_done result_summary, together with WHAT the probe was and what it\n' +
+    '      returned. Then close.\n' +
+    '  (B) ARMED SUCCESSOR. Otherwise arm the next chat FIRST, then close. Two kinds:\n' +
+    '      1. CONTINUATION: more steps remain in this project. Arm the next step.\n' +
+    '      2. VERIFICATION (the DEFAULT, even for a one-step job): the work looks done\n' +
+    '         but you have not independently proved it, or a fresh pair of eyes would\n' +
+    '         raise the bar. Arm a chat that re-derives whether the work is real and\n' +
+    '         excellent, drives the live surface, hunts the failure modes you were too\n' +
+    '         close to see, then confirms (verified-close) or corrects and re-verifies.\n' +
+    'Arm a successor via the scheduler with a FULL self-contained brief (assume no\n' +
+    'context carries over). If the scheduler tool is deferred, load it first:\n' +
+    '  ToolSearch("select:mcp__ecodia-scheduler__schedule_delayed")\n' +
+    '  mcp__ecodia-scheduler__schedule_delayed({\n' +
+    '    name: "cowork.<project>-<next-or-verify>",\n' +
+    '    delay: "in 1m",\n' +
+    '    prompt: "<FULL brief: what you shipped + the exact commit or url, what is still\n' +
+    '             unproven, the exact verify gate or next step, recipe/pattern path and\n' +
+    '             any bearer, AND this SELF-CONTINUATION clause verbatim>"\n' +
+    '  })\n' +
+    'The successor brief MUST carry this clause verbatim; that recursion is what makes\n' +
+    'thoroughness compound instead of decaying to the minimum. Releasing work without an\n' +
+    'independent second pass IS the minimum. A verification chat that independently\n' +
+    'confirms the work is solid closes with verified-close and does NOT chain another\n' +
+    'verifier: that is where the chain naturally ends. You MAY schedule this one successor\n' +
+    'of your own work line (it is not the banned parallel fan-out). The only clean close\n' +
+    'with neither a successor nor verified-close is a genuine external block (vendor\n' +
+    'outage, sealed credential, a Tate-gated step): name it in result_summary, and where\n' +
+    'the block has a known reset, arm a re-check successor at that time.\n'
+
+  return [header, '', identity, '', verifyFirst, '', standDown, '', taskBlock, '', selfContinuation, '', closing].join('\n')
 }
 
 async function dispatch_worker(params) {

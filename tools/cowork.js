@@ -234,9 +234,47 @@ function composeBrief(opts) {
     ? 'YOUR TASK:\nThe full task brief is at:\n  ' + brief_file_path + '\nRead that file in full, then execute.\n'
     : 'YOUR TASK:\n' + brief_body + '\n'
 
+  // 2026-08-18 (self-continuation, Tate mandate). Mirror of the mac-dispatcher.js
+  // clause so the manual_chat REST path + Windows fallback inherit the same terminal
+  // decision by construction. Doctrine: [[self-continuation-is-the-default-terminal-state-2026-08-18]].
+  const selfContinuation =
+    'SELF-CONTINUATION (decide your terminal state BEFORE you signal_done):\n' +
+    'Your run does not end in "done". It ends in one of two states, and closing\n' +
+    'without choosing is the exact failure this clause exists to stop:\n' +
+    '  (A) VERIFIED CLOSE. The WHOLE scope is complete AND you independently proved it\n' +
+    '      on the real deployed surface THIS run with a discriminating probe (the\n' +
+    '      authed-role query, a CDP shot vs the live url, a test that exercises the real\n' +
+    '      path, a build/deploy id). Only then put the token verified-close in your\n' +
+    '      signal_done result_summary, together with WHAT the probe was and what it\n' +
+    '      returned. Then close.\n' +
+    '  (B) ARMED SUCCESSOR. Otherwise arm the next chat FIRST, then close. Two kinds:\n' +
+    '      1. CONTINUATION: more steps remain in this project. Arm the next step.\n' +
+    '      2. VERIFICATION (the DEFAULT, even for a one-step job): the work looks done\n' +
+    '         but you have not independently proved it, or a fresh pair of eyes would\n' +
+    '         raise the bar. Arm a chat that re-derives whether the work is real and\n' +
+    '         excellent, drives the live surface, hunts the failure modes you were too\n' +
+    '         close to see, then confirms (verified-close) or corrects and re-verifies.\n' +
+    'Arm a successor via the scheduler with a FULL self-contained brief (assume no\n' +
+    'context carries over). If the scheduler tool is deferred, load it first:\n' +
+    '  ToolSearch("select:mcp__ecodia-scheduler__schedule_delayed")\n' +
+    '  mcp__ecodia-scheduler__schedule_delayed({\n' +
+    '    name: "cowork.<project>-<next-or-verify>",\n' +
+    '    delay: "in 1m",\n' +
+    '    prompt: "<FULL brief: what you shipped + the exact commit or url, what is still\n' +
+    '             unproven, the exact verify gate or next step, recipe/pattern path and\n' +
+    '             any bearer, AND this SELF-CONTINUATION clause verbatim>"\n' +
+    '  })\n' +
+    'The successor brief MUST carry this clause verbatim; that recursion is what makes\n' +
+    'thoroughness compound instead of decaying to the minimum. Releasing work without an\n' +
+    'independent second pass IS the minimum. A verification chat that independently\n' +
+    'confirms the work is solid closes with verified-close and does NOT chain another\n' +
+    'verifier: that is where the chain naturally ends.\n'
+
   const constraints =
     'CONSTRAINTS (non-negotiable):\n' +
-    '- You are NOT the conductor. Do not orchestrate. Do not spawn workers.\n' +
+    '- You are NOT the conductor. Do not orchestrate a parallel fan-out of workers.\n' +
+    '  You MAY schedule ONE successor chat to continue or verify your OWN work line\n' +
+    '  (see SELF-CONTINUATION above); the banned thing is fanning out parallel sub-workers.\n' +
     '- Report progress via coord.send_message (to: chat.conductor.inbox).\n' +
     '- When the task is complete, call coord.signal_done({task_id, result_summary, terminate: true}).\n' +
     '- Then call mcp__coord__coord_close_my_tab({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '"}) as your FINAL action.\n' +
@@ -245,7 +283,7 @@ function composeBrief(opts) {
     '- You can only emit messages TO chat.conductor.inbox or chat.' + tab_id + '.scratch.\n' +
     '- Heartbeat via coord.heartbeat() at start + end of every turn.\n'
 
-  return [header, '', identity, '', verifyFirst, '', taskBlock, '', constraints].join('\n')
+  return [header, '', identity, '', verifyFirst, '', taskBlock, '', selfContinuation, '', constraints].join('\n')
 }
 
 // Poll for the spawned_at confirmation file written by the coord MCP server
