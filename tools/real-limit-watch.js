@@ -425,7 +425,12 @@ async function run(opts) {
     // loop is not blocked; the re-login completes in the background.
     let launchOk = false
     try {
-      const child = spawn('bash', [ACCOUNT_SWITCH_SH, targetShort], { detached: true, stdio: 'ignore' })
+      // SWITCH_REAWAKEN=1: this is the CAP path - the conductor tab is capped/dead, so a
+      // verified switch must open a FRESH conductor tab on the new account, not just swap
+      // the token. switch-run.js:reawakenConductor honours this flag (2026-08-19).
+      const child = spawn('bash', [ACCOUNT_SWITCH_SH, targetShort], {
+        detached: true, stdio: 'ignore', env: Object.assign({}, process.env, { SWITCH_REAWAKEN: '1' }),
+      })
       child.unref()
       launchOk = true
       status = 'switch_launched'

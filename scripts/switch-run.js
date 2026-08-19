@@ -480,6 +480,7 @@ async function main() {
         })
         try { registry.recordSwitchResult(TARGET, true, null, { by: 'switch-run' }) } catch (e) {}
         notifyConductor(result)
+        reawakenConductor(result)
         beat('DONE')
         return emit(result)
       }
@@ -525,6 +526,62 @@ function notifyConductor(result) {
       '-X', 'POST', '-H', 'content-type: application/json',
       '-H', 'authorization: Bearer ' + token.trim(), '--data-binary', payload], { encoding: 'utf8', timeout: 10000 })
   } catch (e) {}
+}
+
+// REAWAKEN (2026-08-19). notifyConductor above only pings a LIVE conductor's inbox. But the
+// switch that matters is the cap-triggered one: the prior account is capped, so the
+// conductor tab is DEAD and there is nothing to inject into. A courtesy ping to a corpse is
+// not continuity. So on a verified switch, when the caller asks for reawaken
+// (SWITCH_REAWAKEN=1, set only by real-limit-watch's cap path), arm a FRESH conductor tab on
+// the new account through the always-on laptop-agent scheduler - the one process that runs
+// independent of any live conductor. The row opens as a fresh Claude Code tab that reads the
+// resume brief and IS the conductor. Doctrine: mac-unattended-resilience-conductor-survival,
+// account-switch-hcaptcha-solved-via-2captcha-2026-08-19.
+function reawakenConductor(result) {
+  if (process.env.SWITCH_REAWAKEN !== '1') return
+  try {
+    // Storm guard: never arm two reawaken rows inside a cooldown. The scheduler's same-name
+    // guard is the second layer; this stamp is the first and cheapest.
+    const COOLDOWN_MS = 15 * 60 * 1000
+    const stampFile = path.join(path.dirname(cfg.PATHS.SWITCH_STATE_FILE), 'reawaken-stamp.json')
+    try {
+      const prev = JSON.parse(fs.readFileSync(stampFile, 'utf8'))
+      if (prev && prev.at && (Date.now() - Date.parse(prev.at)) < COOLDOWN_MS) {
+        log('reawaken skipped: armed ' + Math.round((Date.now() - Date.parse(prev.at)) / 60000) + 'min ago (cooldown)')
+        return
+      }
+    } catch (_e) {}
+
+    const brief = [
+      '[EOS-CONDUCTOR-REAWAKEN] REPORT-BACK: none',
+      'You are EcodiaOS, the conductor, resuming after an AUTOMATIC account switch. The live',
+      'Claude account was switched from ' + result.from + ' to ' + result.to + ' because the prior',
+      'account hit a usage cap and the conductor tab went dark. You are its successor on the',
+      'fresh account, and this tab IS the conductor now - not a worker, do not signal_done and',
+      'terminate. Resume autonomous operation immediately: read the three CLAUDE.md layers, then',
+      'status_board P1/P2 active rows, then the continuity ledger (backend/continuity/lib.cjs',
+      'ledger) and away-state, then pick up the highest-priority open work and carry it to a',
+      'verified close, self-scheduling successors per doctrine. Do not wait for Tate.',
+    ].join(' ')
+
+    const payload = JSON.stringify({
+      tool: 'scheduler.schedule_delayed',
+      params: {
+        name: 'cowork.conductor-reawaken-after-switch',
+        prompt: brief,
+        delay: 'in 1m',
+        preferred_account: result.target, // open on the account we just switched TO
+        priority_class: 'high',
+      },
+    })
+    let token = ''
+    try { token = (fs.readFileSync(path.join(AGENT_ROOT, '.env'), 'utf8').match(/^AGENT_TOKEN=(.+)$/m) || [])[1] || '' } catch (e) {}
+    const r = spawnSync('curl', ['-sS', '-m', '10', 'http://127.0.0.1:' + (process.env.AGENT_PORT || 7456) + '/api/tool',
+      '-X', 'POST', '-H', 'content-type: application/json',
+      '-H', 'authorization: Bearer ' + token.trim(), '--data-binary', payload], { encoding: 'utf8', timeout: 12000 })
+    try { fs.writeFileSync(stampFile, JSON.stringify({ at: new Date().toISOString(), to: result.to, run_id: RUN_ID })) } catch (_e) {}
+    log('reawaken armed: fresh conductor tab scheduled on ' + result.to + ' (' + String(r.stdout || '').slice(0, 120) + ')')
+  } catch (e) { log('reawaken failed (non-fatal): ' + e.message) }
 }
 
 main()
