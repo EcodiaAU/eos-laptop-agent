@@ -55,6 +55,20 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 const log = (...a) => console.log('[switch:' + TARGET + ']', ...a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
+// DIAGNOSTIC screenshots + DOM dumps, gated on SWITCH_DEBUG_SHOTS=1 so prod behaviour is
+// byte-identical when off. Dir from SWITCH_DEBUG_DIR (default /tmp/switch-debug).
+const DEBUG_SHOTS = process.env.SWITCH_DEBUG_SHOTS === '1'
+const DEBUG_DIR = process.env.SWITCH_DEBUG_DIR || '/tmp/switch-debug'
+if (DEBUG_SHOTS) { try { fs.mkdirSync(DEBUG_DIR, { recursive: true }) } catch (_e) {} }
+async function shot(page, label) {
+  if (!DEBUG_SHOTS) return
+  try {
+    const f = DEBUG_DIR + '/' + String(Date.now()) + '-' + label + '.png'
+    await page.screenshot({ path: f, fullPage: false }).catch(() => {})
+    log('SHOT ' + label + ' -> ' + f)
+  } catch (_e) {}
+}
+
 function validateArgs() {
   if (!EMAIL) { console.error('usage: node account-switch-browser.js <tate|code|money>'); process.exit(2) }
   if (!OAUTH_URL || !CODE_FILE) { console.error('OAUTH_URL and CODE_FILE env required'); process.exit(2) }
@@ -148,6 +162,27 @@ async function readState(page) {
       } catch (_e) { /* never throw */ }
     }
     const hcPresent = hcFrames.length > 0 || !!hcHost || /select all|verify you are human|each image containing/i.test(txt)
+    // DIAGNOSTIC extras: which hcaptcha frames exist, whether a VISIBLE challenge grid is up
+    // (vs pure-invisible), whether the response field is populated post-inject, and any
+    // captcha error text. All read-only; harmless when debug is off.
+    const hcFrameSrcs = hcFrames.map(f => (f.src || '').slice(0, 120))
+    // A REAL visible challenge = a #frame=challenge iframe actually rendered on screen with
+    // real dimensions and not hidden. The pre-loaded invisible widget iframes are NOT this.
+    // Proven 2026-08-20: a clean Authorize click passes the invisible hCaptcha with no solve;
+    // only a genuinely on-screen grid needs solving. Gating on DOM-presence (hcPresent) instead
+    // of this is what made the drive pre-inject a foreign token and POISON a flow that works.
+    let hcChallengeVisible = false
+    for (const f of hcFrames) {
+      if (!/frame=challenge/.test(f.src || '')) continue
+      try {
+        const r = f.getBoundingClientRect()
+        const cs = getComputedStyle(f)
+        if (r.width > 100 && r.height > 100 && r.top < window.innerHeight && r.bottom > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0') hcChallengeVisible = true
+      } catch (_e) { /* never throw */ }
+    }
+    let hcResponseFilled = false
+    document.querySelectorAll('textarea[name="h-captcha-response"],textarea[name="g-recaptcha-response"],input[name="h-captcha-response"]').forEach(el => { if ((el.value || '').length > 20) hcResponseFilled = true })
+    const hcErrorText = (txt.match(/incorrect|try again|verification failed|please try again|rate limited|too many|something went wrong|couldn.t verify/i) || [null])[0]
     // claude.ai OAuth uses a FIXED invisible hCaptcha (verified live 2026-08-03). The sitekey
     // rides in a nested cross-origin challenge iframe the top document cannot always read, and
     // the checkbox-invisible frame carries no sitekey, so extraction returns null and the solve
@@ -157,6 +192,7 @@ async function readState(page) {
       url: location.href,
       loggedInAs: loggedMatch ? loggedMatch[1] : null,
       hcSitekey, hcInvisible, hcPresent,
+      hcFrameSrcs, hcChallengeVisible, hcResponseFilled, hcErrorText,
       hasAuthorize: !!find(/^authorize$/i),
       hasSwitch: !!switchA,
       switchHref: switchA ? switchA.href : null,
@@ -326,12 +362,18 @@ async function run() {
   await focusless(page)
   await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
   await sleep(3500)
+  await shot(page, 'initial-load')
 
   let hcSolveCount = 0
   for (let i = 0; i < 50; i++) {
     let st
     try { st = await readState(page) } catch (e) { log('read err', e.message); await sleep(1500); continue }
     log('main[' + i + ']', st.loggedInAs ? ('as=' + st.loggedInAs) : (st.hcPresent ? 'hcaptcha' : st.head))
+    if (DEBUG_SHOTS && st.hcPresent) {
+      log('  hc-diag: frames=' + JSON.stringify(st.hcFrameSrcs) + ' challengeVisible=' + st.hcChallengeVisible +
+          ' responseFilled=' + st.hcResponseFilled + ' err=' + JSON.stringify(st.hcErrorText) +
+          ' hasAuthorize=' + st.hasAuthorize + ' hasSwitch=' + st.hasSwitch + ' hasContinueGoogle=' + st.hasContinueGoogle)
+    }
 
     if (st.authCode) {
       fs.writeFileSync(CODE_FILE, st.authCode + '\n')
@@ -341,30 +383,50 @@ async function run() {
       return 0
     }
 
-    // hCaptcha wall (2026-08-03). CRITICAL: the captcha overlay hides the "Logged in as"
-    // text, so loggedInAs reads null. If we fall through, the Continue-with-Google branch
-    // fires and RE-RUNS the whole login, landing back on the same captcha - the infinite
-    // loop Tate caught. So when a captcha is present it is a HARD STOP: solve it, or if we
-    // cannot yet (sitekey not extracted, or no key), HOLD. Never fall through to a login
-    // branch while a captcha is up.
-    if (st.hcPresent && !st.authCode) {
+    // hCaptcha (REWRITTEN 2026-08-20). The invisible hCaptcha on the OAuth authorize page
+    // PASSES on a clean Authorize click on our real logged-in canonical-Chrome profile - no
+    // solve needed (proven: clean click -> code issued, hcFrames 2->0, zero challenge). The
+    // old code gated on hcPresent (the pre-loaded widget iframes always in the DOM), so it
+    // pre-injected a foreign 2Captcha token into h-captcha-response BEFORE clicking Authorize,
+    // which POISONED a working flow: hCaptcha then saw a wrong-origin token and the challenge
+    // stuck (`HOLDING solves=3` -> EXHAUSTED). So: solve ONLY when a real on-screen challenge
+    // grid actually renders (hcChallengeVisible = a #frame=challenge iframe with real
+    // dimensions). Otherwise fall through to the normal Authorize / switch-account / Google
+    // branches, which now click Authorize cleanly and let the invisible captcha pass.
+    if (st.hcChallengeVisible && !st.authCode) {
       if (st.hcSitekey && CAPSOLVER_ENABLED && hcSolveCount < 3) {
         hcSolveCount++
         log('hcaptcha[' + hcSolveCount + '] sitekey=' + String(st.hcSitekey).slice(0, 10) + ' invisible=' + st.hcInvisible + ' - solving via ' + SOLVER_NAME + (st.hcRqdata ? ' (rqdata)' : ''))
+        await shot(page, 'hc' + hcSolveCount + '-before-solve')
         try {
           const { token } = await SOLVER.solveHCaptcha({ websiteURL: 'https://claude.ai/oauth/authorize', websiteKey: st.hcSitekey, isInvisible: st.hcInvisible, rqdata: st.hcRqdata || undefined, userAgent: UA })
-          await page.evaluate((tok) => {
-            for (const n of ['h-captcha-response', 'g-recaptcha-response']) {
-              document.querySelectorAll('textarea[name="' + n + '"],input[name="' + n + '"]').forEach(el => {
+          if (DEBUG_SHOTS) log('  solver returned token len=' + String(token || '').length)
+          const injected = await page.evaluate((tok) => {
+            let n = 0
+            for (const nm of ['h-captcha-response', 'g-recaptcha-response']) {
+              document.querySelectorAll('textarea[name="' + nm + '"],input[name="' + nm + '"]').forEach(el => {
                 el.value = tok
                 el.dispatchEvent(new Event('input', { bubbles: true }))
                 el.dispatchEvent(new Event('change', { bubbles: true }))
+                n++
               })
             }
+            // Invisible hCaptcha: the SPA waits on the JS callback, not the textarea. Try to
+            // fire the hCaptcha client callback with the token so the app actually proceeds.
+            let cbFired = false
+            try {
+              if (window.hcaptcha && typeof window.hcaptcha.getResponse === 'function') { /* present */ }
+              // Some integrations stash the onSuccess callback on the widget config.
+              if (window.__hcaptchaOnSuccess) { window.__hcaptchaOnSuccess(tok); cbFired = true }
+            } catch (_e) {}
+            return { fields: n, cbFired }
           }, token)
-          log('hcaptcha token injected; nudging the form')
+          log('hcaptcha token injected (fields=' + injected.fields + ' cbFired=' + injected.cbFired + '); nudging the form')
+          await shot(page, 'hc' + hcSolveCount + '-after-inject')
           await clickText(page, /^(authorize|verify|continue|submit)$/i)
           await sleep(4000)
+          await shot(page, 'hc' + hcSolveCount + '-after-nudge')
+          if (DEBUG_SHOTS) { const s3 = await readState(page).catch(() => null); if (s3) log('  post-nudge: hcPresent=' + s3.hcPresent + ' responseFilled=' + s3.hcResponseFilled + ' err=' + JSON.stringify(s3.hcErrorText) + ' loggedInAs=' + s3.loggedInAs + ' authCode=' + !!s3.authCode) }
         } catch (e) { log('capsolver solve failed: ' + e.message) }
       } else {
         log('hcaptcha present, HOLDING (sitekey=' + (st.hcSitekey ? 'yes' : 'no') + ' key=' + CAPSOLVER_ENABLED + ' solves=' + hcSolveCount + ') - not restarting login')
