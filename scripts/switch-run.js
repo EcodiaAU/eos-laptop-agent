@@ -55,6 +55,17 @@ const PIN_TARGET = args.includes('--pin-target')
 // page with its own vision and drives CDP) to write the code. All orchestration stays here.
 const EXTERNAL_DRIVE = args.includes('--external-drive') || process.env.SWITCH_DRIVE === 'agent'
 const MAX_ATTEMPTS = Number(process.env.SWITCH_MAX_ATTEMPTS) || 2
+// GUARANTEE A (2026-08-20): agent-primary, macro-guaranteed. In --external-drive mode an
+// AGENT (a dispatched CC worker driving with its own vision) is the primary consent driver.
+// But an agent can never come (dispatch failed, the CC tab crashed, the agent got stuck), and
+// an away-weeks switch must complete regardless. So if the agent has not written the code
+// within FALLBACK_MS - or a .driving heartbeat the agent was refreshing goes stale - switch-run
+// spawns the deterministic macro (account-switch-browser.js) itself to finish the job. The
+// macro sweeps stale oauth tabs and opens its own dedicated tab, so a healthy agent's ~1-2min
+// drive completes long before the 6min cap and the two never collide; a dead agent's abandoned
+// tab is swept and the macro takes over. Result: the switch ALWAYS completes.
+const AGENT_FALLBACK_MS = Number(process.env.SWITCH_AGENT_FALLBACK_MS) || 6 * 60 * 1000
+const DRIVING_STALE_MS = Number(process.env.SWITCH_DRIVING_STALE_MS) || 120 * 1000
 
 const RUN_ID = 'sw_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex')
 let TMPDIR = null
@@ -150,6 +161,32 @@ function reapStrayLogins() {
     try { process.kill(pid, 'SIGTERM'); n++ } catch (e) {}
   }
   if (n) log('reaped ' + n + ' stray claude-auth-login process(es) before starting')
+  return n
+}
+
+// Sweep leaked eos-switch-* tmp dirs from prior runs that a SIGKILL bypassed (the exit
+// handler cleanup only runs on a graceful exit; kill -9 or a host crash leaves the mkdtemp
+// dir behind). Each holds only transient login scratch, so anything older than 30min is
+// safe to remove. Bounded and defensive: never throws, never touches THIS run's dir.
+function sweepStaleTmpDirs() {
+  const MAX_AGE_MS = 30 * 60 * 1000
+  let n = 0
+  try {
+    const base = os.tmpdir()
+    for (const name of fs.readdirSync(base)) {
+      if (!name.startsWith('eos-switch-')) continue
+      const p = path.join(base, name)
+      if (TMPDIR && p === TMPDIR) continue
+      try {
+        const st = fs.statSync(p)
+        if (!st.isDirectory()) continue
+        if ((Date.now() - st.mtimeMs) < MAX_AGE_MS) continue
+        fs.rmSync(p, { recursive: true, force: true })
+        n++
+      } catch (_e) {}
+    }
+  } catch (_e) {}
+  if (n) log('swept ' + n + ' leaked eos-switch tmp dir(s) from prior SIGKILLed run(s)')
   return n
 }
 
@@ -389,30 +426,35 @@ async function runLogin(target, row) {
     return { ok: false, stage: 'LOGIN_CLI', reason: 'no OAUTH_URL from account-login.sh within 60s', child }
   }
 
+  // Spawn the deterministic macro browser to drive the consent. Used both as the primary
+  // driver (macro mode) and as the Guarantee-A fallback when an agent never finishes.
+  const spawnMacro = () => spawn('node', [BROWSER_JS, target], {
+    stdio: ['ignore', fs.openSync(out, 'a'), fs.openSync(out, 'a')],
+    env: Object.assign({}, process.env, {
+      OAUTH_URL: oauthUrl, CODE_FILE: codeFile,
+      LOGIN_METHOD: row.login_method || '', TOTP_SERVICE: row.totp_service || '',
+      PW_MIRROR_PATH: row.pw_mirror || '',
+      // hCaptcha solver key (2026-08-03). From env or the local cred mirror; empty is fine,
+      // the browser driver just exhausts on the captcha as before when it is absent.
+      CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
+        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
+      TWOCAPTCHA_API_KEY: process.env.TWOCAPTCHA_API_KEY ||
+        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
+    }),
+  })
+
   let browser = null
   if (EXTERNAL_DRIVE) {
-    // No macro. Emit the handoff and wait for an agent to write the code to CODE_FILE
-    // (account-login.sh is already polling that file, up to 12min).
+    // Emit the handoff and wait for an agent to write the code to CODE_FILE (account-login.sh
+    // is already polling that file, up to 12min). The macro is NOT spawned yet - the agent is
+    // the primary driver - but the wait loop below spawns it as a fallback if the agent stalls.
     beat('AGENT_DRIVE')
     process.stdout.write('SWITCH_OAUTH_URL=' + oauthUrl + '\n')
     process.stdout.write('SWITCH_CODE_FILE=' + codeFile + '\n')
-    log('external-drive: an agent must drive the consent and write the auth code to CODE_FILE')
+    log('external-drive: an agent should drive the consent and write the auth code to CODE_FILE (macro fallback armed at ' + Math.round(AGENT_FALLBACK_MS / 1000) + 's)')
   } else {
     beat('BROWSER_DRIVE')
-    browser = spawn('node', [BROWSER_JS, target], {
-      stdio: ['ignore', fs.openSync(out, 'a'), fs.openSync(out, 'a')],
-      env: Object.assign({}, process.env, {
-        OAUTH_URL: oauthUrl, CODE_FILE: codeFile,
-        LOGIN_METHOD: row.login_method || '', TOTP_SERVICE: row.totp_service || '',
-        PW_MIRROR_PATH: row.pw_mirror || '',
-        // hCaptcha solver key (2026-08-03). From env or the local cred mirror; empty is fine,
-        // the browser driver just exhausts on the captcha as before when it is absent.
-        CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
-          (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
-        TWOCAPTCHA_API_KEY: process.env.TWOCAPTCHA_API_KEY ||
-          (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
-      }),
-    })
+    browser = spawnMacro()
   }
 
   // Wait for a TERMINAL marker from the CLI half, beating throughout. The window is
@@ -420,12 +462,34 @@ async function runLogin(target, row) {
   // and the 2FA path can wait longer still. The lock heartbeat, not this timeout, is what
   // distinguishes slow from wedged.
   const hardDeadline = Date.now() + (Number(process.env.SWITCH_LEG_TIMEOUT_MS) || 16 * 60 * 1000)
+  const drivingMarker = codeFile + '.driving'
+  const legStart = Date.now()
+  let markerSeen = false
+  let fellBackToMacro = false
   let terminal = null
   while (Date.now() < hardDeadline) {
     const text = fs.readFileSync(out, 'utf8')
     if (/^DONE:/m.test(text)) { terminal = 'DONE'; break }
     if (/^(FAILED|TIMEOUT):/m.test(text)) { terminal = 'FAILED'; break }
     if (child.exitCode !== null && (browser ? browser.exitCode !== null : true)) { terminal = child.exitCode === 0 ? 'DONE' : 'FAILED'; break }
+
+    // GUARANTEE A: agent-primary with a macro backstop. If we handed off to an agent and it
+    // has neither written the code nor kept its .driving heartbeat fresh, take over with the
+    // macro. Fires on either signal: no code past the hard fallback window, OR a .driving
+    // marker that once existed and has now gone stale (the agent's CC tab died mid-drive).
+    if (EXTERNAL_DRIVE && !fellBackToMacro) {
+      const codeWritten = (() => { try { return fs.statSync(codeFile).size > 0 } catch (_e) { return false } })()
+      const markerAge = (() => { try { return Date.now() - fs.statSync(drivingMarker).mtimeMs } catch (_e) { return null } })()
+      if (markerAge != null) markerSeen = true
+      const timedOut = (Date.now() - legStart) > AGENT_FALLBACK_MS
+      const markerDied = markerSeen && (markerAge == null || markerAge > DRIVING_STALE_MS)
+      if (!codeWritten && (timedOut || markerDied)) {
+        fellBackToMacro = true
+        log('external-drive FALLBACK: ' + (markerDied ? 'agent .driving heartbeat went stale' : 'no code after ' + Math.round((Date.now() - legStart) / 1000) + 's') + ' - spawning the macro to finish the switch')
+        beat('BROWSER_DRIVE')
+        browser = spawnMacro()
+      }
+    }
     beat()
     await sleep(1000)
   }
@@ -468,6 +532,7 @@ async function main() {
   }
 
   TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'eos-switch-' + RUN_ID + '-'))
+  sweepStaleTmpDirs()
   _heartbeatTimer = setInterval(() => { try { beat() } catch (e) {} }, 30000)
   if (_heartbeatTimer.unref) _heartbeatTimer.unref()
 

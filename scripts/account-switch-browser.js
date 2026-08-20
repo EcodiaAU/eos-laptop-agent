@@ -389,6 +389,10 @@ async function run() {
   let hcSolveCount = 0
   const moneyTriedLinks = new Set()
   let moneyStaleHits = 0
+  // FRESHNESS GATE (2026-08-20): the moment we trigger the magic-link send. The SA reader is
+  // told to return ONLY a link that arrived at/after this, so a stale link from a prior
+  // attempt (still <1h old) can never be picked up and looped over.
+  let moneySendMs = 0
   for (let i = 0; i < 50; i++) {
     let st
     try { st = await readState(page) } catch (e) { log('read err', e.message); await sleep(1500); continue }
@@ -504,12 +508,19 @@ async function run() {
         try { const h = await page.$('[data-eos-email="1"]'); if (h) { await h.click(); await page.keyboard.type(EMAIL, { delay: 20 }) } } catch (_e) {}
         await sleep(500)
       }
+      // Stamp the send moment BEFORE clicking send (so the reader's freshness gate cannot
+      // miss a fast-arriving mail). Set once; if the page already showed "sent" on entry we
+      // still stamp now, accepting only mail from this arc onward.
+      if (!moneySendMs) moneySendMs = Date.now()
       if (!es.sent) { await clickText(page, /^(continue|next|send magic link|log in|sign in|continue with email)$/i); await sleep(4500) }
-      // Poll the SA mailbox for the fresh magic link.
+      // Poll the SA mailbox for THIS attempt's fresh magic link (gated to >= moneySendMs).
       let link = null
       for (let k = 0; k < 14; k++) {
         try {
-          const out = execSync('node ' + MAGLINK_HELPER + ' 2>/dev/null', { timeout: 25000 }).toString()
+          const out = execSync('node ' + MAGLINK_HELPER + ' 2>/dev/null', {
+            timeout: 25000,
+            env: Object.assign({}, process.env, { MAGLINK_SINCE_MS: String(moneySendMs) }),
+          }).toString()
           const m = out.match(/MAGIC_LINK=(\S+)/)
           if (m) { link = m[1]; break }
         } catch (_e) {}

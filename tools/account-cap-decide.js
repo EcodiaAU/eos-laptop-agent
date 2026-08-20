@@ -24,8 +24,11 @@
 // drops to 0.80. Both numbers live in usage-config.
 const _cfg = (() => { try { return require('./usage-config') } catch (e) { return null } })()
 const T = (_cfg && _cfg.TRIGGERS) || {}
+// SESSION (5h) fires at 90%, WEEKLY (7d) fires at 95% (Tate 2026-08-20: "90% session OR
+// 95% weekly"). These used to both read T.SWITCH_USER (0.90); the weekly window now has
+// its own, later trigger so a proactive switch keeps more of the scarce weekly allowance.
 const SESSION_USED_TRIGGER = T.SWITCH_USED || 0.90
-const WEEKLY_USED_TRIGGER = T.SWITCH_USED || 0.90
+const WEEKLY_USED_TRIGGER = T.SWITCH_USED_WEEKLY || 0.95
 const TARGET_MAX_USED = T.TARGET_MAX_USED || 0.50
 const PROJECTION_HORIZON_MIN = T.PROJECTION_HORIZON_MIN || 20
 const PROJECTION_CEILING = T.PROJECTION_CEILING || 0.98
@@ -187,9 +190,18 @@ function selftest() {
   r = decide({ accounts: { 'money@ecodia.au': A(0.18, 0.5), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
   assert(!r.shouldSwitch, '82% 5h used -> hold (the trigger is 90 now, not 80)')
 
-  // 2. live at 91% weekly used -> switch
-  r = decide({ accounts: { 'money@ecodia.au': A(0.7, 0.09), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
-  assert(r.shouldSwitch && r.target === 'code@ecodia.au', '91% weekly used -> switch')
+  // 2. live at 96% weekly used -> switch (weekly trigger moved 0.90 -> 0.95 on 2026-08-20)
+  r = decide({ accounts: { 'money@ecodia.au': A(0.7, 0.04), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
+  assert(r.shouldSwitch && r.target === 'code@ecodia.au', '96% weekly used -> switch')
+
+  // 2b. 91% weekly used no longer triggers on its own: the weekly drain window now runs
+  //     to 95% (Tate 2026-08-20 "90% session OR 95% weekly"). 5h must also be comfortable.
+  r = decide({ accounts: { 'money@ecodia.au': A(0.5, 0.09), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
+  assert(!r.shouldSwitch, '91% weekly used, 50% 5h -> hold (weekly trigger is 95 now)')
+
+  // 2c. weekly boundary: exactly 95% weekly used -> switch (>= inclusive)
+  r = decide({ accounts: { 'money@ecodia.au': A(0.5, 0.05), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')
+  assert(r.shouldSwitch, '95.00% weekly used -> switch (boundary inclusive)')
 
   // 3. live comfortable -> hold
   r = decide({ accounts: { 'money@ecodia.au': A(0.9, 0.9), 'code@ecodia.au': A(1.0, 1.0) } }, 'money@ecodia.au')

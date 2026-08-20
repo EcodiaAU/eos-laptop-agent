@@ -160,38 +160,96 @@ function agentTool(tool, params) {
   } catch (_) { return null }
 }
 
+// AGENT-PRIMARY dispatch cooldown (2026-08-20). A drive worker takes a minute to open its
+// tab, load MCP and acquire the switch lock, so switchInFlight() is briefly false after we
+// dispatch. Without a stamp the next 5-min poll would dispatch a SECOND worker for the same
+// crossing. The lock is the hard guard; this stamp is the cheap first one.
+const CAP_DISPATCH_STAMP = path.join(_COORD_ROOT, 'usage', 'cap-dispatch-stamp.json')
+const CAP_DISPATCH_COOLDOWN_MS = Number(process.env.CAP_DISPATCH_COOLDOWN_MS) || 10 * 60 * 1000
+function capDispatchOnCooldown() {
+  try {
+    const prev = JSON.parse(fs.readFileSync(CAP_DISPATCH_STAMP, 'utf8'))
+    return prev && prev.at && (Date.now() - Date.parse(prev.at)) < CAP_DISPATCH_COOLDOWN_MS
+  } catch (_) { return false }
+}
+function stampCapDispatch(extra) { try { fs.writeFileSync(CAP_DISPATCH_STAMP, JSON.stringify(Object.assign({ at: nowIso() }, extra || {}))) } catch (_) {} }
+
+// Build the dispatched-worker brief. The worker IS the vision model: it drives the OAuth
+// consent by reading screenshots, per the account-switch-drive skill. Kept lean because the
+// skill carries the full loop + every page branch.
+function driveWorkerBrief(targetShort, liveShort, reason) {
+  return [
+    '[EOS-ACCOUNT-SWITCH-DRIVE] REPORT-BACK: coord.signal_done then coord.close_my_tab.',
+    'You are a dispatched EcodiaOS worker. Your ONE job: switch the LIVE Claude account to',
+    targetShort + '@ecodia.au by driving the OAuth consent with your OWN vision. You ARE the',
+    'vision model - never call an API to look at a screenshot; Read the PNG yourself.',
+    'WHY: ' + (reason || 'proactive cap-approach switch') + '. The current account (' + liveShort +
+    ') is near its usage cap but still has budget, so drive the switch now while it can.',
+    'HOW: invoke the account-switch-drive skill and follow it EXACTLY. In brief:',
+    '  cd /Users/ecodia/.code/eos-laptop-agent',
+    '  node scripts/account-switch-drive.cjs begin ' + targetShort + '   (returns oauth_url, code_file, log)',
+    '  loop: node scripts/account-switch-drive.cjs shot <code_file> -> Read the png -> decide ->',
+    '        act via gui.enable_chrome_cdp + cdp.clickByTag/nativeFill (Authorize; RE-CLICK once if',
+    '        it reverts; Switch account if the wrong account is shown; signing-back-in -> Continue).',
+    '  at the callback (platform.claude.com/oauth/code/callback?code=..&state=..):',
+    '        node scripts/account-switch-drive.cjs submit <code_file> "<code>#<state>"',
+    'VERIFY GATE: node scripts/account-switch-drive.cjs await <code_file> MUST print SWITCH_RESULT',
+    '  ok:true (5 identity checks + a live usage probe, all green). If not, the switch failed - say so.',
+    'FALLBACK: if you get stuck for a couple of minutes, STOP acting - switch-run auto-spawns the',
+    '  deterministic macro to finish. Do not fight it or open extra windows.',
+    'Then coord.signal_done({terminate:true}) and coord.close_my_tab.',
+  ].join('\n')
+}
+
 function capAutoSwitch() {
   try {
-    // Decide, then hand off to the ONE sanctioned switch path.
+    // AGENT-PRIMARY (Tate 2026-08-20). The proactive cap-approach switch is now driven by a
+    // dispatched CC worker that reads the consent page with its own vision, not the blind
+    // macro. The macro survives ONLY as the fallback: (1) here, if the worker cannot be
+    // dispatched (agent endpoint down), and (2) inside switch-run --external-drive, if the
+    // agent stalls (Guarantee A). This keeps Tate's "agent uses contextual logic" intent
+    // while staying bulletproof on the worst path.
     //
-    // EXECUTION CHANGED 2026-08-02: this used to call creds.rotate_to, which writes a
-    // stored snapshot into the Keychain. backend/CLAUDE.md had already banned that for
-    // moving the live conductor, and the reason is structural: the Keychain holds one
-    // identity and Anthropic refresh tokens are single-use, so a non-live snapshot is
-    // usually a spent token. rotate_to therefore either refused (the stale-source guard)
-    // or installed a dead lineage. account-switch.sh performs a full OAuth re-login and
-    // mints fresh tokens, so it needs no snapshot at all.
-    //
-    // DETACHED, never spawnSync. A switch leg can legitimately run for minutes (the
-    // money@ magic-link wait alone is bounded at 12), and a synchronous call would stall
-    // this daemon's whole event loop: the 60-second cap watch, the probe tick and the
-    // heartbeat all stop, and the heartbeat canary then reports a dead poller during
-    // exactly the window a switch is in flight. The exit handler below reads the real
-    // result; "launched" is never recorded as success.
+    // The switch itself is still the ONE sanctioned path (switch-run via account-switch.sh):
+    // full OAuth re-login minting fresh tokens (rotate_to snapshot-swap was banned 2026-08-02
+    // - single-use refresh tokens make a stored snapshot a dead lineage).
     if (switchInFlight()) return
+    if (capDispatchOnCooldown()) return
     const decideR = spawnSync(process.execPath, [path.join(AGENT_ROOT, 'tools', 'account-cap-decide.js')], { encoding: 'utf8', timeout: 25000 })
     let d = null
     try { d = JSON.parse(decideR.stdout) } catch (_) { return }
     if (!d || !d.shouldSwitch || !d.target) return  // hold / no-usable-target (alerting lives in the module)
 
     const targetShort = String(d.target).split('@')[0]
+    const liveShort = String(d.live || '').split('@')[0]
+
+    // PRIMARY: dispatch a vision-driving CC worker via the always-on laptop-agent scheduler.
+    // preferred_account = the CURRENT (healthy) account, so the worker opens where there is
+    // still budget to drive; the switch flips the Keychain to the target at the very end.
+    const dispatch = agentTool('scheduler.schedule_delayed', {
+      name: 'cowork.account-switch-drive',
+      prompt: driveWorkerBrief(targetShort, liveShort, d.reason),
+      delay: 'in 1m',
+      preferred_account: liveShort || undefined,
+      priority_class: 'high',
+    })
+    if (dispatch) {
+      stampCapDispatch({ mode: 'agent', target: targetShort, live: liveShort })
+      console.log('[' + nowIso() + '] cap-auto-switch: dispatched AGENT drive worker ' + d.live + ' -> ' + d.target + ' (' + d.reason + ')')
+      return
+    }
+
+    // FALLBACK: the dispatch endpoint is unreachable. Do not lose the switch - spawn the
+    // deterministic macro directly (autonomous, needs no agent), detached so the poll loop
+    // is not blocked. The exit handler reads the real result; "launched" is never success.
+    console.log('[' + nowIso() + '] cap-auto-switch: worker dispatch unreachable - falling back to the macro for ' + d.live + ' -> ' + d.target)
     const logFd = (() => { try { return fs.openSync(usageCfg.PATHS.SWITCH_LOG_FILE, 'a') } catch (e) { return 'ignore' } })()
     const child = spawn('bash', [ACCOUNT_SWITCH_SH, targetShort], {
       detached: true, stdio: ['ignore', logFd, logFd],
-      env: Object.assign({}, process.env, { SWITCH_REASON: d.reason || 'cap-auto-switch' }),
+      env: Object.assign({}, process.env, { SWITCH_REASON: d.reason || 'cap-auto-switch-macro-fallback' }),
     })
     child.unref()
-    console.log('[' + nowIso() + '] cap-auto-switch: launching ' + d.live + ' -> ' + d.target + ' (' + d.reason + ')')
+    stampCapDispatch({ mode: 'macro', target: targetShort, live: liveShort })
     child.on('exit', (code) => {
       // switch-run.js owns switch-request.json and swap_history.json; writing them here
       // too would race its RECORD step and corrupt real-limit-watch's suppression input,
@@ -200,7 +258,7 @@ function capAutoSwitch() {
         : code === 3 ? 'already_in_progress'
         : code === 4 ? 'no_op'
         : 'FAILED(' + code + ')'
-      console.log('[' + nowIso() + '] cap-auto-switch result: ' + d.live + ' -> ' + d.target + ' = ' + verdict +
+      console.log('[' + nowIso() + '] cap-auto-switch (macro fallback) result: ' + d.live + ' -> ' + d.target + ' = ' + verdict +
         (code === 0 ? '' : ' (see ' + usageCfg.PATHS.SWITCH_LOG_FILE + ')'))
     })
   } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }

@@ -92,6 +92,13 @@ const TRIGGERS = {
   // 90 with a 5-minute blind spot is overshot 20.7% of the time at p95. Any phase that
   // ships the threshold without the projection must use SWITCH_USED_NO_PROJECTION.
   SWITCH_USED: 0.90,
+  // Weekly window fires LATER than the 5h window (Tate 2026-08-20: "90% session OR 95%
+  // weekly"). The weekly allowance is the scarcer resource and recovers slowly, so we
+  // squeeze more of it before switching; 5% of a weekly window is still a large absolute
+  // headroom, plenty for an agent to drive the switch. The 5h window is small and resets
+  // fast, so 90 there is the right drain point. SWITCH_USED remains the 5h/session trigger;
+  // callers read SWITCH_USED_WEEKLY for the 7d/weekly window.
+  SWITCH_USED_WEEKLY: 0.95,
   SWITCH_USED_NO_PROJECTION: 0.80,
   PROJECTION_HORIZON_MIN: 20,
   PROJECTION_CEILING: 0.98,
