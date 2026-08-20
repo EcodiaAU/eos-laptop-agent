@@ -119,6 +119,15 @@ const TRIGGERS = {
   TARGET_MAX_USED: 0.50,          // legacy scalar, kept so an old caller still resolves something
   TARGET_MAX_USED_5H: 0.50,       // fast window: resets in <=5h, small
   TARGET_MAX_USED_WEEKLY: 0.90,   // scarce accumulator: just under SWITCH_USED_WEEKLY (0.95)
+
+  // Session-only-wall reset hold (Tate 2026-08-20 "tate@?"). A 5h/session wall resets on a
+  // fixed 5-hour boundary; if it clears within this many minutes AND the weekly window is
+  // comfortable, HOLD instead of switching. Switching a session-only crossing off the fleet's
+  // healthiest-weekly account (e.g. tate@ at 0.27 weekly) onto a scarcer one (money@ 0.67) to
+  // dodge a sub-25-min block spends the scarcer weekly for nothing - and the CDP switch often
+  // completes AFTER the window has already reset. Weekly crossings and long-horizon session
+  // walls still switch. real-limit-watch remains the hard backstop on an actual cap hit.
+  SESSION_RESET_HOLD_MIN: 25,
   WARN_HEADROOM: 0.20,
   CORROBORATION_FLOOR: 0.10,
 

@@ -38,6 +38,10 @@ const WEEKLY_USED_TRIGGER = T.SWITCH_USED_WEEKLY || 0.95
 // just under the weekly trigger; an account is only a bad target if it is near its OWN wall.
 const TARGET_MAX_USED_5H = T.TARGET_MAX_USED_5H || T.TARGET_MAX_USED || 0.50
 const TARGET_MAX_USED_WEEKLY = T.TARGET_MAX_USED_WEEKLY || 0.90
+// Session-only-wall reset hold (2026-08-20). If the ONLY reason to switch is the 5h/session
+// window and that window resets within this many minutes while the weekly window is comfortable,
+// hold rather than spend a scarcer account's weekly to dodge a brief block. 0 disables the hold.
+const SESSION_RESET_HOLD_MIN = T.SESSION_RESET_HOLD_MIN != null ? T.SESSION_RESET_HOLD_MIN : 25
 const PROJECTION_HORIZON_MIN = T.PROJECTION_HORIZON_MIN || 20
 const PROJECTION_CEILING = T.PROJECTION_CEILING || 0.98
 const CAPPED_UTIL = T.CAPPED_UTIL || 0.99
@@ -154,6 +158,27 @@ function decide(state, liveAccount, opts) {
   // cap message) remains the backstop; guessing here would switch on noise.
   if (live.effective_source === 'unknown') {
     return { shouldSwitch: false, reason: 'stale_measurement_hold: no usable usage reading for ' + liveAccount, target: null, live: liveAccount, slots }
+  }
+
+  // SESSION-ONLY RESET HOLD (2026-08-20, Tate "tate@?"). If the ONLY thing forcing a switch is
+  // the 5h/session window, and that window resets within SESSION_RESET_HOLD_MIN while the weekly
+  // window is comfortable (not at/over its trigger, not projected over), HOLD. A CDP switch takes
+  // minutes and would burn a scarcer account's weekly to dodge a block that clears on its own -
+  // exactly what would have happened switching tate@ (0.27 weekly, healthiest) -> money@ (0.67)
+  // for a 9-minute 5h reset. Weekly crossings and far-horizon session walls fall through to switch.
+  const nowMs = opts.nowMs != null ? opts.nowMs : Date.now()
+  const weeklyComfortable = liveUW < wTrig && proj.p7 < PROJECTION_CEILING
+  const sessionOnly = (liveU5 >= sTrig || proj.p5 >= PROJECTION_CEILING) && weeklyComfortable
+  const resetAt = live.real && live.real.resets_at_5h ? Date.parse(live.real.resets_at_5h) : NaN
+  const resetMin = isFinite(resetAt) ? (resetAt - nowMs) / 60000 : Infinity
+  if (SESSION_RESET_HOLD_MIN > 0 && sessionOnly && resetMin >= 0 && resetMin <= SESSION_RESET_HOLD_MIN) {
+    return {
+      shouldSwitch: false,
+      reason: `session_only_reset_hold: 5h wall on ${liveAccount} resets in ${resetMin.toFixed(0)}min (<= ${SESSION_RESET_HOLD_MIN}), weekly comfortable (${liveUW.toFixed(2)}) - riding it out beats spending a scarcer account's weekly`,
+      target: null,
+      live: liveAccount,
+      slots,
+    }
   }
 
   // Eligible targets: not live, not flaky/disabled, both windows comfortable.
@@ -308,6 +333,38 @@ function selftest() {
     'money@ecodia.au': REAL(0.00, 0.89, 1.00, 0.11),
   } }, 'tate@ecodia.au')
   assert(r.shouldSwitch && r.target === 'money@ecodia.au', '0.89 weekly target is just under the ceiling -> switch')
+
+  // 14. SESSION-ONLY RESET HOLD (2026-08-20 "tate@?"). tate@ is the healthiest account on the
+  //     scarce weekly axis (0.25). It hit the 5h wall (0.97) but that window resets in 10 min.
+  //     Switching to money@ (0.67 weekly) to dodge a 10-min block wastes the scarcer weekly, and
+  //     the CDP switch would finish after the reset anyway. HOLD.
+  const NOW = Date.parse('2026-08-20T11:41:00Z')
+  const REALR = (u5, u7, resetIso) => Object.assign(REAL(u5, u7, 1 - u5, 1 - u7), { real: { resets_at_5h: resetIso } })
+  r = decide({ accounts: {
+    'tate@ecodia.au': REALR(0.97, 0.25, '2026-08-20T11:51:00Z'),   // 5h resets in 10 min
+    'code@ecodia.au': REAL(0.00, 0.98, 1.00, 0.02),
+    'money@ecodia.au': REAL(0.00, 0.67, 1.00, 0.33),
+  } }, 'tate@ecodia.au', { nowMs: NOW })
+  assert(!r.shouldSwitch && !r.alert && /session_only_reset_hold/.test(r.reason),
+    'session-only 5h wall resetting in 10min + comfortable weekly -> HOLD, do not burn a scarcer weekly')
+
+  // 14b. Same crossing but the 5h window is 90 min out: too long to ride, switch to money@.
+  r = decide({ accounts: {
+    'tate@ecodia.au': REALR(0.97, 0.25, '2026-08-20T13:11:00Z'),   // 5h resets in 90 min
+    'code@ecodia.au': REAL(0.00, 0.98, 1.00, 0.02),
+    'money@ecodia.au': REAL(0.00, 0.67, 1.00, 0.33),
+  } }, 'tate@ecodia.au', { nowMs: NOW })
+  assert(r.shouldSwitch && r.target === 'money@ecodia.au',
+    'session wall 90min from reset -> switch (too long to ride out)')
+
+  // 14c. The weekly window is ALSO at cap (0.96): not session-only, so the reset hold does not
+  //      apply even with an imminent 5h reset. Switch off the weekly-stressed account.
+  r = decide({ accounts: {
+    'tate@ecodia.au': REALR(0.97, 0.96, '2026-08-20T11:51:00Z'),
+    'money@ecodia.au': REAL(0.00, 0.67, 1.00, 0.33),
+  } }, 'tate@ecodia.au', { nowMs: NOW })
+  assert(r.shouldSwitch && r.target === 'money@ecodia.au',
+    'weekly also at cap -> not session-only, reset hold does not apply, switch')
 
   console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED')
 }
