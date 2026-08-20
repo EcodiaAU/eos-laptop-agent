@@ -103,9 +103,22 @@ const TRIGGERS = {
   PROJECTION_HORIZON_MIN: 20,
   PROJECTION_CEILING: 0.98,
 
-  // A switch target must be comfortably below half on BOTH windows, so we do not switch
-  // into an account that caps ten minutes later.
-  TARGET_MAX_USED: 0.50,
+  // A switch target must not be near its OWN wall on either window, or we switch into an
+  // account that caps again shortly. The ceiling is PER WINDOW and aligned to that window's
+  // trigger, NOT a flat half.
+  //
+  // WHY PER WINDOW (2026-08-20 strand). A flat 0.50 on BOTH windows stranded auto-switch in
+  // the back half of every week: the weekly window ACCUMULATES, so by mid-week every account
+  // crosses 50% weekly and becomes permanently ineligible as a target - even one sitting on a
+  // totally fresh 5h window. On 2026-08-20 tate@ hit the 5h SESSION wall (0.97); code@ was
+  // weekly-capped (0.98) and money@ was excluded for 0.67 weekly despite 5h=0.00, so the fleet
+  // TEXTED Tate "no usable target" instead of switching to money@. The 5h window resets fast
+  // (0.50 there means "not about to cap"); the weekly window is the scarce accumulator, so its
+  // ceiling sits just under the 0.95 weekly trigger. money@ at 0.67 weekly has ~33% of a WEEKLY
+  // allowance left - days of runway, not "ten minutes later".
+  TARGET_MAX_USED: 0.50,          // legacy scalar, kept so an old caller still resolves something
+  TARGET_MAX_USED_5H: 0.50,       // fast window: resets in <=5h, small
+  TARGET_MAX_USED_WEEKLY: 0.90,   // scarce accumulator: just under SWITCH_USED_WEEKLY (0.95)
   WARN_HEADROOM: 0.20,
   CORROBORATION_FLOOR: 0.10,
 

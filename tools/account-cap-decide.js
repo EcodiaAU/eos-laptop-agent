@@ -7,8 +7,9 @@
  * Thresholds (Tate 2026-06-19): switch the live account OFF its window when
  *   5h USED      >= 80%  (headroom_5h_fraction     <= 0.20), OR
  *   weekly USED  >= 90%  (headroom_weekly_fraction <= 0.10).
- * A target must have BOTH windows comfortable (used < TARGET_MAX_USED on each)
- * and not be live/flaky/disabled. Pick the highest min-headroom target.
+ * A target must be clear of BOTH its own walls (5h used < TARGET_MAX_USED_5H, weekly used
+ * < TARGET_MAX_USED_WEEKLY - a PER-WINDOW ceiling, not a flat half) and not be
+ * live/flaky/disabled. Pick the highest min-headroom target.
  *
  * Usage:
  *   node account-cap-decide.js                 # live: read coord usage + Keychain
@@ -29,7 +30,14 @@ const T = (_cfg && _cfg.TRIGGERS) || {}
 // its own, later trigger so a proactive switch keeps more of the scarce weekly allowance.
 const SESSION_USED_TRIGGER = T.SWITCH_USED || 0.90
 const WEEKLY_USED_TRIGGER = T.SWITCH_USED_WEEKLY || 0.95
-const TARGET_MAX_USED = T.TARGET_MAX_USED || 0.50
+// Target eligibility ceiling is PER WINDOW (2026-08-20). A flat 0.50 on BOTH windows stranded
+// auto-switch across the back half of every week: the weekly window accumulates, so once an
+// account passes 50% weekly (mid-week, always) it was permanently ineligible as a target even
+// on a fresh 5h window. tate@ hit the 5h wall at 0.97 while money@ sat at 5h=0.00 / weekly=0.67
+// and got excluded, so the fleet texted Tate instead of switching. The weekly ceiling now sits
+// just under the weekly trigger; an account is only a bad target if it is near its OWN wall.
+const TARGET_MAX_USED_5H = T.TARGET_MAX_USED_5H || T.TARGET_MAX_USED || 0.50
+const TARGET_MAX_USED_WEEKLY = T.TARGET_MAX_USED_WEEKLY || 0.90
 const PROJECTION_HORIZON_MIN = T.PROJECTION_HORIZON_MIN || 20
 const PROJECTION_CEILING = T.PROJECTION_CEILING || 0.98
 const CAPPED_UTIL = T.CAPPED_UTIL || 0.99
@@ -82,7 +90,10 @@ function pickTarget(state, liveAccount, opts) {
     // no-target reasoning.
     .filter(e => !accounts[e].excluded_as_target)
     .map(e => ({ email: e, u5: used5h(accounts[e]), uw: usedWeekly(accounts[e]) }))
-    .filter(c => c.u5 < TARGET_MAX_USED && c.uw < TARGET_MAX_USED)
+    // Per-window ceiling: a target must be clear of BOTH its own walls. The weekly ceiling
+    // sits just under the weekly trigger (0.90 vs 0.95) so an account mid-week - fresh 5h,
+    // 0.67 weekly - is still a valid target instead of stranding the switch.
+    .filter(c => c.u5 < TARGET_MAX_USED_5H && c.uw < TARGET_MAX_USED_WEEKLY)
     // highest min-headroom = lowest max-used
     .sort((a, b) => Math.max(a.u5, a.uw) - Math.max(b.u5, b.uw))
 
@@ -272,6 +283,32 @@ function selftest() {
   r = decide({ accounts: { 'money@ecodia.au': quiet, 'code@ecodia.au': REAL(0.05, 0.05, 0.95, 0.95) } }, 'money@ecodia.au')
   assert(!r.shouldSwitch, '80% used but barely burning -> hold, the drain window is the point')
 
+  // 13. THE 2026-08-20 STRAND (regression guard). tate@ hit the 5h SESSION wall (0.97).
+  //     code@ was weekly-capped (0.98). money@ had a FRESH 5h window (0.00) and 0.67 weekly -
+  //     well under its 0.95 weekly trigger. The old flat TARGET_MAX_USED=0.50 excluded money@
+  //     for weekly>0.50 and the fleet TEXTED Tate "no usable target" instead of switching.
+  //     With the per-window ceiling money@ MUST be the target. If this ever alerts again, the
+  //     weekly ceiling has regressed toward the accumulator trap.
+  r = decide({ accounts: {
+    'tate@ecodia.au': REAL(0.97, 0.25, 0.03, 0.75),
+    'code@ecodia.au': REAL(0.00, 0.98, 1.00, 0.02),
+    'money@ecodia.au': REAL(0.00, 0.67, 1.00, 0.33),
+  } }, 'tate@ecodia.au')
+  assert(r.shouldSwitch && r.target === 'money@ecodia.au' && !r.alert,
+    'session wall + only alternate at 0.67 weekly (fresh 5h) -> switch to it, never alert (2026-08-20 strand)')
+
+  // 13b. Boundary: an alternate at exactly the weekly ceiling (0.90) is NOT a target; just under is.
+  r = decide({ accounts: {
+    'tate@ecodia.au': REAL(0.97, 0.25, 0.03, 0.75),
+    'money@ecodia.au': REAL(0.00, 0.90, 1.00, 0.10),
+  } }, 'tate@ecodia.au')
+  assert(!r.shouldSwitch && r.alert, '0.90 weekly target is at the ceiling -> excluded (alert)')
+  r = decide({ accounts: {
+    'tate@ecodia.au': REAL(0.97, 0.25, 0.03, 0.75),
+    'money@ecodia.au': REAL(0.00, 0.89, 1.00, 0.11),
+  } }, 'tate@ecodia.au')
+  assert(r.shouldSwitch && r.target === 'money@ecodia.au', '0.89 weekly target is just under the ceiling -> switch')
+
   console.log(process.exitCode ? '\nSELFTEST FAILED' : '\nSELFTEST PASSED')
 }
 
@@ -348,4 +385,4 @@ if (require.main === module) {
   else { liveDecide() }
 }
 
-module.exports = { decide, pickTarget, used5h, usedWeekly, SESSION_USED_TRIGGER, WEEKLY_USED_TRIGGER, TARGET_MAX_USED }
+module.exports = { decide, pickTarget, used5h, usedWeekly, SESSION_USED_TRIGGER, WEEKLY_USED_TRIGGER, TARGET_MAX_USED_5H, TARGET_MAX_USED_WEEKLY }
