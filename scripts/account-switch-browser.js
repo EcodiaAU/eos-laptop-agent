@@ -356,16 +356,22 @@ async function run() {
     }
   } catch (_e) {}
 
+  // Open our tab IN THE PRIMARY (keeper) WINDOW, never a NEW window. The chrome-canonical
+  // guardian collapses any non-primary window whose sole content is an oauth/auth-popup tab
+  // (AUTH_POPUP_RX), so a dedicated NEW window gets reaped mid-switch and the code is lost
+  // (proven 2026-08-20: guardian log "collapsed orphan auth-popup window ... closed .../oauth/
+  // authorize"). A tab in the keeper's window is never touched. newWindow:false = a tab in the
+  // current window, which the guardian maintains as the single keeper window.
   let page = null
   try {
     const bcdp = await browser.target().createCDPSession()
-    const { targetId } = await bcdp.send('Target.createTarget', { url: 'about:blank', newWindow: true })
+    const { targetId } = await bcdp.send('Target.createTarget', { url: 'about:blank', newWindow: false })
     await bcdp.detach().catch(() => {})
     for (let k = 0; k < 25 && !page; k++) {
       page = (await browser.pages()).find(p => p.target()._targetId === targetId)
       if (!page) await sleep(200)
     }
-  } catch (e) { log('dedicated-window create failed, falling back to newPage: ' + e.message) }
+  } catch (e) { log('dedicated-tab create failed, falling back to newPage: ' + e.message) }
   if (!page) page = await browser.newPage()
   const OUR_TARGET_ID = (() => { try { return page.target()._targetId } catch (_e) { return null } })()
   log('driving in a dedicated OWN window (isolated; target=' + String(OUR_TARGET_ID).slice(0, 8) + ')')

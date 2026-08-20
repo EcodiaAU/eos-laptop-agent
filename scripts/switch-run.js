@@ -50,6 +50,10 @@ const args = process.argv.slice(2)
 const TARGET = (args.find(a => !a.startsWith('-')) || '').trim().toLowerCase()
 const DRY = args.includes('--dry')
 const PIN_TARGET = args.includes('--pin-target')
+// AGENT-PRIMARY (2026-08-20). --external-drive: switch-run does NOT spawn the blind macro; it
+// emits the OAuth URL + CODE_FILE and waits for an external agent (a CC worker that reads the
+// page with its own vision and drives CDP) to write the code. All orchestration stays here.
+const EXTERNAL_DRIVE = args.includes('--external-drive') || process.env.SWITCH_DRIVE === 'agent'
 const MAX_ATTEMPTS = Number(process.env.SWITCH_MAX_ATTEMPTS) || 2
 
 const RUN_ID = 'sw_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex')
@@ -385,21 +389,31 @@ async function runLogin(target, row) {
     return { ok: false, stage: 'LOGIN_CLI', reason: 'no OAUTH_URL from account-login.sh within 60s', child }
   }
 
-  beat('BROWSER_DRIVE')
-  const browser = spawn('node', [BROWSER_JS, target], {
-    stdio: ['ignore', fs.openSync(out, 'a'), fs.openSync(out, 'a')],
-    env: Object.assign({}, process.env, {
-      OAUTH_URL: oauthUrl, CODE_FILE: codeFile,
-      LOGIN_METHOD: row.login_method || '', TOTP_SERVICE: row.totp_service || '',
-      PW_MIRROR_PATH: row.pw_mirror || '',
-      // hCaptcha solver key (2026-08-03). From env or the local cred mirror; empty is fine,
-      // the browser driver just exhausts on the captcha as before when it is absent.
-      CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
-        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
-      TWOCAPTCHA_API_KEY: process.env.TWOCAPTCHA_API_KEY ||
-        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
-    }),
-  })
+  let browser = null
+  if (EXTERNAL_DRIVE) {
+    // No macro. Emit the handoff and wait for an agent to write the code to CODE_FILE
+    // (account-login.sh is already polling that file, up to 12min).
+    beat('AGENT_DRIVE')
+    process.stdout.write('SWITCH_OAUTH_URL=' + oauthUrl + '\n')
+    process.stdout.write('SWITCH_CODE_FILE=' + codeFile + '\n')
+    log('external-drive: an agent must drive the consent and write the auth code to CODE_FILE')
+  } else {
+    beat('BROWSER_DRIVE')
+    browser = spawn('node', [BROWSER_JS, target], {
+      stdio: ['ignore', fs.openSync(out, 'a'), fs.openSync(out, 'a')],
+      env: Object.assign({}, process.env, {
+        OAUTH_URL: oauthUrl, CODE_FILE: codeFile,
+        LOGIN_METHOD: row.login_method || '', TOTP_SERVICE: row.totp_service || '',
+        PW_MIRROR_PATH: row.pw_mirror || '',
+        // hCaptcha solver key (2026-08-03). From env or the local cred mirror; empty is fine,
+        // the browser driver just exhausts on the captcha as before when it is absent.
+        CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
+          (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
+        TWOCAPTCHA_API_KEY: process.env.TWOCAPTCHA_API_KEY ||
+          (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
+      }),
+    })
+  }
 
   // Wait for a TERMINAL marker from the CLI half, beating throughout. The window is
   // generous on purpose: the magic-link leg legitimately waits up to 12 minutes for mail
@@ -411,7 +425,7 @@ async function runLogin(target, row) {
     const text = fs.readFileSync(out, 'utf8')
     if (/^DONE:/m.test(text)) { terminal = 'DONE'; break }
     if (/^(FAILED|TIMEOUT):/m.test(text)) { terminal = 'FAILED'; break }
-    if (child.exitCode !== null && browser.exitCode !== null) { terminal = child.exitCode === 0 ? 'DONE' : 'FAILED'; break }
+    if (child.exitCode !== null && (browser ? browser.exitCode !== null : true)) { terminal = child.exitCode === 0 ? 'DONE' : 'FAILED'; break }
     beat()
     await sleep(1000)
   }
