@@ -80,6 +80,35 @@ function writeLock() {
     target: TARGET, stage: _stage, heartbeat_at: new Date().toISOString(), started_at: new Date().toISOString(),
   })
 }
+
+// ATOMIC acquire (2026-08-20). The old acquire read the lock then wrote it, a TOCTOU window
+// where two triggers fired at once BOTH read no-lock and BOTH drove a login into the one
+// Keychain (reproduced live: two concurrent `switch-run tate` both reached attempt 1/2).
+// O_EXCL ('wx') makes creation atomic: exactly one process can create the file; the loser
+// gets EEXIST and then applies lockVerdict (wait if the holder is alive, reclaim if dead).
+function acquireLock() {
+  const payload = () => JSON.stringify({
+    run_id: RUN_ID, pid: process.pid, pgid: (() => { try { return process.getpgid(0) } catch (e) { return null } })(),
+    target: TARGET, stage: _stage, heartbeat_at: new Date().toISOString(), started_at: new Date().toISOString(),
+  })
+  for (let tries = 0; tries < 3; tries++) {
+    try {
+      const fd = fs.openSync(cfg.PATHS.SWITCH_LOCK_FILE, 'wx') // O_CREAT|O_EXCL: atomic
+      fs.writeSync(fd, payload()); fs.closeSync(fd)
+      return { ok: true }
+    } catch (e) {
+      if (e.code !== 'EEXIST') return { ok: false, reason: 'lock open failed: ' + e.message }
+      const existing = readJson(cfg.PATHS.SWITCH_LOCK_FILE, null)
+      const verdict = core.lockVerdict(existing, { pidAlive })
+      if (verdict.action === 'wait') return { ok: false, reason: verdict.reason, in_progress: true }
+      // reclaim: the holder is dead. Reap its group, remove the stale lock, retry the create.
+      log('reclaiming the switch lock: ' + verdict.reason)
+      reapGroup(existing && existing.pgid, existing && existing.pid)
+      try { fs.unlinkSync(cfg.PATHS.SWITCH_LOCK_FILE) } catch (_e) {}
+    }
+  }
+  return { ok: false, reason: 'could not acquire the switch lock after 3 tries (contended)' }
+}
 function beat(stage) {
   if (stage) _stage = stage
   const cur = readJson(cfg.PATHS.SWITCH_LOCK_FILE, null)
@@ -212,6 +241,28 @@ function cdpAlive() {
     req.on('timeout', () => { try { req.destroy() } catch (e) {}; resolve(false) })
     req.on('error', () => resolve(false))
   })
+}
+
+// SELF-HEAL (2026-08-20). cdpAlive() only gates: if canonical Chrome is down the preflight
+// fails and the account can NEVER rotate. Over weeks unattended, Chrome WILL crash (see the
+// UAF-crashloop doctrine), which then caps and kills the conductor with no human to relaunch.
+// So on a dead 9222, relaunch canonical Chrome via the ONLY sanctioned launch (chrome-cdp.sh,
+// parameterless) and re-probe before giving up. Turns a total outage into a self-healing blip.
+async function ensureCdp() {
+  if (await cdpAlive()) return true
+  const sh = path.join(os.homedir(), '.code', 'ecodiaos', 'backend', 'scripts', 'chrome-cdp.sh')
+  if (!fs.existsSync(sh)) { log('cdp down and chrome-cdp.sh missing at ' + sh); return false }
+  log('canonical Chrome 9222 is down - relaunching via chrome-cdp.sh (self-heal)')
+  try {
+    const child = spawn('bash', [sh], { detached: true, stdio: 'ignore' })
+    child.unref()
+  } catch (e) { log('chrome relaunch spawn failed: ' + e.message); return false }
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 1000))
+    if (await cdpAlive()) { log('canonical Chrome back up after ~' + (i + 1) + 's'); return true }
+  }
+  log('canonical Chrome did NOT come up within 30s of relaunch')
+  return false
 }
 
 // A google-sso leg needs either a usable password mirror or a live Google session. The
@@ -396,19 +447,13 @@ async function main() {
   if (!TARGET) return emit({ ok: false, code: core.EXIT.USAGE, reason: 'usage: switch-run.js <tate|code|money> [--dry] [--pin-target]' })
 
   // Lock first, so two triggers can never drive two concurrent logins into one Keychain.
-  const existing = readJson(cfg.PATHS.SWITCH_LOCK_FILE, null)
-  const verdict = core.lockVerdict(existing, { pidAlive })
-  if (verdict.action === 'wait') {
-    return emit({ ok: false, code: core.EXIT.IN_PROGRESS, reason: verdict.reason, in_progress: true })
-  }
-  if (verdict.action === 'reclaim') {
-    log('reclaiming the switch lock: ' + verdict.reason)
-    reapGroup(existing && existing.pgid, existing && existing.pid)
-    try { fs.unlinkSync(cfg.PATHS.SWITCH_LOCK_FILE) } catch (e) {}
+  // ATOMIC: acquireLock uses O_EXCL so exactly one process wins even on a simultaneous fire.
+  const acq = acquireLock()
+  if (!acq.ok) {
+    return emit({ ok: false, code: core.EXIT.IN_PROGRESS, reason: acq.reason, in_progress: true })
   }
 
   TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'eos-switch-' + RUN_ID + '-'))
-  writeLock()
   _heartbeatTimer = setInterval(() => { try { beat() } catch (e) {} }, 30000)
   if (_heartbeatTimer.unref) _heartbeatTimer.unref()
 
@@ -431,9 +476,10 @@ async function main() {
   const currentEmail = await liveEmailFromToken()
   const currentShort = currentEmail ? currentEmail.split('@')[0] : null
 
+  // DRY only probes (no side effects); a real run self-heals a dead Chrome before failing.
   const pre = core.preflightVerdict({
     target: TARGET, registry: reg, pinRaw, currentShort,
-    cdpAlive: await cdpAlive(), prereq: loginPrereq(row),
+    cdpAlive: DRY ? await cdpAlive() : await ensureCdp(), prereq: loginPrereq(row),
   })
   if (!pre.ok) return emit({ ok: false, code: pre.code, reason: pre.reason, from: currentEmail })
   if (DRY) return emit({ ok: true, code: core.EXIT.VERIFIED, dry: true, target: TARGET, from: currentEmail, reason: 'preflight clean' })

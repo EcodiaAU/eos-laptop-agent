@@ -340,31 +340,49 @@ async function waitForGooglePopup(browser, knownIds) {
 
 async function run() {
   const browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:' + PORT, defaultViewport: null })
-  const pages = await browser.pages()
 
-  // TAB HIJACK FIX (2026-08-02). This used to fall back to pages[pages.length - 1] when
-  // no OAuth tab was open, then NAVIGATE that tab to the consent URL. The canonical
-  // Chrome profile is where every logged-in vendor console lives, so "the last tab" was
-  // routinely a live Play Console or a Gmail window, yanked away from whatever it was
-  // doing. Reuse a genuine OAuth tab if one exists; otherwise open our OWN and close it
-  // on the way out.
-  let page = pages.find(p => /claude\.(ai|com)\/oauth|platform\.claude/.test(p.url()))
-  let ownedTab = false
-  if (!page) {
-    page = await browser.newPage()
-    ownedTab = true
-    log('opened a dedicated OAuth tab (never navigating an existing one)')
-  }
+  // ISOLATION (2026-08-20). The old drive REUSED any existing claude-oauth tab anywhere in
+  // the chaotic canonical profile. Parallel chats spawn extra windows and a crashed prior
+  // switch leaves oauth debris, so it grabbed the wrong tab in the wrong window and any
+  // macro deviation cascaded (Tate: "opens login tabs in multiple windows... switches back
+  // and forth... everything downstream is fucked"). Now the switch owns its world: (1) sweep
+  // stale oauth/callback debris so nothing is reused or accumulates, (2) create ONE dedicated
+  // window we fully own via Target.createTarget(newWindow), (3) close it on EVERY exit. The
+  // switch is now immune to how many other windows exist or what parallel chats do.
+  const STALE_OAUTH = /claude\.(ai|com)\/(cai\/)?oauth|platform\.claude\.com\/oauth/i
+  try {
+    for (const p of await browser.pages()) {
+      if (STALE_OAUTH.test(p.url())) { log('sweeping stale oauth tab: ' + p.url().slice(0, 60)); try { await p.close() } catch (_e) {} }
+    }
+  } catch (_e) {}
+
+  let page = null
+  try {
+    const bcdp = await browser.target().createCDPSession()
+    const { targetId } = await bcdp.send('Target.createTarget', { url: 'about:blank', newWindow: true })
+    await bcdp.detach().catch(() => {})
+    for (let k = 0; k < 25 && !page; k++) {
+      page = (await browser.pages()).find(p => p.target()._targetId === targetId)
+      if (!page) await sleep(200)
+    }
+  } catch (e) { log('dedicated-window create failed, falling back to newPage: ' + e.message) }
+  if (!page) page = await browser.newPage()
+  const OUR_TARGET_ID = (() => { try { return page.target()._targetId } catch (_e) { return null } })()
+  log('driving in a dedicated OWN window (isolated; target=' + String(OUR_TARGET_ID).slice(0, 8) + ')')
+
   const closeOwned = async () => {
-    if (!ownedTab || !page) return
-    try { if (!page.isClosed()) await page.close() } catch (e) {}
+    try { if (page && !page.isClosed()) await page.close() } catch (e) {}
   }
+
+  try {
   await focusless(page)
   await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
   await sleep(3500)
   await shot(page, 'initial-load')
 
   let hcSolveCount = 0
+  const moneyTriedLinks = new Set()
+  let moneyStaleHits = 0
   for (let i = 0; i < 50; i++) {
     let st
     try { st = await readState(page) } catch (e) { log('read err', e.message); await sleep(1500); continue }
@@ -378,8 +396,6 @@ async function run() {
     if (st.authCode) {
       fs.writeFileSync(CODE_FILE, st.authCode + '\n')
       log('AUTH_CODE_WRITTEN -> ' + CODE_FILE)
-      await closeOwned()
-      await browser.disconnect()
       return 0
     }
 
@@ -494,7 +510,20 @@ async function run() {
         await sleep(4000)
       }
       if (!link) { log('NO_MAGIC_LINK from SA mailbox after polling'); await sleep(2000); continue }
-      log('money magic-link acquired; navigating it')
+      // STALE-LINK GUARD (2026-08-20). The SA reader returns any Claude link from the last
+      // hour (newer_than:1h), so a link from a PRIOR attempt gets navigated over and over
+      // while the real send step is not producing a fresh one - an infinite loop that burns
+      // all 50 iterations (observed live). If we have already navigated this exact link, it
+      // is stale: give it a couple of chances for a fresher mail, then abort THIS attempt
+      // cleanly (fail-safe: the switch stays on the current account) rather than loop.
+      if (moneyTriedLinks.has(link)) {
+        moneyStaleHits++
+        log('magic-link is STALE (already navigated) - stale#' + moneyStaleHits + '; not re-navigating')
+        if (moneyStaleHits >= 3) { log('money: only stale links available - aborting this attempt (fail-safe)'); break }
+        await sleep(4000); continue
+      }
+      moneyTriedLinks.add(link)
+      log('money magic-link acquired (fresh); navigating it')
       await page.goto(link, { waitUntil: 'domcontentloaded' }).catch(() => {})
       await focusless(page); await sleep(4000)
       await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
@@ -505,9 +534,13 @@ async function run() {
     await sleep(1500)
   }
   log('EXHAUSTED without writing code')
-  await closeOwned()
-  await browser.disconnect()
   return 1
+  } finally {
+    // GUARANTEED cleanup on EVERY exit path (success, exhaust, thrown error): close our
+    // dedicated window and drop the CDP connection. No leaked oauth tab, ever.
+    await closeOwned()
+    try { await browser.disconnect() } catch (_e) {}
+  }
 }
 
 if (require.main === module) {
