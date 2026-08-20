@@ -177,7 +177,16 @@ async function readState(page) {
       try {
         const r = f.getBoundingClientRect()
         const cs = getComputedStyle(f)
-        if (r.width > 100 && r.height > 100 && r.top < window.innerHeight && r.bottom > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0') hcChallengeVisible = true
+        // The discriminator for a REAL on-screen challenge is a #frame=challenge iframe with
+        // real rendered dimensions that is not css-hidden. The viewport-POSITION checks that
+        // used to be here (r.top < innerHeight && r.bottom > 0) were too strict for a focusless
+        // background tab: getBoundingClientRect/window.innerHeight there can report the grid as
+        // off-viewport even while it is genuinely rendered, so readState returned false and the
+        // macro re-clicked Authorize forever instead of escalating to the solver (observed live
+        // 2026-08-20: a dimensions-only probe saw the grid; this stricter check missed it). A
+        // clean-passing invisible captcha has no >100px frame=challenge iframe, so dimensions +
+        // not-hidden stays a safe positive that will not poison a flow that would pass cleanly.
+        if (r.width > 100 && r.height > 100 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0') hcChallengeVisible = true
       } catch (_e) { /* never throw */ }
     }
     let hcResponseFilled = false
