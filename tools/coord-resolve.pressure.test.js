@@ -326,6 +326,42 @@ function simulateHeartbeat(sid, newLabel, viewColumn, index) {
   try { await coord.name_chat({}) } catch (e) { threwOnEmpty = true }
   ok('name_chat with no fields throws', threwOnEmpty)
 
+  // ══ GROUP O: CONTESTED tab - two fresh anchors, ONE live tab (the live bug) ═
+  // Reproduces the 2026-08-21 live misroute: a focus-race gave two chats the same
+  // auto-title, both anchors resolve to the one live tab, and resolveSelector vs
+  // list_channels deduped in different orders -> a selector resolved to a
+  // different session than list_channels reported. Fix: a contested tab is
+  // label-addressed only (never a guessed session), consistently in both.
+  G('O. Contested tab (2 fresh anchors -> 1 live tab): no wrong-session misroute + consistent views')
+  clearAnchors()
+  anchor('o-A', { name: 'canon-a', label: 'Drafts Canon Everything', viewColumn: 1, index: 2 })
+  anchor('o-B', { name: 'canon-b', label: 'Drafts Canon Everything', viewColumn: 1, index: 5 })  // stale pos, same label
+  const oTabs = [{ label: 'Drafts Canon Everything', viewColumn: 1, index: 2, isActive: false }]  // only ONE live tab
+  await withTabs(oTabs, async () => {
+    const r = await coord.resolveSelector('drafts canon everything')
+    ok('contested selector never resolves to a guessed SESSION', !(r.ok && /chat\.session:o-[AB]\.inbox/.test(r.address)), r.ok ? r.address : r.reason)
+    ok('contested tab resolves by LABEL (physical tab) or is ambiguous', r.ok ? r.kind === 'label' : (r.reason === 'ambiguous' || r.reason === 'no_live_match'))
+    const byName = await coord.resolveSelector('canon-a')
+    ok('a NAME on a contested tab does NOT route to its session', !(byName.ok && byName.address === 'chat.session:o-A.inbox'))
+    // consistency: list_channels and resolveSelector must AGREE on that tab
+    const lc = await coord.list_channels({}, {})
+    const row = lc.channels.find(c => c.label === 'Drafts Canon Everything')
+    ok('list_channels marks the contested tab (no session_address)', row && !row.session_address && row.contested === true, JSON.stringify(row && { addr: row.address, sess: row.session_address, contested: row.contested }))
+    ok('list_channels + resolveSelector AGREE (both label, never divergent sessions)', row && (!r.ok || r.address === row.address || r.address === row.label_address))
+  })
+  // control: two DISTINCT live tabs with the same label are two real chats -> each
+  // stays its own session candidate (the fix must not collapse a genuine pair).
+  clearAnchors()
+  anchor('o-real1', { label: 'Twin Title', viewColumn: 1, index: 0 })
+  anchor('o-real2', { label: 'Twin Title', viewColumn: 1, index: 1 })
+  await withTabs([
+    { label: 'Twin Title', viewColumn: 1, index: 0 },
+    { label: 'Twin Title', viewColumn: 1, index: 1 },
+  ], async () => {
+    const r = await coord.resolveSelector('twin title')
+    ok('two REAL same-title tabs stay ambiguous (both addressable, not collapsed)', r.ok === false && r.reason === 'ambiguous' && (r.candidates || []).length === 2)
+  })
+
   // ── report ────────────────────────────────────────────────────────────────
   chatInject.listChatTabs = realList
   console.log('\n' + '='.repeat(60))

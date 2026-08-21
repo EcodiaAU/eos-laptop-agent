@@ -710,10 +710,35 @@ function _canonicalAddress(to) {
   return null
 }
 
-// Build the live candidate set: every FRESH anchor that still resolves to a live
-// non-worker tab (carrying its declared name/context + current position), plus any
-// live non-worker tab with no fresh anchor (addressable by label only). Returns
-// [{session_id?, name?, aliases?, context?, label, viewColumn, index, role}].
+// Map each live non-worker tab position -> the FRESH anchors that resolve to it.
+// The SINGLE source of truth for "who owns this live tab", shared by
+// _liveChatCandidates and list_channels so the two can NEVER disagree (a
+// disagreement is a misroute: caught live 2026-08-21, when two chats briefly
+// shared an auto-title and each function deduped the collision in a different
+// iteration order, so a selector resolved to a different session than
+// list_channels reported). Returns Map(posKey -> { live, recs:[anchor,...] }).
+// posKey is viewColumn:index. A key with recs.length > 1 is CONTESTED: two or
+// more fresh anchors claim the one tab (a focus-race mis-capture gave two chats
+// the same label), and no single session id can be trusted for it.
+function _anchorClaimsByPosition(nonWorker) {
+  const byPos = new Map()
+  for (const rec of _freshAnchors()) {
+    if (rec.role === 'worker') continue   // workers are addressed by tab_id, not by selector
+    const live = _resolveAnchorToTab(rec, nonWorker)
+    if (!live) continue
+    const key = live.viewColumn + ':' + live.index
+    if (!byPos.has(key)) byPos.set(key, { live: live, recs: [] })
+    byPos.get(key).recs.push(rec)
+  }
+  return byPos
+}
+
+// Build the live candidate set. A live tab claimed by exactly ONE fresh anchor is
+// a stable session candidate (carrying its name/context). A CONTESTED tab (2+
+// fresh anchors) is emitted as a LABEL-only candidate - it points at the physical
+// tab, never a guessed session, so a selector can never route to the wrong
+// session's inbox (declared names on the contestants are dropped for the same
+// reason). A live tab with no fresh anchor is an anonymous label candidate.
 async function _liveChatCandidates() {
   let tabs
   try { tabs = await _chatInject.listChatTabs() } catch (e) { return { error: 'bridge_unreachable:' + e.message, cands: [] } }
@@ -721,23 +746,25 @@ async function _liveChatCandidates() {
   const nonWorker = tabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
   const cands = []
   const claimed = new Set()
-  for (const rec of _freshAnchors()) {
-    if (rec.role === 'worker') continue   // workers are addressed by tab_id, not by selector
-    const live = _resolveAnchorToTab(rec, nonWorker)
-    if (!live) continue
-    const key = live.viewColumn + ':' + live.index
-    if (claimed.has(key)) continue
+  const byPos = _anchorClaimsByPosition(nonWorker)
+  for (const [key, info] of byPos) {
     claimed.add(key)
-    cands.push({
-      session_id: rec.session_id || null,
-      name: rec.name || null,
-      aliases: rec.aliases || null,
-      context: rec.context || null,
-      label: live.label,
-      viewColumn: live.viewColumn,
-      index: live.index,
-      role: rec.role || 'conductor',
-    })
+    if (info.recs.length === 1) {
+      const rec = info.recs[0]
+      cands.push({
+        session_id: rec.session_id || null,
+        name: rec.name || null,
+        aliases: rec.aliases || null,
+        context: rec.context || null,
+        label: info.live.label,
+        viewColumn: info.live.viewColumn,
+        index: info.live.index,
+        role: rec.role || 'conductor',
+      })
+    } else {
+      // CONTESTED: address by label only (the physical tab), no session, no name.
+      cands.push({ session_id: null, name: null, aliases: null, context: null, label: info.live.label, viewColumn: info.live.viewColumn, index: info.live.index, role: 'chat', contested: true })
+    }
   }
   for (const t of nonWorker) {
     const key = t.viewColumn + ':' + t.index
@@ -799,7 +826,26 @@ async function name_chat(params, ctx) {
   if (!name && !context && !(aliases && aliases.length)) {
     throw new Error('name, context, or aliases required')
   }
-  let sessionId = params.session_id ? String(params.session_id).trim() : _recentActiveSession()
+  // Resolve WHICH chat to name, safely (2026-08-21 hardening). The old default -
+  // "_recentActiveSession() when no session_id" - is a foot-gun for any caller
+  // that is NOT the recently-active human chat: a dispatched worker calling
+  // name_chat with no session_id stamped its name onto an unrelated human chat
+  // (caught live: probe worker's "coord-probe-1" landed on a real conductor chat).
+  // A worker is NEVER the recently-active human turn. So: an explicit session_id
+  // wins; else a coord-tab_id caller (worker) is resolved to ITS OWN session via
+  // its anchor and never to _recent_active; only a genuine conductor caller (no
+  // worker tab_id) falls back to _recent_active, which its own user turn just set.
+  let sessionId = params.session_id ? String(params.session_id).trim() : null
+  let named_via = sessionId ? 'explicit' : null
+  if (!sessionId && ctx && /^tab_\d+_/.test(String(ctx.tab_id || ''))) {
+    const own = _allSessionAnchors().find((a) => a && a.tab_id === ctx.tab_id)
+    if (own && own.session_id) { sessionId = own.session_id; named_via = 'caller_worker_anchor' }
+    else {
+      return { ok: false, error: 'caller_session_unresolved',
+        hint: 'This worker tab is not anchored yet (needs one turn so its session anchor exists), or pass session_id explicitly. Refusing to guess - a worker is never the recently-active chat, so defaulting would mislabel a different chat.' }
+    }
+  }
+  if (!sessionId) { sessionId = _recentActiveSession(); named_via = 'recent_active' }
   if (!sessionId) {
     return { ok: false, error: 'no_session_anchor',
       hint: 'This chat is not anchored yet - conductor_heartbeat captures a chat tab only on a genuine user turn. Take one normal turn then re-call, or pass session_id explicitly.' }
@@ -814,6 +860,7 @@ async function name_chat(params, ctx) {
   if (context) rec.context = context.slice(0, 200)
   if (aliases && aliases.length) rec.aliases = aliases.map((a) => a.slice(0, 60))
   rec.named_at = Math.floor(Date.now() / 1000)
+  if (named_via) rec.named_via = named_via   // provenance: explicit | caller_worker_anchor | recent_active
   if (!rec.updated_at) rec.updated_at = rec.named_at   // let a name-before-first-heartbeat still be fresh
   try { fs.writeFileSync(p, JSON.stringify(rec)) } catch (e) { return { ok: false, error: 'write_failed:' + e.message } }
   const anchored = !!rec.label
@@ -1357,16 +1404,18 @@ async function list_channels(params, ctx) {
   const liveWorkers = _liveWorkerRows()
   const nonWorker = tabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
 
-  // Map each live non-worker tab position -> its FRESH session anchor (stable id +
-  // declared name/context). This is what makes a chat reliably addressable: a
-  // stable chat.session:<id> address that survives Claude Code retitles, plus any
-  // self-declared name from coord.name_chat.
-  const anchorByPos = new Map()
-  for (const rec of _freshAnchors()) {
-    if (rec.role === 'worker') continue
-    const live = _resolveAnchorToTab(rec, nonWorker)
-    if (!live) continue
-    anchorByPos.set(live.viewColumn + ':' + live.index, rec)
+  // Map each live non-worker tab position -> its FRESH session anchor(s), via the
+  // SAME shared claim map resolveSelector uses (so the two can never disagree about
+  // who owns a tab - that disagreement is a misroute). A position claimed by ONE
+  // fresh anchor gets that stable session address; a CONTESTED position (2+ fresh
+  // anchors, a focus-race title collision) gets NO session address and is labelled
+  // ambiguous - reachable by its physical label_address, never a guessed session.
+  const claims = _anchorClaimsByPosition(nonWorker)
+  const anchorByPos = new Map()   // posKey -> the single trusted anchor, or null if contested
+  const contestedPos = new Set()
+  for (const [key, info] of claims) {
+    if (info.recs.length === 1) anchorByPos.set(key, info.recs[0])
+    else contestedPos.add(key)
   }
 
   const out = []
@@ -1376,7 +1425,9 @@ async function list_channels(params, ctx) {
     const workerMatch = _matchWorkerRow(t, liveWorkers)
     const isConductorTab = !!t.isActive && !!conductor &&
       (!conductorLabel || label === conductorLabel || conductorLabel.startsWith('['))
-    const anchor = anchorByPos.get(t.viewColumn + ':' + t.index) || null
+    const posKey = t.viewColumn + ':' + t.index
+    const contested = contestedPos.has(posKey)
+    const anchor = anchorByPos.get(posKey) || null
     const session_address = anchor && anchor.session_id ? ('chat.session:' + anchor.session_id + '.inbox') : null
     let kind = 'chat', label_address = addressForLabel(label)
     if (workerMatch) { kind = 'worker' }
@@ -1403,8 +1454,10 @@ async function list_channels(params, ctx) {
       active: !!t.isActive,
       // addressable if it has a stable id/name/worker/conductor identity; a bare
       // anonymous chat is addressable only when its auto-title is non-generic and
-      // unique (collision flagged below).
+      // unique (collision flagged below). A CONTESTED tab has no trusted session,
+      // so it is reachable only by its physical label (and flagged).
       addressable: !!(session_address || (anchor && anchor.name) || workerMatch || isConductorTab) || (kind === 'chat' && !generic),
+      contested: contested || undefined,
       task_id: workerMatch ? workerMatch.task_id : null,
       worker_status: workerMatch ? (workerMatch.status || null) : null,
     })
