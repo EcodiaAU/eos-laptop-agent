@@ -177,16 +177,15 @@ async function readState(page) {
       try {
         const r = f.getBoundingClientRect()
         const cs = getComputedStyle(f)
-        // The discriminator for a REAL on-screen challenge is a #frame=challenge iframe with
-        // real rendered dimensions that is not css-hidden. The viewport-POSITION checks that
-        // used to be here (r.top < innerHeight && r.bottom > 0) were too strict for a focusless
-        // background tab: getBoundingClientRect/window.innerHeight there can report the grid as
-        // off-viewport even while it is genuinely rendered, so readState returned false and the
-        // macro re-clicked Authorize forever instead of escalating to the solver (observed live
-        // 2026-08-20: a dimensions-only probe saw the grid; this stricter check missed it). A
-        // clean-passing invisible captcha has no >100px frame=challenge iframe, so dimensions +
-        // not-hidden stays a safe positive that will not poison a flow that would pass cleanly.
-        if (r.width > 100 && r.height > 100 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0') hcChallengeVisible = true
+        // A REAL on-screen challenge is a #frame=challenge iframe with real dimensions that is
+        // actually IN the viewport and not css-hidden. The viewport-position checks are load-
+        // bearing: hCaptcha keeps a 300x150 pre-render challenge frame parked far OFF-screen
+        // (observed live 2026-08-20: top=-10088, bottom=-9938) even when no challenge is shown,
+        // so a dimensions-only test false-positives on it and would make the macro "solve" a
+        // non-existent challenge, injecting a foreign token that POISONS a flow that would have
+        // authorized cleanly (the 62d9389 failure). r.bottom > 0 && r.top < innerHeight excludes
+        // the off-screen frame; keep them.
+        if (r.width > 100 && r.height > 100 && r.top < window.innerHeight && r.bottom > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0') hcChallengeVisible = true
       } catch (_e) { /* never throw */ }
     }
     let hcResponseFilled = false
@@ -248,6 +247,35 @@ async function clickText(page, re) {
     await page.evaluate(() => { const e = document.querySelector('[data-eos-click]'); if (e) e.removeAttribute('data-eos-click') }).catch(() => {})
     return false
   }
+}
+
+// trustedClickText - click a button by text using ONLY a real trusted mouse event
+// (page.mouse at the element centre), with NO preceding synthetic el.click().
+//
+// WHY (root-caused 2026-08-21). The OAuth Authorize button gates on an INVISIBLE hCaptcha.
+// It PASSES on a lone trusted user-gesture click on our real logged-in canonical-Chrome
+// profile, but STICKS when clickText's synthetic e.click() fires the Authorize handler
+// FIRST: the untrusted gesture triggers the captcha in a non-user-gesture context and
+// poisons it, so the following real click lands on an already-failed challenge and no code
+// is issued (same failure family as the pre-injected-token poisoning noted above). A tate@
+// switch looped main[3]/main[4] 'authorize' to TIMEOUT this way; a single trusted
+// Input.dispatchMouseEvent click issued the code instantly. This uses the same trusted
+// page.mouse idiom driveGoogle already relies on.
+async function trustedClickText(page, re) {
+  await focusless(page)
+  const pt = await page.evaluate((pattern) => {
+    const r = new RegExp(pattern, 'i')
+    const el = [].slice.call(document.querySelectorAll('button,[role=button],a'))
+      .find(e => r.test((e.innerText || '').trim()))
+    if (!el) return null
+    el.scrollIntoView({ block: 'center', inline: 'center' })
+    const b = el.getBoundingClientRect()
+    if (!b.width || !b.height) return null
+    return { x: b.x + b.width / 2, y: b.y + b.height / 2 }
+  }, re.source)
+  if (!pt) return false
+  await page.mouse.click(pt.x, pt.y)
+  return true
 }
 
 // Drive a Google GSI page (popup or same-tab) to select EMAIL + pass pw/2FA. Focusless.
@@ -471,7 +499,9 @@ async function run() {
     }
     if (st.loggedInAs === EMAIL && st.hasAuthorize) {
       log('authorize')
-      await clickText(page, /^authorize$/i)
+      // Trusted-only click: a synthetic e.click() first poisons the invisible hCaptcha (see
+      // trustedClickText). This is the click that issues the OAuth code, so it must be clean.
+      await trustedClickText(page, /^authorize$/i)
       // Wait for the callback/code page instead of blind re-looping (the consent
       // re-renders and a too-fast re-click races it - the 2026-06-22 loop).
       for (let w = 0; w < 10; w++) {
