@@ -148,6 +148,42 @@ async function injectTurn(opts) {
     return { ok: false, reason: 'empty_text' }
   }
 
+  // PREFERRED PATH (2026-08-21): deliver by Claude Code SESSION id via the
+  // extension's own bridge primitive (/ide/chat/send_message). It selects the
+  // target chat by session, so it works for ANY tab position. The old path
+  // selected the tab with workbench.action.openEditorAtIndex<N> - but that command
+  // only exists for N=1..9, so a chat past the 9th tab was NEVER selected and the
+  // paste misfired into whatever tab was active (the wrong-chat bug Tate hit with
+  // many tabs open). And the post-select focus-verify had been removed, so nothing
+  // caught it. chat_send_message needs no index and no paste. It still focuses the
+  // tab (extension behaviour) so we keep the inject lock. Proven 4/4 session->tab.
+  // Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+  const hasPos0 = opts.viewColumn != null && opts.index != null
+  if (opts.session) {
+    const lock = await injectLock.acquire({ who: 'chat-inject-session', timeoutMs: opts.lockTimeoutMs || 9000 })
+    if (!lock.ok) return { ok: false, reason: 'inject_lock_' + (lock.reason || 'busy'), held_by: lock.held_by }
+    try {
+      let r
+      try { r = await ide.chat_send_message({ session: opts.session, prompt: String(text || ''), submit: opts.submitOnly !== true }) }
+      catch (e) { r = { ok: false, error: e.message } }
+      const ot = (r && r.opened_tab) || {}
+      // Success = the bridge opened a tab for this session and (unless submitOnly)
+      // the submit command fired. Guard against a wrong-tab open: if the bridge
+      // reports an opened_tab whose label contradicts a non-generic target label,
+      // treat as failure and fall through to the position-based chain.
+      const labelOk = !opts.label || GENERIC_LABEL_RE.test(String(opts.label).trim()) || !ot.label || ot.label === opts.label
+      const submitOk = opts.submitOnly === true || r.submit_command_ok !== false
+      if (r && r.ok && r.open_command_ok !== false && labelOk && submitOk) {
+        return { ok: true, label: ot.label || opts.label || null, viewColumn: ot.viewColumn, index: ot.index, via: 'chat_send_message', session: opts.session }
+      }
+      // session delivery did not confirm; fall back to the GUI chain if we have a
+      // position, else report the failure (message stays in the durable inbox).
+      if (!hasPos0) return { ok: false, reason: 'chat_send_message_unconfirmed', detail: r }
+    } finally {
+      injectLock.release(lock.token)
+    }
+  }
+
   let viewColumn = opts.viewColumn
   let index = opts.index
   let resolvedLabel = opts.label || null
@@ -198,19 +234,29 @@ async function injectTurn(opts) {
     }
 
     // 2. Select the target tab, focus its input, bring VS Code forward, settle.
-    // No focus-verify: the bridge's active-tab signal is only trustworthy while
-    // VS Code is foreground, which is NOT the case when a push runs in the
-    // background/away - exactly when it matters. A verify keyed on it aborted
-    // EVERY away inject (proven 2026-08-03 on the iMessage twin, which this
-    // mirrors), silently disabling delivery. The lock removes injector-vs-
-    // injector races; the only residual misroute is when Tate is actively
-    // viewing another tab, which he flagged as not worth battling (he is right
-    // there, and it lands in a real chat either way). Route directly.
-    // Doctrine: injection-must-verify-target-focused-never-blind-paste-2026-08-03.
+    // This GUI-paste chain is now the FALLBACK only (anonymous label-only tabs);
+    // session-addressed / worker / anchored targets deliver via chat_send_message
+    // above. Two fixes vs the historical chain:
+    //   (a) INDEX BUG: the numbered workbench.action.openEditorAtIndex<N> command
+    //       only exists for N=1..9, so a tab past the 9th was never selected and
+    //       the paste misfired into the active tab (the wrong-chat bug). Use the
+    //       numbered command for index<9 and the GENERIC openEditorAtIndex with an
+    //       index arg for index>=9, which handles any position.
+    //   (b) VERIFY-GATE: after selecting, read back the active tab and only paste
+    //       if it IS the target (for a non-generic label). A mismatch aborts to the
+    //       inbox rather than blind-pasting into the wrong chat. The 2026-08-03
+    //       "verify aborts every away inject" concern applied to the OLD verify that
+    //       gated on foreground focus; here the primary path is session delivery, so
+    //       gating the rare fallback on label match is the safe choice (queue beats
+    //       misroute). Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
     const fg = focusGroupCmd(viewColumn)
     if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(150) }
-    if (index >= 0 && index < 40) {
+    if (index >= 0 && index < 9) {
       await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (index + 1) }).catch(() => {})
+      await sleep(150)
+    } else if (index >= 9 && index < 200) {
+      // generic command, index arg (proven to accept an arg on this bridge)
+      await ide.command({ cmd: 'workbench.action.openEditorAtIndex', args: [index] }).catch(() => {})
       await sleep(150)
     }
     await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
@@ -218,6 +264,17 @@ async function injectTurn(opts) {
     await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
     steps.push('activate')
     await sleep(settleMs)
+
+    // 2b. VERIFY the selected tab is the target before pasting (non-generic label
+    // only; a generic/absent label cannot be verified and falls through - those
+    // should be delivered by session, not reach here). Abort-to-inbox on mismatch.
+    if (!GENERIC_LABEL_RE.test(String(resolvedLabel || '').trim())) {
+      const v = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
+      if (!v.ok) {
+        return { ok: false, reason: 'target_not_focused_after_select', steps, target: resolvedLabel, active_label: v.active_label }
+      }
+      steps.push('verified')
+    }
 
     // 3. Paste (Cmd+V). Skipped in submitOnly mode.
     if (!submitOnly) {

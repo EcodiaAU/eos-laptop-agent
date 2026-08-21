@@ -1239,13 +1239,34 @@ async function pushInject(msg) {
     const tgt = await resolveLiveTargetTab(topic)
     if (!tgt.ok) return { attempted: true, ok: false, reason: tgt.reason }
     const text = buildChatInjectionText(msg)
+    // Determine the target's Claude Code SESSION id so injectTurn can deliver by
+    // session (reliable at ANY tab position) instead of editor-index selection,
+    // which only reached the first 9 tabs. Sources, in order: the session:<id>
+    // topic itself; a worker's own session anchor (by tab_id); or a UNIQUE fresh
+    // anchor at the resolved tab position (covers conductor + named/anchored
+    // chats). A contested position yields no session -> the GUI chain (fixed +
+    // verify-gated) handles it. Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+    let session = null
+    if (mid && mid.indexOf('session:') === 0) session = mid.slice('session:'.length)
+    else if (tgt.kind === 'worker') {
+      const wa = _allSessionAnchors().find((a) => a && a.role === 'worker' && a.tab_id === mid)
+      if (wa) session = wa.session_id
+    }
+    if (!session && tgt.viewColumn != null && tgt.index != null) {
+      try {
+        const tabs = await _chatInject.listChatTabs()
+        const nonWorker = tabs.filter((t) => !_looksLikeWorkerTab(t, _liveWorkerRows()))
+        const claim = _anchorClaimsByPosition(nonWorker).get(tgt.viewColumn + ':' + tgt.index)
+        if (claim && claim.recs.length === 1) session = claim.recs[0].session_id
+      } catch (e) {}
+    }
     _noteInject(topic)
     let r
-    try { r = await _chatInject.injectTurn({ label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text }) }
+    try { r = await _chatInject.injectTurn({ session: session || undefined, label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text }) }
     catch (e) { return { attempted: true, ok: false, reason: 'inject_threw', error: e.message } }
     if (r && r.ok) {
       try { markSeen([msg]) } catch (e) {}
-      return { attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind }
+      return { attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind, via: r.via || 'gui' }
     }
     return { attempted: true, ok: false, reason: (r && r.reason) || 'inject_failed', detail: r }
   }
