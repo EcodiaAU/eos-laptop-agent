@@ -1237,50 +1237,18 @@ async function pushInject(msg) {
 
   const run = async () => {
     const text = buildChatInjectionText(msg)
-    // SESSION-FIRST delivery (2026-08-21). When the target's Claude Code session id
-    // is known directly from the topic - a session:<id> topic, or a worker's own
-    // session anchor (by tab_id) - deliver via chat_send_message WITHOUT first
-    // mapping the session to a live tab. chat_send_message selects the tab by
-    // session internally, so this works even when our anchor's cached LABEL is
-    // stale (a just-booted worker still titled "Claude Code", a chat retitled since
-    // its last heartbeat) - the exact case where resolveLiveTargetTab returns
-    // session_unresolved and blocked delivery. It cannot misroute (session id is
-    // the true identity), so the tab-mapping + ownership-conflict guard are not
-    // needed on this path. Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
-    let directSession = null
-    if (mid && mid.indexOf('session:') === 0) directSession = mid.slice('session:'.length)
-    else if (mid && /^tab_/.test(mid)) {
-      const wa = _allSessionAnchors().find((a) => a && a.role === 'worker' && a.tab_id === mid)
-      if (wa) directSession = wa.session_id
-    }
-    if (directSession) {
-      _noteInject(topic)
-      let r
-      try { r = await _chatInject.injectTurn({ session: directSession, text }) }
-      catch (e) { r = { ok: false, reason: 'inject_threw', error: e.message } }
-      if (r && r.ok) {
-        try { markSeen([msg]) } catch (e) {}
-        return { attempted: true, ok: true, resolved_label: r.label, kind: 'session', via: r.via || 'chat_send_message' }
-      }
-      // session delivery unconfirmed -> fall through to position-based resolution
-    }
-
-    // Position path (conductor / label targets, or a session-first miss).
+    // Resolve the target tab (label + CURRENT viewColumn/index) and deliver via the
+    // position chain in injectTurn. That chain now selects any index (generic
+    // openEditorAtIndex + arg, not the numbered-1..9 command) and verifies the
+    // active tab is the target before pasting. This is the transcript-PROVEN path;
+    // the earlier chat_send_message session primitive reported success but did not
+    // land a turn, so it is not used. Doctrine:
+    // coord-deliver-by-session-not-editor-index-2026-08-21.
     const tgt = await resolveLiveTargetTab(topic)
     if (!tgt.ok) return { attempted: true, ok: false, reason: tgt.reason }
-    // A unique fresh anchor at the resolved position gives a session for those too.
-    let session = directSession
-    if (!session && tgt.viewColumn != null && tgt.index != null) {
-      try {
-        const tabs = await _chatInject.listChatTabs()
-        const nonWorker = tabs.filter((t) => !_looksLikeWorkerTab(t, _liveWorkerRows()))
-        const claim = _anchorClaimsByPosition(nonWorker).get(tgt.viewColumn + ':' + tgt.index)
-        if (claim && claim.recs.length === 1) session = claim.recs[0].session_id
-      } catch (e) {}
-    }
     _noteInject(topic)
     let r
-    try { r = await _chatInject.injectTurn({ session: session || undefined, label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text }) }
+    try { r = await _chatInject.injectTurn({ label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text }) }
     catch (e) { return { attempted: true, ok: false, reason: 'inject_threw', error: e.message } }
     if (r && r.ok) {
       try { markSeen([msg]) } catch (e) {}
