@@ -209,21 +209,20 @@ async function injectTurn(opts) {
     }
 
     // 2. Select the target tab, focus its input, bring VS Code forward, settle.
-    // This GUI-paste chain is now the FALLBACK only (anonymous label-only tabs);
-    // session-addressed / worker / anchored targets deliver via chat_send_message
-    // above. Two fixes vs the historical chain:
+    // This position chain is THE delivery path (transcript-proven). Two fixes vs
+    // the historical chain:
     //   (a) INDEX BUG: the numbered workbench.action.openEditorAtIndex<N> command
     //       only exists for N=1..9, so a tab past the 9th was never selected and
     //       the paste misfired into the active tab (the wrong-chat bug). Use the
     //       numbered command for index<9 and the GENERIC openEditorAtIndex with an
-    //       index arg for index>=9, which handles any position.
+    //       index arg for index>=9, which selects any position (verified: it makes
+    //       a tab at index 9 the active tab).
     //   (b) VERIFY-GATE: after selecting, read back the active tab and only paste
     //       if it IS the target (for a non-generic label). A mismatch aborts to the
-    //       inbox rather than blind-pasting into the wrong chat. The 2026-08-03
-    //       "verify aborts every away inject" concern applied to the OLD verify that
-    //       gated on foreground focus; here the primary path is session delivery, so
-    //       gating the rare fallback on label match is the safe choice (queue beats
-    //       misroute). Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+    //       inbox rather than blind-pasting into the wrong chat (proven: a wrong
+    //       target aborts and pastes nothing). This restores the verify the
+    //       2026-08-03 change removed; delivery is now transcript-verified so a
+    //       false green cannot hide. Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
     const fg = focusGroupCmd(viewColumn)
     if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(150) }
     if (index >= 0 && index < 9) {
