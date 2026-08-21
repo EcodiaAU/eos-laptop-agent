@@ -48,7 +48,8 @@ const TOOLS = Object.freeze([
       type: 'object',
       properties: {
         to: { type: 'string', description: 'Target chat. Best: a NAME set via coord.name_chat, or a stable "chat.session:<id>.inbox" / worker tab_id / "conductor" / full "chat.*.inbox" address (all from coord.list_channels). Also accepts a fuzzy selector (context phrase or partial tab label) - scored; if not decisive you get ranked candidates back to retry against.' },
-        text: { type: 'string', description: 'The message to land as a turn in the target chat.' },
+        text: { type: 'string', description: 'The message to land as a turn in the target chat. Optional when resolve_only is true.' },
+        resolve_only: { type: 'boolean', description: 'Dry-run: return the resolution decision ({would_send_to, resolved_by, name, matched_label, score} or ranked candidates) WITHOUT sending. Use to check "who would this route to?" before committing a send.' },
         from_label: { type: 'string', description: 'How you want to be named to the recipient (e.g. "Chambers chat"). Defaults to your tab identity.' },
         from_address: { type: 'string', description: 'The address the recipient should reply to. Defaults to your own inbox (worker) or the conductor. Set this so a peer chat can reply directly to you.' },
         task_id: { type: 'string', description: 'Optional task correlation id.' },

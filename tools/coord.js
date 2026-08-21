@@ -1266,7 +1266,12 @@ async function message_chat(params, ctx) {
   params = params || {}
   ctx = ctx || {}
   const text = params.text != null ? String(params.text) : (params.body && params.body.text)
-  if (!params.to || !text || !String(text).trim()) throw new Error('to and text required')
+  // resolve_only (dry-run): return the resolution decision WITHOUT sending -
+  // "who would this route to?". Lets a caller check a target before committing,
+  // and makes the resolver observable with zero side effects. Text is optional here.
+  const resolveOnly = params.resolve_only === true || params.dry_run === true
+  if (!params.to) throw new Error('to required')
+  if (!resolveOnly && (!text || !String(text).trim())) throw new Error('to and text required')
   // Resolution v4 (2026-08-21): canonical addresses (full address / conductor /
   // session:<id> / worker tab_id) take the stable fast-path unchanged. A fuzzy
   // selector (a name / context phrase / partial label) goes through the scored,
@@ -1277,23 +1282,38 @@ async function message_chat(params, ctx) {
   // which was the whole complaint.
   let to_address = _canonicalAddress(params.to)
   let resolved_by = to_address ? 'address' : null
+  let resolvedTarget = null
   if (!to_address) {
     const r = await resolveSelector(params.to)
     if (r.ok) {
       to_address = r.address
       resolved_by = 'selector:' + r.kind
+      resolvedTarget = r
     } else {
       return {
         ok: false,
         error: 'unresolved_target',
         reason: r.reason,
         to: params.to,
+        resolve_only: resolveOnly || undefined,
         candidates: r.candidates || [],
         delivered: false,
         hint: r.reason === 'ambiguous'
           ? ('"' + params.to + '" matched ' + (r.candidates || []).length + ' live chats non-decisively - NOT sent to avoid a misroute. Retry coord.message_chat with an exact address from candidates[] (e.g. candidates[0].address), or a chat name set via coord.name_chat. coord.list_channels shows every live chat with its stable session address.')
           : ('"' + params.to + '" matched no live chat. coord.list_channels lists who is live and addressable; use an exact address or a name registered via coord.name_chat. (Nothing was queued - fix the target and resend.)'),
       }
+    }
+  }
+  if (resolveOnly) {
+    return {
+      ok: true,
+      resolve_only: true,
+      would_send_to: to_address,
+      resolved_by: resolved_by,
+      name: resolvedTarget ? (resolvedTarget.name || null) : null,
+      matched_label: resolvedTarget && resolvedTarget.target ? resolvedTarget.target.label : null,
+      score: resolvedTarget ? (resolvedTarget.score || null) : null,
+      to: params.to,
     }
   }
   const reply_to_address = params.from_address || (ctx.tab_id ? addressForWorker(ctx.tab_id) : addressForConductor())
