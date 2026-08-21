@@ -605,6 +605,231 @@ function _recentActiveSession() {
   } catch (e) { return null }
 }
 
+// ── scored, freshness-filtered chat resolution (2026-08-21) ──────────────────
+// Why this exists: message_chat's `to` selector (a name / context phrase / partial
+// label) was resolved by binary exact-then-substring matching against the LIVE tab
+// titles, which Claude Code auto-generates from the user's first words and truncates
+// to ~24 chars. Result, observed live: two open chats titled "Studio rejected on
+// plays…", and "Can you make the friend …" vs "Can you create a friend …" - a
+// selector either hit multiple tabs (ambiguous -> silent inbox-queue) or zero
+// (retitled since -> silent inbox-queue). The sender got a terse reason buried in
+// the return and moved on; the message sat in an unpolled inbox. THAT is the
+// unreliability. This layer replaces it with: (1) a stable SELF-DECLARED name +
+// context on the session anchor, (2) a scored matcher (name/alias >> context >>
+// label; exact >> token-coverage >> truncation-prefix >> substring), (3) a
+// freshness filter so only chats active in the last window + actually live in the
+// tab list are candidates (kills the 1000 dead-anchor noise), and (4) ranked
+// candidate feedback on ambiguity instead of a silent queue, so the caller retries
+// against an exact address. Decisive matches resolve to the STABLE chat.session:<id>
+// address, so injection reuses the proven, conflict-guarded session injector.
+// Doctrine: coord-chat-resolution-scored-named-freshness-2026-08-21.
+const ANCHOR_FRESH_MS = Number(process.env.COORD_ANCHOR_FRESH_MS || 30 * 60 * 1000)
+const _SEL_ACCEPT = 300   // a candidate must score at least this to be a decisive winner
+const _SEL_MARGIN = 120   // and must lead the runner-up by at least this
+
+function _tokenize(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/).filter(Boolean)
+}
+
+// Every chat anchor heartbeated within maxAgeMs (updated_at is unix SECONDS). The
+// live-active set, ~15-150 rows, not the 1000+ dead ones _allSessionAnchors scans.
+function _freshAnchors(maxAgeMs) {
+  const cutoffSec = (Date.now() - (maxAgeMs || ANCHOR_FRESH_MS)) / 1000
+  const out = []
+  try {
+    const dir = path.join(COORD_ROOT, 'chat-tabs')
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.json') || f[0] === '_') continue
+      let rec
+      try { rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')) } catch (e) { continue }
+      if (!rec || !rec.label) continue
+      if ((rec.updated_at || 0) < cutoffSec) continue
+      out.push(rec)
+    }
+  } catch (e) {}
+  return out
+}
+
+// Score how strongly selector `sel` identifies candidate chat `cand`.
+// Tiers (highest wins): declared name/alias, then context text, then live label.
+// Within a tier: exact/slug-equal > selector-fully-covered > substring > coverage
+// fraction > truncation-prefix. 0 means no signal (candidate is dropped).
+function _scoreCandidate(sel, cand) {
+  const selL = String(sel || '').toLowerCase().trim()
+  if (!selL) return 0
+  const selTok = _tokenize(selL)
+  if (!selTok.length) return 0
+  let best = 0
+  const names = []
+  if (cand.name) names.push(cand.name)
+  if (Array.isArray(cand.aliases)) for (const a of cand.aliases) if (a) names.push(a)
+  for (const n of names) {
+    const nl = String(n).toLowerCase()
+    if (!nl) continue
+    if (nl === selL || labelSlug(nl) === labelSlug(selL)) { best = Math.max(best, 1000); continue }
+    if (nl.indexOf(selL) !== -1 || selL.indexOf(nl) !== -1) { best = Math.max(best, 820); continue }
+    const nt = new Set(_tokenize(nl))
+    const inter = selTok.filter((t) => nt.has(t)).length
+    if (inter === selTok.length) best = Math.max(best, 800)
+    else if (inter) best = Math.max(best, 640 + inter * 10)
+  }
+  const hayParts = []
+  if (cand.context) hayParts.push(String(cand.context).toLowerCase())
+  if (cand.label) hayParts.push(String(cand.label).toLowerCase())
+  for (let i = 0; i < hayParts.length; i++) {
+    const hay = hayParts[i]
+    const isLabel = cand.label && hay === String(cand.label).toLowerCase()
+    const hayVis = _visiblePrefix(hay)
+    const base = isLabel ? 0 : 60   // context outranks the auto-title on ties
+    if (hayVis === selL) { best = Math.max(best, 600 + base); continue }
+    if (hay.indexOf(selL) !== -1) { best = Math.max(best, 420 + base); continue }
+    const ht = new Set(_tokenize(hay))
+    const inter = selTok.filter((t) => ht.has(t)).length
+    if (inter) {
+      const coverage = inter / selTok.length
+      best = Math.max(best, Math.round(200 + coverage * 300) + (isLabel ? 0 : 40))
+    }
+    // truncation-prefix: the auto-title is CC-truncated and the selector is (a prefix
+    // of) its visible head, or vice-versa - a weak but real signal.
+    if (_isTruncatedLabel(cand.label || '') && hayVis.length >= _MIN_TRUNC_PREFIX &&
+        (selL.startsWith(hayVis) || hayVis.startsWith(selL))) {
+      best = Math.max(best, 320)
+    }
+  }
+  return best
+}
+
+// The canonical-address fast-paths (stable, non-fuzzy). Returns an address or null.
+function _canonicalAddress(to) {
+  to = String(to || '').trim()
+  if (!to) return null
+  if (/^chat\..+\.inbox$/.test(to)) return to
+  if (to === 'conductor') return addressForConductor()
+  if (/^session:/.test(to)) return 'chat.' + to + '.inbox'
+  if (/^tab_/.test(to) && loadWorkerRegistry(to)) return addressForWorker(to)
+  return null
+}
+
+// Build the live candidate set: every FRESH anchor that still resolves to a live
+// non-worker tab (carrying its declared name/context + current position), plus any
+// live non-worker tab with no fresh anchor (addressable by label only). Returns
+// [{session_id?, name?, aliases?, context?, label, viewColumn, index, role}].
+async function _liveChatCandidates() {
+  let tabs
+  try { tabs = await _chatInject.listChatTabs() } catch (e) { return { error: 'bridge_unreachable:' + e.message, cands: [] } }
+  const liveWorkers = _liveWorkerRows()
+  const nonWorker = tabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
+  const cands = []
+  const claimed = new Set()
+  for (const rec of _freshAnchors()) {
+    if (rec.role === 'worker') continue   // workers are addressed by tab_id, not by selector
+    const live = _resolveAnchorToTab(rec, nonWorker)
+    if (!live) continue
+    const key = live.viewColumn + ':' + live.index
+    if (claimed.has(key)) continue
+    claimed.add(key)
+    cands.push({
+      session_id: rec.session_id || null,
+      name: rec.name || null,
+      aliases: rec.aliases || null,
+      context: rec.context || null,
+      label: live.label,
+      viewColumn: live.viewColumn,
+      index: live.index,
+      role: rec.role || 'conductor',
+    })
+  }
+  for (const t of nonWorker) {
+    const key = t.viewColumn + ':' + t.index
+    if (claimed.has(key)) continue
+    if (isGenericLabelStr(t.label)) continue
+    cands.push({ session_id: null, name: null, aliases: null, context: null, label: t.label, viewColumn: t.viewColumn, index: t.index, role: 'chat' })
+  }
+  return { cands: cands }
+}
+
+function _candAddress(c) {
+  return c.session_id ? ('chat.session:' + c.session_id + '.inbox') : addressForLabel(c.label)
+}
+
+// Resolve a fuzzy selector to ONE live chat, with ranked candidate feedback.
+//   {ok:true, address, target:{label,viewColumn,index}, kind, name?, score}
+//   {ok:false, reason:'ambiguous'|'no_live_match'|'bridge_unreachable', candidates:[...]}
+async function resolveSelector(sel) {
+  sel = String(sel || '').trim()
+  if (!sel) return { ok: false, reason: 'empty_selector', candidates: [] }
+  const built = await _liveChatCandidates()
+  if (built.error) return { ok: false, reason: built.error, candidates: [] }
+  const scored = built.cands
+    .map((c) => ({ c: c, score: _scoreCandidate(sel, c) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+  if (!scored.length) return { ok: false, reason: 'no_live_match', candidates: [] }
+  const view = (x) => ({ address: _candAddress(x.c), label: x.c.label, name: x.c.name || null, context: x.c.context || null, role: x.c.role, score: x.score })
+  const top = scored[0], second = scored[1]
+  const decisive = top.score >= _SEL_ACCEPT && (!second || (top.score - second.score) >= _SEL_MARGIN)
+  if (decisive) {
+    return {
+      ok: true,
+      address: _candAddress(top.c),
+      target: { label: top.c.label, viewColumn: top.c.viewColumn, index: top.c.index },
+      kind: top.c.session_id ? 'session' : 'label',
+      name: top.c.name || null,
+      score: top.score,
+    }
+  }
+  return { ok: false, reason: 'ambiguous', candidates: scored.slice(0, 6).map(view) }
+}
+
+// coord.name_chat - a chat DECLARES a stable, self-chosen identity (name + a short
+// context line + optional aliases) so peers can reach it by intent regardless of
+// how Claude Code auto-titles and truncates its tab. The auto-title is derived from
+// the user's first words and mutates constantly; a declared name does not. Written
+// into THIS chat's session anchor (the most-recently-active one - i.e. the caller,
+// which just took a user turn - or an explicit session_id), and PRESERVED across
+// every subsequent conductor_heartbeat via that hook's read-merge. Idempotent;
+// re-call any time to rename or add context. Doctrine:
+// coord-chat-resolution-scored-named-freshness-2026-08-21.
+async function name_chat(params, ctx) {
+  params = params || {}
+  const name = params.name != null ? String(params.name).trim() : ''
+  const context = params.context != null ? String(params.context).trim() : ''
+  const aliases = Array.isArray(params.aliases)
+    ? params.aliases.map((a) => String(a).trim()).filter(Boolean).slice(0, 8) : null
+  if (!name && !context && !(aliases && aliases.length)) {
+    throw new Error('name, context, or aliases required')
+  }
+  let sessionId = params.session_id ? String(params.session_id).trim() : _recentActiveSession()
+  if (!sessionId) {
+    return { ok: false, error: 'no_session_anchor',
+      hint: 'This chat is not anchored yet - conductor_heartbeat captures a chat tab only on a genuine user turn. Take one normal turn then re-call, or pass session_id explicitly.' }
+  }
+  ensureDirs()
+  const safe = String(sessionId).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120)
+  const p = path.join(COORD_ROOT, 'chat-tabs', safe + '.json')
+  let rec
+  try { rec = JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { rec = null }
+  if (!rec || !rec.session_id) rec = { session_id: sessionId, role: 'conductor' }
+  if (name) rec.name = name.slice(0, 60)
+  if (context) rec.context = context.slice(0, 200)
+  if (aliases && aliases.length) rec.aliases = aliases.map((a) => a.slice(0, 60))
+  rec.named_at = Math.floor(Date.now() / 1000)
+  if (!rec.updated_at) rec.updated_at = rec.named_at   // let a name-before-first-heartbeat still be fresh
+  try { fs.writeFileSync(p, JSON.stringify(rec)) } catch (e) { return { ok: false, error: 'write_failed:' + e.message } }
+  const anchored = !!rec.label
+  return {
+    ok: true,
+    session_id: sessionId,
+    name: rec.name || null,
+    aliases: rec.aliases || null,
+    context: rec.context || null,
+    address: 'chat.session:' + sessionId + '.inbox',
+    note: 'This chat is now addressable as coord.message_chat({ to: "' + (rec.name || sessionId) + '" }).'
+      + (anchored ? '' : ' (Live tab not captured yet - it resolves once this chat takes one genuine user turn.)')
+      + ' The name persists across Claude Code retitles.',
+  }
+}
+
 // ── worker self-close via session anchor (T2, 2026-08-14) ────────────────────
 // close_my_tab / kill_worker historically matched the worker tab by a fuzzy
 // autotitle fingerprint that returns no_match/ambiguous often (Tate flagged it),
@@ -640,7 +865,10 @@ async function _resolveWorkerAnchorCloseTarget(workerTabId, idePort) {
     if (!cand) return null
     // Ownership-conflict guard: if ANY OTHER anchor resolves to this same live tab,
     // one is a mis-capture - refuse (safe leak), same guard the session-inject path uses.
-    const conflict = _allSessionAnchors().some((a) => {
+    // FRESH anchors only (2026-08-21): a long-dead anchor whose stale (label,pos)
+    // happens to coincide with this live tab must not veto a real close/deliver -
+    // that spurious refusal, over 1000+ accreted anchors, was a silent-failure class.
+    const conflict = _freshAnchors().some((a) => {
       if (!a || a.session_id === rec.session_id) return false
       const t = _resolveAnchorToTab(a, liveTabs)
       return t && t.viewColumn === cand.viewColumn && t.index === cand.index
@@ -857,7 +1085,11 @@ async function resolveLiveTargetTab(topic) {
     // "HOly fuck..." tab, colliding with faa8e205). We cannot tell which anchor is
     // correct, so REFUSE for both and let the reports fall to their inboxes. This
     // converts a would-be misroute into a safe queue, the whole point of v3.
-    const conflict = _allSessionAnchors().some((a) => {
+    // FRESH anchors only (2026-08-21): scanning the full accreted set let a
+    // long-dead anchor's stale (label,pos) coincidence veto a live delivery -
+    // the spurious-conflict silent-failure class. A real focus-race mis-capture
+    // is between two RECENTLY-active chats, so the fresh window still catches it.
+    const conflict = _freshAnchors().some((a) => {
       if (!a || a.session_id === sessionId) return false
       const t = _resolveAnchorToTab(a, pool)
       return t && t.viewColumn === cand.viewColumn && t.index === cand.index
@@ -1035,8 +1267,35 @@ async function message_chat(params, ctx) {
   ctx = ctx || {}
   const text = params.text != null ? String(params.text) : (params.body && params.body.text)
   if (!params.to || !text || !String(text).trim()) throw new Error('to and text required')
-  const to_address = await normalizeToAddress(params.to)
-  if (!to_address) return { ok: false, error: 'unresolved_target', to: params.to }
+  // Resolution v4 (2026-08-21): canonical addresses (full address / conductor /
+  // session:<id> / worker tab_id) take the stable fast-path unchanged. A fuzzy
+  // selector (a name / context phrase / partial label) goes through the scored,
+  // freshness-filtered resolver. A decisive winner resolves to its STABLE
+  // chat.session:<id> address so injection is anchored, not slug-derived. A
+  // non-decisive match returns ok:false + RANKED candidates so the caller retries
+  // against an exact address - never a silent misroute into an unpolled inbox,
+  // which was the whole complaint.
+  let to_address = _canonicalAddress(params.to)
+  let resolved_by = to_address ? 'address' : null
+  if (!to_address) {
+    const r = await resolveSelector(params.to)
+    if (r.ok) {
+      to_address = r.address
+      resolved_by = 'selector:' + r.kind
+    } else {
+      return {
+        ok: false,
+        error: 'unresolved_target',
+        reason: r.reason,
+        to: params.to,
+        candidates: r.candidates || [],
+        delivered: false,
+        hint: r.reason === 'ambiguous'
+          ? ('"' + params.to + '" matched ' + (r.candidates || []).length + ' live chats non-decisively - NOT sent to avoid a misroute. Retry coord.message_chat with an exact address from candidates[] (e.g. candidates[0].address), or a chat name set via coord.name_chat. coord.list_channels shows every live chat with its stable session address.')
+          : ('"' + params.to + '" matched no live chat. coord.list_channels lists who is live and addressable; use an exact address or a name registered via coord.name_chat. (Nothing was queued - fix the target and resend.)'),
+      }
+    }
+  }
   const reply_to_address = params.from_address || (ctx.tab_id ? addressForWorker(ctx.tab_id) : addressForConductor())
   const from_label = params.from_label || (ctx.tab_id ? ('worker ' + ctx.tab_id) : 'conductor')
   const body = {
@@ -1050,7 +1309,16 @@ async function message_chat(params, ctx) {
   // the target's inbox for it to read_inbox, exactly like the pre-push model.
   if (params.deliver === 'queue') body.deliver = 'queue'
   const r = await send_message({ to: to_address, body: body, task_id: params.task_id, in_reply_to: params.in_reply_to }, ctx)
-  return Object.assign({ ok: true, to_address: to_address, reply_to_address: reply_to_address }, r)
+  // Surface whether the turn actually landed in the target's live stream vs only
+  // its inbox. delivered:false is not a failure to persist (the message is in the
+  // inbox), but it IS the caller's cue that the recipient will not see it until
+  // their next inbox peek - so it is reported plainly, never hidden.
+  const injected = !!(r.delivery && r.delivery.ok)
+  const delivered = params.deliver === 'queue' ? false : injected
+  return Object.assign(
+    { ok: true, to_address: to_address, reply_to_address: reply_to_address, resolved_by: resolved_by, delivered: delivered },
+    r
+  )
 }
 
 // coord.list_channels - the directory of live, addressable chats. Every open
@@ -1067,6 +1335,19 @@ async function list_channels(params, ctx) {
   const conductor = loadConductorRegistration()
   const conductorLabel = conductor && conductor.title_match ? String(conductor.title_match) : ''
   const liveWorkers = _liveWorkerRows()
+  const nonWorker = tabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
+
+  // Map each live non-worker tab position -> its FRESH session anchor (stable id +
+  // declared name/context). This is what makes a chat reliably addressable: a
+  // stable chat.session:<id> address that survives Claude Code retitles, plus any
+  // self-declared name from coord.name_chat.
+  const anchorByPos = new Map()
+  for (const rec of _freshAnchors()) {
+    if (rec.role === 'worker') continue
+    const live = _resolveAnchorToTab(rec, nonWorker)
+    if (!live) continue
+    anchorByPos.set(live.viewColumn + ':' + live.index, rec)
+  }
 
   const out = []
   for (const t of tabs) {
@@ -1075,26 +1356,50 @@ async function list_channels(params, ctx) {
     const workerMatch = _matchWorkerRow(t, liveWorkers)
     const isConductorTab = !!t.isActive && !!conductor &&
       (!conductorLabel || label === conductorLabel || conductorLabel.startsWith('['))
-    let kind = 'chat', address
-    if (workerMatch) { kind = 'worker'; address = addressForWorker(workerMatch.tab_id) }
-    else if (isConductorTab) { kind = 'conductor'; address = addressForConductor() }
-    else { kind = 'chat'; address = addressForLabel(label) }
+    const anchor = anchorByPos.get(t.viewColumn + ':' + t.index) || null
+    const session_address = anchor && anchor.session_id ? ('chat.session:' + anchor.session_id + '.inbox') : null
+    let kind = 'chat', label_address = addressForLabel(label)
+    if (workerMatch) { kind = 'worker' }
+    else if (isConductorTab) { kind = 'conductor' }
+    // The recommended address: a self-declared NAME > stable SESSION id > worker
+    // tab_id > conductor slot > label slug. Named/anchored chats are ALWAYS
+    // uniquely addressable even when their auto-titles collide.
+    let address
+    if (anchor && anchor.name) address = 'chat.session:' + anchor.session_id + '.inbox'
+    else if (session_address) address = session_address
+    else if (workerMatch) address = addressForWorker(workerMatch.tab_id)
+    else if (isConductorTab) address = addressForConductor()
+    else address = label_address
     out.push({
       address: address,
+      name: anchor && anchor.name ? anchor.name : null,
+      context: anchor && anchor.context ? anchor.context : null,
+      session_address: session_address,
+      label_address: label_address,
       label: label,
       kind: kind,
       viewColumn: t.viewColumn,
       index: t.index,
       active: !!t.isActive,
-      addressable: kind !== 'chat' || !generic,
+      // addressable if it has a stable id/name/worker/conductor identity; a bare
+      // anonymous chat is addressable only when its auto-title is non-generic and
+      // unique (collision flagged below).
+      addressable: !!(session_address || (anchor && anchor.name) || workerMatch || isConductorTab) || (kind === 'chat' && !generic),
       task_id: workerMatch ? workerMatch.task_id : null,
       worker_status: workerMatch ? (workerMatch.status || null) : null,
     })
   }
-  // Flag colliding addresses as not-uniquely-addressable (two same-slug tabs).
+  // Flag colliding LABEL-only addresses as not-uniquely-addressable. A stable
+  // session/name address never collides, so those keep addressable:true.
   const counts = new Map()
-  for (const c of out) counts.set(c.address, (counts.get(c.address) || 0) + 1)
-  for (const c of out) if (counts.get(c.address) > 1) { c.addressable = false; c.ambiguous = true }
+  for (const c of out) if (!c.session_address && !c.name) counts.set(c.address, (counts.get(c.address) || 0) + 1)
+  for (const c of out) if (!c.session_address && !c.name && counts.get(c.address) > 1) { c.addressable = false; c.ambiguous = true }
+
+  // Named/anchored chats first (most reliable to target), then active, then the rest.
+  out.sort((a, b) => {
+    const s = (c) => (c.name ? 4 : 0) + (c.session_address ? 2 : 0) + (c.active ? 1 : 0)
+    return s(b) - s(a)
+  })
 
   return {
     ok: true,
@@ -1103,7 +1408,7 @@ async function list_channels(params, ctx) {
     your_tab_id: ctx.tab_id || null,
     your_address: ctx.tab_id ? addressForWorker(ctx.tab_id) : 'chat.conductor.inbox (if you are the conductor)',
     inject_enabled: process.env.COORD_CHAT_INJECT !== '0',
-    note: 'coord.message_chat({to:<address|label>, text}) pushes a turn straight into another chat. Machine signals (done/progress) still use send_message/signal_done.',
+    note: 'To reach a chat reliably use its `address` (prefer a `name` or `session_address` - stable across Claude Code retitles; a `label_address` is a mutable auto-title slug and can go stale). coord.message_chat({to:<name|address>, text}) pushes a turn in. A chat names itself with coord.name_chat({name, context}). Machine signals (done/progress) still use send_message/signal_done.',
   }
 }
 
@@ -2200,6 +2505,7 @@ async function set_wake_policy(params, _ctx) {
 module.exports = {
   send_message: send_message,
   message_chat: message_chat,
+  name_chat: name_chat,
   list_channels: list_channels,
   read_inbox: read_inbox,
   peek_inbox: peek_inbox,
@@ -2251,4 +2557,9 @@ module.exports = {
   _resolveWorkerAnchorCloseTarget: _resolveWorkerAnchorCloseTarget,
   _closeAnchorTarget: _closeAnchorTarget,
   _allSessionAnchors: _allSessionAnchors,
+  _freshAnchors: _freshAnchors,
+  _scoreCandidate: _scoreCandidate,
+  _liveChatCandidates: _liveChatCandidates,
+  resolveSelector: resolveSelector,
+  _canonicalAddress: _canonicalAddress,
 }

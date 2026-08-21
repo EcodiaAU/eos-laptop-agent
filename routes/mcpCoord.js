@@ -43,11 +43,11 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.message_chat',
-    description: 'Push a message straight into ANOTHER live Claude Code chat as a new turn - the way chats coordinate on shared work without either side polling an inbox. `to` accepts a full address ("chat.conductor.inbox" | "chat.<worker_tab_id>.inbox" | "chat.label:<slug>.inbox"), the word "conductor", a worker tab_id, or a live tab label / substring (e.g. "Studio"). The message is persisted to the durable inbox AND injected as a turn into the target tab; if the target is mid-turn, ambiguous, gone, or over the rate limit it stays inbox-queued (delivery.ok=false with a reason) and the recipient can still read it. The receiving chat sees your text framed with a reply address so it can push straight back via coord.message_chat. Use coord.list_channels first to see who is live. Injection steals focus, so this is an away/night capability by default (kill-switch env COORD_CHAT_INJECT=0). Returns {ok, to_address, reply_to_address, message_id, delivery}.',
+    description: 'Push a message straight into ANOTHER live Claude Code chat as a new turn - how chats coordinate without polling an inbox. `to` resolution (v4, 2026-08-21) is a scored, freshness-filtered match, most-reliable first: (1) a NAME a chat gave itself via coord.name_chat; (2) a stable "chat.session:<id>.inbox" address (survives Claude Code auto-retitles); (3) a worker tab_id or the word "conductor"; (4) a full "chat.*.inbox" address; (5) a fuzzy selector - a context phrase or partial tab label, scored against every live chat. A DECISIVE match is sent and injected. A non-decisive/ambiguous match is NOT sent (avoids the misroute-into-an-unpolled-inbox that made this unreliable): you get {ok:false, reason:"ambiguous"|"no_live_match", candidates:[{address,name,label,score}], hint} - retry with an exact candidates[].address or a name. Returns on success {ok:true, to_address, resolved_by, delivered, delivery, message_id}; delivered:false means it persisted to the inbox but could not inject live (target mid-turn / rate-limited / away). Prefer targeting by NAME (ask chats to name themselves) or by a stable session_address from coord.list_channels over a raw tab label. Injection steals focus (kill-switch env COORD_CHAT_INJECT=0). Call coord.list_channels first to see who is live.',
     inputSchema: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: 'Target chat: full chat.*.inbox address, "conductor", a worker tab_id, or a live tab label / substring.' },
+        to: { type: 'string', description: 'Target chat. Best: a NAME set via coord.name_chat, or a stable "chat.session:<id>.inbox" / worker tab_id / "conductor" / full "chat.*.inbox" address (all from coord.list_channels). Also accepts a fuzzy selector (context phrase or partial tab label) - scored; if not decisive you get ranked candidates back to retry against.' },
         text: { type: 'string', description: 'The message to land as a turn in the target chat.' },
         from_label: { type: 'string', description: 'How you want to be named to the recipient (e.g. "Chambers chat"). Defaults to your tab identity.' },
         from_address: { type: 'string', description: 'The address the recipient should reply to. Defaults to your own inbox (worker) or the conductor. Set this so a peer chat can reply directly to you.' },
@@ -59,8 +59,22 @@ const TOOLS = Object.freeze([
     },
   },
   {
+    name: 'coord.name_chat',
+    description: 'Give THIS chat a stable, self-declared identity so peers can reach it by intent regardless of how Claude Code auto-titles and truncates its tab. The auto-title is derived from the user first words and mutates constantly; a declared name does not. Sets a short kebab name (e.g. "studio-ux"), an optional one-line context ("Studio editor UX pass"), and optional aliases; writes them into this chat session anchor and they PERSIST across turns. After naming, peers target you with coord.message_chat({to:"studio-ux"}) and you appear by name in coord.list_channels. Call once early in a chat that expects to coordinate, and re-call any time to rename/add context. Targets the most-recently-active chat (the caller) by default; pass session_id to target a specific one. Returns {ok, session_id, name, address, note}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Short stable handle for this chat, e.g. "studio-ux" or "friend-motion". Kebab/lowercase reads best but any string works (matched case- and punctuation-insensitively).' },
+        context: { type: 'string', description: 'One line on what this chat is doing, e.g. "Studio editor breadcrumb + pin-release". Used as a secondary match signal and shown in list_channels.' },
+        aliases: { type: 'array', items: { type: 'string' }, description: 'Optional extra handles this chat also answers to.' },
+        session_id: { type: 'string', description: 'Optional: target a specific chat by its Claude Code session_id instead of the most-recently-active one.' },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
     name: 'coord.list_channels',
-    description: 'List every live, addressable Claude Code chat (the coordination directory). Each entry: {address, label, kind: conductor|worker|chat, active, addressable, task_id?, worker_status?}. Use the `address` with coord.message_chat to push a turn into that chat. `addressable:false` means the tab is generic-labelled or its address collides with another tab, so it cannot be uniquely targeted yet (name the chat to fix). Returns {ok, count, channels[], your_address, inject_enabled}.',
+    description: 'List every live, addressable Claude Code chat (the coordination directory), most-reliably-targetable first. Each entry: {address (the recommended target), name, context, session_address (stable across retitles), label_address (mutable auto-title slug), label, kind: conductor|worker|chat, active, addressable, ambiguous?, task_id?, worker_status?}. Target a chat by its `address` - prefer `name` or `session_address` over `label_address`, which can go stale. `addressable:false` (with `ambiguous:true` when its auto-title collides with another tab) means it has no stable id/name yet - it can be given one with coord.name_chat. Returns {ok, count, channels[], your_address, inject_enabled}.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: true },
   },
   {
