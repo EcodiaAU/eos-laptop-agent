@@ -203,12 +203,18 @@ function driveWorkerBrief(targetShort, liveShort, reason) {
 
 function capAutoSwitch() {
   try {
-    // AGENT-PRIMARY (Tate 2026-08-20). The proactive cap-approach switch is now driven by a
-    // dispatched CC worker that reads the consent page with its own vision, not the blind
-    // macro. The macro survives ONLY as the fallback: (1) here, if the worker cannot be
-    // dispatched (agent endpoint down), and (2) inside switch-run --external-drive, if the
-    // agent stalls (Guarantee A). This keeps Tate's "agent uses contextual logic" intent
-    // while staying bulletproof on the worst path.
+    // MACRO-PRIMARY (2026-08-21). The reactive cap-approach switch spawns the deterministic
+    // macro DIRECTLY. It is fast (~30s, no cold start) and reliable since the trusted-click fix
+    // (proven both directions). The former AGENT-PRIMARY path (dispatch a vision-driving CC
+    // worker, macro only as fallback) added ~5 MINUTES of dead latency on 2026-08-21: the
+    // dispatched CC tab cold-started, never refreshed its .driving heartbeat (never actually
+    // drove), and only after the heartbeat went stale did switch-run's macro fallback finish
+    // the switch - by which time tate@ had already climbed 0.95 -> capped mid-burn and Tate
+    // switched by hand. A fast-burning account caps INSIDE the agent dispatch latency, which
+    // defeats the whole point of a proactive switch. The macro handles the standard Google-SSO
+    // consent itself (driveGoogle selects the account, trustedClickText passes the invisible
+    // captcha), so the agent's vision is not needed for the common reactive case; the
+    // account-switch-drive skill stays available for a manual/vision-complex drive.
     //
     // The switch itself is still the ONE sanctioned path (switch-run via account-switch.sh):
     // full OAuth re-login minting fresh tokens (rotate_to snapshot-swap was banned 2026-08-02
@@ -223,33 +229,16 @@ function capAutoSwitch() {
     const targetShort = String(d.target).split('@')[0]
     const liveShort = String(d.live || '').split('@')[0]
 
-    // PRIMARY: dispatch a vision-driving CC worker via the always-on laptop-agent scheduler.
-    // preferred_account = the CURRENT (healthy) account, so the worker opens where there is
-    // still budget to drive; the switch flips the Keychain to the target at the very end.
-    const dispatch = agentTool('scheduler.schedule_delayed', {
-      name: 'cowork.account-switch-drive',
-      prompt: driveWorkerBrief(targetShort, liveShort, d.reason),
-      delay: 'in 1m',
-      preferred_account: liveShort || undefined,
-      priority_class: 'high',
-    })
-    if (dispatch) {
-      stampCapDispatch({ mode: 'agent', target: targetShort, live: liveShort })
-      console.log('[' + nowIso() + '] cap-auto-switch: dispatched AGENT drive worker ' + d.live + ' -> ' + d.target + ' (' + d.reason + ')')
-      return
-    }
-
-    // FALLBACK: the dispatch endpoint is unreachable. Do not lose the switch - spawn the
-    // deterministic macro directly (autonomous, needs no agent), detached so the poll loop
-    // is not blocked. The exit handler reads the real result; "launched" is never success.
-    console.log('[' + nowIso() + '] cap-auto-switch: worker dispatch unreachable - falling back to the macro for ' + d.live + ' -> ' + d.target)
+    // Spawn the macro directly, detached so the poll loop is not blocked. The exit handler
+    // reads the real result; "launched" is never success.
     const logFd = (() => { try { return fs.openSync(usageCfg.PATHS.SWITCH_LOG_FILE, 'a') } catch (e) { return 'ignore' } })()
     const child = spawn('bash', [ACCOUNT_SWITCH_SH, targetShort], {
       detached: true, stdio: ['ignore', logFd, logFd],
-      env: Object.assign({}, process.env, { SWITCH_REASON: d.reason || 'cap-auto-switch-macro-fallback' }),
+      env: Object.assign({}, process.env, { SWITCH_REASON: d.reason || 'cap-auto-switch-macro' }),
     })
     child.unref()
     stampCapDispatch({ mode: 'macro', target: targetShort, live: liveShort })
+    console.log('[' + nowIso() + '] cap-auto-switch: spawned macro ' + d.live + ' -> ' + d.target + ' (' + d.reason + ')')
     child.on('exit', (code) => {
       // switch-run.js owns switch-request.json and swap_history.json; writing them here
       // too would race its RECORD step and corrupt real-limit-watch's suppression input,
@@ -258,7 +247,7 @@ function capAutoSwitch() {
         : code === 3 ? 'already_in_progress'
         : code === 4 ? 'no_op'
         : 'FAILED(' + code + ')'
-      console.log('[' + nowIso() + '] cap-auto-switch (macro fallback) result: ' + d.live + ' -> ' + d.target + ' = ' + verdict +
+      console.log('[' + nowIso() + '] cap-auto-switch macro result: ' + d.live + ' -> ' + d.target + ' = ' + verdict +
         (code === 0 ? '' : ' (see ' + usageCfg.PATHS.SWITCH_LOG_FILE + ')'))
     })
   } catch (e) { console.error('[cap-auto-switch] ' + (e && e.message || e)) }
