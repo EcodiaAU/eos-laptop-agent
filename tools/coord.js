@@ -1236,22 +1236,40 @@ async function pushInject(msg) {
   if (isConductor && conductor && conductor.in_turn) return { attempted: false, reason: 'conductor_in_turn' }
 
   const run = async () => {
+    const text = buildChatInjectionText(msg)
+    // SESSION-FIRST delivery (2026-08-21). When the target's Claude Code session id
+    // is known directly from the topic - a session:<id> topic, or a worker's own
+    // session anchor (by tab_id) - deliver via chat_send_message WITHOUT first
+    // mapping the session to a live tab. chat_send_message selects the tab by
+    // session internally, so this works even when our anchor's cached LABEL is
+    // stale (a just-booted worker still titled "Claude Code", a chat retitled since
+    // its last heartbeat) - the exact case where resolveLiveTargetTab returns
+    // session_unresolved and blocked delivery. It cannot misroute (session id is
+    // the true identity), so the tab-mapping + ownership-conflict guard are not
+    // needed on this path. Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+    let directSession = null
+    if (mid && mid.indexOf('session:') === 0) directSession = mid.slice('session:'.length)
+    else if (mid && /^tab_/.test(mid)) {
+      const wa = _allSessionAnchors().find((a) => a && a.role === 'worker' && a.tab_id === mid)
+      if (wa) directSession = wa.session_id
+    }
+    if (directSession) {
+      _noteInject(topic)
+      let r
+      try { r = await _chatInject.injectTurn({ session: directSession, text }) }
+      catch (e) { r = { ok: false, reason: 'inject_threw', error: e.message } }
+      if (r && r.ok) {
+        try { markSeen([msg]) } catch (e) {}
+        return { attempted: true, ok: true, resolved_label: r.label, kind: 'session', via: r.via || 'chat_send_message' }
+      }
+      // session delivery unconfirmed -> fall through to position-based resolution
+    }
+
+    // Position path (conductor / label targets, or a session-first miss).
     const tgt = await resolveLiveTargetTab(topic)
     if (!tgt.ok) return { attempted: true, ok: false, reason: tgt.reason }
-    const text = buildChatInjectionText(msg)
-    // Determine the target's Claude Code SESSION id so injectTurn can deliver by
-    // session (reliable at ANY tab position) instead of editor-index selection,
-    // which only reached the first 9 tabs. Sources, in order: the session:<id>
-    // topic itself; a worker's own session anchor (by tab_id); or a UNIQUE fresh
-    // anchor at the resolved tab position (covers conductor + named/anchored
-    // chats). A contested position yields no session -> the GUI chain (fixed +
-    // verify-gated) handles it. Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
-    let session = null
-    if (mid && mid.indexOf('session:') === 0) session = mid.slice('session:'.length)
-    else if (tgt.kind === 'worker') {
-      const wa = _allSessionAnchors().find((a) => a && a.role === 'worker' && a.tab_id === mid)
-      if (wa) session = wa.session_id
-    }
+    // A unique fresh anchor at the resolved position gives a session for those too.
+    let session = directSession
     if (!session && tgt.viewColumn != null && tgt.index != null) {
       try {
         const tabs = await _chatInject.listChatTabs()
