@@ -35,7 +35,9 @@ function focusGroupCmd(vc) {
   if (target.index < 9) await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (target.index + 1) }).catch(() => {})
   else await ide.command({ cmd: 'workbench.action.openEditorAtIndex', args: [target.index] }).catch(() => {})
   await sleep(200)
-  await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
+  // focusActiveEditorGroup (the just-selected tab), NOT global claude-vscode.focus
+  // which jumps to a fixed Claude view and lands every paste in the same chat.
+  await ide.command({ cmd: 'workbench.action.focusActiveEditorGroup' }).catch(() => {})
   await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
   await sleep(900)
 

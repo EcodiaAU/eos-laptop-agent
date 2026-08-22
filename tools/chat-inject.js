@@ -244,7 +244,15 @@ async function injectTurn(opts) {
       await ide.command({ cmd: 'workbench.action.openEditorAtIndex', args: [index] }).catch(() => {})
       await sleep(150)
     }
-    await ide.command({ cmd: 'claude-vscode.focus' }).catch(() => {})
+    // Focus the ACTIVE editor group (the tab openEditorAtIndex just selected), NOT
+    // the global claude-vscode.focus. claude-vscode.focus focuses a FIXED Claude
+    // view (its siblings are primaryEditor.open / editor.openLast), so after we
+    // select tab N by index it yanks focus to that one fixed chat - every paste
+    // then lands in the SAME wrong chat (proven 2026-08-22: 6 route-test markers
+    // all piled into one input box). focusActiveEditorGroup keeps focus on the
+    // just-selected target. (The dispatcher keeps claude-vscode.focus because a
+    // freshly-opened tab IS the primary/last Claude editor - they coincide there.)
+    await ide.command({ cmd: 'workbench.action.focusActiveEditorGroup' }).catch(() => {})
     steps.push('select')
     await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
     steps.push('activate')
