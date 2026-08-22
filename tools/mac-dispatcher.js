@@ -493,10 +493,20 @@ async function dispatch_worker(params) {
         //     the window is shared with Tate's live session).
         //     workbench.action.openEditorAtIndexN is 1-based over the active
         //     group; opened_tab.index is 0-based.
-        if (typeof tab_handle.tabIndex === 'number' && tab_handle.tabIndex >= 0 && tab_handle.tabIndex < 30) {
+        if (typeof tab_handle.tabIndex === 'number' && tab_handle.tabIndex >= 0 && tab_handle.tabIndex < 40) {
           try {
+            // The numbered workbench.action.openEditorAtIndex<N> only exists for
+            // N=1..9, so re-asserting a worker tab past the 9th position silently
+            // no-oped and the brief could submit into whatever tab was active
+            // (wrong-chat bug). Use the numbered command for index<9 and the
+            // GENERIC openEditorAtIndex with an index arg for index>=9 (works at
+            // any position). Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+            const idx = tab_handle.tabIndex
+            const cmd = idx < 9
+              ? { cmd: 'workbench.action.openEditorAtIndex' + (idx + 1) }
+              : { cmd: 'workbench.action.openEditorAtIndex', args: [idx] }
             await Promise.race([
-              ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (tab_handle.tabIndex + 1) }),
+              ide.command(cmd),
               new Promise((_, rej) => setTimeout(() => rej(new Error('open_at_index_timeout_3s')), 3000)),
             ])
             await sleep(150)
