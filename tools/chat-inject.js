@@ -219,21 +219,27 @@ async function injectTurn(opts) {
       steps.push('clipboard')
     }
 
-    // 2. Select the target tab, focus its input, bring VS Code forward, settle.
-    // This position chain is THE delivery path (transcript-proven). Two fixes vs
-    // the historical chain:
-    //   (a) INDEX BUG: the numbered workbench.action.openEditorAtIndex<N> command
-    //       only exists for N=1..9, so a tab past the 9th was never selected and
-    //       the paste misfired into the active tab (the wrong-chat bug). Use the
-    //       numbered command for index<9 and the GENERIC openEditorAtIndex with an
-    //       index arg for index>=9, which selects any position (verified: it makes
-    //       a tab at index 9 the active tab).
-    //   (b) VERIFY-GATE: after selecting, read back the active tab and only paste
-    //       if it IS the target (for a non-generic label). A mismatch aborts to the
-    //       inbox rather than blind-pasting into the wrong chat (proven: a wrong
-    //       target aborts and pastes nothing). This restores the verify the
-    //       2026-08-03 change removed; delivery is now transcript-verified so a
-    //       false green cannot hide. Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+    // 2. Bring VS Code forward, THEN select the target tab. Order is load-bearing
+    // (3 fixes vs the historical chain, all 2026-08-22 proven by step-by-step diag):
+    //   (a) ACTIVATE FIRST: applescript.activate_app ("tell VS Code to activate")
+    //       RESETS the active editor to the FIRST tab. The old chain selected the
+    //       target and THEN activated, so activate undid the select and every paste
+    //       landed in the first tab (Tate: "zapping to the first tab"). Activate
+    //       BEFORE selecting so the select is the LAST focus action and the target
+    //       stays focused (diag: activate->idx0, then select->target, paste lands
+    //       on target).
+    //   (b) INDEX BUG: numbered workbench.action.openEditorAtIndex<N> only exists
+    //       for N=1..9. Use it for index<9 and the GENERIC openEditorAtIndex with an
+    //       index arg for index>=9 (selects any position).
+    //   (c) focusActiveEditorGroup (the just-selected tab), NOT global
+    //       claude-vscode.focus - that focuses a FIXED Claude view and would land
+    //       paste in one fixed chat.
+    // Then VERIFY-GATE: read back the active tab and only paste if it IS the target
+    // (non-generic label); a mismatch aborts to the inbox instead of misrouting.
+    // Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
+    await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
+    steps.push('activate')
+    await sleep(400)
     const fg = focusGroupCmd(viewColumn)
     if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(150) }
     if (index >= 0 && index < 9) {
@@ -244,18 +250,8 @@ async function injectTurn(opts) {
       await ide.command({ cmd: 'workbench.action.openEditorAtIndex', args: [index] }).catch(() => {})
       await sleep(150)
     }
-    // Focus the ACTIVE editor group (the tab openEditorAtIndex just selected), NOT
-    // the global claude-vscode.focus. claude-vscode.focus focuses a FIXED Claude
-    // view (its siblings are primaryEditor.open / editor.openLast), so after we
-    // select tab N by index it yanks focus to that one fixed chat - every paste
-    // then lands in the SAME wrong chat (proven 2026-08-22: 6 route-test markers
-    // all piled into one input box). focusActiveEditorGroup keeps focus on the
-    // just-selected target. (The dispatcher keeps claude-vscode.focus because a
-    // freshly-opened tab IS the primary/last Claude editor - they coincide there.)
     await ide.command({ cmd: 'workbench.action.focusActiveEditorGroup' }).catch(() => {})
     steps.push('select')
-    await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
-    steps.push('activate')
     await sleep(settleMs)
 
     // 2b. VERIFY the selected tab is the target before pasting (non-generic label

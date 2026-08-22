@@ -29,7 +29,10 @@ function focusGroupCmd(vc) {
   console.log('\nTARGET: idx' + target.index + ' ' + JSON.stringify(target.label.slice(0, 34)))
   console.log('MARKER: ' + marker + '  (pasting, NOT submitting)')
 
-  // FIXED selection chain
+  // FIXED selection chain. Activate VS Code FIRST (it resets the active editor to
+  // the first tab), THEN select the target LAST so the target stays focused.
+  await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
+  await sleep(400)
   const fg = focusGroupCmd(target.viewColumn)
   if (fg) { await ide.command({ cmd: fg }).catch(() => {}); await sleep(150) }
   if (target.index < 9) await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (target.index + 1) }).catch(() => {})
@@ -38,8 +41,7 @@ function focusGroupCmd(vc) {
   // focusActiveEditorGroup (the just-selected tab), NOT global claude-vscode.focus
   // which jumps to a fixed Claude view and lands every paste in the same chat.
   await ide.command({ cmd: 'workbench.action.focusActiveEditorGroup' }).catch(() => {})
-  await applescript.activate_app({ app: 'Visual Studio Code' }).catch(() => {})
-  await sleep(900)
+  await sleep(500)
 
   // what does the bridge think is active now?
   const after = focusedOf(await ci.listChatTabs())
