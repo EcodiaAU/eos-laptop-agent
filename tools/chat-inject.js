@@ -77,6 +77,11 @@ async function listChatTabs() {
   const tabs = []
   for (const g of groups) {
     const viewColumn = g.viewColumn
+    // groupActive: is THIS editor group the focused one? VS Code marks isActive on
+    // the active tab of EVERY group (per-group), and marks exactly one GROUP as
+    // active. The truly-focused tab is the active tab of the active group, so we
+    // carry groupActive to disambiguate (see verifyActiveIsTarget).
+    const groupActive = g.isActive === true
     const gtabs = g.tabs || []
     gtabs.forEach((t, i) => {
       const vt = t.viewType || (t.input && t.input.viewType) || null
@@ -86,6 +91,7 @@ async function listChatTabs() {
         viewColumn: viewColumn != null ? viewColumn : 1,
         index: typeof t.index === 'number' ? t.index : i,
         isActive: t.isActive === true || t.active === true,
+        groupActive,
         viewType: vt,
       })
     })
@@ -124,7 +130,12 @@ async function resolveTabByLabel(label) {
 async function verifyActiveIsTarget(label, viewColumn, index) {
   let tabs
   try { tabs = await listChatTabs() } catch (e) { return { ok: false, active_label: null, reason: 'bridge_unreachable' } }
-  const active = tabs.find((t) => t.isActive)
+  // The focused tab is the active tab OF THE ACTIVE GROUP. With >1 editor group
+  // each group carries its own active tab, so a bare find(isActive) can return a
+  // BACKGROUND group's active tab and read a false "active" - the bridge-active-
+  // vs-reality split. Prefer (isActive && groupActive); fall back to plain
+  // isActive only if the bridge did not mark group focus (older bridge).
+  const active = tabs.find((t) => t.isActive && t.groupActive) || tabs.find((t) => t.isActive)
   if (!active) return { ok: false, active_label: null, reason: 'no_active_tab' }
   const generic = GENERIC_LABEL_RE.test(String(label || '').trim())
   if (!generic) {
