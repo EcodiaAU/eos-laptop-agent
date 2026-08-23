@@ -17,6 +17,12 @@ const os = require('os')
 const path = require('path')
 const { execFileSync } = require('child_process')
 
+// Isolate the audit log BEFORE requiring the module. Fixture runs must never
+// write into ~/.claude/logs/ecodia/doctrine-harvest.jsonl, which is the real
+// signal a human reads to see whether harvest actually fired on a live prune.
+// A test that pollutes the log it is testing makes that log unreadable.
+process.env.DOCTRINE_HARVEST_LOG = path.join(os.tmpdir(), 'doctrine-harvest-test-audit.jsonl')
+
 const { harvestDoctrine } = require('./doctrine-harvest')
 
 let passed = 0, failed = 0
