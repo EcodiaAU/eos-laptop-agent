@@ -1367,6 +1367,29 @@ exports.dispatchOne = async function dispatchOne(row) {
     // in the IDE, useful as the iMessage reply prefix, and routable by topic. The
     // dispatcher still stamps the sentinel + fingerprint for the close path, so
     // this only changes the human-facing name, not how the tab is closed.
+    // 2026-08-24: PREFIX the readable name with 4 hex of the task id.
+    //
+    // coord resolves a worker tab through its sentinel_prefix / autotitle
+    // fingerprint, both derived from the TAB TITLE. This name comes from the
+    // row's own name, and a worker chain names its successors after the same
+    // project (coexist-ticket-selfservice, then -verify, then -verify-pass-3),
+    // so sibling tabs carried IDENTICAL sentinels and the registry rows
+    // collapsed onto whichever tab registered last. Two symptoms, one cause:
+    // close_my_tab failed safe and refused (so every chained worker tab leaked
+    // into the IDE), and message_chat to a colliding chat returned
+    // delivered:false / session_ownership_conflict, which reads as a worker
+    // failing to report when it actually reported fine.
+    //
+    // Found 2026-08-24 by worker d9f75736 while trying to close its own tab: one
+    // list_channels call returned your_tab_id = <its own id> with NO channel row
+    // carrying that address, and three rows all resolved to a sibling.
+    //
+    // The prefix goes at the FRONT deliberately. Claude Code truncates the
+    // displayed label to ~24 chars, so a suffix would be cut off and the
+    // disambiguator would vanish exactly where it is needed.
+    //
+    // name_chat does NOT fix this: it sets a stable inbox address and leaves the
+    // window-title fingerprint untouched (ruled out empirically, same run).
     const workerName = (function () {
       const n = String((row && row.name) || '')
         .replace(/^cowork\./, '')
@@ -1374,9 +1397,11 @@ exports.dispatchOne = async function dispatchOne(row) {
         .replace(/[^A-Za-z0-9 ]/g, '')
         .replace(/\s+/g, ' ')
         .trim()
-        .slice(0, 40)
+        .slice(0, 34)
         .trim()
-      return n || undefined
+      const shortId = String((row && row.id) || '').replace(/[^a-f0-9]/gi, '').slice(0, 4)
+      if (!n) return shortId || undefined
+      return (shortId ? shortId + ' ' + n : n).slice(0, 40).trim()
     })()
     const dispatcher = getDispatcher()
     const result = await dispatcher.dispatch_worker({
