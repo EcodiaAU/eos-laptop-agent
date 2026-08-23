@@ -321,8 +321,35 @@ async function defaultAllocateWorktreeForRow(row) {
   return wtPath
 }
 
+// 2026-08-23 doctrine-harvest. A dispatched worker CANNOT push (the worker
+// capability ceiling denies `git ... push`, correctly: a worker is the likeliest
+// injection pivot). So any pattern file it authored lived only on its branch,
+// and pruning the worktree made that doctrine invisible to knowledge.lookup
+// forever. Measured cost: 184 distinct pattern files stranded across 60
+// branches, one method codified and lost three separate times. Board ad25d3fb.
+//
+// Harvest runs BEFORE the remove, which is the only ordering where the branch
+// is still guaranteed readable. It is add-only (top-level patterns/*.md whose
+// basename is absent from origin/main), never touches _archived, refuses
+// em-dashes, and runs on pure git plumbing with a temp index so it can neither
+// move HEAD nor write into any working tree. Failure NEVER blocks the prune.
 async function defaultPruneWorktreeForRow(row) {
   const wtPath = path.join(WORKTREE_ROOT, String(row.id))
+  try {
+    const { harvestDoctrine } = require('./doctrine-harvest')
+    const res = await harvestDoctrine({
+      sharedTree: SHARED_TREE,
+      branch: 'worker/' + String(row.id),
+      rowId: String(row.id),
+    })
+    if (res && res.landed && res.landed.length) {
+      process.stderr.write('[scheduler] doctrine-harvest: landed ' + res.landed.length +
+        ' pattern file(s) on main from worker/' + row.id + ' (' + res.commit + ')\n')
+    }
+  } catch (e) {
+    process.stderr.write('[scheduler] doctrine-harvest failed for ' + row.id + ': ' +
+      (e && e.message || e) + ' (pruning anyway)\n')
+  }
   await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
   await runGit(['worktree', 'prune']).catch(() => {})
 }
