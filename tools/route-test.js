@@ -5,7 +5,12 @@
 // So nothing takes a turn - Tate just sees which chat's input box shows the marker.
 // Also prints what the bridge THINKS the active tab is after selecting, so we can
 // see bridge-view vs reality.
-process.env.COORD_DISABLE_SWEEP = '1'
+// Guard EVERY side effect behind require.main. index.js boot autoloads every
+// tools/*.js via loadTools(); without this guard, requiring this manual CLI at
+// boot fired its IIFE - pasting a ROUTE-TEST marker into Tate's first CC tab and
+// calling process.exit(0), which launchd then respawned into a paste-loop
+// (2026-08-23). This file is a hands-on tool, not an autoloadable module.
+if (require.main === module) process.env.COORD_DISABLE_SWEEP = '1'
 const ide = require('./ide')
 const applescript = require('./applescript')
 const ci = require('./chat-inject')
@@ -16,6 +21,7 @@ function focusGroupCmd(vc) {
 }
 
 ;(async () => {
+  if (require.main !== module) return // inert on require (autoload); only runs as: node tools/route-test.js
   const needle = (process.argv[2] || '').toLowerCase()
   const marker = process.argv[3] || ('[ROUTE-TEST ' + Date.now().toString(36) + ']')
   // group-aware focused-tab read: active tab of the ACTIVE group (matches the
