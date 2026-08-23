@@ -171,6 +171,47 @@ async function main () {
     fs.rmSync(root, { recursive: true, force: true })
   }
 
+  // 6. EVERY invocation is audited, including the silent no-ops.
+  //
+  // This is the regression guard for the 2026-08-24 observability fix. Before it,
+  // audit() sat inside the success paths only, so a prune that invoked harvest and
+  // correctly found nothing wrote no line anywhere. Two live prunes did exactly
+  // that on 2026-08-23 and left the mechanism unprovable from its own telemetry.
+  // The rule now: one audit line per call, whatever the outcome.
+  {
+    const { root, shared } = setup()
+    const logPath = process.env.DOCTRINE_HARVEST_LOG
+    try { fs.unlinkSync(logPath) } catch (_e) {}
+
+    const readLog = () => {
+      let raw = ''
+      try { raw = fs.readFileSync(logPath, 'utf8') } catch (_e) { return [] }
+      return raw.split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    }
+
+    await harvestDoctrine({ sharedTree: shared, branch: 'worker/nope', rowId: 'audit-missing-branch' })
+    ok('a missing-branch no-op writes an audit line',
+      readLog().some((r) => r.rowId === 'audit-missing-branch' && /does not exist/.test(r.reason)),
+      JSON.stringify(readLog()))
+
+    plantWorkerBranch(shared, root, 'worker/audit-nopat', { 'README.md': 'no doctrine\n' })
+    await harvestDoctrine({ sharedTree: shared, branch: 'worker/audit-nopat', rowId: 'audit-no-patterns' })
+    ok('a branch with no patterns writes an audit line',
+      readLog().some((r) => r.rowId === 'audit-no-patterns'),
+      JSON.stringify(readLog()))
+
+    await harvestDoctrine({ sharedTree: shared, branch: null, rowId: 'audit-bad-args' })
+    ok('a bad-args refusal writes an audit line',
+      readLog().some((r) => r.rowId === 'audit-bad-args' && r.ok === false),
+      JSON.stringify(readLog()))
+
+    ok('one audit line per invocation, no duplicates',
+      readLog().filter((r) => r.rowId === 'audit-no-patterns').length === 1,
+      JSON.stringify(readLog()))
+
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
   console.log('\n  ' + passed + ' passed, ' + failed + ' failed')
   process.exit(failed === 0 ? 0 : 1)
 }

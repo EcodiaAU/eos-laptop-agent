@@ -126,7 +126,7 @@ async function basenamesOnMain (git) {
  * @param {boolean} [opts.dryRun]   build the commit but do not push
  * @returns {Promise<object>} { ok, landed[], skipped[], refused[], commit, reason }
  */
-async function harvestDoctrine (opts) {
+async function _harvest (opts) {
   const sharedTree = opts && opts.sharedTree
   const branch = opts && opts.branch
   const rowId = (opts && opts.rowId) || 'unknown'
@@ -209,8 +209,7 @@ async function harvestDoctrine (opts) {
   if (!toLand.length) {
     result.ok = true
     result.reason = 'nothing new to land'
-    audit(result)
-    return result
+      return result
   }
 
   // Build the commit entirely in a temp index, off a pinned origin/main.
@@ -257,14 +256,45 @@ async function harvestDoctrine (opts) {
   if (pushed && pushed.error) {
     result.reason = 'push failed: ' + pushed.error
     result.refused = result.refused.concat(toLand.map((f) => ({ path: f.path, reason: 'push failed' })))
-    audit(result)
-    return result
+      return result
   }
 
   result.ok = true
   result.commit = pushed.commit
   result.landed = toLand.map((f) => f.path)
   result.reason = dryRun ? 'dry run (commit built, not pushed)' : 'landed on main'
+  return result
+}
+
+// 2026-08-24 observability fix. Every early return above used to leave the audit
+// log silent, so a prune that invoked harvest and legitimately found nothing was
+// byte-for-byte indistinguishable from a prune where harvest never ran at all.
+// Two live prunes on 2026-08-23 (rows d067c604 and 440536b5) hit `no commits off
+// main` and wrote nothing anywhere, which left the whole mechanism unfalsifiable
+// from its own telemetry: the only evidence it had fired was the absence of a
+// directory. A log that speaks only on success cannot be used to prove liveness,
+// which is the same "a check that cannot fail is not a check" shape this module
+// was written to close. So the audit moves OUT of the success paths and wraps the
+// whole call: one line per invocation, no matter how it ends, throw included.
+// Doctrine: backend/patterns/a-harvest-that-logs-only-on-success-cannot-prove-it-ran-2026-08-24.md
+async function harvestDoctrine (opts) {
+  let result
+  try {
+    result = await _harvest(opts)
+  } catch (e) {
+    result = {
+      ok: false,
+      landed: [],
+      skipped: [],
+      refused: [],
+      commit: null,
+      reason: 'threw: ' + (e && e.message || String(e)),
+      rowId: (opts && opts.rowId) || 'unknown',
+      branch: (opts && opts.branch) || null,
+    }
+    audit(result)
+    throw e
+  }
   audit(result)
   return result
 }
