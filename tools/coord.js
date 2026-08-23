@@ -1153,6 +1153,17 @@ async function resolveLiveTargetTab(topic) {
   }
 
   const w = loadWorkerRegistry(mid)
+  // A TERMINATED worker is never a delivery target. Its on-disk row is reaped
+  // (WORKERS_DIR unlink, ~L2224) but the in-memory `workers` entry survives with
+  // terminated_at set, and loadWorkerRegistry's hot path serves it regardless. The
+  // label fallback below is truncation-aware, so a dead worker's stored label
+  // prefix-matches a LIVE sibling in the same arc and the reply is injected into a
+  // stranger, reported as delivered:true kind:'worker'. Observed twice on 2026-08-23:
+  // a reply meant for the finished strip worker landed in the verify worker's tab,
+  // which only surfaced because that worker refused credit for work it had not done.
+  // Same class as the IDE-bridge rule shipped the same night: a closed tab's identity
+  // is NEVER inherited. Fail closed to the inbox instead.
+  if (w && w.terminated_at) return { ok: false, kind: 'worker', reason: 'worker_terminated' }
   if (w && w.tab_handle) {
     const th = w.tab_handle
     let picked = null
@@ -1172,6 +1183,22 @@ async function resolveLiveTargetTab(topic) {
       const lab = th.label && !isGenericLabelStr(th.label) ? th.label
         : (th.label_at_spawn && !isGenericLabelStr(th.label_at_spawn) ? th.label_at_spawn : null)
       if (lab) { const hits = tabs.filter((t) => _labelMatchesStored(t.label, lab)); if (hits.length === 1) picked = hits[0] }
+    }
+    // Ownership guard: the soft label fallback above can land on a tab that a
+    // DIFFERENT live worker owns (same arc, shared truncated prefix). Injecting
+    // there is a misroute wearing a success code. Refuse and let the inbox carry it.
+    if (picked) {
+      let owner = null
+      for (const [, lw] of workers.entries()) {
+        if (!lw || lw.terminated_at || lw.tab_id === mid) continue
+        const lth = lw.tab_handle
+        if (!lth) continue
+        const hit = (lth.sentinel_prefix && _labelMatchesStored(picked.label, lth.sentinel_prefix)) ||
+                    (lth.label && _labelMatchesStored(picked.label, lth.label)) ||
+                    (lth.label_at_spawn && _labelMatchesStored(picked.label, lth.label_at_spawn))
+        if (hit) { owner = lw; break }
+      }
+      if (owner) return { ok: false, kind: 'worker', reason: 'worker_tab_owned_by_other', owner: owner.tab_id }
     }
     if (picked) return Object.assign({ ok: true, kind: 'worker' }, _pos(picked))
     return { ok: false, kind: 'worker', reason: 'worker_tab_unresolved' }
@@ -2642,4 +2669,8 @@ module.exports = {
   _liveChatCandidates: _liveChatCandidates,
   resolveSelector: resolveSelector,
   _canonicalAddress: _canonicalAddress,
+  // Exposed for coord-resolve-worker-terminated.test.js: the worker branch is
+  // where a dead worker's stored label could be inherited by a live sibling.
+  // Testable surface, not a tool.
+  _resolveLiveTargetTab: resolveLiveTargetTab,
 }
