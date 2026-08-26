@@ -735,10 +735,25 @@ exports.breakerNoteQuarantine = function breakerNoteQuarantine(name, count) {
 }
 
 // DB action for the same-name guard: pause the runaway row so leaseDueRows stops
-// picking it, release any lease, and record why. Mirrors schedule_pause's proven
-// last_status='paused' predicate. Separated from dispatchOne so it integration-tests
-// against a stub pool. Never throws to the caller - a DB hiccup here must not crash
-// the dispatch pass (the aggregate breaker is the fleet-wide backstop).
+// picking it, release any lease, and record why. Separated from dispatchOne so it
+// integration-tests against a stub pool. Never throws to the caller - a DB hiccup
+// here must not crash the dispatch pass (the aggregate breaker is the fleet-wide
+// backstop).
+//
+// status = 'paused', NOT 'active' (changed 2026-08-26, task daead163). It wrote
+// last_status='paused' with status='active' to mirror schedule_pause, and that one
+// word made this the most invisible failure in the fleet: leaseDueRows excludes
+// last_status IN ('paused','cancelled'), so a quarantined row NEVER fires again,
+// while every ordinary status query reads it as a healthy active row. On
+// 2026-08-26 that hid 35 silently-dead rows for hours, including gmail-inbox-poll,
+// which left inbound client mail dark. Two nets missed them for the same reason:
+// scheduler-spawn-fail-guard.sh deliberately skips status='active' rows as 'still
+// owned by the live dispatcher', and scheduler-lease-stall-canary.cjs excludes
+// last_status='paused' as deliberate. Both were right about the field they read
+// and wrong about the row. 'paused' is a valid status enum value (the CHECK
+// constraint allows active/paused/cancelled/dispatching/running/completed/failed/
+// orphaned) and schedule_resume clears BOTH columns, so a quarantine is now
+// visible in any status query and still resumable by the normal path.
 exports.quarantineRow = async function quarantineRow(pool, row, count) {
   const reason = 'runaway breaker: same-name re-dispatch guard quarantined this row (' +
     count + ' dispatches in ' + Math.round(BREAKER_SAMENAME_WINDOW_MS / 60000) +
@@ -746,7 +761,7 @@ exports.quarantineRow = async function quarantineRow(pool, row, count) {
   try {
     await pool.query(
       `UPDATE os_scheduled_tasks
-       SET last_status = 'paused', status = 'active',
+       SET last_status = 'paused', status = 'paused',
            leased_by = NULL, leased_at = NULL,
            last_error = $2, updated_at = NOW()
        WHERE id = $1`,
@@ -1204,11 +1219,25 @@ exports.dispatchOne = async function dispatchOne(row) {
       }
     }
 
-    // 0b. Runaway circuit breaker (Hunter 4 #7, 2026-08-13). Two brakes checked
+    // 0b. Runaway circuit breaker (Hunter 4 #7, 2026-08-13). Two brakes CHECKED
     // under the launch-lock, BEFORE any cred pick / worktree / tab spawn, so a
     // runaway is stopped before it spends a single token. Like the austerity gate
     // above, a trip RELEASES the lease without a retry (a freeze/quarantine is
     // suppression, not a row failure) so cadence and retry budget are untouched.
+    //
+    // CHECKED here, RECORDED after the spawn (split 2026-08-26, task daead163).
+    // breakerRecordDispatch used to run at the end of this block, before any tab
+    // existed, so it counted ATTEMPTS rather than dispatches. A spawn outage
+    // therefore manufactured quarantines out of perfectly healthy rows: the row
+    // is re-leased, re-recorded, and 5 failures inside the 10min window trip a
+    // guard built for runaway LOOPS. Measured 2026-08-26: a 3h02m IDE-bridge
+    // outage (04:18Z to 07:20Z) quarantined 35 rows at roughly one every 7
+    // minutes, each at exactly its due minute, and 33 of them had run_count=0 and
+    // had never run once. The breaker exists to stop a row that keeps SPAWNING
+    // workers, so a spawn that never happened must not count toward it. The
+    // spawn-failure class has its own owner (scheduler-spawn-fail-guard.sh plus
+    // the noteFailedDispatch outage pager); it was never this breaker's job.
+    let breakerRowName = null
     {
       const nowMs = Date.now()
       const rowName = row.name || String(row.id)
@@ -1244,8 +1273,9 @@ exports.dispatchOne = async function dispatchOne(row) {
         return
       }
 
-      // Both brakes clear: record this dispatch against both windows.
-      exports.breakerRecordDispatch(rowName, nowMs)
+      // Both brakes clear. The dispatch is NOT recorded here - see the
+      // breakerRecordDispatch call after the confirmed tab spawn below.
+      breakerRowName = rowName
     }
 
     // 1. Dispatch on the account that is ALREADY live. No per-dispatch rotation.
@@ -1461,6 +1491,14 @@ exports.dispatchOne = async function dispatchOne(row) {
     // because a tab spawn already proves the bridge; a bound timeout on a live
     // bridge is a different (worker-side) failure and must not re-arm the pager.
     exports.noteSuccessfulDispatch()
+
+    // Record this dispatch against both breaker windows, now that a worker tab
+    // provably exists. See the CHECKED-here/RECORDED-there note in the breaker
+    // block above: recording before the spawn let a spawn outage manufacture
+    // quarantines. A fresh Date.now() is deliberate - prep between the check and
+    // here can take a while, and the window this feeds should measure when
+    // workers actually started.
+    if (breakerRowName) exports.breakerRecordDispatch(breakerRowName, Date.now())
 
     // 4. Wait for signal_bound (inside launch-lock).
     // Poll coord inbox for a message with body.type==='bound' && body.task_id === row.id

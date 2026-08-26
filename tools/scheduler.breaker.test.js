@@ -218,6 +218,25 @@ ok('quarantineRow: pauses the row via last_status=paused and records the reason'
   assert.ok(/runaway breaker/.test(calls[0].params[1]), 'records the runaway-breaker reason')
 })
 
+// ── 9b. A quarantine must NOT read as a healthy active row ────────────────────
+//
+// REGRESSION, 2026-08-26 (task daead163). quarantineRow wrote status='active'
+// alongside last_status='paused'. leaseDueRows excludes last_status IN
+// ('paused','cancelled'), so the row could never fire again, while every ordinary
+// status query read it as healthy. 35 rows died that way in one afternoon,
+// including gmail-inbox-poll, which left inbound client mail dark for hours.
+// Test 9 above could not catch it: it asserted last_status and never looked at
+// status, so it passed identically before and after the defect. This one asserts
+// the field that was wrong.
+ok('quarantineRow: the pause is VISIBLE (status=paused, never active)', async () => {
+  const calls = []
+  const stubPool = { query: async (sql, params) => { calls.push({ sql, params }); return { rowCount: 1 } } }
+  await scheduler.quarantineRow(stubPool, { id: 'row-vis' }, 9)
+  const sql = calls[0].sql
+  assert.ok(/status = 'paused'/.test(sql), 'quarantine sets status=paused so it cannot masquerade as active')
+  assert.ok(!/status = 'active'/.test(sql), 'quarantine must never leave status=active (the 2026-08-26 silent-death bug)')
+})
+
 // ── 10. quarantineRow never throws on a DB error (dispatch pass must survive) ──
 ok('quarantineRow: a DB error is swallowed, not thrown', async () => {
   const badPool = { query: async () => { throw new Error('connection reset') } }
