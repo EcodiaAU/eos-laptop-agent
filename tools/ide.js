@@ -290,7 +290,15 @@ async function chatSendMessage(params) {
   if (!params || !params.prompt) throw new Error('prompt required');
   return call(params, 'POST', '/ide/chat/send_message', {
     prompt: params.prompt,
-    session: params.session,
+    // 2026-08-26 DISPATCH OUTAGE FIX. Claude Code's `claude-vscode.editor.open`
+    // calls .startsWith() on the session argument, so a null session throws
+    // "Cannot read properties of null (reading 'startsWith')", no tab is created,
+    // and the bridge's active_fallback then reports the CONDUCTOR's own tab as the
+    // spawned one. Every dispatch since then registered a worker that never ran:
+    // registered_at == last_heartbeat_at, dead at the 60min GC. An empty string is
+    // the "no prior session" sentinel the command accepts. Proven live 2026-08-26:
+    // session '' opened a real tab (11 -> 12) and the worker executed its command.
+    session: params.session != null ? params.session : '',
     submit: params.submit,
   });
 }

@@ -550,7 +550,19 @@ async function dispatch_worker(params) {
       spawn_error = 'editor.open failed: ' + (inner.open_error || 'unknown')
     }
     const ot = inner.opened_tab
-    if (ot && ot.viewColumn != null) {
+    // 2026-08-26 FAIL-LOUD GATE. The bridge's step-4 diff falls back to "whatever
+    // CC chat is currently active" when it cannot find a newly-created tab. That
+    // fallback is the CONDUCTOR's own tab, and accepting it is what let a thrown
+    // editor.open masquerade as a successful spawn: the worker row got written,
+    // the submit Enter was aimed at the conductor, and the worker never took a
+    // turn (registered_at == last_heartbeat_at, GC'd at 60min). A dispatch whose
+    // open failed, or that can only name a tab via active_fallback, has NOT
+    // spawned anything and must fail here rather than register a phantom worker.
+    const viaFallback = ot && ot.via === 'active_fallback'
+    if (viaFallback && !spawn_error) {
+      spawn_error = 'editor.open produced no new tab (bridge returned active_fallback: refusing to adopt the conductor tab)'
+    }
+    if (ot && ot.viewColumn != null && !spawn_error) {
       tab_handle = {
         sentinel_prefix: sentinel_prefix,
         viewColumn: ot.viewColumn,
