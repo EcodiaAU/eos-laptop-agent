@@ -1,7 +1,7 @@
 'use strict'
 
-// doctrine-harvest - land a dispatched worker's NEW pattern files on main before
-// the dispatcher prunes its worktree.
+// doctrine-harvest - land a dispatched worker's NEW pattern files in the
+// conductor's doctrine corpus before the dispatcher prunes its worktree.
 //
 // THE CAUSE THIS CLOSES
 // A dispatched worker commits doctrine to its isolated branch and then cannot
@@ -23,24 +23,52 @@
 // call sites). One edit covers all five, and harvest-before-remove is the only
 // ordering where the branch is guaranteed to still be readable.
 //
-// WHY PLUMBING, NOT A CHECKOUT
-// Everything below runs through git plumbing against the shared .git directory
-// with a TEMP index file. It never checks anything out, never moves HEAD, and
-// never writes into a working tree, so it cannot trip the shared tree's
-// reference-transaction branch-thrash guard and cannot disturb a live session.
+// WHERE IT LANDS, AND WHY THAT IS THE WHOLE POINT (revised 2026-08-27)
+// It writes the file into the conductor's working tree on disk. It does NOT
+// publish to origin/main, and the first version of this module did, which
+// recreated the very failure it was built to close.
+//
+// knowledge-index/indexer.js reads the corpus from DISK: BACKEND is
+// path.resolve(__dirname, '..') and ROOTS[0] is path.join(BACKEND, 'patterns'),
+// walked with fs and keyed on mtime. It never resolves a git ref. So a file that
+// exists only on origin/main is unreachable by knowledge.lookup, which is the
+// single reader this mechanism exists to serve. Measured 2026-08-27: nothing on
+// any schedule brings origin/main back into the conductor tree. There is no
+// launchd puller, no scheduler row, and no git hook. The only reconvergence is a
+// conductor session running `git merge origin/main` by hand, seven times in
+// main's 242-entry reflog and every one of them inside the four days this module
+// has been publishing. Doctrine moved from "stranded on a worker branch" to
+// "stranded on origin/main", and stayed invisible either way until a human
+// happened to notice.
+//
+// Writing to disk instead puts worker doctrine in the same durability lane every
+// conductor-authored pattern already uses, which is the lane that demonstrably
+// works: corpus-snapshot-committer commits patterns/ locally within 6h,
+// precious-work-backup carries those commits off-disk, and the conductor pushes
+// on its own cadence. It is also how the 17 files rescued on 2026-08-23 landed.
+// Nothing new has to be built or scheduled for this to be durable.
+//
+// WHY A PLAIN WRITE CANNOT DISTURB THE SHARED TREE
+// A plain fs write touches no ref, no index, and no HEAD, so the shared tree's
+// reference-transaction branch-thrash guard is structurally unreachable from
+// here: that guard only rejects updates to HEAD or to HEAD's target ref, and a
+// file write performs neither. This is strictly safer than the old plumbing
+// path, which at least wrote a temp index and pushed a ref. Only ref flips
+// endanger a live session; an untracked file appearing under patterns/ does not.
 // (Doctrine: branch-thrash-guard-on-shared-tree-2026-06-10.)
 //
 // SAFETY RAILS (all of them fail CLOSED: harvest nothing rather than harm)
 //  - Top-level patterns/*.md only. Never patterns/_archived/ and never any
 //    other path, so this can only ever add doctrine.
-//  - ADD-ONLY. A basename that already exists anywhere under patterns/ on
-//    origin/main is skipped, so an existing pattern can never be overwritten
-//    or rewritten by this path.
+//  - ADD-ONLY, enforced by the filesystem. The write uses the 'wx' flag, an
+//    atomic exclusive create that fails if the path exists, so an existing
+//    pattern can never be overwritten even by two harvests racing on the same
+//    basename. The pre-check below (disk basenames, including _archived/, unioned
+//    with origin/main) reports the skip with a reason; 'wx' is what guarantees it.
 //  - Em-dashes (U+2014) are banned at character level, so a file carrying one
 //    is refused rather than landed.
-//  - MAX_FILES caps one harvest; never force-push; the push is a plain
-//    fast-forward off the origin/main it was built on, retried once if a
-//    concurrent push moved main underneath.
+//  - MAX_FILES caps one harvest. A partial batch is reported honestly: files
+//    written before a mid-batch failure stay written and stay in landed[].
 //
 // Doctrine: backend/patterns/worker-doctrine-must-be-harvested-at-prune-2026-08-23.md
 
@@ -104,6 +132,37 @@ async function addedPatternPaths (git, sha) {
     .filter((p) => /^patterns\/[^/]+\.md$/.test(p))
 }
 
+// Every pattern basename the corpus ALREADY holds, from both surfaces, because
+// they disagree and add-only has to hold against the union of them.
+//
+// DISK is the one that decides whether a write can succeed, and it is the one
+// knowledge.lookup reads, so it is the primary. origin/main is unioned in as a
+// second rail: a basename published there but not yet merged down would
+// otherwise be written to disk as a divergent second copy of the same doctrine,
+// and the next `git merge origin/main` would land it as a conflict. Skipping it
+// leaves a real gap (that pattern is unreachable by lookup until someone merges),
+// but that gap is doctrine-branch-drift-canary's job to surface, not this one's
+// to paper over by duplicating the file.
+//
+// Recurses, so patterns/_archived/ counts as present: re-landing a basename the
+// conductor deliberately archived would resurrect superseded doctrine.
+function basenamesOnDisk (sharedTree) {
+  const set = new Set()
+  const root = path.join(sharedTree, 'patterns')
+  const walk = (dir) => {
+    let entries = []
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_e) { return }
+    for (const e of entries) {
+      if (e.name === 'node_modules' || e.name === '.git') continue
+      const full = path.join(dir, e.name)
+      if (e.isDirectory()) walk(full)
+      else if (e.isFile() && e.name.endsWith('.md')) set.add(e.name)
+    }
+  }
+  walk(root)
+  return set
+}
+
 async function basenamesOnMain (git) {
   const out = await git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'patterns/'])
   const set = new Set()
@@ -114,17 +173,35 @@ async function basenamesOnMain (git) {
   return set
 }
 
+// The union. A failure to read origin/main is NOT fatal (the disk rail plus the
+// 'wx' exclusive create still hold add-only), but it must not silently widen
+// what harvest is willing to write, so it degrades to disk-only and says so.
+async function existingBasenames (git, sharedTree) {
+  const disk = basenamesOnDisk(sharedTree)
+  let degraded = false
+  try {
+    for (const bn of await basenamesOnMain(git)) disk.add(bn)
+  } catch (_e) { degraded = true }
+  return { set: disk, degraded }
+}
+
 // ── the harvest ──────────────────────────────────────────────────────────────
 
 /**
- * Land a worker branch's NEW top-level pattern files onto origin/main.
+ * Land a worker branch's NEW top-level pattern files in the conductor's corpus
+ * on disk, where knowledge.lookup reads.
  *
  * @param {object} opts
- * @param {string} opts.sharedTree  path to the shared working tree (its .git is the object store)
+ * @param {string} opts.sharedTree  the conductor working tree: BOTH the git object
+ *                                  store the branch is read from AND the corpus
+ *                                  written to
  * @param {string} opts.branch      the worker branch ref, e.g. worker/<row.id>
- * @param {string} [opts.rowId]     scheduler row id, recorded in the commit trailer
- * @param {boolean} [opts.dryRun]   build the commit but do not push
+ * @param {string} [opts.rowId]     scheduler row id, recorded in the audit line
+ * @param {boolean} [opts.dryRun]   resolve and vet the files but write nothing
  * @returns {Promise<object>} { ok, landed[], skipped[], refused[], commit, reason }
+ *                            commit is always null now: nothing is committed here,
+ *                            corpus-snapshot-committer does that within 6h. The key
+ *                            is kept so existing audit-log readers do not break.
  */
 async function _harvest (opts) {
   const sharedTree = opts && opts.sharedTree
@@ -177,13 +254,14 @@ async function _harvest (opts) {
     return result
   }
 
-  const onMain = await basenamesOnMain(git)
+  const existing = await existingBasenames(git, sharedTree)
+  if (existing.degraded) result.degraded = 'could not read origin/main basenames; add-only fell back to disk plus the exclusive create'
 
   // Resolve each candidate to a blob, applying the add-only and em-dash rails.
   const toLand = []
   for (const [p, sha] of candidates) {
     const bn = path.posix.basename(p)
-    if (onMain.has(bn)) { result.skipped.push({ path: p, reason: 'basename already on main' }); continue }
+    if (existing.set.has(bn)) { result.skipped.push({ path: p, reason: 'basename already in the corpus' }); continue }
     if (toLand.length >= MAX_FILES) { result.skipped.push({ path: p, reason: 'MAX_FILES cap reached' }); continue }
     let blob
     try {
@@ -203,7 +281,10 @@ async function _harvest (opts) {
     if (!body.trim()) {
       result.refused.push({ path: p, reason: 'empty file' }); continue
     }
-    toLand.push({ path: p, blob, sha, basename: bn })
+    // body is carried, not re-read at write time: it is the exact bytes already
+    // vetted against the em-dash ban and the empty-file rail. Re-reading the blob
+    // later would let a vetted file and a written file drift apart.
+    toLand.push({ path: p, blob, sha, basename: bn, body })
   }
 
   if (!toLand.length) {
@@ -212,57 +293,58 @@ async function _harvest (opts) {
       return result
   }
 
-  // Build the commit entirely in a temp index, off a pinned origin/main.
-  const idxFile = path.join(os.tmpdir(), 'doctrine-harvest-' + process.pid + '-' + Date.now() + '.idx')
-  const idxEnv = { GIT_INDEX_FILE: idxFile }
-  const pushed = await (async function attemptPush (retry) {
-    const base = (await git(['rev-parse', 'origin/main'])).trim()
-    await git(['read-tree', base], { env: idxEnv })
-    for (const f of toLand) {
-      await git(['update-index', '--add', '--cacheinfo', '100644,' + f.blob + ',' + f.path], { env: idxEnv })
-    }
-    const tree = (await git(['write-tree'], { env: idxEnv })).trim()
+  if (dryRun) {
+    result.ok = true
+    result.landed = toLand.map((f) => f.path)
+    result.reason = 'dry run (files vetted, nothing written)'
+    return result
+  }
 
-    const names = toLand.map((f) => f.basename)
-    const subject = 'doctrine(harvest): land ' + names.length + ' pattern file' +
-      (names.length === 1 ? '' : 's') + ' from worker branch ' + branch
-    const body = [
-      'A dispatched worker authored these and could not push them: the worker',
-      'capability ceiling denies `git push`, correctly. Harvested from the branch',
-      'by the dispatcher at prune time so the doctrine reaches main instead of',
-      'dying with the worktree.',
-      '',
-      'Scheduler row: ' + rowId,
-      'Files:',
-    ].concat(names.map((n) => '  ' + n)).join('\n')
+  // Write each vetted file into the conductor's corpus.
+  //
+  // 'wx' is an atomic exclusive create: it fails with EEXIST rather than
+  // truncating. That is what actually enforces add-only, and it is why two
+  // harvests racing on the same basename cannot corrupt a pattern. The
+  // basename pre-check above is the fast path that reports a readable reason;
+  // this flag is the guarantee. The old publish path had no equivalent, and the
+  // audit log shows the race it allowed: row d85e97cd landed the same three
+  // files twice, commits 995a6658 and 1718914339, eight seconds apart.
+  //
+  // A mid-batch failure is reported honestly rather than rolled back. Files
+  // already written are real doctrine that is already readable, so removing
+  // them to make the result tidy would destroy the exact thing this exists to
+  // save. landed[] carries what is on disk; refused[] carries the rest.
+  const patternsDir = path.join(sharedTree, 'patterns')
+  try {
+    fs.mkdirSync(patternsDir, { recursive: true })
+  } catch (e) {
+    result.reason = 'patterns dir unusable: ' + (e && e.message || e)
+    result.refused = result.refused.concat(toLand.map((f) => ({ path: f.path, reason: 'patterns dir unusable' })))
+    return result
+  }
 
-    const commit = (await git(['commit-tree', tree, '-p', base, '-m', subject, '-m', body])).trim()
-    if (dryRun) return { commit, base, pushed: false }
+  for (const f of toLand) {
+    const dest = path.join(patternsDir, f.basename)
     try {
-      await git(['push', 'origin', commit + ':refs/heads/main'])
-      return { commit, base, pushed: true }
+      fs.writeFileSync(dest, f.body, { encoding: 'utf8', flag: 'wx' })
+      result.landed.push(f.path)
     } catch (e) {
-      // A concurrent push moved main. Re-fetch and rebuild once off the new tip.
-      if (retry > 0) {
-        await git(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
-        return attemptPush(retry - 1)
+      const code = e && e.code
+      if (code === 'EEXIST') {
+        // Lost a race, or the pre-check read a stale directory. Either way the
+        // corpus already holds this basename and add-only held.
+        result.skipped.push({ path: f.path, reason: 'basename appeared in the corpus before the write' })
+      } else {
+        result.refused.push({ path: f.path, reason: 'write failed: ' + (code || (e && e.message) || e) })
       }
-      throw e
     }
-  })(1).catch((e) => ({ error: e && e.message || String(e) }))
-
-  try { fs.unlinkSync(idxFile) } catch (_e) {}
-
-  if (pushed && pushed.error) {
-    result.reason = 'push failed: ' + pushed.error
-    result.refused = result.refused.concat(toLand.map((f) => ({ path: f.path, reason: 'push failed' })))
-      return result
   }
 
   result.ok = true
-  result.commit = pushed.commit
-  result.landed = toLand.map((f) => f.path)
-  result.reason = dryRun ? 'dry run (commit built, not pushed)' : 'landed on main'
+  result.commit = null
+  result.reason = result.landed.length
+    ? 'written to the conductor corpus on disk'
+    : 'nothing new to land'
   return result
 }
 

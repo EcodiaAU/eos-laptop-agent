@@ -1,9 +1,21 @@
 // doctrine-harvest.test.js - REAL-git proof that a worker's stranded doctrine
-// reaches main. Stubbed git would prove nothing here: the whole mechanism is
-// plumbing (read-tree / update-index / write-tree / commit-tree / push), so the
-// test stands up a throwaway bare origin plus a shared tree, plants a worker
-// branch carrying a dummy patterns/*.md exactly the way a dispatched worker
-// leaves one behind, runs the harvest, and asserts the file is on origin/main.
+// reaches the surface knowledge.lookup actually reads.
+//
+// Stubbed git would prove nothing here: the mechanism reads a branch through git
+// plumbing and then writes the corpus through the filesystem, so the test stands
+// up a throwaway bare origin plus a shared tree, plants a worker branch carrying
+// a dummy patterns/*.md exactly the way a dispatched worker leaves one behind,
+// runs the harvest, and asserts the file is ON DISK in the shared tree.
+//
+// WHY DISK IS THE ASSERTION (revised 2026-08-27)
+// The first version of this suite asserted the file reached origin/main, and it
+// passed for four days while the mechanism was failing at its actual purpose.
+// knowledge-index/indexer.js reads the corpus from disk with fs, never from a git
+// ref, and nothing on any schedule brings origin/main back into the conductor
+// tree. So "on origin/main" was never the property worth testing, and asserting
+// it made a broken outcome look green. Test 1 now carries an explicit NEGATIVE
+// control: the file must NOT be on origin/main, which is what stops this suite
+// silently re-passing if the publish path is ever reinstated.
 //
 // Same posture as scheduler-worktree-alloc.test.js: real git, throwaway dirs,
 // nothing touches the live repo.
@@ -76,52 +88,118 @@ function plantWorkerBranch (shared, root, branch, files) {
   return wt
 }
 
+// THE surface under test: the conductor corpus on disk, which is what
+// knowledge-index walks with fs.
+function patternsOnDisk (shared) {
+  const out = []
+  const root = path.join(shared, 'patterns')
+  const walk = (dir, prefix) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix ? prefix + '/' + e.name : e.name
+      if (e.isDirectory()) walk(path.join(dir, e.name), rel)
+      else out.push('patterns/' + rel)
+    }
+  }
+  walk(root, '')
+  return out.sort()
+}
+
 function filesOnMain (shared) {
   git(shared, ['fetch', 'origin', '--quiet'])
   return git(shared, ['ls-tree', '-r', '--name-only', 'origin/main']).split('\n').map((s) => s.trim()).filter(Boolean)
 }
 
+function readDisk (shared, rel) {
+  return fs.readFileSync(path.join(shared, rel), 'utf8')
+}
+
 async function main () {
   console.log('doctrine-harvest: real-git proof\n')
 
-  // ── 1. the headline case: a worker's new pattern reaches main ──────────────
+  // 1. The headline case, restated. A worker's new pattern must reach the DISK
+  //    corpus, and must NOT be published to origin/main.
   {
     const { root, shared } = setup()
     plantWorkerBranch(shared, root, 'worker/row-aaa', {
       'patterns/dummy-harvest-proof-2026-08-23.md': '---\ntriggers: dummy harvest proof\n---\n# dummy harvest proof\n\nA throwaway file planted by the harvest test.\n',
     })
 
-    const before = filesOnMain(shared)
-    ok('before: dummy file is NOT on main', !before.includes('patterns/dummy-harvest-proof-2026-08-23.md'))
+    const before = patternsOnDisk(shared)
+    ok('before: dummy file is NOT in the disk corpus', !before.includes('patterns/dummy-harvest-proof-2026-08-23.md'))
 
     const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-aaa', rowId: 'row-aaa' })
-    const after = filesOnMain(shared)
+    const after = patternsOnDisk(shared)
 
     ok('harvest reports ok', res.ok === true, JSON.stringify(res))
     ok('harvest landed exactly the dummy file', res.landed.length === 1 && res.landed[0] === 'patterns/dummy-harvest-proof-2026-08-23.md', JSON.stringify(res.landed))
-    ok('AFTER: dummy file IS on origin/main', after.includes('patterns/dummy-harvest-proof-2026-08-23.md'), JSON.stringify(after))
-    ok('main advanced by exactly one commit', git(shared, ['rev-list', '--count', 'origin/main']).trim() === '2')
+    ok('AFTER: dummy file IS in the disk corpus', after.includes('patterns/dummy-harvest-proof-2026-08-23.md'), JSON.stringify(after))
+    ok('landed content is byte-identical to what the worker wrote',
+      readDisk(shared, 'patterns/dummy-harvest-proof-2026-08-23.md').includes('A throwaway file planted by the harvest test.'))
 
-    const landedBody = git(shared, ['show', 'origin/main:patterns/dummy-harvest-proof-2026-08-23.md'])
-    ok('landed content is byte-identical to what the worker wrote', landedBody.includes('A throwaway file planted by the harvest test.'))
+    // NEGATIVE CONTROL. This is the assertion that would have caught the
+    // original design. Landing must not publish, and main must not move.
+    ok('NEGATIVE CONTROL: dummy file was NOT published to origin/main',
+      !filesOnMain(shared).includes('patterns/dummy-harvest-proof-2026-08-23.md'))
+    ok('NEGATIVE CONTROL: origin/main did not advance', git(shared, ['rev-list', '--count', 'origin/main']).trim() === '1')
+    ok('no commit is claimed in the result', res.commit === null, JSON.stringify(res.commit))
+
+    // The file must be untracked-and-new, so corpus-snapshot-committer picks it
+    // up on its own cadence. That is the durability lane the design relies on.
+    const st = git(shared, ['status', '--porcelain', '--', 'patterns/']).trim()
+    ok('lands as an untracked add the committer will collect', /^\?\? patterns\/dummy-harvest-proof-2026-08-23\.md$/m.test(st), st)
     fs.rmSync(root, { recursive: true, force: true })
   }
 
-  // ── 2. add-only: never overwrite an existing pattern ──────────────────────
+  // 2. add-only, and WHICH rail catches what. There are two, they fire at
+  //    different layers, and conflating them hides a hole.
+  //
+  //    (a) A worker REWRITING a pattern that its branch base already carries is
+  //        a modification, so --diff-filter=A drops it before it is ever a
+  //        candidate. It never reaches the basename check, which is why skipped[]
+  //        is empty here rather than carrying a reason. Asserting a skip reason
+  //        on this case would be asserting a rail that does not run.
+  //
+  //    (b) A worker ADDING a basename the DISK corpus already holds is a genuine
+  //        add against its base, so only the basename check can stop it. This is
+  //        the case the origin/main baseline used to miss completely: a pattern
+  //        written by the conductor but not yet pushed is absent from origin/main,
+  //        so the old check waved the duplicate through and the harvest published
+  //        a second copy of doctrine that already existed on disk.
   {
     const { root, shared } = setup()
     plantWorkerBranch(shared, root, 'worker/row-bbb', {
       'patterns/existing-rule-2026-01-01.md': '# HOSTILE REWRITE of a live pattern\n',
     })
     const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-bbb', rowId: 'row-bbb' })
-    const body = git(shared, ['show', 'origin/main:patterns/existing-rule-2026-01-01.md'])
-    ok('existing pattern is untouched on main', body.trim() === '# an existing rule', body)
-    ok('nothing was landed', res.landed.length === 0, JSON.stringify(res))
-    ok('main did NOT advance', git(shared, ['rev-list', '--count', 'origin/main']).trim() === '1')
+    ok('(a) existing pattern is untouched on disk', readDisk(shared, 'patterns/existing-rule-2026-01-01.md').trim() === '# an existing rule')
+    ok('(a) nothing was landed', res.landed.length === 0, JSON.stringify(res))
+    ok('(a) a rewrite is dropped by diff-filter=A, so it never reaches the basename rail',
+      res.skipped.length === 0 && /no patterns\/\*\.md added/.test(res.reason), JSON.stringify(res))
+    ok('(a) the working tree is clean', git(shared, ['status', '--porcelain']).trim() === '')
+
+    // (b) The disk-baseline case. Written to disk, deliberately NOT committed, so
+    // origin/main does not know about it. The old baseline would have landed a
+    // duplicate here.
+    fs.writeFileSync(path.join(shared, 'patterns', 'uncommitted-rule-2026-08-27.md'), '# authored by the conductor, not yet pushed\n')
+    ok('(b) fixture: on disk, absent from origin/main',
+      !filesOnMain(shared).includes('patterns/uncommitted-rule-2026-08-27.md'))
+
+    plantWorkerBranch(shared, root, 'worker/row-bbb2', {
+      'patterns/uncommitted-rule-2026-08-27.md': '# a worker DUPLICATE of an uncommitted conductor pattern\n',
+    })
+    const res2 = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-bbb2', rowId: 'row-bbb2' })
+    ok('(b) a basename present only on DISK still blocks the add',
+      res2.landed.length === 0 && res2.skipped.some((s) => /already in the corpus/.test(s.reason)), JSON.stringify(res2))
+    ok('(b) the uncommitted conductor pattern was not overwritten',
+      readDisk(shared, 'patterns/uncommitted-rule-2026-08-27.md').trim() === '# authored by the conductor, not yet pushed')
     fs.rmSync(root, { recursive: true, force: true })
   }
 
-  // ── 3. _archived is out of scope ──────────────────────────────────────────
+  // 3. _archived is out of scope BOTH ways: never harvested FROM, and a basename
+  //    already sitting in _archived/ is never resurrected into the live corpus.
+  //    The second half is the one that bites: re-landing a pattern the conductor
+  //    deliberately archived would put superseded doctrine back in front of
+  //    knowledge.lookup.
   {
     const { root, shared } = setup()
     plantWorkerBranch(shared, root, 'worker/row-ccc', {
@@ -129,29 +207,38 @@ async function main () {
       'src/not-a-pattern.js': 'console.log(1)\n',
     })
     const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ccc', rowId: 'row-ccc' })
-    const after = filesOnMain(shared)
+    const after = patternsOnDisk(shared)
     ok('archived file not landed', !after.includes('patterns/_archived/sneaky-2026-08-23.md'))
-    ok('non-pattern source not landed', !after.includes('src/not-a-pattern.js'))
+    ok('non-pattern source not landed', !after.includes('patterns/not-a-pattern.js'))
     ok('reports nothing to harvest', res.ok === true && res.landed.length === 0, JSON.stringify(res))
+
+    plantWorkerBranch(shared, root, 'worker/row-ccc2', {
+      'patterns/old-rule-2025-01-01.md': '# a resurrected archived rule\n',
+    })
+    const res2 = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ccc2', rowId: 'row-ccc2' })
+    ok('an ARCHIVED basename is not resurrected into the live corpus',
+      res2.landed.length === 0 && !fs.existsSync(path.join(shared, 'patterns', 'old-rule-2025-01-01.md')),
+      JSON.stringify(res2))
     fs.rmSync(root, { recursive: true, force: true })
   }
 
-  // ── 4. em-dash refusal (character-level ban) ──────────────────────────────
+  // 4. em-dash refusal (character-level ban)
   {
     const { root, shared } = setup()
     plantWorkerBranch(shared, root, 'worker/row-ddd', {
+      // Escaped, never a literal: this file is itself subject to the character-level ban.
       'patterns/has-em-dash-2026-08-23.md': '# a rule\n\nthis line carries an em dash ' + '\u2014' + ' right here\n',
       'patterns/is-clean-2026-08-23.md': '# a clean rule\n\nno banned characters here\n',
     })
     const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ddd', rowId: 'row-ddd' })
-    const after = filesOnMain(shared)
+    const after = patternsOnDisk(shared)
     ok('em-dash file refused', !after.includes('patterns/has-em-dash-2026-08-23.md'))
     ok('refusal is reported with a reason', res.refused.some((r) => /em-dash/.test(r.reason)), JSON.stringify(res.refused))
     ok('clean sibling still landed', after.includes('patterns/is-clean-2026-08-23.md'), JSON.stringify(after))
     fs.rmSync(root, { recursive: true, force: true })
   }
 
-  // ── 5. clean no-ops ───────────────────────────────────────────────────────
+  // 5. clean no-ops + idempotence
   {
     const { root, shared } = setup()
     const a = await harvestDoctrine({ sharedTree: shared, branch: 'worker/does-not-exist', rowId: 'row-eee' })
@@ -161,22 +248,31 @@ async function main () {
     const b = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-fff', rowId: 'row-fff' })
     ok('branch with no patterns is a clean no-op', b.ok === true && b.landed.length === 0, JSON.stringify(b))
 
-    // Re-running the same harvest must be idempotent: the basenames are now on
-    // main, so the second pass lands nothing and main does not advance again.
+    // Re-running the same harvest must be idempotent: the basename is now in the
+    // disk corpus, so the second pass lands nothing and the file is not rewritten.
     plantWorkerBranch(shared, root, 'worker/row-ggg', { 'patterns/idem-2026-08-23.md': '# idempotence\n' })
     await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ggg', rowId: 'row-ggg' })
-    const countAfterFirst = git(shared, ['rev-list', '--count', 'origin/main']).trim()
+    const bodyAfterFirst = readDisk(shared, 'patterns/idem-2026-08-23.md')
     const second = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ggg', rowId: 'row-ggg' })
-    ok('re-harvest is idempotent', second.landed.length === 0 && git(shared, ['rev-list', '--count', 'origin/main']).trim() === countAfterFirst, JSON.stringify(second))
+    ok('re-harvest is idempotent',
+      second.landed.length === 0 && readDisk(shared, 'patterns/idem-2026-08-23.md') === bodyAfterFirst,
+      JSON.stringify(second))
+
+    // A dry run must vet without writing anything.
+    plantWorkerBranch(shared, root, 'worker/row-hhh', { 'patterns/dry-2026-08-27.md': '# dry run\n' })
+    const dry = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-hhh', rowId: 'row-hhh', dryRun: true })
+    ok('dry run reports the file but writes nothing',
+      dry.landed.length === 1 && !fs.existsSync(path.join(shared, 'patterns', 'dry-2026-08-27.md')),
+      JSON.stringify(dry))
     fs.rmSync(root, { recursive: true, force: true })
   }
 
   // 6. EVERY invocation is audited, including the silent no-ops.
   //
-  // This is the regression guard for the 2026-08-24 observability fix. Before it,
-  // audit() sat inside the success paths only, so a prune that invoked harvest and
-  // correctly found nothing wrote no line anywhere. Two live prunes did exactly
-  // that on 2026-08-23 and left the mechanism unprovable from its own telemetry.
+  // Regression guard for the 2026-08-24 observability fix. Before it, audit() sat
+  // inside the success paths only, so a prune that invoked harvest and correctly
+  // found nothing wrote no line anywhere. Two live prunes did exactly that on
+  // 2026-08-23 and left the mechanism unprovable from its own telemetry.
   // The rule now: one audit line per call, whatever the outcome.
   {
     const { root, shared } = setup()
@@ -209,6 +305,56 @@ async function main () {
       readLog().filter((r) => r.rowId === 'audit-no-patterns').length === 1,
       JSON.stringify(readLog()))
 
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 7. The union rail. A basename that is on origin/main but NOT yet on disk is
+  //    skipped rather than written, because writing it would create a second,
+  //    divergent copy of the same doctrine that the next merge turns into a
+  //    conflict. Surfacing that gap is doctrine-branch-drift-canary's job.
+  {
+    const { root, origin, shared } = setup()
+
+    // Publish a pattern from a SEPARATE clone, so the shared tree's disk never
+    // holds it while its origin/main does.
+    const other = path.join(root, 'other')
+    execFileSync('git', ['clone', origin, other], { stdio: 'ignore' })
+    fs.writeFileSync(path.join(other, 'patterns', 'main-only-2026-08-27.md'), '# published elsewhere\n')
+    git(other, ['add', '-A'])
+    git(other, ['commit', '-q', '-m', 'a pattern that never reached the conductor tree'])
+    git(other, ['push', '-q', 'origin', 'main'])
+    git(shared, ['fetch', 'origin', '--quiet'])
+
+    ok('fixture: the basename is on origin/main but NOT on disk',
+      filesOnMain(shared).includes('patterns/main-only-2026-08-27.md') &&
+      !fs.existsSync(path.join(shared, 'patterns', 'main-only-2026-08-27.md')))
+
+    plantWorkerBranch(shared, root, 'worker/row-union', { 'patterns/main-only-2026-08-27.md': '# a DIVERGENT second copy\n' })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-union', rowId: 'row-union' })
+    ok('a basename already on origin/main is not written to disk as a second copy',
+      res.landed.length === 0 && !fs.existsSync(path.join(shared, 'patterns', 'main-only-2026-08-27.md')),
+      JSON.stringify(res))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 8. The exclusive-create rail. Two harvests racing on the same branch must not
+  //    produce a duplicated or half-written file. The old publish path had no
+  //    equivalent and the live audit log records the race it allowed: row
+  //    d85e97cd landed the same three files twice, commits 995a6658 and
+  //    1718914339, eight seconds apart.
+  {
+    const { root, shared } = setup()
+    plantWorkerBranch(shared, root, 'worker/row-race', { 'patterns/race-2026-08-27.md': '# exactly one copy\n' })
+    const [r1, r2] = await Promise.all([
+      harvestDoctrine({ sharedTree: shared, branch: 'worker/row-race', rowId: 'row-race-1' }),
+      harvestDoctrine({ sharedTree: shared, branch: 'worker/row-race', rowId: 'row-race-2' }),
+    ])
+    const total = r1.landed.length + r2.landed.length
+    ok('two concurrent harvests land the file exactly once', total === 1, JSON.stringify([r1.landed, r2.landed]))
+    ok('the raced file is intact, not truncated or doubled',
+      readDisk(shared, 'patterns/race-2026-08-27.md') === '# exactly one copy\n',
+      JSON.stringify(readDisk(shared, 'patterns/race-2026-08-27.md')))
+    ok('both invocations report ok', r1.ok === true && r2.ok === true, JSON.stringify([r1.reason, r2.reason]))
     fs.rmSync(root, { recursive: true, force: true })
   }
 
