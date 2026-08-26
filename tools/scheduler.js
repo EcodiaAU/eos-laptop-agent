@@ -1167,6 +1167,28 @@ exports.dispatchOne = async function dispatchOne(row) {
              AND leased_by IS NOT DISTINCT FROM $2`,
           [row.id, row.leased_by || null]
         )
+        // Converge the marker with the live band, or this gate becomes a hot loop.
+        // leaseDueRows only excludes a cron whose austerity_paused MARKER is set, so a
+        // band-suppressed cron carrying no marker is re-leased on EVERY poll, re-checked
+        // here, and released again, forever. Measured 2026-08-26: cowork.nwg-score-on-arrival
+        // (next_run_at 30h in the past, band-suppressed, no marker) skipped 125 times in the
+        // 100 minutes after the 01:57Z boot, and 28,197 of 169,876 lines in
+        // eos-laptop-agent.err.log were that single row. Writing the marker the gate has
+        // just computed moves the exclusion back to lease time and the spin stops.
+        // Safe to write from here: scheduler-austerity.cjs applyState() recomputes
+        // toPause/toResume across the WHOLE fleet from the live band, not from who set the
+        // marker, so the next lever run clears this row (with its own stagger) the moment it
+        // stops being suppressed. next_run_at is still left intact, so the catch-up run the
+        // original comment wanted is preserved.
+        let markerWritten = false
+        if (bandSuppressed && g.type === 'cron' && g.austerity_paused !== true) {
+          const m = await pool.query(
+            `UPDATE os_scheduled_tasks SET austerity_paused = true, updated_at = NOW()
+             WHERE id = $1 AND type = 'cron' AND austerity_paused IS NOT TRUE`,
+            [row.id]
+          )
+          markerWritten = m.rowCount > 0
+        }
         // Distinguish the cause so the log tells us WHICH gate fired. A
         // 'band>level(no-marker)' skip means a marker-less suppressed cron was
         // caught - the exact 2026-07-15 leak class - now harmless and self-reporting.
@@ -1177,7 +1199,7 @@ exports.dispatchOne = async function dispatchOne(row) {
           bandSuppressed ? 'band>level(no-marker)' : 'unknown'
         process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
           (g && g.name || row.name || '?') + ') - austerity gate [' + cause + ']; ' +
-          'lease released without retry\n')
+          'lease released without retry' + (markerWritten ? '; marker written (spin stopped)' : '') + '\n')
         return
       }
     }
