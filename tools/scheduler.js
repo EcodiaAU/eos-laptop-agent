@@ -355,10 +355,18 @@ async function defaultPruneWorktreeForRow(row) {
 }
 
 async function runGit(args) {
-  // ECODIAOS_BRANCH_OK=1 lets the dispatcher's own worktree add survive even
-  // when the shared-tree hook tightens. The hook today only blocks HEAD updates
-  // on the shared tree; worktree add does not move HEAD there. The env var is
-  // a future-proof for hook tightening.
+  // ECODIAOS_BRANCH_OK=1 is load-bearing here, not future-proofing.
+  // Measured 2026-08-27 on git 2.50.1: allocating a worktree from the shared
+  // tree DOES open a HEAD ref update on the shared tree itself (ref=HEAD,
+  // old=all-zeros, new=ref:refs/heads/<newbranch>), evaluated by that tree's
+  // reference-transaction hook with GIT_DIR empty. The previous claim here,
+  // that "worktree add does not move HEAD there", was wrong, and that error is
+  // why the branch-thrash guard silently refused every MANUAL allocation for
+  // months while automated dispatch kept working: this env var was the only
+  // thing exempting us. The guard now also exempts an allocation by inspecting
+  // the invoking command, so the manual path works too; this stays as the
+  // explicit, process-independent guarantee for the dispatcher.
+  // Doctrine: ecodiaos/backend/patterns/branch-thrash-guard-on-shared-tree-2026-06-10.md
   const env = Object.assign({}, process.env, { ECODIAOS_BRANCH_OK: '1' })
   return execFileP('git', ['-C', SHARED_TREE].concat(args), {
     timeout: WORKTREE_GIT_TIMEOUT_MS,
