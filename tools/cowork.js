@@ -258,7 +258,16 @@ function composeBrief(opts) {
     'context carries over). If the scheduler tool is deferred, load it first:\n' +
     '  ToolSearch("select:mcp__ecodia-scheduler__schedule_delayed")\n' +
     '  mcp__ecodia-scheduler__schedule_delayed({\n' +
-    '    name: "cowork.<project>-<next-or-verify>",\n' +
+    '    name: "cowork.<lowercase-project>-lane-<Letter><digit>-<next-or-verify>",\n' +
+    '          THE NAME SHAPE IS LOAD-BEARING, not cosmetic. Only a name matching\n' +
+    '            cowork.<lowercase-project>-lane-<Letter><digit>[-<free suffix>]\n' +
+    '          (lane ids S0, A3, W2; the project slug must be lowercase; the separator\n' +
+    '          is \"-lane-\" WITH the trailing hyphen) is seen by the migration-147\n' +
+    '          trigger trg_os_scheduled_tasks_one_live_row_per_lane, which cancels any\n' +
+    '          EARLIER pending row holding the same lane. Any other name parses to NULL\n' +
+    '          and gets NO collision guard, so a second successor armed for the same job\n' +
+    '          opens a second worker tab against the same repo and both do the work.\n' +
+    '          Carry forward the lane id of the row that armed you; vary only the suffix.\n' +
     '    delay: "in 1m",\n' +
     '    prompt: "<FULL brief: what you shipped + the exact commit or url, what is still\n' +
     '             unproven, the exact verify gate or next step, recipe/pattern path and\n' +
