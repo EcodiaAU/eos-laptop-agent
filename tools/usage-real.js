@@ -262,9 +262,30 @@ async function probeAccount(short, opts) {
     return keep('http_429', { backoff_until: new Date(nowMs + wait).toISOString() })
   }
   if (r.status === 401 || r.status === 403) {
-    // On a snapshot this means the stored lineage is dead. It does NOT block switching:
+    // On a snapshot a 401 means the stored lineage is dead. It does NOT block switching:
     // account-switch.sh performs a full OAuth re-login and needs no snapshot.
-    return keep('http_' + r.status, { backoff_until: new Date(nowMs + backoffMs((prior.consecutive_failures || 0) + 1)).toISOString() })
+    //
+    // A 403 is NOT the same thing and must not be reported as one. 2026-08-26: money@ sat
+    // at 277 consecutive failures reading as "the snapshot is dead" while its access token
+    // was FRESH (cred-refresher had renewed it minutes earlier, 7.7h of validity left). The
+    // real body was:
+    //   {"type":"permission_error","message":"OAuth authentication is currently not allowed
+    //    for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}}
+    // That is an ORG POLICY block. No amount of re-login fixes it, and account-switch.sh
+    // --dry still returns "preflight clean" because dry only checks LOCAL preconditions and
+    // never exercises the forbidden OAuth flow. Conflating the two costs days of chasing a
+    // credential that was never broken, so name the real cause on the row.
+    let probe_reason = null
+    if (r.status === 403) {
+      let code = null
+      try { code = JSON.parse(r.body).error.details.error_code } catch (e) { /* body not the shape we know */ }
+      probe_reason = code === 'oauth_not_allowed_for_organization'
+        ? 'org policy: OAuth is disabled for this account\'s organization. A re-login CANNOT fix this; the org setting must change.'
+        : 'http 403 forbidden' + (code ? ' (' + code + ')' : '') + ': the token authenticated but the resource is denied. This is NOT a dead token.'
+    }
+    return keep('http_' + r.status, Object.assign(
+      { backoff_until: new Date(nowMs + backoffMs((prior.consecutive_failures || 0) + 1)).toISOString() },
+      probe_reason ? { probe_reason: probe_reason } : {}))
   }
   if (r.status !== 200) {
     const status = r.status === 0 ? (r.error === 'timeout' ? 'timeout' : 'network') : ('http_' + r.status)
