@@ -210,31 +210,91 @@ function check(label, fn) {
   // are the two PRE-SPAWN bails, where dispatchOne releases the lease before any
   // worker exists, so re-leasing cannot duplicate anything and leaving next_run_at
   // alone is what makes the row retry promptly once the suppression lifts.
-  check('case 7: every post-spawn active re-arm also re-arms next_run_at', () => {
-    const src = require('fs').readFileSync(require('path').join(__dirname, 'scheduler.js'), 'utf8')
-    const PRE_SPAWN_BAILS = [
-      'austerity',        // dispatchOne defense-in-depth austerity gate, released pre-spawn
-      'aggregate breaker' // dispatchOne rolling-window freeze, released pre-spawn
-    ]
-    const offenders = []
+  //
+  // 2026-08-26 verification pass (worker d38b5a28). The exemption WAS a substring
+  // test over the ~700 chars of context surrounding the statement, which is not a
+  // property of the statement at all. Measured against this very file: an UPDATE
+  // that returns a row to active with no re-arm, placed anywhere downstream of a
+  // comment containing the word "austerity", was silently exempted and the suite
+  // still reported green. The scheduler's suppression logic is exactly where that
+  // word clusters, so the next path added near the austerity gate would have
+  // inherited an exemption it never earned. The opt-out is now a marker INSIDE the
+  // SQL block (an ordinary SQL line comment, ignored by Postgres), so it travels
+  // with the statement and cannot be inherited from a neighbour. Both negative
+  // controls below are pinned so the weaker form cannot come back.
+  const PRE_SPAWN_BAIL_MARKER = 'PRE-SPAWN-BAIL'
+  function scanForOffenders(src) {
+    const offenders = [], exempted = [], activeBlocks = []
     const re = /`(UPDATE os_scheduled_tasks[\s\S]*?)`/g
     let m
     while ((m = re.exec(src)) !== null) {
-      const block = m.group ? m.group(1) : m[1]
+      const block = m[1]
       if (!block.includes("status = 'active'")) continue
+      const line = src.slice(0, m.index).split('\n').length
+      activeBlocks.push(line)
+      // Structural opt-out FIRST: the marker must sit INSIDE this statement, and it
+      // is checked ahead of the re-arm test so that a marker whose own wording happens
+      // to contain the column name cannot silently reclassify the statement as a
+      // re-arm. (That is not hypothetical: the first cut of this marker mentioned the
+      // column in its prose, both bails read as re-arming, and only the vacuity pin
+      // below caught it.)
+      if (block.includes(PRE_SPAWN_BAIL_MARKER)) { exempted.push(line); continue }
       if (block.includes('next_run_at')) continue
-      // Classify by the ~700 chars of context around the statement.
-      const ctx = src.slice(Math.max(0, m.index - 700), m.index + 400).toLowerCase()
-      if (PRE_SPAWN_BAILS.some(tag => ctx.includes(tag))) continue
-      offenders.push(src.slice(0, m.index).split('\n').length)
+      offenders.push(line)
     }
-    assert.deepStrictEqual(offenders, [],
+    return { offenders, exempted, activeBlocks }
+  }
+
+  const realSrc = require('fs').readFileSync(require('path').join(__dirname, 'scheduler.js'), 'utf8')
+  const real = scanForOffenders(realSrc)
+
+  check('case 7: every post-spawn active re-arm also re-arms next_run_at', () => {
+    assert.deepStrictEqual(real.offenders, [],
       'these UPDATEs return a row to active WITHOUT re-arming next_run_at, at lines ' +
-      offenders.join(', ') + '. A row put back to active with a past-due next_run_at is ' +
+      real.offenders.join(', ') + '. A row put back to active with a past-due next_run_at is ' +
       'immediately re-leasable, and if its worker is still alive that is a duplicate ' +
       'dispatch on the same task_id. Re-arm next_run_at (bounded RETRY_BACKOFF_MS for a ' +
-      'retry, computeNextRunAt for a cron defer), or add the path to PRE_SPAWN_BAILS if ' +
-      'it provably releases the lease before any worker is spawned.')
+      'retry, computeNextRunAt for a cron defer), or add the ' + PRE_SPAWN_BAIL_MARKER +
+      ' marker INSIDE the SQL if it provably releases the lease before any worker is spawned.')
+  })
+
+  // Anti-vacuous-green pin. A scanner that matches nothing reports zero offenders
+  // and reads exactly like a pass. Assert it actually SAW the population it grades:
+  // the live file carries a dozen active-setting UPDATEs and exactly two sanctioned
+  // pre-spawn bails.
+  check('case 7: the scanner is not vacuous (it sees the real population)', () => {
+    assert.ok(real.activeBlocks.length >= 10,
+      'scanner matched only ' + real.activeBlocks.length + ' active-setting UPDATE blocks; ' +
+      'the regex has gone blind and every assertion above it is vacuous')
+    assert.strictEqual(real.exempted.length, 2,
+      'expected exactly 2 marked pre-spawn bails (austerity gate, aggregate breaker), got ' +
+      real.exempted.length + ' at lines ' + real.exempted.join(', ') +
+      '. A new marker means someone opted a statement out of the class guard.')
+  })
+
+  // Negative control 1: the scanner must CATCH a plain offender.
+  check('case 7 control: an injected non-re-arming active UPDATE is caught', () => {
+    const injected = realSrc + '\nasync function _c1(pool, row) {\n' +
+      '  await pool.query(`UPDATE os_scheduled_tasks\n' +
+      '     SET status = \'active\', leased_by = NULL, updated_at = NOW()\n' +
+      '     WHERE id = $1`, [row.id])\n}\n'
+    assert.strictEqual(scanForOffenders(injected).offenders.length, 1,
+      'the class guard failed to flag an obvious offender, so it grades nothing')
+  })
+
+  // Negative control 2: the regression pin for the context-inheritance bypass.
+  // Merely MENTIONING a bail keyword near the statement must not exempt it.
+  check('case 7 control: a bail keyword in nearby context does NOT exempt an offender', () => {
+    const injected = realSrc +
+      '\n// This comment mentions austerity and the aggregate breaker, and nothing here\n' +
+      '// releases a lease before a worker is spawned.\n' +
+      'async function _c2(pool, row) {\n' +
+      '  await pool.query(`UPDATE os_scheduled_tasks\n' +
+      '     SET status = \'active\', leased_by = NULL, updated_at = NOW()\n' +
+      '     WHERE id = $1`, [row.id])\n}\n'
+    assert.strictEqual(scanForOffenders(injected).offenders.length, 1,
+      'an offender was exempted by CONTEXT rather than by an in-statement marker; ' +
+      'the exemption has regressed to the substring form that read green on a real bypass')
   })
 
   console.log(failures === 0

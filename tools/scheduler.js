@@ -1283,6 +1283,12 @@ exports.dispatchOne = async function dispatchOne(row) {
       if (suppressed) {
         await pool.query(
           `UPDATE os_scheduled_tasks
+           -- PRE-SPAWN-BAIL: the lease is released here BEFORE any worker is spawned,
+           -- so leaving the due time past-due cannot duplicate a live worker, and it is
+           -- what lets the row retry promptly once the suppression lifts. This marker is
+           -- the structural opt-out read by the case 7 class guard in
+           -- tools/scheduler.rearm-reentry-oneshot.test.js. Do NOT add it to a statement
+           -- that can run after a worker exists.
            SET status = 'active', leased_by = NULL, leased_at = NULL, updated_at = NOW()
            WHERE id = $1
              AND status = 'dispatching'
@@ -1368,6 +1374,12 @@ exports.dispatchOne = async function dispatchOne(row) {
       if (!agg.allow) {
         await pool.query(
           `UPDATE os_scheduled_tasks
+           -- PRE-SPAWN-BAIL: the lease is released here BEFORE any worker is spawned,
+           -- so leaving the due time past-due cannot duplicate a live worker, and it is
+           -- what lets the row retry promptly once the suppression lifts. This marker is
+           -- the structural opt-out read by the case 7 class guard in
+           -- tools/scheduler.rearm-reentry-oneshot.test.js. Do NOT add it to a statement
+           -- that can run after a worker exists.
            SET status = 'active', leased_by = NULL, leased_at = NULL, updated_at = NOW()
            WHERE id = $1 AND status = 'dispatching'
              AND leased_by IS NOT DISTINCT FROM $2`,
