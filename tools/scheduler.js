@@ -1881,12 +1881,24 @@ const STALE_WORKER_LIVENESS_MS = 180_000
 
 async function hasLiveWorkerForTask(taskId) {
   try {
-    const r = await getCoord().list_workers({})
+    // include_dead:true is REQUIRED, and dropping the w.dead test with it.
+    // coord.list_workers defaults include_dead=false and filters server-side on
+    // its OWN constant (DEAD_HEARTBEAT_MS = 90s), so without this the scheduler
+    // documents a 180s policy and silently enforces 90s: every guard below is
+    // unreachable for exactly the rows it exists to catch. And because coord
+    // still sets dead=true past 90s, asking for the dead rows while keeping
+    // `if (w.dead) continue` drops them again client-side, so the flag has to go
+    // with it. terminated_at is checked separately, which is the only other
+    // thing w.dead contributed. STALE_WORKER_LIVENESS_MS is then the single
+    // liveness policy, which was the author's intent.
+    // Origin 2026-08-26: a worker inside one long Read/Bash/CDP step goes >90s
+    // silent, becomes invisible here, and its LIVE lease is reclaimed and
+    // re-dispatched (the same-lane double-dispatch), or its worktree is reaped.
+    const r = await getCoord().list_workers({ include_dead: true })
     const ws = (r && r.workers) || []
     for (const w of ws) {
       if (w.task_id !== taskId) continue
       if (w.terminated_at) continue
-      if (w.dead) continue
       if (typeof w.stale_ms === 'number' && w.stale_ms >= STALE_WORKER_LIVENESS_MS) continue
       return w
     }
@@ -2881,9 +2893,22 @@ exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
   // heartbeat was alive); the dry-run caught it before any deletion.
   const liveIds = new Set()
   try {
-    const r = await getCoord().list_workers({})
+    // include_dead:true is REQUIRED, and dropping the w.dead test with it.
+    // coord.list_workers defaults include_dead=false and filters server-side on
+    // its OWN constant (DEAD_HEARTBEAT_MS = 90s), so without this the scheduler
+    // documents a 180s policy and silently enforces 90s: every guard below is
+    // unreachable for exactly the rows it exists to catch. And because coord
+    // still sets dead=true past 90s, asking for the dead rows while keeping
+    // `if (w.dead) continue` drops them again client-side, so the flag has to go
+    // with it. terminated_at is checked separately, which is the only other
+    // thing w.dead contributed. STALE_WORKER_LIVENESS_MS is then the single
+    // liveness policy, which was the author's intent.
+    // Origin 2026-08-26: a worker inside one long Read/Bash/CDP step goes >90s
+    // silent, becomes invisible here, and its LIVE lease is reclaimed and
+    // re-dispatched (the same-lane double-dispatch), or its worktree is reaped.
+    const r = await getCoord().list_workers({ include_dead: true })
     for (const w of ((r && r.workers) || [])) {
-      if (w.terminated_at || w.dead) continue
+      if (w.terminated_at) continue
       if (typeof w.stale_ms === 'number' && w.stale_ms >= STALE_WORKER_LIVENESS_MS) continue
       if (w.task_id) liveIds.add(String(w.task_id))
     }
