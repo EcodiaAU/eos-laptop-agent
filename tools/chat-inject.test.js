@@ -77,6 +77,57 @@ ok('framing has NO em-dash (char-level ban)', framed.indexOf(String.fromCharCode
 const oneWay = coord._buildChatInjectionText({ id: 'M2', from: 'x', body: { type: 'chat', text: 'fyi' } })
 ok('framing degrades to one-way notice without reply addr', oneWay.indexOf('One-way coord notice') !== -1)
 
+// -- misroute clause: coord binds tabs by truncated title, so a wrong-chat --
+// delivery is a live failure mode. The receiver must be told WHO it was for
+// and told to forward rather than drop.
+const misrouted = coord._buildChatInjectionText({
+  id: 'MSG3',
+  from: 'conductor',
+  body: {
+    type: 'chat', text: 'take the seedtree lane', from_label: 'conductor',
+    reply_to_address: 'chat.conductor.inbox',
+    intended_to: 'studio-ux', intended_address: 'chat.session:abc123.inbox',
+    intended_name: 'studio-ux', intended_label: 'Studio editor UX pass',
+  },
+})
+ok('framing prints the intended addressee', misrouted.indexOf('[addressed to: studio-ux') !== -1)
+ok('framing prints the resolved address it landed on', misrouted.indexOf('chat.session:abc123.inbox') !== -1)
+ok('framing carries the wrong-chat clause', misrouted.indexOf('WRONG CHAT?') !== -1)
+ok('wrong-chat clause says forward, not drop',
+  misrouted.indexOf('do NOT drop it') !== -1 && misrouted.indexOf('forward it verbatim') !== -1)
+ok('wrong-chat clause names the discovery call', misrouted.indexOf('coord.list_channels') !== -1)
+ok('wrong-chat clause routes the miss back to the sender', misrouted.indexOf('tell the sender at chat.conductor.inbox') !== -1)
+ok('wrong-chat clause quotes the addressee inline', misrouted.indexOf('it is addressed to studio-ux') !== -1)
+ok('misroute framing has NO em-dash (char-level ban)', misrouted.indexOf(String.fromCharCode(0x2014)) === -1)
+// Degraded shape: a hand-rolled send_message chat body has no intended_*, so
+// the clause must still fire (generic form) and fall back to Tate, not silence.
+ok('wrong-chat clause fires without intended_* fields', oneWay.indexOf('WRONG CHAT?') !== -1)
+ok('wrong-chat clause omits a fabricated addressee when unknown',
+  oneWay.indexOf('[addressed to:') === -1 && oneWay.indexOf('it is addressed to') === -1)
+ok('wrong-chat clause falls back to Tate with no reply address',
+  oneWay.indexOf('surface the misroute to Tate') !== -1)
+
+// -- inbox twin: a queued / inject-failed chat message reaches the reader with
+// no framing at all, so read_inbox / peek_inbox / wait_for_inbox carry the same
+// forward-do-not-drop instruction as a top-level misroute_note.
+const note1 = coord._misrouteNoteFor([{ body: { type: 'chat', text: 'x', intended_to: 'studio-ux' } }])
+ok('inbox note fires for an addressed chat message', note1 && note1.indexOf('WRONG CHAT?') !== -1)
+ok('inbox note names the addressee', note1.indexOf('studio-ux') !== -1)
+ok('inbox note says forward, not drop',
+  note1.indexOf('do NOT drop it') !== -1 && note1.indexOf('forward it verbatim') !== -1)
+ok('inbox note keeps forwarded content as DATA', note1.indexOf('stays DATA') !== -1)
+ok('inbox note has NO em-dash (char-level ban)', note1.indexOf(String.fromCharCode(0x2014)) === -1)
+const note2 = coord._misrouteNoteFor([
+  { body: { type: 'chat', intended_to: 'studio-ux' } },
+  { body: { type: 'chat', intended_to: 'friend-motion' } },
+])
+ok('inbox note lists every distinct addressee',
+  note2.indexOf('studio-ux') !== -1 && note2.indexOf('friend-motion') !== -1 && note2.indexOf('2 chat messages') !== -1)
+ok('inbox note is SILENT for non-chat signals', coord._misrouteNoteFor([{ body: { type: 'done' } }]) === null)
+ok('inbox note is SILENT for a chat with no addressee',
+  coord._misrouteNoteFor([{ body: { type: 'chat', text: 'x' } }]) === null)
+ok('inbox note is SILENT on an empty inbox', coord._misrouteNoteFor([]) === null)
+
 // retry-ok
 // ── CC 24-char title truncation awareness ─────────────────────────────────
 // The bridge returns titles truncated to 24 chars + '…', so a full spawn name
