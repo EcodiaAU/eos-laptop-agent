@@ -1043,7 +1043,32 @@ exports.markFailed = async function markFailed(row, err) {
   // Even on cron-defer-to-next-interval the worktree should be cleaned: the
   // next fire will allocate a fresh one off origin/main (the FF history may
   // have advanced) and idempotent allocate would tolerate either path.
-  try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
+  //
+  // 2026-08-26 (status_board 2c95a094): GATED on coord worker liveness, exactly
+  // as staleLeaseRecovery branches 2a/2b/3 already are. This was the ONE
+  // unconditional prune of the six call sites, and it sits at the TOP of
+  // markFailed, before the cron-defer branch. markFailed fires on ANY dispatchOne
+  // error that is not AllAccountsCappedError, and several of those are raised
+  // while a dispatched worker is alive and mid-run INSIDE that very worktree, so
+  // the cleanup deleted a live worker's tree out from under it and its
+  // uncommitted work with it.
+  //
+  // A prune is a cleanup, never urgent. Skipping one leaks a directory that
+  // reapOrphanWorktrees later collects, which is strictly cheaper than
+  // destroying in-flight work. hasLiveWorkerForTask fails OPEN (returns null when
+  // coord is unreachable), so a coord outage preserves the previous behaviour
+  // rather than leaking every tree.
+  try {
+    const liveWorker = await hasLiveWorkerForTask(String(row.id))
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping markFailed worktree prune\n'
+      )
+    } else {
+      await exports.pruneWorktreeForRow(row)
+    }
+  } catch (_e) {}
   if (newRetryCount >= MAX_RETRY_COUNT) {
     // 2026-06-02 P0 fix. Cron rows MUST NOT permanently die after 3 retries -
     // that loses every future interval of recurring work. Defer to the next

@@ -575,6 +575,66 @@ test('markComplete: calls pruneWorktreeForRow', async () => {
   scheduler._resetWorktreeFns()
 })
 
+// 2026-08-26 (status_board 2c95a094): markFailed prune is liveness-gated.
+//
+// markFailed pruned the row's worktree UNCONDITIONALLY at the top of the
+// function. It fires on any dispatchOne error that is not AllAccountsCappedError,
+// and some of those are raised while a dispatched worker is alive and working
+// inside that very tree, so the "cleanup" destroyed a live worker's uncommitted
+// work. These two cases pin both directions of the gate.
+
+test('markFailed: SKIPS worktree prune while a live worker holds the task', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  let pruneCalledWith = null
+  scheduler._setWorktreeFns({
+    allocate: async () => '/tmp/x',
+    prune: async (row) => { pruneCalledWith = row },
+  })
+
+  const origListWorkers = coordModule.list_workers
+  coordModule.list_workers = async () => ({
+    workers: [{ task_id: 'mf-live-worker', tab_id: 'tab_live_1', stale_ms: 5000, terminated_at: null }],
+  })
+
+  const row = makeRow({ id: 'mf-live-worker', type: 'cron', cron_expression: '0 9 * * *' })
+  await scheduler.markFailed(row, new Error('synthetic dispatch error while worker is alive'))
+
+  assert(pruneCalledWith === null,
+    'markFailed: pruneWorktreeForRow NOT called while a live worker holds the task')
+
+  coordModule.list_workers = origListWorkers
+  scheduler._resetWorktreeFns()
+})
+
+test('markFailed: still prunes when no live worker holds the task', async () => {
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+
+  let pruneCalledWith = null
+  scheduler._setWorktreeFns({
+    allocate: async () => '/tmp/x',
+    prune: async (row) => { pruneCalledWith = row },
+  })
+
+  const origListWorkers = coordModule.list_workers
+  // Same task id, but the worker is past STALE_WORKER_LIVENESS_MS (180s), so it
+  // is NOT live and the cleanup must still happen.
+  coordModule.list_workers = async () => ({
+    workers: [{ task_id: 'mf-dead-worker', tab_id: 'tab_dead_1', stale_ms: 600000, terminated_at: null }],
+  })
+
+  const row = makeRow({ id: 'mf-dead-worker', type: 'cron', cron_expression: '0 9 * * *' })
+  await scheduler.markFailed(row, new Error('synthetic dispatch error, no live worker'))
+
+  assert(pruneCalledWith && pruneCalledWith.id === 'mf-dead-worker',
+    'markFailed: pruneWorktreeForRow still called when no live worker holds the task')
+
+  coordModule.list_workers = origListWorkers
+  scheduler._resetWorktreeFns()
+})
+
 // ── Task 3.2: dispatchOne AllAccountsCappedError defers ──────────────────────
 
 test('dispatchOne AllAccountsCappedError: defers row, does not mark failed', async () => {
