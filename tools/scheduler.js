@@ -893,6 +893,35 @@ exports.cronAlreadyRanThisPeriod = function cronAlreadyRanThisPeriod(row, now) {
   }
 }
 
+// One-shot analogue of cronAlreadyRanThisPeriod. A delayed / one_shot / chain row
+// has no cadence, so "already ran this period" has to be expressed against its
+// single due-event instead: next_run_at IS that due-event, and last_run_at at or
+// after it means markComplete already ran the row for this very firing. Re-leasing
+// it is a double-run of one-shot work.
+//
+// Deliberately expressed as last_run_at >= next_run_at rather than as a run_count
+// test. schedule_run_now RE-ARMS a completed one-shot from any terminal status and
+// does NOT reset run_count (see its UPDATE in backend/mcp-servers/scheduler and
+// tools/scheduler.js schedule_run_now: it sets next_run_at = NOW()), so a
+// run_count > 0 refusal would break the sanctioned forced re-run. A forced re-run
+// moves next_run_at to NOW(), strictly after the old last_run_at, so it passes this
+// guard cleanly while a genuine re-lease off an already-served due-event does not.
+//
+// Pure and FAIL-OPEN like its siblings: any missing field or unparseable date
+// returns the "dispatch normally" answer, so the guard can never strand a row.
+exports.oneShotAlreadyRanThisDueEvent = function oneShotAlreadyRanThisDueEvent(row) {
+  try {
+    if (!row || row.type === 'cron') return false
+    if (!row.last_run_at || !row.next_run_at) return false
+    const lastRun = new Date(row.last_run_at)
+    const dueAt = new Date(row.next_run_at)
+    if (isNaN(lastRun.getTime()) || isNaN(dueAt.getTime())) return false
+    return lastRun.getTime() >= dueAt.getTime()
+  } catch (_e) {
+    return false
+  }
+}
+
 // Next scheduled boundary for a cron row as an ISO string. Fails open to a 1h
 // fallback (mirrors the catch in staleLeaseRecovery branches 2a/3).
 exports.computeNextRunAt = function computeNextRunAt(row, now) {
@@ -1023,6 +1052,31 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
         ' (' + (row.name || '?') + ') - already ran this period; next_run_at -> ' + nextRunAt + '\n')
       continue
     }
+    // One-shot twin of the guard above. A delayed / one_shot / chain row whose
+    // last_run_at is at or after its next_run_at already ran for this due-event,
+    // so dispatching it now double-runs one-shot work. Settle it to 'completed'
+    // rather than releasing it back to 'active': 'active' with an unchanged
+    // past-due next_run_at is precisely the re-leasable state this whole fix
+    // exists to remove, so it would spin every poll. A forced re-run via
+    // schedule_run_now sets next_run_at = NOW(), which is strictly after the old
+    // last_run_at, so it never reaches this branch. Same cancellation/pause guard
+    // and same lease scoping as every other re-arm site.
+    if (exports.oneShotAlreadyRanThisDueEvent(row)) {
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'completed',
+             last_error = 'reentry-guard: one-shot already ran this due-event, not re-dispatched',
+             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+         WHERE id = $1 AND status = 'dispatching' AND leased_by = $2
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+        [row.id, leaseId]
+      )
+      process.stderr.write('[scheduler] leaseDueRows: one-shot re-entry guard skipped ' + row.id +
+        ' (' + (row.name || '?') + ') - last_run_at ' + row.last_run_at +
+        ' is at/after due-event ' + row.next_run_at + '; settled to completed\n')
+      continue
+    }
     dispatchable.push(row)
   }
   return dispatchable
@@ -1100,14 +1154,42 @@ exports.markFailed = async function markFailed(row, err) {
       )
     }
   } else {
+    // 2026-08-26 re-lease-while-live fix (status_board 76393b47). This retryable
+    // branch was the ONE re-arm path of four that left next_run_at untouched.
+    // Its three siblings all recompute: staleLeaseRecovery branch 1 uses the same
+    // bounded RETRY_BACKOFF_MS below, branch 2a and the cron arm above use
+    // computeNextRunAt. Leaving next_run_at at its original (now past-due) value
+    // put the row straight back into leaseDueRows' due-window on the very next
+    // 30s poll, WHILE the worker spawned by the failed dispatch was still alive
+    // and working: a second tab opens on the same task_id and both run the brief.
+    // Live evidence 2026-08-26, task 1acff6af (cowork.seedtree-lane-S2b-enrichment
+    // -build, a lane that WRITES to a client production database): next_run_at
+    // frozen at 12:20:00Z with last_run_at NULL for the whole 50min run, tab
+    // ...f1fe7f54 dispatched 12:23:12Z, tab ...19c302c6 dispatched 13:12:38Z on
+    // the SAME row, final run_count=2 retry_count=2 on a ONE-SHOT row. The frozen
+    // next_run_at is what discriminates this path from branch 1, which would have
+    // overwritten it with NOW()+backoff.
+    //
+    // The leaseDueRows re-entry guard could not catch it: cronAlreadyRanThisPeriod
+    // returns false for type!=='cron' AND returns false when last_run_at is NULL,
+    // and this row was both. Fixing the re-arm at source is the layer that holds
+    // for one-shot rows.
+    //
+    // Bounded backoff (not computeNextRunAt) is deliberate and matches branch 1:
+    // it preserves up to MAX_RETRY_COUNT quick re-attempts for a transient bind
+    // failure while bounding re-dispatch to once per window. A one-shot row has
+    // no next interval to defer to, so the full-interval recompute has no meaning
+    // here. Doctrine:
+    // [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
     await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'active', retry_count = $1, last_error = $2,
+           next_run_at = NOW() + ($4 || ' milliseconds')::interval,
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
        WHERE id = $3
          AND archived_at IS NULL
          AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
-      [newRetryCount, errMsg, row.id]
+      [newRetryCount, errMsg, row.id, RETRY_BACKOFF_MS]
     )
   }
 }
