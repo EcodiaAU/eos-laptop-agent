@@ -901,7 +901,16 @@ function pickAccount(params) {
     buffer_factor: BUFFER_FACTOR,
     estimated_tokens: estimated,
     polled_at: state.polled_at,
-    reason: bestScore < 0 ? 'best-account-still-insufficient (estimate exceeds buffered headroom)' : 'highest-measured-headroom',
+    // Say what the ranking actually rested on. Calling an estimate "measured" is how a
+    // dead probe reads as a healthy account: on 2026-08-25 tate@ was picked at score
+    // 0.8481 with reason 'highest-measured-headroom' while its probe had returned
+    // http_401 eight times running, and four dispatches then died on a weekly cap.
+    // usedSource() is already computed above as `source`; surface it in the reason.
+    reason: bestScore < 0
+      ? 'best-account-still-insufficient (estimate exceeds buffered headroom)'
+      : usageReal.usedSource(a) === 'real'
+        ? 'highest-measured-headroom (vendor-measured)'
+        : 'highest-headroom-BUT-UNMEASURED (source=' + usageReal.usedSource(a) + '; no usable vendor measurement, treat as a guess)',
     candidates: candidates,
     flaky_excluded: flakyExcluded,
     cap_excluded: capExcluded,
