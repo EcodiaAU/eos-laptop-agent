@@ -1090,6 +1090,8 @@ async function _captureStableTabId(tab_id, opts) {
     if (!w) return { ok: false, reason: 'unknown_worker' }
     const th = w.tab_handle
     if (!th) return { ok: false, reason: 'no_tab_handle' }
+    const conductor = loadConductorRegistration()
+    if (!conductor || !conductor.ide_bridge_port) return { ok: false, reason: 'no_conductor_ide_port' }
     if (th.tabId && !opts.force) {
       // 2026-08-29 (handed over by lane T1, verified here against this file).
       // This branch returns BEFORE the _stampAnchorTabId call at the bottom, so
@@ -1099,10 +1101,50 @@ async function _captureStableTabId(tab_id, opts) {
       // with no id is exactly what the orphan sweep's resolve step needs. Stamp
       // idempotently here; _stampAnchorTabId no-ops when it already matches.
       _stampAnchorTabId(tab_id, th.tabId)
-      return { ok: true, tabId: th.tabId, reason: 'already_set' }
+      // 2026-08-29 lane T1-verify. A stored id is NOT self-evidently good, and
+      // the dispatcher stamp made that the common case rather than the corner.
+      // The bridge synthesises ttab_ ids by reconciling each listing against the
+      // previous one on (viewColumn+label) then (viewColumn+index)
+      // (cursor-preview-extension/ide-bridge.js assignStableTabIds). A tab that
+      // RETITLES and REORDERS between two listings matches neither pass and is
+      // minted a NEW id. That is not a corner case for a dispatched worker: it
+      // is every one of them. Claude Code autotitles the tab from the generic
+      // "Claude Code" to a summary of the brief within ~11s of spawn, while the
+      // dispatcher's spawn-diff captures at ~3s. Measured 2026-08-29 over the
+      // live fleet: 0 of 10 dispatch_spawn_diff ids still resolved to a live
+      // tab, against 8 of 10 for the slower bind-time sentinel capture.
+      //
+      // Left alone that is worse than capturing nothing, because the close path
+      // treats a stored id as TERMINAL: _resolveStableIdCloseTarget returns
+      // {refused} and close_my_tab sets stableSettled, so the anchor and label
+      // tiers below it never run. A stale id therefore does not degrade the
+      // close, it GUARANTEES the leak. The no-fallthrough rule is right and is
+      // left exactly as it is; the repair belongs here at capture, where a wrong
+      // value can still be replaced by a right one.
+      //
+      // Fail-safe in the direction of keeping the id: only a SUCCESSFUL listing
+      // that does not contain it proves it dead. A bridge error or an empty
+      // listing proves nothing and keeps the stored value untouched.
+      let liveIds = null
+      try {
+        const probe = await _liveCcTabsWithIds(conductor.ide_bridge_port)
+        if (probe && probe.length) liveIds = new Set(probe.map((t) => t.tabId).filter(Boolean))
+      } catch (e) { liveIds = null }
+      if (!liveIds) return { ok: true, tabId: th.tabId, reason: 'already_set_liveness_unknown' }
+      if (liveIds.has(th.tabId)) return { ok: true, tabId: th.tabId, reason: 'already_set' }
+      // Proven dead. Drop it so a re-capture that cannot resolve unambiguously
+      // leaves the row with NO id ({none}) and the legacy ladder runs, rather
+      // than leaving a value we have just proven wrong to hard-refuse the close.
+      const staleId = th.tabId
+      delete th.tabId
+      th.tabId_stale_dropped = staleId
+      th.tabId_stale_dropped_at = new Date().toISOString()
+      th.tabId_stale_dropped_from_via = th.tabId_captured_via || null
+      w.tab_handle = th
+      workers.set(tab_id, w)
+      try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+      // fall through and re-capture against the CURRENT labels
     }
-    const conductor = loadConductorRegistration()
-    if (!conductor || !conductor.ide_bridge_port) return { ok: false, reason: 'no_conductor_ide_port' }
     let tabs
     try { tabs = await _liveCcTabsWithIds(conductor.ide_bridge_port) }
     catch (e) { return { ok: false, reason: 'bridge_unreachable:' + (e.message || String(e)) } }

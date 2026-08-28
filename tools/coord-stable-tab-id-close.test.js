@@ -394,6 +394,87 @@ function setTabId(tab_id, ttab) {
   ok('a reconciled id yields no new tab, declines cleanly rather than throwing',
     noNew.ok === false && noNew.reason === 'no_new_tab_id', JSON.stringify(noNew))
 
+  console.log('\n== Part 9: the stored id is not self-evidently good. Stale-at-bind repair ==')
+
+  // Measured on the live fleet 2026-08-29, after the dispatcher stamp shipped:
+  // 0 of 10 dispatch_spawn_diff ids still resolved to a live tab, against 8 of
+  // 10 for the slower bind-time sentinel capture. The bridge re-mints an id when
+  // a tab RETITLES and REORDERS between two listings (assignStableTabIds keys on
+  // viewColumn+label, then viewColumn+index, and nothing else). The dispatcher
+  // captures at ~3s while the tab still reads "Claude Code"; Claude Code
+  // autotitles it ~11s later, and the id the dispatcher stored is orphaned.
+  //
+  // That is worse than storing nothing, because close_my_tab treats a stored id
+  // as TERMINAL: it refuses and never runs the tiers below. So a stale id does
+  // not degrade the close, it guarantees the leak. The terminal rule is correct
+  // and stays; the repair is here at capture.
+  //
+  // CC keeps the sentinel at the head of its summary (the brief opens with it),
+  // truncated to 24 chars plus an ellipsis, which is why the bind-time sentinel
+  // tier still resolves after the retitle.
+  const RETITLED = SENTINEL.slice(0, 24) + '…'
+
+  // 9a. CONTROL: a stored id that IS live must still short-circuit untouched.
+  //     Without this, an assertion that a stale id gets replaced proves nothing.
+  mkCronWorker('w-live-id', 4)
+  setTabId('w-live-id', 'ttab_live_1_1')
+  LIVE_TABS = [{ tabId: 'ttab_live_1_1', label: RETITLED, viewColumn: 1, viewType: CC, index: 4 }]
+  const keptRes = await coord._captureStableTabId('w-live-id')
+  ok('CONTROL: a LIVE stored id short-circuits and is not re-captured',
+    keptRes.ok === true && keptRes.reason === 'already_set' && keptRes.tabId === 'ttab_live_1_1',
+    JSON.stringify(keptRes))
+
+  // 9b. The real shape. The dispatcher stamped the pre-autotitle id; the bridge
+  //     has since re-minted the tab. Re-capture must replace it with the live id.
+  mkCronWorker('w-stale-id', 5)
+  setTabId('w-stale-id', 'ttab_preautotitle_1_1')
+  LIVE_TABS = [{ tabId: 'ttab_reminted_1_1', label: RETITLED, viewColumn: 1, viewType: CC, index: 5 }]
+  const repaired = await coord._captureStableTabId('w-stale-id')
+  ok('a STALE stored id is dropped and re-captured against the current labels',
+    repaired.ok === true && repaired.tabId === 'ttab_reminted_1_1',
+    JSON.stringify(repaired))
+  const wRep = coord.loadWorkerRegistry('w-stale-id')
+  ok('and the row records which id was dropped, so the churn stays visible',
+    wRep.tab_handle.tabId === 'ttab_reminted_1_1'
+      && wRep.tab_handle.tabId_stale_dropped === 'ttab_preautotitle_1_1',
+    JSON.stringify(wRep.tab_handle))
+
+  // 9c. Re-capture cannot always win: two unclaimed same-sentinel corpses are
+  //     genuinely undecidable. The id must still be GONE, so the close resolves
+  //     {none} and the legacy ladder runs, rather than {refused} which would
+  //     hard-stop the close on a value already proven wrong.
+  mkCronWorker('w-stale-ambig', 6)
+  setTabId('w-stale-ambig', 'ttab_preautotitle_2_1')
+  LIVE_TABS = [
+    { tabId: 'ttab_corpseA_1_1', label: RETITLED, viewColumn: 1, viewType: CC, index: 6 },
+    { tabId: 'ttab_corpseB_1_1', label: RETITLED, viewColumn: 1, viewType: CC, index: 7 },
+  ]
+  const ambig = await coord._captureStableTabId('w-stale-ambig')
+  ok('an undecidable re-capture still refuses rather than guessing',
+    ambig.ok === false && ambig.reason === 'ambiguous_sentinel', JSON.stringify(ambig))
+  const wAmb = coord.loadWorkerRegistry('w-stale-ambig')
+  ok('but the proven-dead id is GONE, so the close falls to the ladder not a hard refusal',
+    !wAmb.tab_handle.tabId && wAmb.tab_handle.tabId_stale_dropped === 'ttab_preautotitle_2_1',
+    JSON.stringify(wAmb.tab_handle))
+  const settles = await coord._resolveStableIdCloseTarget('w-stale-ambig', 65535)
+  ok('and that row resolves {none}, which is what lets the legacy tiers run',
+    settles && settles.none === true && !settles.refused, JSON.stringify(settles))
+
+  // 9d. FAIL-SAFE, the direction that matters. An empty or failed listing proves
+  //     NOTHING about the stored id. Dropping it there would discard a good id
+  //     every time the bridge hiccups, which is the mirror-image bug.
+  mkCronWorker('w-bridge-dark', 8)
+  setTabId('w-bridge-dark', 'ttab_unverifiable_1_1')
+  LIVE_TABS = []
+  const dark = await coord._captureStableTabId('w-bridge-dark')
+  ok('FAIL-SAFE: an empty listing keeps the stored id, it does not prove it dead',
+    dark.ok === true && dark.tabId === 'ttab_unverifiable_1_1'
+      && dark.reason === 'already_set_liveness_unknown', JSON.stringify(dark))
+  const wDark = coord.loadWorkerRegistry('w-bridge-dark')
+  ok('and nothing was dropped on that path',
+    wDark.tab_handle.tabId === 'ttab_unverifiable_1_1' && !wDark.tab_handle.tabId_stale_dropped,
+    JSON.stringify(wDark.tab_handle))
+
   ide.tabs = realTabs
   ide.tabs_close = realClose
   console.log('\n' + (fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'))
