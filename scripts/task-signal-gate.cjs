@@ -620,6 +620,72 @@ async function main() {
       'H11. markFailed consumes on a suspended row too (done_at=' + h.done_at + ' done_status=' + h.done_status + ')')
     ok(h.last_status === 'paused',
       'H12. CONTROL: and that path did not resurrect it either (last_status=' + h.last_status + ')')
+
+    // markFailed has TWO guarded arms and H11 above reaches only ONE of them.
+    // H11 presets retry_count=0, so newRetryCount=1 < MAX_RETRY_COUNT and control
+    // falls to the RETRYABLE arm. The other arm - the cron-defer taken when
+    // newRetryCount >= MAX_RETRY_COUNT on a cron row - carries its OWN guarded
+    // UPDATE and its OWN consume, and nothing above ever executed it.
+    //
+    // MEASURED 2026-08-29, eighth worker on lane R1: deleting the consume from
+    // that one arm left this gate at 75 of 75, exit 0, on an isolated archive
+    // copy of the fixed tree. A hole a whole arm wide, in the same routine the
+    // section was written for. The legs below are what turn that green red.
+    //
+    // Reachable through the same shipped tool as the rest of section H: a cron
+    // row that has already burned its retries, paused mid-flight via
+    // schedule_pause, whose worker then signals failed. Its guarded UPDATE
+    // matches nothing, so without the consume, completionPass re-selects it
+    // every 5s forever - kill_worker on the tab on every pass, run_count frozen.
+    //
+    // retry_count is set far above MAX_RETRY_COUNT rather than to its exact
+    // value (the constant is not exported), and H13 is the POSITIVE CONTROL that
+    // the arm was actually taken: without it, a raised MAX_RETRY_COUNT would
+    // route these rows back to the retryable arm and H14 would pass vacuously as
+    // a second copy of H11.
+    const H_MAXED_RETRY = 99
+    const hdIns = await client.query(
+      `INSERT INTO os_scheduled_tasks (name, type, prompt, status, next_run_at, run_count, retry_count, cron_expression, tz)
+       VALUES ($1, 'cron', 'task-signal-gate cron-defer arm control', 'active', $2, 0, $3, '0 3 * * *', 'Australia/Brisbane')
+       RETURNING id`,
+      [LANE + '-crondefer-control', FAR_FUTURE, H_MAXED_RETRY]
+    )
+    const hdId = hdIns.rows[0].id
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(),
+         leased_by='lease-hd', dispatched_tab_id='tab_hd' WHERE id=$1`, [hdId])
+    await taskSignals.recordDone({ task_id: hdId, tab_id: 'tab_hd', status: 'failed', result_summary: 'hd max-retry failure' })
+    await scheduler.completionPass()
+    const hd = await hRow(hdId)
+    ok(hd.status === 'active' && hd.retry_count === 0 && /cron: deferred to next interval/.test(String(hd.last_error || '')),
+      'H13. POSITIVE CONTROL: retry_count=' + H_MAXED_RETRY + ' on a cron row really does take the cron-defer arm (status=' +
+        hd.status + ' retry_count=' + hd.retry_count + ')')
+
+    hKilled.length = 0
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(), leased_by='lease-h',
+         dispatched_tab_id='tab_h_maxfail', retry_count=$2 WHERE id=$1`, [hId, H_MAXED_RETRY])
+    await taskSignals.recordDone({ task_id: hId, tab_id: 'tab_h_maxfail', status: 'failed', result_summary: 'h suspended max-retry failure' })
+    await scheduler.completionPass()
+    const hMaxKillsAfter1 = hKilled.filter(t => t === 'tab_h_maxfail').length
+    // Re-park the child so passes 2 and 3 have to move it again to be seen, for
+    // the same reason H6 does: an assertion that cannot go red proves nothing.
+    await client.query('UPDATE os_scheduled_tasks SET next_run_at = $2 WHERE id = $1', [hChildId, FAR_FUTURE])
+    await scheduler.completionPass()
+    await scheduler.completionPass()
+    h = await hRow(hId)
+    ok(h.done_at === null && h.done_status === null,
+      'H14. THE FIX, cron-defer arm: a retry-exhausted suspended cron row consumes too (done_at=' + h.done_at + ' done_status=' + h.done_status + ')')
+    ok(hKilled.filter(t => t === 'tab_h_maxfail').length === hMaxKillsAfter1,
+      'H15. ABSENCE: passes 2 and 3 did not re-kill that tab (total ' +
+        hKilled.filter(t => t === 'tab_h_maxfail').length + ', unfixed this climbs every pass)')
+    // No chain-child leg here, deliberately. markComplete returns into markFailed
+    // BEFORE its chain wake, which is guarded on !explicitFailure, so the failure
+    // path never wakes children and such a leg could not go red. Measured: it
+    // stayed green against the very breakage H14/H15 catch. A leg that cannot
+    // fail is the H6 mistake one arc earlier, and it is not repeated here.
+    ok(h.last_status === 'paused' && h.status !== 'active',
+      'H16. CONTROL: and the cron-defer consume did not resurrect it (status=' + h.status + ' last_status=' + h.last_status + ')')
     scheduler._resetWorktreeFns()
 
     // ── F. the retired bus types are genuinely gone, not renamed ─────────────
