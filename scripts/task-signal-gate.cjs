@@ -468,6 +468,35 @@ async function main() {
     ok(String(g.last_result || '').indexOf('g adopted fire') !== -1,
       'G8. CONTROL: and it is THAT done that landed, not the consumed one')
 
+    // THE REAL LOSING CASE for a clear-at-adopt fix, which G7/G8 do NOT model:
+    // they write the adopted worker's done AFTER the adopt, so a clear at adopt
+    // cannot touch it. The window that a clear-at-adopt actually destroys is
+    // BEFORE it. staleLeaseRecovery branch 1 reclaims a lease and nulls
+    // leased_by/leased_at while leaving dispatched_tab_id intact, so the worker
+    // it reclaimed can still write a legitimate done onto a row sitting at
+    // status='active'. That done is unconsumed. If the row is then adopted and
+    // the adopt blanks the columns, the completion is gone and the row rots to
+    // the 6h orphan sweep. It must survive the adopt and complete.
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='active', leased_by=NULL, leased_at=NULL,
+         dispatched_tab_id='tab_g4_reclaimed' WHERE id=$1`, [gId])
+    const gPre = (await gRow()).run_count
+    const dR = await taskSignals.recordDone({ task_id: gId, tab_id: 'tab_g4_reclaimed',
+      status: 'success', result_summary: 'g done after lease reclaim' })
+    ok(dR && dR.ok === true,
+      'G10. a worker whose lease was reclaimed can still write its done (dispatched_tab_id survives branch 1)')
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='dispatching', leased_by='lease-g-adopt2' WHERE id=$1`, [gId])
+    await client.query(UPD_ADOPT, ['tab_g4_reclaimed', gId, 'lease-g-adopt2'])
+    await client.query(
+      `UPDATE os_scheduled_tasks SET leased_at=NOW() WHERE id=$1 AND leased_at IS NULL`, [gId])
+    ok((await gRow()).done_at !== null,
+      'G11. CONTROL: the adopt did NOT erase that unconsumed done (a clear-at-adopt fix fails HERE)')
+    await scheduler.completionPass()
+    g = await gRow()
+    ok(g.run_count === gPre + 1,
+      'G12. CONTROL: and it still completes the row (run_count ' + gPre + ' -> ' + g.run_count + ')')
+
     // markFailed is the other terminal transition and needs the same consume, or
     // a failed row carries its signal into the next adopt exactly the same way.
     await client.query(
