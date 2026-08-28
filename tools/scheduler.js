@@ -988,6 +988,10 @@ exports.runCountAnomalyForRow = function runCountAnomalyForRow(row, now) {
 // "Due" means: status='active' AND next_run_at <= NOW() (or next_run_at IS NULL)
 // Ordered by priority ASC (1=highest), then next_run_at ASC.
 
+// Pool seam for tools/worker-liveness.js report(). The liveness probe reads
+// os_scheduled_tasks and must not open a second pool against the same database.
+exports._poolForLiveness = function _poolForLiveness() { return getPool() }
+
 exports.leaseDueRows = async function leaseDueRows(limit) {
   const n = (typeof limit === 'number' && limit > 0) ? limit : DISPATCH_LIMIT
   const pool = getPool()
@@ -1001,9 +1005,37 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
   // existing "next_run_at IS NULL" branch would lease them immediately.
   const sql = `
     WITH due AS (
-      SELECT id FROM os_scheduled_tasks
+      SELECT id FROM os_scheduled_tasks d
       WHERE status = 'active'
         AND archived_at IS NULL
+        -- 2026-08-28 lane-defer (coord rebuild R1). The migration-147 insert
+        -- trigger supersedes PENDING siblings on a lane and never looks at
+        -- 'running', so the moment a worker tab opened and its row flipped, the
+        -- lane went unguarded and the next arrival opened a SECOND tab on the
+        -- same client. Observed live on cowork.daycrew-lane-S1 (two running
+        -- rows) and again on cowork.client-app-health-lane-v1.
+        --
+        -- The fix is deliberately NOT "add 'running' to the trigger's supersede
+        -- clause". Cancelling a running row does not close its tab: the worker
+        -- keeps burning usage and writing against a row marked cancelled. The
+        -- holder is the incumbent and the new arrival is the duplicate, so the
+        -- ARRIVAL defers. Deferral needs no bookkeeping and no resume sweep: the
+        -- row stays status='active' and past-due, so the first tick after the
+        -- lane frees leases it. That is why this is a lease-side predicate and
+        -- not a status change.
+        --
+        -- A dead holder would otherwise pin its lane shut forever, which is what
+        -- livenessReapPass exists to prevent: it settles provably-dead running
+        -- rows from an OBSERVED signal (transcript mtime), so the lane reopens.
+        -- Doctrine: patterns/one-live-scheduled-row-per-work-lane-2026-08-26.md
+        AND NOT EXISTS (
+          SELECT 1 FROM os_scheduled_tasks h
+           WHERE h.id <> d.id
+             AND h.archived_at IS NULL
+             AND h.status IN ('running', 'dispatching')
+             AND os_sched_lane_key(h.name) IS NOT NULL
+             AND os_sched_lane_key(h.name) = os_sched_lane_key(d.name)
+        )
         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))
         -- Austerity suppresses RECURRING crons only. One-shot delayed/chain/followup
         -- rows have no austerity band (L4 doctrine: "only one-off delayed tasks +
@@ -2339,6 +2371,98 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   }
 }
 
+// ── livenessReapPass ─────────────────────────────────────────────────────────
+//
+// 2026-08-28, coord rebuild lane R1. A row in status='running' held its lane shut
+// against the new lane-defer predicate in leaseDueRows, so a dead holder would
+// pin a lane forever. This is the counterweight: settle rows that are PROVABLY
+// dead, from an observed signal, on a 60s cadence instead of the 6h orphan timer.
+//
+// It exists because the pre-existing reclaim path could not be trusted to do it.
+// That path gates on hasLiveWorkerForTask, which reads the coord heartbeat, and
+// the heartbeat declares a worker dead after 90 SECONDS of not calling coord.
+// Measured 2026-08-28T06:26Z: coord.list_workers returned 1 while 24 sessions had
+// written a transcript turn in the previous three minutes. A signal that wrong in
+// the unsafe direction cannot be the thing that decides to kill a worker, so its
+// only remaining gate was the 6h timeout, which is far too slow to free a lane.
+//
+// tools/worker-liveness.js supplies the verdict from transcript mtime (a file the
+// harness writes every turn with no cooperation from the model) with a worktree
+// mtime fallback. Only verdict 'dead' is actionable: 'unknown' covers the boot
+// race, a missing tab id and any probe error, and every one of those means leave
+// the row alone. Reaping nothing is always safe.
+//
+// Settle semantics deliberately MIRROR the orphan-timeout path above: a cron row
+// returns to 'active' at its next boundary (it will fire again on schedule), a
+// one-shot goes terminal as 'orphaned'. Either way the lane reopens on the next
+// lease tick, which is what makes the defer predicate safe to ship.
+exports.livenessReapPass = async function livenessReapPass(opts) {
+  opts = opts || {}
+  const pool = opts.pool || getPool()
+  const liveness = opts.liveness || require('./worker-liveness')
+  const dispatcher = opts.dispatcher || getDispatcher()
+  const res = await pool.query(
+    `SELECT id, name, type, cron_expression, task_id, status, leased_at, dispatched_tab_id
+       FROM os_scheduled_tasks WHERE status = 'running' AND archived_at IS NULL`
+  )
+  if (!res.rows.length) return { scanned: 0, reaped: 0, live: 0, unknown: 0, verdicts: [] }
+
+  let verdicts
+  try {
+    verdicts = liveness.probeRows(res.rows, opts)
+  } catch (e) {
+    // Probe failure is not evidence of death. Change nothing.
+    process.stderr.write('[scheduler] livenessReapPass probe error (reaping nothing): ' + e.message + '\n')
+    return { scanned: res.rows.length, reaped: 0, live: 0, unknown: res.rows.length, error: e.message, verdicts: [] }
+  }
+
+  const byId = new Map(res.rows.map(r => [String(r.id), r]))
+  let reaped = 0, live = 0, unknown = 0
+  for (const v of verdicts) {
+    if (v.verdict === 'live') { live++; continue }
+    if (v.verdict !== 'dead') { unknown++; continue }
+    const row = byId.get(String(v.id))
+    if (!row) { unknown++; continue }
+
+    let closeOk = false
+    if (row.dispatched_tab_id && dispatcher && dispatcher.kill_worker) {
+      try {
+        const r = await dispatcher.kill_worker({ tab_id: row.dispatched_tab_id })
+        closeOk = !!(r && r.closed)
+      } catch (e) {
+        process.stderr.write('[scheduler] livenessReapPass kill_worker tolerated error for ' + row.id + ': ' + e.message + '\n')
+      }
+    }
+    const tabFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
+    const why = 'liveness-reap: ' + v.reason + ' (' + JSON.stringify(v.evidence) + ')'
+
+    if (row.type === 'cron' && row.cron_expression) {
+      let nextRunAt = null
+      try { nextRunAt = exports.computeNextRunAt(row) }
+      catch (_e) { nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() }
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'active', retry_count = 0, last_run_at = NOW(), next_run_at = $1,
+             last_error = $3, leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
+         WHERE id = $2 AND status = 'running' AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+        [nextRunAt, row.id, why.slice(0, 900)]
+      )
+    } else {
+      await pool.query(
+        `UPDATE os_scheduled_tasks
+         SET status = 'orphaned', last_run_at = NOW(), last_error = $2, ${tabFrag} updated_at = NOW()
+         WHERE id = $1 AND status = 'running' AND archived_at IS NULL`,
+        [row.id, why.slice(0, 900)]
+      )
+    }
+    try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
+    reaped++
+    process.stderr.write('[scheduler] livenessReapPass settled ' + row.id + ' (' + (row.name || '?') + '): ' + v.reason + '\n')
+  }
+  return { scanned: res.rows.length, reaped, live, unknown, verdicts }
+}
+
 // ── runCountAnomalyAudit ─────────────────────────────────────────────────────
 //
 // Dispatcher self-audit canary. Scans non-archived cron rows and flags any whose
@@ -3410,6 +3534,17 @@ exports.start = function start() {
       await exports.staleTick(Date.now())
     } catch (e) {
       process.stderr.write('[scheduler] staleLeaseRecovery error: ' + e.message + '\n')
+    }
+    // 2026-08-28 R1. Runs AFTER staleTick in the same tick, never in parallel, so
+    // a reclaim and a liveness reap can never both settle one row in one pass.
+    try {
+      const t = await exports.livenessReapPass()
+      if (t.reaped) {
+        process.stderr.write('[scheduler] livenessReapPass: scanned=' + t.scanned +
+          ' reaped=' + t.reaped + ' live=' + t.live + ' unknown=' + t.unknown + '\n')
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] livenessReapPass error: ' + e.message + '\n')
     }
   }, STALE_LEASE_INTERVAL_MS)
 

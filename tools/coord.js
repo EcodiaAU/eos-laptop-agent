@@ -2747,6 +2747,56 @@ async function set_wake_policy(params, _ctx) {
   return { ok: true, wake_policy: next }
 }
 
+// ── retirement seam (2026-08-28 coord rebuild, lane R1) ───────────────────
+//
+// The inbox had no retirement mechanism at all. 5,838 unseen conductor messages
+// had accumulated since 2026-07-20, of which 5,605 were pure machine lifecycle
+// telemetry (bound / progress / done / account_switch) describing scheduler rows
+// that had long since reached a terminal state. Nothing ever marked them; the
+// only prior drain was a hand-run one-off on 2026-07-21 that left a
+// _drain-backup directory and no mechanism behind it.
+//
+// These two functions are the seam tools/coord-retire.js sweeps through. They
+// live HERE, not there, because messagesById is this module's state: a mark
+// written straight to disk by an outside module would be invisible to the
+// running process until the next boot, so the very next peek_inbox would serve
+// the message again. One owner for the mutation.
+//
+// Deliberately NOT a filter on the read path. A read-side filter hides the
+// backlog while it keeps growing; retirement has to be a write that shrinks it.
+// Doctrine: patterns/an-inbox-that-serves-oldest-first-goes-blind-as-it-fills-2026-08-28.md
+
+// Every unseen message on a topic, newest last. No side effects, no marking.
+function _unseenForTopic(topic) {
+  const slug = safeTopicSlug(topic)
+  const ids = inboxIndex.get(slug) || new Set()
+  const out = []
+  for (const id of ids) {
+    const m = messagesById.get(id)
+    if (!m || m.seen_at) continue
+    out.push(m)
+  }
+  out.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+  return out
+}
+
+// Mark specific message ids seen, in memory AND on disk, and report how many
+// actually flipped. Ids that are unknown or already seen are skipped, not
+// counted, so a caller can never inflate its own drain number.
+function _markSeenByIds(ids, reason) {
+  const now = new Date().toISOString()
+  let n = 0
+  for (const id of ids || []) {
+    const m = messagesById.get(id)
+    if (!m || m.seen_at) continue
+    m.seen_at = now
+    if (reason) m.action_summary = String(reason).slice(0, 300)
+    try { atomicWriteJson(path.join(MESSAGES_DIR, m.id + '.json'), m) } catch (e) { continue }
+    n++
+  }
+  return n
+}
+
 // ── exports ──────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -2816,4 +2866,8 @@ module.exports = {
   // where a dead worker's stored label could be inherited by a live sibling.
   // Testable surface, not a tool.
   _resolveLiveTargetTab: resolveLiveTargetTab,
+  // Retirement seam for tools/coord-retire.js. Not tools (no leading name on the
+  // MCP surface would be meaningful); the sweep is the tool, these are its hands.
+  _unseenForTopic: _unseenForTopic,
+  _markSeenByIds: _markSeenByIds,
 }
