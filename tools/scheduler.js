@@ -3961,6 +3961,42 @@ exports.start = function start() {
     }
   }, CAP_OBSERVER_INTERVAL_MS)
 
+// Summarise cleanup_orphan_workers results into an attributable one-liner.
+// Families only (the part before the first ':'), so a per-tab id never lands in
+// the log. Empty string when there is nothing to say, so a quiet sweep keeps
+// printing exactly the line it always printed.
+function _orphanSweepBreakdown(r) {
+  try {
+    const rows = (r && r.results) || []
+    // A strategy reads 'stable_tab_id:ttab_x' and a refusal reads
+    // 'stable_id_not_live:ttab_x', so a fixed segment count keeps the id in one
+    // and drops the reason in the other. Take segments until one looks like a
+    // bridge id: that both aggregates (10 closes collapse to one entry instead
+    // of ten) and keeps a per-tab handle out of the log.
+    const fam = (s) => {
+      const parts = String(s || 'unknown').split(':')
+      const out = []
+      for (const p of parts) {
+        if (/^ttab_/.test(p)) break
+        out.push(p)
+        if (out.length >= 2) break
+      }
+      return out.length ? out.join(':') : 'unknown'
+    }
+    const tally = (pred, key) => {
+      const c = {}
+      for (const x of rows) if (pred(x)) { const k = fam(x[key]); c[k] = (c[k] || 0) + 1 }
+      return Object.keys(c).sort((a, b) => c[b] - c[a]).map((k) => k + '=' + c[k])
+    }
+    const closed = tally((x) => x.action === 'closed', 'strategy')
+    const leaked = tally((x) => x.action === 'leak', 'reason').slice(0, 4)
+    let out = ''
+    if (closed.length) out += ' [closed: ' + closed.join(' ') + ']'
+    if (leaked.length) out += ' [leak: ' + leaked.join(' ') + ']'
+    return out
+  } catch (e) { return '' }
+}
+
   // 2026-05-29 ultracode audit C3 fix. cleanup_orphan_workers reconciles
   // the worker registry against live ide.tabs and closes orphans the strict
   // close path could not match. The audit caught this wired to zero cron -
@@ -3972,7 +4008,16 @@ exports.start = function start() {
       if (dispatcher.cleanup_orphan_workers) {
         const r = await dispatcher.cleanup_orphan_workers({ max_age_days: 7, force_untitled: false })
         if (r && (r.closed > 0 || r.candidates > 0)) {
-          process.stderr.write('[scheduler] cleanup_orphan_workers: closed=' + r.closed + ' of ' + r.candidates + ' candidates (leaked=' + (r.leaked || 0) + ')\n')
+          // 2026-08-29 verification-pass fix. This line printed only the counts,
+          // so a non-zero close could not be attributed to a strategy from the
+          // log at all: the sweep writes stderr ONLY on the refusal path, and
+          // its success path is silent. The lane W1 brief asked its verifier to
+          // grep this log for 'stable_tab_id' to prove the stable-id close had
+          // fired; that check could never fire by construction, and proving the
+          // gate took a forensic walk of ~107 registry .json files instead.
+          // The per-row strategy was already in r.results and was simply not
+          // being summarised. Attribution now lands in the line itself.
+          process.stderr.write('[scheduler] cleanup_orphan_workers: closed=' + r.closed + ' of ' + r.candidates + ' candidates (leaked=' + (r.leaked || 0) + ')' + _orphanSweepBreakdown(r) + '\n')
         }
       }
     } catch (e) {
