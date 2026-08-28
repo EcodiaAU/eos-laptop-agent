@@ -1150,6 +1150,37 @@ async function resolveLiveTargetTab(topic) {
       return t && t.viewColumn === cand.viewColumn && t.index === cand.index
     })
     if (conflict) return { ok: false, kind: 'session', reason: 'session_ownership_conflict' }
+    // LABEL-SHARE guard (2026-08-28). The conflict test above compares RESOLVED
+    // positions, so it is silent when two same-labelled anchors pin DIFFERENT
+    // live tabs: each resolves cleanly and neither sees the other. That is not
+    // safety, it is two chats having been told they own one identity string,
+    // and a focus-race mis-capture is exactly how a chat acquires another's
+    // label. Reproduced 2026-08-28 (race2.js CASE D): a mis-captured anchor won
+    // its pinned index unopposed while the true owner resolved elsewhere.
+    // A shared label means the (label, position) pair is the ONLY thing telling
+    // them apart, and position is the half that drifts, so refuse.
+    // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+    const labelShared = _freshAnchors().some((a) => (
+      a && a.session_id !== sessionId && a.label === rec.label &&
+      !!_resolveAnchorToTab(a, pool)
+    ))
+    if (labelShared) return { ok: false, kind: 'session', reason: 'session_label_shared_with_live_peer' }
+    // NOT GUARDED, deliberately: a STALE anchor sharing this label. A quiet
+    // chat (no turn in 30 min) stops defending its tab, so a fresh mis-capture
+    // of its label resolves unopposed. Reproduced 2026-08-28 (race.js CASE C).
+    // A stale-claimant veto was BUILT for this and reverted the same turn,
+    // because it immediately blocked a real live chat: "Open my travel
+    // itinerary" had a 57-minute-old anchor from an earlier session of itself
+    // (a resume leaves the dead session's record behind), and that dead record
+    // vetoed the live one. That is exactly the spurious-veto class the
+    // 2026-08-21 fresh window was narrowed to kill, and a resumed session is
+    // common while a mis-capture of an idle chat's label is rare. Refusing
+    // every resumed chat to catch it trades a frequent silent stall for an
+    // infrequent misroute, which is the worse trade.
+    // The durable answer is a per-tab id that does not depend on labels at all;
+    // until VS Code exposes one, the mitigation is that a wrongly-delivered
+    // coord turn carries its intended addressee and a forward instruction.
+    // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
     return Object.assign({ ok: true, kind: 'session' }, _pos(cand))
   }
 
