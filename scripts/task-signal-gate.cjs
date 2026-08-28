@@ -509,6 +509,119 @@ async function main() {
       'G9. ABSENCE: markFailed consumes the signal too (done_at=' + g.done_at + ' done_status=' + g.done_status + ')')
     scheduler._resetWorktreeFns()
 
+    // ── H. a row SUSPENDED while running does not loop forever ──────────────
+    //
+    // 2026-08-29, seventh worker on this lane. The G legs above all run on rows
+    // with a clean last_status, so 63 of 63 was green over this.
+    //
+    // markComplete's cron arm and markFailed's cron-defer / retryable arms are
+    // guarded on `archived_at IS NULL AND last_status NOT IN ('paused','cancelled')`
+    // and nothing inspected rowCount, so on a suspended row the statement is a
+    // no-op and the CONSUME riding inside it is skipped with the status advance.
+    // completionPass carries no such guard, so it re-selected the row every 5s
+    // forever: kill_worker on the tab and a chain wake, every pass, run_count
+    // frozen.
+    //
+    // The state is REACHABLE THROUGH THE SHIPPED TOOL, which is why this is a
+    // gate leg and not a curiosity: schedule_pause sets last_status and
+    // deliberately leaves status alone, so pausing a task whose worker is
+    // mid-flight produces it. These legs drive the real exported schedule_pause,
+    // never a hand-typed UPDATE, so a change to its semantics fails here.
+    console.log('\nH. a row paused WHILE RUNNING consumes its signal instead of looping')
+    const hIns = await client.query(
+      `INSERT INTO os_scheduled_tasks (name, type, prompt, status, next_run_at, run_count, cron_expression, tz)
+       VALUES ($1, 'cron', 'task-signal-gate suspended probe', 'active', $2, 0, '0 3 * * *', 'Australia/Brisbane')
+       RETURNING id`,
+      [LANE + '-suspended-probe', FAR_FUTURE]
+    )
+    const hId = hIns.rows[0].id
+    const hChildIns = await client.query(
+      `INSERT INTO os_scheduled_tasks (name, type, prompt, status, next_run_at, run_count, cron_expression, tz)
+       VALUES ($1, 'cron', 'task-signal-gate suspended child', 'active', $2, 0, '0 4 * * *', 'Australia/Brisbane')
+       RETURNING id`,
+      [LANE + '-suspended-child', FAR_FUTURE]
+    )
+    const hChildId = hChildIns.rows[0].id
+    await client.query('UPDATE os_scheduled_tasks SET chain_after = $1 WHERE id = $2', [hId, hChildId])
+    const hRow = async (id) => (await client.query('SELECT * FROM os_scheduled_tasks WHERE id = $1', [id])).rows[0]
+    const hKilled = []
+    scheduler._setDispatcher({ kill_worker: async (a) => { hKilled.push(a && a.tab_id); return { closed: false } } })
+    scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(),
+         leased_by='lease-h', dispatched_tab_id='tab_h_live' WHERE id=$1`, [hId])
+    const hPause = await scheduler.schedule_pause({ id: hId })
+    ok(!!(hPause && hPause.ok), 'H1. REACHABILITY: the shipped schedule_pause succeeds on a row that is running')
+    let h = await hRow(hId)
+    ok(h.status === 'running' && h.last_status === 'paused',
+      'H2. REACHABILITY: it leaves status=running and sets last_status=paused (status=' + h.status + ' last_status=' + h.last_status + ')')
+    const hDone = await taskSignals.recordDone({ task_id: hId, tab_id: 'tab_h_live', status: 'success', result_summary: 'h suspended fire' })
+    ok(!!(hDone && hDone.ok), 'H3. REACHABILITY: the worker\'s done still lands on the suspended row')
+
+    const hBefore = await hRow(hId)
+    hKilled.length = 0
+    // Pass 1 is the legitimate one: the row IS completing, so one kill and one
+    // chain wake are correct here and are NOT what this section is measuring.
+    await scheduler.completionPass()
+    const hKillsAfter1 = hKilled.filter(t => t === 'tab_h_live').length
+    // Re-park the child so passes 2 and 3 have to move it again to be seen. An
+    // OR'd assertion here would be a leg that cannot fail; this one can.
+    await client.query('UPDATE os_scheduled_tasks SET next_run_at = $2 WHERE id = $1', [hChildId, FAR_FUTURE])
+    await scheduler.completionPass()
+    await scheduler.completionPass()
+    h = await hRow(hId)
+    ok(h.done_at === null && h.done_status === null,
+      'H4. THE FIX: the signal is consumed even though the guarded status advance did not apply (done_at=' + h.done_at + ')')
+    ok(hKilled.filter(t => t === 'tab_h_live').length === hKillsAfter1,
+      'H5. ABSENCE: passes 2 and 3 killed the tab again ZERO times (total ' + hKilled.filter(t => t === 'tab_h_live').length + ', pre-fix this was 3)')
+    const hChild = await hRow(hChildId)
+    ok(new Date(hChild.next_run_at).getTime() === new Date(FAR_FUTURE).getTime(),
+      'H6. ABSENCE: the chain child was not re-woken by passes 2 and 3 (next_run_at=' + hChild.next_run_at + ')')
+
+    // THE CONTROL FOR THE OTHER DIRECTION. The consume must not have become a
+    // resurrection: a suspended row must NOT be advanced to active, and its
+    // suspension must survive. A fix that simply dropped the guard passes H4-H6
+    // and fails here.
+    ok(h.status !== 'active',
+      'H7. CONTROL: the suspended row was NOT resurrected to active (status=' + h.status + ')')
+    ok(h.last_status === 'paused',
+      'H8. CONTROL: and its suspension survived the consume (last_status=' + h.last_status + ')')
+    ok(h.run_count === hBefore.run_count,
+      'H9. CONTROL: the guarded bookkeeping still did not apply (run_count ' + hBefore.run_count + ' -> ' + h.run_count + ')')
+
+    // POSITIVE CONTROL: without this, a completionPass that had crashed or a
+    // markComplete that no-opped for every row would score H4-H6 green.
+    const hcIns = await client.query(
+      `INSERT INTO os_scheduled_tasks (name, type, prompt, status, next_run_at, run_count, cron_expression, tz)
+       VALUES ($1, 'cron', 'task-signal-gate suspended control', 'active', $2, 0, '0 3 * * *', 'Australia/Brisbane')
+       RETURNING id`,
+      [LANE + '-suspended-control', FAR_FUTURE]
+    )
+    const hcId = hcIns.rows[0].id
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(),
+         leased_by='lease-hc', dispatched_tab_id='tab_hc' WHERE id=$1`, [hcId])
+    await taskSignals.recordDone({ task_id: hcId, tab_id: 'tab_hc', status: 'success', result_summary: 'h control fire' })
+    await scheduler.completionPass()
+    const hc = await hRow(hcId)
+    ok(hc.status === 'active' && hc.run_count === 1 && hc.done_at === null,
+      'H10. POSITIVE CONTROL: an unsuspended row in the same run still completes and consumes (status=' + hc.status + ' run_count=' + hc.run_count + ')')
+
+    // markFailed's guarded arms need the same consume, or a FAILED run on a
+    // suspended row loops the same way through the explicitFailure route.
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(), leased_by='lease-h',
+         dispatched_tab_id='tab_h_fail', retry_count=0 WHERE id=$1`, [hId])
+    await taskSignals.recordDone({ task_id: hId, tab_id: 'tab_h_fail', status: 'failed', result_summary: 'h suspended failure' })
+    await scheduler.completionPass()
+    h = await hRow(hId)
+    ok(h.done_at === null && h.done_status === null,
+      'H11. markFailed consumes on a suspended row too (done_at=' + h.done_at + ' done_status=' + h.done_status + ')')
+    ok(h.last_status === 'paused',
+      'H12. CONTROL: and that path did not resurrect it either (last_status=' + h.last_status + ')')
+    scheduler._resetWorktreeFns()
+
     // ── F. the retired bus types are genuinely gone, not renamed ─────────────
     console.log('\nF. the retired message types are not produced anywhere')
     ok(typeof coord.scanTopicByType !== 'function',
