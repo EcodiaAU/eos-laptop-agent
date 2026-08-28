@@ -181,7 +181,7 @@ function diffNewWindows(pre, post, exeFilter) {
 // parameter on subsequent coord.* tool calls (NOT for registration).
 function composeBrief(opts) {
   const {
-    tab_id, task_id, tab_credential, parent_conductor_tab_id,
+    tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session,
     brief_body, brief_size_bytes, brief_storage, brief_file_path,
   } = opts
 
@@ -191,7 +191,13 @@ function composeBrief(opts) {
     'task_id="' + task_id + '"',
     'tab_credential="' + tab_credential + '"',
     'inbox="chat.' + tab_id + '.inbox"',
-    'conductor="chat.conductor.inbox"',
+    // The address a worker copies to reach "the conductor". It MUST be the chat
+    // that dispatched it, not `chat.conductor.inbox`: that is a single slot every
+    // chat's turn-start heartbeat overwrites, so a worker trusting this attribute
+    // posts into whichever chat was typed in most recently (proven misroute
+    // 2026-08-28). Mirrors mac-dispatcher.composeBrief.
+    // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+    'conductor="' + (parent_session ? ('chat.session:' + parent_session + '.inbox') : 'chat.conductor.inbox') + '"',
     'parent_conductor_tab_id="' + (parent_conductor_tab_id || 'unknown') + '"',
     'brief_storage="' + brief_storage + '"',
     'registered="conductor-side"',
@@ -363,6 +369,18 @@ async function dispatch_worker(params) {
   // Earlier prototype used a separate stub on 7457; that path is deprecated.
   const coord_url = params.coord_url || 'http://localhost:7456'
 
+  // parent_session (2026-08-28): the stable session_id of the DISPATCHING chat,
+  // recorded on the worker row so a later `to:"conductor"` send from the worker
+  // resolves to that chat rather than the shared singleton slot.
+  // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+  let parent_session = params.parent_session || null
+  if (!parent_session) {
+    try {
+      const coord = require('./coord')
+      parent_session = (coord._recentActiveSession && coord._recentActiveSession()) || null
+    } catch (e) {}
+  }
+
   if (!brief_body) throw new Error('brief required')
 
   ensureDirs()
@@ -437,6 +455,7 @@ async function dispatch_worker(params) {
         task_id: task_id,
         tab_credential: tab_credential,
         parent_conductor_tab_id: parent_conductor_tab_id,
+        parent_session: parent_session,
         account_active_when_spawned: account_active_when_spawned,
       },
       loadLaptopAgentToken()
@@ -462,6 +481,7 @@ async function dispatch_worker(params) {
     task_id: task_id,
     tab_credential: tab_credential,
     parent_conductor_tab_id: parent_conductor_tab_id,
+    parent_session: parent_session,
     brief_body: brief_storage === 'inline' ? brief_body : '',
     brief_size_bytes: brief_size_bytes,
     brief_storage: compose_brief_storage,
@@ -1668,6 +1688,10 @@ async function swap_history(params) {
 
 module.exports = {
   dispatch_worker: dispatch_worker,
+  // Exposed for tests only: the `conductor=` attribute in the composed brief is
+  // the address a worker copies, so it has to be assertable directly rather than
+  // trusted. Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+  _composeBrief: composeBrief,
   list_workers: list_workers,
   kill_worker: kill_worker,
   cleanup_orphan_workers: cleanup_orphan_workers,

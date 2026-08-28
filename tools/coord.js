@@ -326,7 +326,7 @@ async function wakeConductor(msg) {
 
 // ── core ops (no auth here - that's the route layer's job) ───────────────
 
-function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conductor_tab_id, account_active_when_spawned }) {
+function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session, account_active_when_spawned }) {
   if (!tab_id) throw new Error('tab_id required')
   if (!tab_credential) throw new Error('tab_credential required')
   ensureDirs()
@@ -336,6 +336,14 @@ function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conduc
     tab_credential: tab_credential,
     task_id: task_id || null,
     parent_conductor_tab_id: parent_conductor_tab_id || null,
+    // The stable Claude Code session_id of the chat that DISPATCHED this worker.
+    // parent_conductor_tab_id is not this: dispatch_worker fills it from the
+    // conductor registration whose tab_id is the literal string 'conductor', the
+    // shared singleton slot. parent_session is per-dispatch and cannot be
+    // overwritten by another chat taking a turn, so it is the only handle that
+    // answers "which chat owns this worker" minutes later. Doctrine:
+    // coord-conductor-addressing-per-tab-identity-2026-08-13.
+    parent_session: parent_session || null,
     account_active_when_spawned: account_active_when_spawned || null,
     registered_at: now,
     last_heartbeat_at: now,
@@ -1419,6 +1427,39 @@ async function message_chat(params, ctx) {
       to: params.to,
     }
   }
+  // WORKER -> `conductor` REWRITE (2026-08-28). `conductor` is a SINGLE global
+  // slot that EVERY non-worker chat's turn-start heartbeat overwrites with its
+  // own label, so it does not mean "the chat that dispatched me", it means
+  // "whichever chat Tate typed in most recently". A worker addressing it lands
+  // its report in a stranger's stream.
+  // PROVEN 2026-08-28: worker tab_1787806439688_403f2ce5 (coexist lane Q1) sent
+  // to `conductor` at 01:12:23Z. Its parent was session dbf03de2 ("Guess what!!!
+  // Tim and..."), but chat ebad5adf ("Ryan sent me this yester...") had taken a
+  // user turn 62s earlier and therefore held the slot, so the injected turn
+  // landed there (its transcript, 01:12:26.940Z) while the parent never saw it.
+  // The GUI injection chain was blameless: it delivered exactly where resolution
+  // pointed. The defect is that `conductor` is not an identity.
+  // So: a WORKER sending to `conductor` is redirected to its OWN dispatching
+  // chat's stable session address. With no recorded parent, the message stays
+  // inbox-queued rather than being injected into a guess: the conductor-inbox
+  // peek still surfaces it at the right chat's next turn, which is late but
+  // never wrong. Non-worker senders are untouched: a peer conductor chat
+  // addressing `conductor` still means the shared slot.
+  // Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+  let parent_rewrite = null
+  if (to_address === addressForConductor() && ctx.tab_id) {
+    const wrow = workers.get(ctx.tab_id)
+    if (wrow && !wrow.terminated_at) {
+      if (wrow.parent_session) {
+        const parentAddr = 'chat.session:' + wrow.parent_session + '.inbox'
+        parent_rewrite = { was: to_address, now: parentAddr, reason: 'worker_parent_session' }
+        to_address = parentAddr
+        resolved_by = 'worker_parent_session'
+      } else {
+        parent_rewrite = { was: to_address, now: to_address, reason: 'worker_parent_unknown_queue_only' }
+      }
+    }
+  }
   const reply_to_address = params.from_address || (ctx.tab_id ? addressForWorker(ctx.tab_id) : addressForConductor())
   const from_label = params.from_label || (ctx.tab_id ? ('worker ' + ctx.tab_id) : 'conductor')
   const body = {
@@ -1439,15 +1480,20 @@ async function message_chat(params, ctx) {
   // Opt-out of the focus-stealing push: deliver:"queue" leaves the message in
   // the target's inbox for it to read_inbox, exactly like the pre-push model.
   if (params.deliver === 'queue') body.deliver = 'queue'
+  // A worker whose parent chat is unrecorded must never be injected into the
+  // singleton's current holder. Queue it: the conductor-inbox peek delivers it
+  // to the right reader at their next turn.
+  if (parent_rewrite && parent_rewrite.reason === 'worker_parent_unknown_queue_only') body.deliver = 'queue'
   const r = await send_message({ to: to_address, body: body, task_id: params.task_id, in_reply_to: params.in_reply_to }, ctx)
   // Surface whether the turn actually landed in the target's live stream vs only
   // its inbox. delivered:false is not a failure to persist (the message is in the
   // inbox), but it IS the caller's cue that the recipient will not see it until
   // their next inbox peek - so it is reported plainly, never hidden.
   const injected = !!(r.delivery && r.delivery.ok)
-  const delivered = params.deliver === 'queue' ? false : injected
+  const delivered = (params.deliver === 'queue' || (body.deliver === 'queue')) ? false : injected
   return Object.assign(
     { ok: true, to_address: to_address, reply_to_address: reply_to_address, resolved_by: resolved_by, delivered: delivered },
+    parent_rewrite ? { parent_rewrite: parent_rewrite } : {},
     r
   )
 }
@@ -2712,6 +2758,8 @@ module.exports = {
   _normalizeToAddress: normalizeToAddress,
   _pushInject: pushInject,
   _readSessionTab: _readSessionTab,
+  // Worker-row map, for tests that need to age or terminate a row directly.
+  _workersMap: function () { return workers },
   _recentActiveSession: _recentActiveSession,
   _resolveWorkerAnchorCloseTarget: _resolveWorkerAnchorCloseTarget,
   _closeAnchorTarget: _closeAnchorTarget,

@@ -9,7 +9,7 @@ const coord = require('../tools/coord')
 function mount(app, auth) {
   app.post('/api/comms/register-worker', auth, (req, res) => {
     try {
-      const { tab_id, task_id, tab_credential, parent_conductor_tab_id, account_active_when_spawned } = req.body || {}
+      const { tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session, account_active_when_spawned } = req.body || {}
       if (!tab_id || !tab_credential) {
         return res.status(400).json({ error: 'tab_id + tab_credential required' })
       }
@@ -18,6 +18,7 @@ function mount(app, auth) {
         task_id: task_id,
         tab_credential: tab_credential,
         parent_conductor_tab_id: parent_conductor_tab_id,
+        parent_session: parent_session,
         account_active_when_spawned: account_active_when_spawned,
       })
       return res.json({

@@ -104,7 +104,7 @@ function postJson(urlStr, body, bearerToken) {
 // explicit instruction needed. Everything else is the cron's responsibility.
 function composeBrief(opts) {
   const {
-    tab_id, task_id, tab_credential, parent_conductor_tab_id,
+    tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session,
     brief_body, brief_size_bytes, brief_storage, brief_file_path,
     report_back,
   } = opts
@@ -115,7 +115,15 @@ function composeBrief(opts) {
     'task_id="' + task_id + '"',
     'tab_credential="' + tab_credential + '"',
     'inbox="chat.' + tab_id + '.inbox"',
-    'conductor="chat.conductor.inbox"',
+    // The address a worker copies when it wants to reach "the conductor". It MUST
+    // be its own dispatching chat, not the shared `chat.conductor.inbox` slot:
+    // that slot is rewritten by every chat's turn-start heartbeat, so a worker
+    // that trusted this attribute posted into whichever chat Tate had most
+    // recently typed in (proven misroute 2026-08-28, coexist lane Q1 into an
+    // unrelated Common Ground chat). coord.message_chat rewrites `conductor` for
+    // a worker sender as a belt; this attribute is the braces, so the brief the
+    // worker reads is not itself lying.
+    'conductor="' + (parent_session ? ('chat.session:' + parent_session + '.inbox') : 'chat.conductor.inbox') + '"',
     'parent_conductor_tab_id="' + (parent_conductor_tab_id || 'unknown') + '"',
     'brief_storage="' + brief_storage + '"',
     'registered="conductor-side"',
@@ -349,6 +357,24 @@ async function dispatch_worker(params) {
     }
   }
 
+  // parent_session (2026-08-28): the stable session_id of the chat DISPATCHING
+  // this worker, recorded on the worker row so a later ad-hoc `to:"conductor"`
+  // send resolves to that chat instead of the shared singleton slot (which every
+  // chat's turn-start heartbeat overwrites). Prefer the already-resolved
+  // report_back target; otherwise the most-recently-anchored chat, which at
+  // dispatch time is the dispatcher by construction.
+  // Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+  let parent_session = null
+  if (report_back && /^session:/i.test(String(report_back))) {
+    parent_session = String(report_back).slice('session:'.length)
+  }
+  if (!parent_session) {
+    try {
+      const coord = require('./coord')
+      parent_session = (coord._recentActiveSession && coord._recentActiveSession()) || null
+    } catch (e) {}
+  }
+
   if (!brief_body) throw new Error('brief required')
   ensureDirs()
 
@@ -402,6 +428,7 @@ async function dispatch_worker(params) {
       {
         tab_id, task_id, tab_credential,
         parent_conductor_tab_id,
+        parent_session,
         account_active_when_spawned,
       },
       loadLaptopAgentToken()
@@ -419,7 +446,7 @@ async function dispatch_worker(params) {
 
   // Compose brief.
   const composedBriefInner = composeBrief({
-    tab_id, task_id, tab_credential, parent_conductor_tab_id,
+    tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session,
     brief_body: brief_storage === 'inline' ? brief_body : '',
     brief_size_bytes,
     brief_storage,
