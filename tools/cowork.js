@@ -1295,6 +1295,23 @@ async function cleanup_orphan_workers(params) {
           fs.writeFileSync(filePath, JSON.stringify(cur, null, 2))
         } catch (e) {}
         closedCount++
+        // Retire the tab from the ONE up-front snapshot the legacy ladder still
+        // reads. Pass 0 re-probes per orphan, the ladder does not, so without
+        // this a no-id sibling row of the SAME cron can match the tab we just
+        // closed by its sentinel and send a stale index. The bridge exactLabel
+        // race guard makes that a refusal rather than a wrong close in the
+        // common case, but a same-label corpse sitting at the stale index would
+        // satisfy it. Cheapest correct fix: the closed tab stops being a
+        // candidate for everyone.
+        const closedCtx = groupByCol[st.tab.viewColumn]
+        if (closedCtx) {
+          const drop = (arr) => {
+            const i = arr.findIndex((t) => (t.tabId && st.tabId && t.tabId === st.tabId))
+            if (i >= 0) arr.splice(i, 1)
+          }
+          drop(closedCtx.allTabs)
+          drop(closedCtx.ccTabs)
+        }
         results.push({ tab_id: worker.tab_id, action: 'closed', label: st.tab.label,
                        strategy: cr.strategy, viewColumn: st.tab.viewColumn, tabId: st.tabId })
       } else {
