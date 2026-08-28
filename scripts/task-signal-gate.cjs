@@ -42,7 +42,18 @@
 // the deployed value is 180s, so three of them would take nine minutes. dotenv
 // does not override an already-set variable, which is exactly why this goes
 // first. Set GATE_BOUND_TIMEOUT_MS to run the legs at the deployed budget.
-process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS = process.env.GATE_BOUND_TIMEOUT_MS || '3000'
+//
+// 2026-08-29 verification pass: raised 3000 -> 6000. Section D's RELEASE legs
+// (D1, D9) assert wall-clock elapsed < budget, and wall clock cannot tell a
+// released lock from a stalled query. Steady-state round-trip to this database
+// is p50 36ms / max 54ms over 40 samples, so the budget was never the systematic
+// problem; the observed failures were single-query STALLS of ~2s and ~9s
+// (D9 3223ms of 3000ms, D1 10449ms of 3000ms) against a pooler the live daemon
+// also uses. A legitimate release costs about one 1000ms poll, so 6000 buys real
+// headroom over a 2s stall. It does NOT eliminate the floor: a stall longer than
+// the budget still reads as a held lock, so an isolated D1/D9 failure with every
+// other leg green is a stall, not a regression - re-run before believing it.
+process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS = process.env.GATE_BOUND_TIMEOUT_MS || '6000'
 
 // COORD_ROOT: section D calls the real coord.signal_done, which still posts a
 // worker_report notice to the file substrate. Without this the gate would write
@@ -101,6 +112,28 @@ function shippedStatement(pred) {
     i = b + 1
   }
 }
+// The ADOPT statement (dispatchOne step 2d, the 2026-07-17 double-spawn guard)
+// lives BEFORE the 3b block, so it needs its own extractor over the whole source.
+// Extracted rather than retyped for the same reason as the claim: a gate that
+// replays a hand-copied statement measures the copy, and section G's whole point
+// is that this transition reaches running WITHOUT the claim's clear. Retyping it
+// here would have scored a clear-at-adopt fix exactly as green as a correct one.
+function shippedStatementIn(src, pred) {
+  let i = 0
+  for (;;) {
+    const a = src.indexOf('`', i); if (a < 0) return null
+    const b = src.indexOf('`', a + 1); if (b < 0) return null
+    const body = src.slice(a + 1, b)
+    if (pred(body)) return body
+    i = b + 1
+  }
+}
+const UPD_ADOPT_RAW = shippedStatementIn(SRC, b =>
+  /UPDATE\s+os_scheduled_tasks/.test(b) && /SET status = 'running', dispatched_tab_id = \$1/.test(b))
+const UPD_ADOPT = UPD_ADOPT_RAW
+  ? UPD_ADOPT_RAW.replace('${taskSignals.CLEAR_SQL_FRAGMENT}', taskSignals.CLEAR_SQL_FRAGMENT)
+  : null
+
 const UPD_CLAIM_RAW = shippedStatement(b => /UPDATE\s+os_scheduled_tasks/.test(b) && /dispatched_tab_id\s*=\s*\$1/.test(b))
 // The shipped statement interpolates the clear-list from the module that owns it,
 // so the raw source carries the template token rather than the column names.
@@ -283,15 +316,31 @@ async function main() {
         },
         kill_worker: async () => ({ closed: false }),
       })
+      // MEASURE THE WAIT, NOT THE CALL. dispatchOne completes a fast worker
+      // INLINE, so on D9 markComplete runs inside the same call and its cost
+      // lands in any end-to-end timing. Measured 2026-08-29: that inflated D9 to
+      // 16645ms against a 6000ms budget on a contended pooler and reported a
+      // working handshake as broken - the invented-failure shape this lane
+      // already has doctrine for. Stamping the moment markComplete is entered
+      // separates the two: waitMs is the lock, the remainder is the completion.
+      const origMarkComplete = scheduler.markComplete
+      let tMark = null
+      scheduler.markComplete = async function (...a) { if (tMark === null) tMark = Date.now(); return origMarkComplete.apply(this, a) }
       const t0 = Date.now()
-      await scheduler.dispatchOne(Object.assign({}, fresh, { leased_by: 'lease-d' }))
-      return Date.now() - t0
+      try {
+        await scheduler.dispatchOne(Object.assign({}, fresh, { leased_by: 'lease-d' }))
+      } finally {
+        scheduler.markComplete = origMarkComplete
+      }
+      const total = Date.now() - t0
+      return { total, waitMs: tMark === null ? total : tMark - t0 }
     }
 
     const BUDGET = parseInt(process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS, 10)
 
     // D1: a legitimate bind. The lock must RELEASE well inside the budget.
-    const d1ms = await runDispatch('tab_d1', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_d1' }))
+    const d1 = await runDispatch('tab_d1', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_d1' }))
+    const d1ms = d1.waitMs
     r = await row()
     ok(d1ms < BUDGET, 'D1. RELEASES: a bind from the dispatched tab ends the wait early (' + d1ms + 'ms of ' + BUDGET + 'ms)')
     ok(!!r.bound_at, 'D2. the bind actually landed on the row')
@@ -301,7 +350,7 @@ async function main() {
     // D5: NO bind at all. The lock must NOT release: the wait runs its budget.
     // This is the direction a one-sided gate cannot see. Without it, a lock that
     // never engages at all scores identically to a working handshake.
-    const d5ms = await runDispatch('tab_d5', null)
+    const d5ms = (await runDispatch('tab_d5', null)).waitMs
     r = await row()
     ok(d5ms >= BUDGET, 'D5. DOES NOT RELEASE: with no bind the wait runs its full budget (' + d5ms + 'ms of ' + BUDGET + 'ms)')
     ok(r.bound_at === null, 'D6. ABSENCE: bound_at stayed NULL through the whole wait')
@@ -309,7 +358,7 @@ async function main() {
     // D7: a bind from the WRONG tab, arriving during the wait. This separates
     // "the handshake works" from "the guard works". An unguarded sink releases
     // the lock here, and every other leg in this gate would still be green.
-    const d7ms = await runDispatch('tab_d7', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_an_impostor' }))
+    const d7ms = (await runDispatch('tab_d7', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_an_impostor' }))).waitMs
     r = await row()
     ok(d7ms >= BUDGET, 'D7. DOES NOT RELEASE on a bind from a tab that does not own the row (' + d7ms + 'ms of ' + BUDGET + 'ms)')
     ok(r.bound_at === null, 'D8. ABSENCE: the impostor bind did not stamp the row')
@@ -317,9 +366,10 @@ async function main() {
     // D9: the fast worker. A done that arrives without a bound must still end the
     // wait AND complete the row inline. Losing this case rotted rows at running
     // until the 6h orphan sweep through all of July.
-    const d9ms = await runDispatch('tab_d9', () => coord.signal_done(
+    const d9 = await runDispatch('tab_d9', () => coord.signal_done(
       { task_id: taskId, status: 'success', result_summary: 'finished before binding' },
       { tab_id: 'tab_d9' }))
+    const d9ms = d9.waitMs
     r = await row()
     ok(d9ms < BUDGET, 'D9. a done without a bound ends the wait early (' + d9ms + 'ms of ' + BUDGET + 'ms)')
     ok(r.status === 'completed', 'D10. and the row is completed inline, not left running for the orphan sweep')
@@ -388,12 +438,15 @@ async function main() {
     ok(g.done_status === null && g.done_summary === null && g.done_pointer === null,
       'G3. ABSENCE: it consumed done_status/summary/pointer with it')
 
-    // the ADOPT path, byte-for-byte what dispatchOne step 2d writes: a flip to
-    // running against a DIFFERENT live tab, with no claim and no clear.
+    // the ADOPT path, driven through dispatchOne's OWN shipped statement rather
+    // than a hand-copy. Its guard is (status='dispatching' AND leased_by match),
+    // so put the row where the real 2d branch finds it first.
+    ok(!!UPD_ADOPT, 'G3b. the adopt statement was found in dispatchOne\'s shipped source')
     await client.query(
-      `UPDATE os_scheduled_tasks
-         SET status='running', dispatched_tab_id=$1, leased_at=NOW(), updated_at=NOW()
-       WHERE id=$2`, ['tab_g2_live', gId])
+      `UPDATE os_scheduled_tasks SET status='dispatching', leased_by='lease-g-adopt' WHERE id=$1`, [gId])
+    await client.query(UPD_ADOPT, ['tab_g2_live', gId, 'lease-g-adopt'])
+    await client.query(
+      `UPDATE os_scheduled_tasks SET leased_at=NOW() WHERE id=$1 AND leased_at IS NULL`, [gId])
     const gBefore = (await gRow()).run_count
     gKilled.length = 0
     await scheduler.completionPass()
