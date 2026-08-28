@@ -139,7 +139,10 @@ for s in tools/account-cap-decide.js tools/real-limit-watch.js tools/usage-real.
 done
 
 echo "=== suites ==="
-for t in "$ROOT"/tools/*.test.js "$ROOT"/daemons/*.test.js; do
+# lib/ was NOT in this glob until 2026-08-29, so a test living beside the module
+# it guards was invisible to the commit gate. That is the enrolment half of the
+# same failure this repo keeps hitting: the artifact exists, nothing runs it.
+for t in "$ROOT"/tools/*.test.js "$ROOT"/lib/*.test.js "$ROOT"/daemons/*.test.js; do
   [ -f "$t" ] || continue
   run_bounded "$t" "${t#$ROOT/}"
 done
