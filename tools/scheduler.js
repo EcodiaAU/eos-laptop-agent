@@ -2402,7 +2402,7 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
   const liveness = opts.liveness || require('./worker-liveness')
   const dispatcher = opts.dispatcher || getDispatcher()
   const res = await pool.query(
-    `SELECT id, name, type, cron_expression, task_id, status, leased_at, dispatched_tab_id
+    `SELECT id, name, type, cron_expression, status, leased_at, dispatched_tab_id
        FROM os_scheduled_tasks WHERE status = 'running' AND archived_at IS NULL`
   )
   if (!res.rows.length) return { scanned: 0, reaped: 0, live: 0, unknown: 0, verdicts: [] }

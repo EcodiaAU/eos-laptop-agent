@@ -51,8 +51,26 @@ const DEFAULT_WINDOW_MIN = 30
 // A row leased less than this ago has not necessarily written turn 1 yet. Never
 // reap inside it: that is the boot race, and it would kill workers on spawn.
 const DEFAULT_BOOT_GRACE_MIN = 10
+// Inside this window, silence alone is not enough to call a row dead: a second
+// independent negative is required (the coord registry recording the worker
+// terminated). Found live 2026-08-28: two rows leased 28 and 33 minutes earlier
+// had no own transcript and a stale worktree, but their registry rows were NOT
+// terminated, so the only evidence was an absence. Absence of evidence inside
+// half an hour is a slow start as easily as a death. Past the window, sustained
+// silence on every observable surface IS the evidence.
+const DEFAULT_CONFIRM_WINDOW_MIN = 60
 const HEAD_BYTES = 262_144
-const TAB_RE = /tab_17\d{11}_[a-f0-9]{8}/
+const TAB_RE = /tab_17\d{11}_[a-f0-9]{8}/g
+// A transcript OWNS a tab only if its head carries the dispatched-worker boot
+// envelope, which writes the id as `tab_id: tab_...` / `tab_id="tab_..."`. The
+// bare id is not enough: a CONDUCTOR transcript names every tab it dispatched, so
+// taking the first bare match attributed a conductor's mtime to somebody else's
+// tab (observed: one head named 11 distinct tabs). That error marks a dead tab
+// live, which blocks its lane instead of freeing it, so it is worth excluding
+// even though it fails in the safe direction. The single-tab fallback keeps a
+// worker transcript whose envelope is formatted differently, because one tab in
+// a whole head is unambiguous by construction.
+const OWNER_RE = /tab_id["']?\s*[:=]\s*["']?(tab_17\d{11}_[a-f0-9]{8})/
 
 // liveTabs(windowMinutes) -> Map<tab_id, mtimeMs>
 // Every tab that has written a transcript turn inside the window.
@@ -81,10 +99,16 @@ function liveTabs(windowMinutes) {
           head = buf.toString('utf8')
         } finally { fs.closeSync(fd) }
       } catch (err) { continue }
-      const m = TAB_RE.exec(head)
-      if (!m) continue
-      const prev = out.get(m[0])
-      if (!prev || st.mtimeMs > prev) out.set(m[0], st.mtimeMs)
+      let owner = null
+      const strict = OWNER_RE.exec(head)
+      if (strict) owner = strict[1]
+      else {
+        const all = new Set(head.match(TAB_RE) || [])
+        if (all.size === 1) owner = [...all][0]
+      }
+      if (!owner) continue
+      const prev = out.get(owner)
+      if (!prev || st.mtimeMs > prev) out.set(owner, st.mtimeMs)
     }
   }
   return out
@@ -131,6 +155,7 @@ function probeRows(rows, opts) {
   opts = opts || {}
   const windowMin = typeof opts.window_minutes === 'number' ? opts.window_minutes : DEFAULT_WINDOW_MIN
   const graceMin = typeof opts.boot_grace_minutes === 'number' ? opts.boot_grace_minutes : DEFAULT_BOOT_GRACE_MIN
+  const confirmMin = typeof opts.confirm_window_minutes === 'number' ? opts.confirm_window_minutes : DEFAULT_CONFIRM_WINDOW_MIN
   const now = opts.now_ms || Date.now()
   const live = opts.live_tabs || liveTabs(windowMin)
   const out = []
@@ -166,6 +191,9 @@ function probeRows(rows, opts) {
     }
 
     // 4. Working tree still being written counts as alive.
+    // os_scheduled_tasks has NO task_id column: the row id IS the task id, and it
+    // is what names the dispatched worktree directory. Selecting task_id threw
+    // 'column does not exist' and would have made every reap pass a no-op.
     const wt = worktreeMtime(r.task_id || r.id)
     if (wt && (now - wt) < windowMin * 60_000) {
       ev.worktree_age_min = Math.round((now - wt) / 60_000)
@@ -181,6 +209,13 @@ function probeRows(rows, opts) {
     ev.registry_heartbeat_age_min = reg && (reg.last_heartbeat_at || reg.registered_at)
       ? Math.round((now - new Date(reg.last_heartbeat_at || reg.registered_at).getTime()) / 60_000)
       : null
+    // Two-negative rule inside the confirmation window (see DEFAULT_CONFIRM_WINDOW_MIN).
+    if (ageMin < confirmMin && !ev.registry_terminated) {
+      out.push({ id: r.id, name: r.name, tab_id: tabId, verdict: 'unknown',
+        reason: 'silent but under ' + confirmMin + 'm and the registry does not record it terminated',
+        evidence: ev })
+      continue
+    }
     out.push({ id: r.id, name: r.name, tab_id: tabId, verdict: 'dead',
       reason: 'no transcript turn and no worktree write for ' + windowMin + 'm', evidence: ev })
   }
@@ -194,7 +229,7 @@ async function report(params) {
   const pool = scheduler._poolForLiveness ? scheduler._poolForLiveness() : null
   if (!pool) return { ok: false, error: 'no pool available' }
   const res = await pool.query(
-    `SELECT id, name, task_id, status, leased_at, dispatched_tab_id
+    `SELECT id, name, status, leased_at, dispatched_tab_id
        FROM os_scheduled_tasks WHERE status = 'running' AND archived_at IS NULL`)
   const verdicts = probeRows(res.rows, params)
   const counts = verdicts.reduce((a, v) => { a[v.verdict] = (a[v.verdict] || 0) + 1; return a }, {})
@@ -204,5 +239,5 @@ async function report(params) {
 module.exports = {
   report,
   liveTabs, probeRows, worktreeMtime, registryRow,
-  DEFAULT_WINDOW_MIN, DEFAULT_BOOT_GRACE_MIN,
+  DEFAULT_WINDOW_MIN, DEFAULT_BOOT_GRACE_MIN, DEFAULT_CONFIRM_WINDOW_MIN,
 }

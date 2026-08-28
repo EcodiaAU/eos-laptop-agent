@@ -169,6 +169,20 @@ async function testProbe() {
     { live_tabs: tabs })
   ok(v2[0].verdict === 'live', 'C7. CONTROL: a freshly written worktree rescues a tab with no live transcript')
 
+  // C8/C9: the two-negative rule inside the confirmation window.
+  const recent = new Date(Date.now() - 25 * 60000).toISOString()
+  const v3 = L.probeRows([{ id: 9, name: 'e', task_id: 'te', leased_at: recent, dispatched_tab_id: DEAD_TAB }],
+    { live_tabs: tabs })
+  ok(v3[0].verdict === 'unknown',
+     'C8. CONTROL: silent for 25m with no registry termination is unknown, not dead')
+  fs.mkdirSync(path.join(root, 'workers'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'workers', DEAD_TAB + '.json'),
+    JSON.stringify({ tab_id: DEAD_TAB, terminated_at: new Date().toISOString() }))
+  const v4 = L.probeRows([{ id: 9, name: 'e', task_id: 'te', leased_at: recent, dispatched_tab_id: DEAD_TAB }],
+    { live_tabs: tabs })
+  ok(v4[0].verdict === 'dead',
+     'C9. the SECOND negative (registry records it terminated) confirms death inside the window')
+
   try { fs.rmSync(root, { recursive: true, force: true }) } catch (e) {}
 }
 
