@@ -316,7 +316,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.set_wake_policy',
-    description: 'Configure how the conductor is woken when messages land in chat.conductor.*. mode = "toast" (default - notification only) | "flash" (toast + flash conductor taskbar) | "auto_type" (toast + flash + focus + paste wake message into chat, then press enter) | "silent" (disable wake entirely). notify_types filters by body.type ("done", "error", "progress", or "*" for all). Defaults: mode=toast, notify_types=[done, error].',
+    description: 'Configure how the conductor is woken when messages land in chat.conductor.*. mode = "toast" (default - notification only) | "flash" (toast + flash conductor taskbar) | "auto_type" (toast + flash + focus + paste wake message into chat, then press enter) | "silent" (disable wake entirely). notify_types filters by body.type. Live types: "worker_report" (a dispatched worker finished), "error", "inbound_sms", "inbound_telegram", or "*" for all. Defaults: mode=toast, notify_types=[worker_report, error, inbound_sms, inbound_telegram]. NOTE the whole list is REPLACED by what you pass, never merged, so omitting a type unsubscribes from it. Legacy: "done" and "progress" are retired types that nothing produces any more (a worker completion is now a row write plus a worker_report notice); a policy still listing "done" is honoured for worker_report so an old on-disk policy does not silently stop waking.',
     inputSchema: {
       type: 'object',
       properties: {

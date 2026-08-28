@@ -294,6 +294,47 @@ async function runTests() {
   assertTrue(rep6b && rep6b.body.signal_recorded === false,
     'the notice reports signal_recorded:false instead of implying the row completed')
 
+  // ── TEST 6c: A STALE ON-DISK WAKE POLICY MUST STILL WAKE ────────────────
+  //
+  // 2026-08-28 lane R1 item 2. Adding 'worker_report' to DEFAULT_WAKE_POLICY is
+  // NOT sufficient and this is the leg that proves it. loadWakePolicy does
+  // Object.assign({}, DEFAULT_WAKE_POLICY, onDisk), so an on-disk policy REPLACES
+  // notify_types wholesale. One exists on this machine
+  // (~/.ecodiaos/coordination/wake_policy.json, written 2026-08-27, carrying
+  // exactly ["done","error"]), so without the compat in shouldWake the new
+  // default never applies: signal_done posts a worker_report, nothing matches,
+  // and wake-on-worker-finish dies SILENTLY. Config, not code, so no grep of
+  // either repo would ever have found it.
+  console.log('TEST 6c: a stale on-disk policy listing only "done" still wakes on a worker_report')
+  const staleDonePolicy = { mode: 'toast', notify_types: ['done', 'error'] }
+  assertTrue(
+    coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'worker_report' } }, staleDonePolicy),
+    'a policy listing "done" is honoured for worker_report (the live on-disk shape)'
+  )
+  // NEGATIVE CONTROL. Without it, a compat that returned true for everything
+  // would pass the leg above and silence nothing while waking on all noise.
+  assertFalse(
+    coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'some_other_type' } }, staleDonePolicy),
+    'NEGATIVE CONTROL: an unlisted type still does NOT wake'
+  )
+  // The compat is deliberately ONE-WAY. The ~2,568 historical `done` messages
+  // must not start waking a policy that never subscribed to them.
+  assertFalse(
+    coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'done' } },
+      { mode: 'toast', notify_types: ['worker_report', 'error'] }),
+    'the compat is one-way: a worker_report subscription is NOT woken by a legacy done'
+  )
+  assertFalse(
+    coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'worker_report' } },
+      { mode: 'silent', notify_types: ['done'] }),
+    'mode=silent still wins over the compat'
+  )
+  assertTrue(
+    coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'worker_report' } },
+      { mode: 'toast', notify_types: ['worker_report'] }),
+    'a policy that names worker_report directly wakes on it'
+  )
+
   // ── TEST 7: read_inbox({ids}) consumes ONLY the given ids, leaving others ─
   // 2026-07-08 regression guard for the lost-signal_done defect. The conductor
   // turn hooks surface inbound_* messages and must dedupe ONLY those; a blanket

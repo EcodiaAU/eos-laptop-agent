@@ -248,11 +248,29 @@ function isWakeTopic(topic) {
 function shouldWake(msg, policy) {
   if (!isWakeTopic(msg.to)) return false
   if (policy.mode === 'silent') return false
-  const types = policy.notify_types || ['done', 'error']
+  const types = policy.notify_types || ['worker_report', 'done', 'error']
   if (types.indexOf('*') !== -1) return true
   const t = (msg.body && typeof msg.body === 'object') ? msg.body.type : null
   if (!t) return false  // body has no type field - don't wake (free-form messages are noise)
-  return types.indexOf(t) !== -1
+  if (types.indexOf(t) !== -1) return true
+  // 2026-08-28 lane R1 item 2. THE DEFAULT IS NOT ENOUGH, and this line is the
+  // difference between the migration working and silently killing the wake.
+  //
+  // loadWakePolicy does Object.assign({}, DEFAULT_WAKE_POLICY, onDisk), so an
+  // on-disk policy REPLACES notify_types wholesale rather than merging into it.
+  // One exists: ~/.ecodiaos/coordination/wake_policy.json, written 2026-08-27,
+  // carrying exactly ["done","error"] <!-- probed this arc -->. Adding
+  // 'worker_report' to the default therefore changes nothing on this machine.
+  // signal_done would post a worker_report, this function would find no match,
+  // and wake-on-worker-finish would die SILENTLY - the precise regression the
+  // notice was kept to prevent, arriving through config rather than code.
+  //
+  // So a policy that asks to be woken on a worker finishing is honoured whatever
+  // the era of its vocabulary. Deliberately one-way: worker_report satisfies a
+  // 'done' subscription, never the reverse, because the ~2,568 historical `done`
+  // messages must not start waking a policy that never asked for them.
+  if (t === 'worker_report' && types.indexOf('done') !== -1) return true
+  return false
 }
 
 function buildWakeNotice(msg) {
@@ -2741,6 +2759,9 @@ module.exports = {
   _allSessionAnchors: _allSessionAnchors,
   _freshAnchors: _freshAnchors,
   _canonicalAddress: _canonicalAddress,
+  // Exported for the wake-policy compat test. A policy is CONFIG, not code, so no
+  // amount of grepping the repos finds a wake that a stale on-disk list silenced.
+  _shouldWake: shouldWake,
   // Exposed for coord-resolve-worker-terminated.test.js: the worker branch is
   // where a dead worker's stored label could be inherited by a live sibling.
   // Testable surface, not a tool.

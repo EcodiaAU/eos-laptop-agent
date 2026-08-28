@@ -51,8 +51,14 @@ process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS = process.env.GATE_BOUND_TIMEOUT_M
 // filling with machine sediment.
 const os = require('os')
 const fsx = require('fs')
-process.env.COORD_ROOT = process.env.COORD_ROOT ||
-  fsx.mkdtempSync(require('path').join(os.tmpdir(), 'task-signal-gate-'))
+const OWNED_COORD_ROOT = process.env.COORD_ROOT
+  ? null
+  : fsx.mkdtempSync(require('path').join(os.tmpdir(), 'task-signal-gate-'))
+process.env.COORD_ROOT = process.env.COORD_ROOT || OWNED_COORD_ROOT
+// Close what you opened. Only the directory THIS run created, never one handed in.
+process.on('exit', () => {
+  if (OWNED_COORD_ROOT) { try { fsx.rmSync(OWNED_COORD_ROOT, { recursive: true, force: true }) } catch (e) {} }
+})
 process.env.COORD_DISABLE_SWEEP = '1'
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') })
