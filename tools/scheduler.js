@@ -1132,6 +1132,52 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
 // Increments retry_count, clears the lease, and leaves status=active so the
 // row will be picked up again. After MAX_RETRY_COUNT retries, sets status=failed.
 
+// ── consumeSuspendedSignal ───────────────────────────────────────────────────
+//
+// 2026-08-29 lane R1, seventh-worker verification pass. THE GUARDED TERMINAL
+// UPDATE CAN MATCH ZERO ROWS, AND NOTHING INSPECTED rowCount.
+//
+// markComplete's cron arm and markFailed's cron-defer and retryable arms are all
+// guarded on `archived_at IS NULL AND last_status NOT IN ('paused','cancelled')`.
+// That guard is right for what it was written for: it stops a terminal transition
+// flipping a paused or cancelled row back to status='active' (the 2026-06-19
+// cancellation-durability fix). But the CONSUME added on 2026-08-29 rides inside
+// those same statements, so the guard silently covers it too. On a suspended row
+// the whole statement is a no-op: the status is not advanced AND done_at is not
+// consumed.
+//
+// completionPass selects `status='running' AND done_at IS NOT NULL` and carries no
+// such guard, so it re-selects that row every COMPLETION_POLL_INTERVAL_MS (5s)
+// forever. Each pass calls kill_worker on the tab and wakes the chain children off
+// a completion that never landed, while run_count never moves.
+//
+// THE STATE IS REACHABLE THROUGH A SHIPPED TOOL. schedule_pause sets
+// last_status='paused' and deliberately does NOT touch status, and it refuses only
+// archived rows, so pausing a task whose worker is mid-flight produces exactly
+// `status='running' AND last_status='paused'`. Measured 2026-08-29 on the real
+// table inside a rolled-back transaction: 3 completionPass passes produced 3
+// kill_worker calls on the live tab, the chain child re-woken on every pass, and
+// run_count frozen at 0. A negative control with a clean last_status completed and
+// consumed normally on the first pass.
+//
+// This consume touches ONLY the lifecycle columns. It never writes status,
+// next_run_at or last_status, so it cannot resurrect a paused or cancelled row -
+// and leaseDueRows gates on `last_status NOT IN ('paused','cancelled')`
+// independently of status, so the suspension holds regardless.
+//
+// RESIDUAL, named rather than hidden: the row is left at status='running' with its
+// lease. That is pre-existing and orthogonal - a row paused mid-flight is already
+// in a half-state - and staleLeaseRecovery branch 3 is its designed recovery at
+// ORPHAN_TIMEOUT_MS. What this removes is the 5-second storm, not the half-state.
+async function consumeSuspendedSignal(pool, rowId) {
+  await pool.query(
+    `UPDATE os_scheduled_tasks
+     SET ${taskSignals.CLEAR_SQL_FRAGMENT}, updated_at = NOW()
+     WHERE id = $1`,
+    [rowId]
+  )
+}
+
 exports.markFailed = async function markFailed(row, err) {
   const pool = getPool()
   const newRetryCount = (row.retry_count || 0) + 1
@@ -1179,7 +1225,7 @@ exports.markFailed = async function markFailed(row, err) {
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }
-      await pool.query(
+      const deferRes = await pool.query(
         `UPDATE os_scheduled_tasks
          SET status = 'active', retry_count = 0, last_error = $1, next_run_at = $2,
              leased_by = NULL, leased_at = NULL,
@@ -1189,6 +1235,7 @@ exports.markFailed = async function markFailed(row, err) {
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [errMsg + ' (cron: deferred to next interval, retry_count reset)', nextRunAt, row.id]
       )
+      if (!deferRes.rowCount) await consumeSuspendedSignal(pool, row.id)
     } else {
       await pool.query(
         `UPDATE os_scheduled_tasks
@@ -1227,7 +1274,7 @@ exports.markFailed = async function markFailed(row, err) {
     // no next interval to defer to, so the full-interval recompute has no meaning
     // here. Doctrine:
     // [[cron-rearm-must-recompute-next-run-at-or-guard-reentry-per-period-2026-06-19]].
-    await pool.query(
+    const retryRes = await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'active', retry_count = $1, last_error = $2,
            next_run_at = NOW() + ($4 || ' milliseconds')::interval,
@@ -1238,6 +1285,7 @@ exports.markFailed = async function markFailed(row, err) {
          AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [newRetryCount, errMsg, row.id, RETRY_BACKOFF_MS]
     )
+    if (!retryRes.rowCount) await consumeSuspendedSignal(pool, row.id)
   }
 }
 
@@ -2133,7 +2181,7 @@ exports.markComplete = async function markComplete(row, signal) {
     } catch (cronErr) {
       process.stderr.write('[scheduler] cron-parser error for "' + row.cron_expression + '": ' + cronErr.message + '\n')
     }
-    await pool.query(
+    const cronRes = await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'active', last_run_at = NOW(), next_run_at = $1,
            run_count = run_count + 1, last_result = $2,
@@ -2145,6 +2193,7 @@ exports.markComplete = async function markComplete(row, signal) {
          AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
     )
+    if (!cronRes.rowCount) await consumeSuspendedSignal(pool, row.id)
   } else {
     // one_shot or delayed: mark completed - or cancelled when stood down, since
     // the scope was abandoned rather than finished. 'cancelled' is also what
