@@ -1182,7 +1182,8 @@ exports.markFailed = async function markFailed(row, err) {
       await pool.query(
         `UPDATE os_scheduled_tasks
          SET status = 'active', retry_count = 0, last_error = $1, next_run_at = $2,
-             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+             leased_by = NULL, leased_at = NULL,
+             ${taskSignals.CLEAR_SQL_FRAGMENT}, updated_at = NOW()
          WHERE id = $3
            AND archived_at IS NULL
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
@@ -1192,7 +1193,8 @@ exports.markFailed = async function markFailed(row, err) {
       await pool.query(
         `UPDATE os_scheduled_tasks
          SET status = 'failed', retry_count = $1, last_error = $2,
-             leased_by = NULL, leased_at = NULL, updated_at = NOW()
+             leased_by = NULL, leased_at = NULL,
+             ${taskSignals.CLEAR_SQL_FRAGMENT}, updated_at = NOW()
          WHERE id = $3`,
         [newRetryCount, errMsg, row.id]
       )
@@ -1229,7 +1231,8 @@ exports.markFailed = async function markFailed(row, err) {
       `UPDATE os_scheduled_tasks
        SET status = 'active', retry_count = $1, last_error = $2,
            next_run_at = NOW() + ($4 || ' milliseconds')::interval,
-           leased_by = NULL, leased_at = NULL, updated_at = NOW()
+           leased_by = NULL, leased_at = NULL,
+           ${taskSignals.CLEAR_SQL_FRAGMENT}, updated_at = NOW()
        WHERE id = $3
          AND archived_at IS NULL
          AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
@@ -2098,6 +2101,28 @@ exports.markComplete = async function markComplete(row, signal) {
 
   const rowType = row.type || 'one_shot'
 
+  // 2026-08-29 lane R1 item 2, verification pass. CONSUME the lifecycle signal
+  // at the terminal transition, in every branch below and in markFailed.
+  //
+  // Without this, done_at / done_status survive completion forever: nothing else
+  // clears them but dispatchOne's step 3b, and the ADOPT path (the 2026-07-17
+  // double-spawn guard, dispatchOne step 2d) flips a row to status='running'
+  // and RETURNS before ever reaching 3b. completionPass then matches
+  // `status='running' AND done_at IS NOT NULL` against the PREVIOUS fire's
+  // signal, kills the live worker it has just adopted, and advances the row and
+  // its chain children off work that already completed once.
+  //
+  // Measured on the real table 2026-08-29, inside a rolled-back transaction:
+  // run_count went 1 -> 2 off a consumed signal and kill_worker was called on
+  // the adopted tab. The adopt path fired 19 times in the current daemon log,
+  // so this is a live recovery route, not a theoretical one.
+  //
+  // Clearing HERE rather than at adopt is deliberate. staleLeaseRecovery branch 1
+  // reclaims a lease WITHOUT touching dispatched_tab_id, so a worker whose lease
+  // was reclaimed can still legitimately write its done while the row sits
+  // active; clearing at adopt would erase that and rot the row to the 6h orphan
+  // sweep. Consuming at the terminal transition instead makes "done_at present"
+  // mean UNCONSUMED, which is what completionPass has always assumed.
   if (rowType === 'cron' && row.cron_expression) {
     // Compute next_run_at via cron-parser using the row's tz (default Brisbane).
     // Pre-2026-05-31 this was hardcoded {utc:true}, which mis-fired AEST schedules
@@ -2113,6 +2138,7 @@ exports.markComplete = async function markComplete(row, signal) {
        SET status = 'active', last_run_at = NOW(), next_run_at = $1,
            run_count = run_count + 1, last_result = $2,
            retry_count = 0, leased_by = NULL, leased_at = NULL,
+           ${taskSignals.CLEAR_SQL_FRAGMENT},
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $3
          AND archived_at IS NULL
@@ -2132,6 +2158,7 @@ exports.markComplete = async function markComplete(row, signal) {
       `UPDATE os_scheduled_tasks
        SET status = '${oneShotStatusSqlLiteral}', last_run_at = NOW(), last_result = $1,
            run_count = run_count + 1, leased_by = NULL, leased_at = NULL,
+           ${taskSignals.CLEAR_SQL_FRAGMENT},
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $2`,
       [String((signal && signal.result_summary) || '').slice(0, 2000), row.id]
