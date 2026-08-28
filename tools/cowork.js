@@ -1148,11 +1148,13 @@ async function cleanup_orphan_workers(params) {
   // registered conductor identity. Load the conductor tab_id once.
   // Doctrine: coord-sweep-must-exempt-registered-conductor-tab-2026-07-21.
   let conductorTabId = null
+  let conductorRow = null
   try {
     const coordMod = require('./coord')
     const c = coordMod._loadConductorRegistration && coordMod._loadConductorRegistration()
-    if (c && c.tab_id) conductorTabId = c.tab_id
+    if (c) { conductorRow = c; if (c.tab_id) conductorTabId = c.tab_id }
   } catch (e) {}
+  const idePort = conductorRow && conductorRow.ide_bridge_port
 
   // Load candidate orphans from registry
   let files = []
@@ -1172,7 +1174,13 @@ async function cleanup_orphan_workers(params) {
       const ts = Date.parse(w.terminated_at)
       if (!Number.isFinite(ts) || ts < cutoffMs) continue
       const th = w.tab_handle
-      if (!th || th.viewColumn == null) continue
+      // 2026-08-29: the viewColumn gate is LADDER-only. It exists because every
+      // legacy pass keys off a per-column candidate list. A stable tab id is
+      // column-independent and resolves to the tab's own current column, so
+      // gating it here would silently filter out exactly the rows the fix is
+      // for (a tab that was dragged to another column carries no stale column).
+      if (!th) continue
+      if (!th.tabId && th.viewColumn == null) continue
       orphans.push({ filePath: filePath, worker: w })
     } catch (e) {}
   }
@@ -1216,6 +1224,86 @@ async function cleanup_orphan_workers(params) {
     let match = null
     let strategy = null
     let usedTabIndex = null
+
+    // ── Pass 0: the stable IDE tab id (2026-08-29 sibling-writer fix) ───────
+    //
+    // f45fed6 taught coord.close_my_tab and coord.kill_worker the bridge's
+    // stable per-tab id and left THIS sweep on the old ladder. That was the
+    // whole remaining leak, because this sweep is the only recurring close path
+    // for a worker that never called close_my_tab, and 77 of 111 terminated
+    // rows are exactly that (terminated_reason=stale_heartbeat: killed or
+    // usage-capped mid-run, so no close path ever ran). Measured on the live
+    // agent every 7 minutes for hours before this fix:
+    //     [scheduler] cleanup_orphan_workers: closed=0 of 76 candidates (leaked=76)
+    //
+    // Why the ladder below cannot win on a cron: one os_scheduled_tasks row
+    // re-fires a byte-identical brief, so every handle the ladder owns is
+    // derived from text that is identical across fires. Pass 2's claimed-set is
+    // keyed on the LABEL, so two corpses sharing a title collapse to one key and
+    // the second is locked out; Pass 2.5 matches then is refused outright by
+    // tab-close-guard belt 3 on every sweep path. The bridge id is the only
+    // handle that is not derived from the brief.
+    //
+    // RESOLVE PER ORPHAN, not from the one snapshot above. A successful close
+    // removes a tab and shifts every later index, and the bridge's exactLabel
+    // race guard then refuses the next same-titled corpse. One snapshot closes
+    // corpse 1 and leaks 2..N, which is the same leak wearing a new hat.
+    //
+    // NO FALLTHROUGH. A stored id that is not live means the tab is already
+    // gone or the bridge re-minted, and the ladder would then resolve the SAME
+    // sentinel onto a sibling fire's live tab. Refuse and leak: a cosmetic ghost
+    // tab is cheaper than closing a live worker or Tate's chat.
+    // Doctrine: a-handle-derived-from-the-brief-collides-with-every-fire-of-its-cron-2026-08-29.
+    if (th.tabId) {
+      let coordMod = null
+      try { coordMod = require('./coord') } catch (e) {}
+      const canResolve = coordMod && coordMod._resolveStableIdCloseTarget && coordMod._closeStableIdTarget
+      if (!canResolve) {
+        results.push({ tab_id: worker.tab_id, action: 'leak', reason: 'stable_id_resolver_unavailable', tabId: th.tabId })
+        continue
+      }
+      let st
+      try { st = await coordMod._resolveStableIdCloseTarget(worker.tab_id, idePort) }
+      catch (e) { st = { refused: 'stable_id_resolve_threw:' + (e.message || String(e)) } }
+
+      if (!st || !st.tab) {
+        // {none} lands here too: cowork read an id off disk that coord's registry
+        // does not carry. Undecidable, so it refuses like any other stored id.
+        const reason = (st && st.refused) || 'stable_id_unresolved:' + th.tabId
+        results.push({ tab_id: worker.tab_id, action: 'leak', reason: reason, tabId: th.tabId, viewColumn: vc })
+        continue
+      }
+
+      if (dry_run) {
+        results.push({ tab_id: worker.tab_id, action: 'would_close', label: st.tab.label,
+                       strategy: 'stable_tab_id:' + st.tabId, viewColumn: st.tab.viewColumn, tabId: st.tabId })
+        continue
+      }
+
+      let cr
+      try { cr = await coordMod._closeStableIdTarget(st, conductorRow, {}) }
+      catch (e) { cr = { closed: false, refused: 'stable_id_close_threw:' + (e.message || String(e)) } }
+
+      if (cr && cr.closed) {
+        try {
+          const cur = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+          cur.closed_tab_at = new Date().toISOString()
+          cur.closed_tab_ok = true
+          cur.closed_tab_strategy = 'cleanup_orphan:' + cr.strategy
+          cur.closed_tab_label = st.tab.label
+          cur.closed_tab_stable_id = st.tabId
+          fs.writeFileSync(filePath, JSON.stringify(cur, null, 2))
+        } catch (e) {}
+        closedCount++
+        results.push({ tab_id: worker.tab_id, action: 'closed', label: st.tab.label,
+                       strategy: cr.strategy, viewColumn: st.tab.viewColumn, tabId: st.tabId })
+      } else {
+        results.push({ tab_id: worker.tab_id, action: 'leak',
+                       reason: (cr && (cr.refused || cr.strategy)) || 'stable_id_close_failed',
+                       label: st.tab.label, tabId: st.tabId, viewColumn: st.tab.viewColumn })
+      }
+      continue
+    }
 
     // Pass 1: tabIndex direct lookup, REQUIRES label OR sentinel confirmation.
     // 2026-05-29 audit C2 fix - tabIndex alone is identity-blind under tab

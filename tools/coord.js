@@ -1090,7 +1090,17 @@ async function _captureStableTabId(tab_id, opts) {
     if (!w) return { ok: false, reason: 'unknown_worker' }
     const th = w.tab_handle
     if (!th) return { ok: false, reason: 'no_tab_handle' }
-    if (th.tabId && !opts.force) return { ok: true, tabId: th.tabId, reason: 'already_set' }
+    if (th.tabId && !opts.force) {
+      // 2026-08-29 (handed over by lane T1, verified here against this file).
+      // This branch returns BEFORE the _stampAnchorTabId call at the bottom, so
+      // an id that arrived by any route other than this function never reaches
+      // the chat-tabs anchor. Nearly dead today, but it becomes the DOMINANT
+      // path the moment the dispatcher stamps tabId at spawn, and an anchor
+      // with no id is exactly what the orphan sweep's resolve step needs. Stamp
+      // idempotently here; _stampAnchorTabId no-ops when it already matches.
+      _stampAnchorTabId(tab_id, th.tabId)
+      return { ok: true, tabId: th.tabId, reason: 'already_set' }
+    }
     const conductor = loadConductorRegistration()
     if (!conductor || !conductor.ide_bridge_port) return { ok: false, reason: 'no_conductor_ide_port' }
     let tabs
@@ -3239,6 +3249,11 @@ module.exports = {
   // Stable IDE tab id (2026-08-29): capture at bind, resolve at close.
   _captureStableTabId: _captureStableTabId,
   _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
+  // Exported 2026-08-29 for cowork.cleanup_orphan_workers, the recurring sweep
+  // that is the ONLY close path for a worker killed or usage-capped mid-run (77
+  // of 111 terminated rows). It must share this exact close, not a copy: the
+  // guard belts and the exactLabel race guard are the whole safety argument.
+  _closeStableIdTarget: _closeStableIdTarget,
   _liveCcTabsWithIds: _liveCcTabsWithIds,
   _claimedStableTabIds: _claimedStableTabIds,
   _allSessionAnchors: _allSessionAnchors,
