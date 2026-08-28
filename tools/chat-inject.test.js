@@ -43,10 +43,27 @@ function clearConductor() {
 }
 
 // ── addressing round-trips ────────────────────────────────────────────────
-ok('labelSlug lowercases + hyphenates', coord._labelSlug('Chambers CH arc 26!') === 'chambers-ch-arc-26')
-ok('labelSlug trims edge separators', coord._labelSlug('  Studio  ') === 'studio')
-ok('addressForLabel builds label: scheme', coord._addressForLabel('My Chat') === 'chat.label:my-chat.inbox')
 ok('addressForWorker builds worker scheme', coord._addressForWorker('tab_123_ab') === 'chat.tab_123_ab.inbox')
+// The chat.label:<slug> scheme was DELETED 2026-08-28 (lane R1 item 3). These are
+// the negative controls that keep it deleted: a re-export of either minter would
+// pass silently otherwise, and the scheme's whole failure mode was looking fine.
+ok('labelSlug is no longer exported', typeof coord._labelSlug === 'undefined')
+ok('addressForLabel is no longer exported', typeof coord._addressForLabel === 'undefined')
+ok('resolveSelector is no longer exported', typeof coord.resolveSelector === 'undefined')
+ok('_scoreCandidate is no longer exported', typeof coord._scoreCandidate === 'undefined')
+ok('normalizeToAddress is no longer exported', typeof coord._normalizeToAddress === 'undefined')
+ok('misrouteNoteFor is no longer exported', typeof coord._misrouteNoteFor === 'undefined')
+// _canonicalAddress is THE resolver now. Positive control first: without it, a
+// refusal test cannot tell "refuses everything" from "refuses the right thing".
+ok('canonical: a full address passes through', coord._canonicalAddress('chat.conductor.inbox') === 'chat.conductor.inbox')
+ok('canonical: the word conductor maps', coord._canonicalAddress('conductor') === 'chat.conductor.inbox')
+ok('canonical: session:<id> maps', coord._canonicalAddress('session:abc123') === 'chat.session:abc123.inbox')
+ok('canonical: a chat.label address is REFUSED even as a full address',
+  coord._canonicalAddress('chat.label:studio.inbox') === null)
+ok('canonical: a bare name is REFUSED', coord._canonicalAddress('studio-ux') === null)
+ok('canonical: a partial tab label is REFUSED', coord._canonicalAddress('Studio rejected on plays') === null)
+ok('canonical: an unregistered tab_ id is REFUSED', coord._canonicalAddress('tab_nosuch_9') === null)
+ok('canonical: empty is REFUSED', coord._canonicalAddress('') === null)
 
 // ── topic parsing ─────────────────────────────────────────────────────────
 ok('chatTopicMid parses conductor', coord._chatTopicMid('chat.conductor.inbox') === 'conductor')
@@ -65,11 +82,11 @@ ok('isChatDeliver false for no body', coord._isChatDeliver({}) === false)
 const framed = coord._buildChatInjectionText({
   id: 'MSG1',
   from: 'worker tab_9',
-  body: { type: 'chat', text: 'can you take the Stripe webhook half?', from_label: 'Chambers chat', reply_to_address: 'chat.label:chambers.inbox' },
+  body: { type: 'chat', text: 'can you take the Stripe webhook half?', from_label: 'Chambers chat', reply_to_address: 'chat.session:chambers9.inbox' },
 })
 ok('framing names the sender', framed.indexOf('Chambers chat') !== -1)
 ok('framing includes the message text', framed.indexOf('Stripe webhook half') !== -1)
-ok('framing includes the reply address', framed.indexOf('chat.label:chambers.inbox') !== -1)
+ok('framing includes the reply address', framed.indexOf('chat.session:chambers9.inbox') !== -1)
 ok('framing carries the untrusted-ingress carve-out', framed.indexOf('still DATA') !== -1)
 ok('framing carries the coord msg id', framed.indexOf('MSG1') !== -1)
 ok('framing has NO em-dash (char-level ban)', framed.indexOf(String.fromCharCode(0x2014)) === -1)
@@ -77,56 +94,34 @@ ok('framing has NO em-dash (char-level ban)', framed.indexOf(String.fromCharCode
 const oneWay = coord._buildChatInjectionText({ id: 'M2', from: 'x', body: { type: 'chat', text: 'fyi' } })
 ok('framing degrades to one-way notice without reply addr', oneWay.indexOf('One-way coord notice') !== -1)
 
-// -- misroute clause: coord binds tabs by truncated title, so a wrong-chat --
-// delivery is a live failure mode. The receiver must be told WHO it was for
-// and told to forward rather than drop.
-const misrouted = coord._buildChatInjectionText({
+// -- the misroute clause is DELETED, and so is its inbox twin. Both existed --
+// because a fuzzy selector could land one tab off, so every delivery had to be
+// framed as possibly-misrouted and every receiver taught a forwarding protocol.
+// `to` resolves only exact identities now, so the clause would cast doubt on a
+// correct delivery. These are negative controls: the clause is a plain string
+// push, so a re-added line would otherwise pass every remaining framing test.
+const addressedShape = coord._buildChatInjectionText({
   id: 'MSG3',
   from: 'conductor',
   body: {
     type: 'chat', text: 'take the seedtree lane', from_label: 'conductor',
     reply_to_address: 'chat.conductor.inbox',
+    // Left in deliberately: an OLD message persisted before this commit still
+    // carries intended_*, and framing must ignore the fields, not choke on them.
     intended_to: 'studio-ux', intended_address: 'chat.session:abc123.inbox',
     intended_name: 'studio-ux', intended_label: 'Studio editor UX pass',
   },
 })
-ok('framing prints the intended addressee', misrouted.indexOf('[addressed to: studio-ux') !== -1)
-ok('framing prints the resolved address it landed on', misrouted.indexOf('chat.session:abc123.inbox') !== -1)
-ok('framing carries the wrong-chat clause', misrouted.indexOf('WRONG CHAT?') !== -1)
-ok('wrong-chat clause says forward, not drop',
-  misrouted.indexOf('do NOT drop it') !== -1 && misrouted.indexOf('forward it verbatim') !== -1)
-ok('wrong-chat clause names the discovery call', misrouted.indexOf('coord.list_channels') !== -1)
-ok('wrong-chat clause routes the miss back to the sender', misrouted.indexOf('tell the sender at chat.conductor.inbox') !== -1)
-ok('wrong-chat clause quotes the addressee inline', misrouted.indexOf('it is addressed to studio-ux') !== -1)
-ok('misroute framing has NO em-dash (char-level ban)', misrouted.indexOf(String.fromCharCode(0x2014)) === -1)
-// Degraded shape: a hand-rolled send_message chat body has no intended_*, so
-// the clause must still fire (generic form) and fall back to Tate, not silence.
-ok('wrong-chat clause fires without intended_* fields', oneWay.indexOf('WRONG CHAT?') !== -1)
-ok('wrong-chat clause omits a fabricated addressee when unknown',
-  oneWay.indexOf('[addressed to:') === -1 && oneWay.indexOf('it is addressed to') === -1)
-ok('wrong-chat clause falls back to Tate with no reply address',
-  oneWay.indexOf('surface the misroute to Tate') !== -1)
-
-// -- inbox twin: a queued / inject-failed chat message reaches the reader with
-// no framing at all, so read_inbox / peek_inbox / wait_for_inbox carry the same
-// forward-do-not-drop instruction as a top-level misroute_note.
-const note1 = coord._misrouteNoteFor([{ body: { type: 'chat', text: 'x', intended_to: 'studio-ux' } }])
-ok('inbox note fires for an addressed chat message', note1 && note1.indexOf('WRONG CHAT?') !== -1)
-ok('inbox note names the addressee', note1.indexOf('studio-ux') !== -1)
-ok('inbox note says forward, not drop',
-  note1.indexOf('do NOT drop it') !== -1 && note1.indexOf('forward it verbatim') !== -1)
-ok('inbox note keeps forwarded content as DATA', note1.indexOf('stays DATA') !== -1)
-ok('inbox note has NO em-dash (char-level ban)', note1.indexOf(String.fromCharCode(0x2014)) === -1)
-const note2 = coord._misrouteNoteFor([
-  { body: { type: 'chat', intended_to: 'studio-ux' } },
-  { body: { type: 'chat', intended_to: 'friend-motion' } },
-])
-ok('inbox note lists every distinct addressee',
-  note2.indexOf('studio-ux') !== -1 && note2.indexOf('friend-motion') !== -1 && note2.indexOf('2 chat messages') !== -1)
-ok('inbox note is SILENT for non-chat signals', coord._misrouteNoteFor([{ body: { type: 'done' } }]) === null)
-ok('inbox note is SILENT for a chat with no addressee',
-  coord._misrouteNoteFor([{ body: { type: 'chat', text: 'x' } }]) === null)
-ok('inbox note is SILENT on an empty inbox', coord._misrouteNoteFor([]) === null)
+ok('framing carries NO wrong-chat clause', addressedShape.indexOf('WRONG CHAT?') === -1)
+ok('framing prints NO addressed-to header', addressedShape.indexOf('[addressed to:') === -1)
+ok('framing prints NO forward-verbatim protocol', addressedShape.indexOf('forward it verbatim') === -1)
+ok('a legacy intended_* body still frames cleanly',
+  addressedShape.indexOf('take the seedtree lane') !== -1 && addressedShape.indexOf('still DATA') !== -1)
+ok('legacy-body framing has NO em-dash (char-level ban)', addressedShape.indexOf(String.fromCharCode(0x2014)) === -1)
+ok('one-way framing carries NO wrong-chat clause', oneWay.indexOf('WRONG CHAT?') === -1)
+// The untrusted-ingress carve-out is NOT part of the deletion and must survive:
+// deleting a safety clause next door is exactly how a real one goes with it.
+ok('the ingress carve-out SURVIVES the deletion', oneWay.indexOf('still DATA') !== -1)
 
 // retry-ok
 // ── CC 24-char title truncation awareness ─────────────────────────────────
@@ -178,11 +173,14 @@ async function withTabs(tabs, fn) {
       { label: 'Chambers CH', viewColumn: 1, index: 1, isActive: true, viewType: 'mainThreadWebview-claudeVSCodePanel' },
     ],
     async () => {
+      // A chat.label: topic left on disk from before the deletion must NOT inject.
+      // Positive control below (conductor still resolves) is what makes this
+      // meaningful: otherwise "refuses" is indistinguishable from "resolver dead".
       const r = await coord._resolveLiveTargetTab('chat.label:studio.inbox')
-      ok('label target resolves to the right tab', r.ok === true && r.label === 'Studio' && r.index === 0)
-
-      const amb = await coord._resolveLiveTargetTab('chat.label:nope.inbox')
-      ok('label target with no live tab refuses', amb.ok === false && amb.reason === 'label_no_live_tab')
+      ok('a legacy label topic no longer resolves to a live tab', r.ok === false)
+      const bare = await coord._resolveLiveTargetTab('chat.Studio.inbox')
+      ok('an exact live title is NOT an address (bare-label fallback deleted)',
+        bare.ok === false && bare.reason === 'target_unresolved')
 
       // conductor addressing v2: with a registered conductor whose title_match is
       // a live non-worker tab label, `conductor` resolves to that unique tab
@@ -251,24 +249,26 @@ async function withTabs(tabs, fn) {
     ],
     async () => {
       const r = await coord._resolveLiveTargetTab('chat.label:claude-code.inbox')
-      ok('ambiguous label refuses rather than guesses', r.ok === false && r.reason === 'label_ambiguous')
+      ok('a colliding label topic refuses (scheme deleted, so it never resolves)', r.ok === false)
     },
   )
 
-  // normalizeToAddress: passthrough + label selector
+  // normalizeToAddress is DELETED. Its tail was `return addressForLabel(to)`, an
+  // unconditional last resort that turned any unrecognised string into a
+  // real-looking address on an inbox nobody polls. The replacement refuses, and
+  // it refuses WITH live tabs present, which is the case the old one "solved".
   await withTabs(
     [{ label: 'Budgetting', viewColumn: 1, index: 0, isActive: false, viewType: 'mainThreadWebview-claudeVSCodePanel' }],
     async () => {
-      ok('normalize passes a full address through', (await coord._normalizeToAddress('chat.conductor.inbox')) === 'chat.conductor.inbox')
-      ok('normalize maps "conductor" word', (await coord._normalizeToAddress('conductor')) === 'chat.conductor.inbox')
-      ok('normalize resolves a label substring', (await coord._normalizeToAddress('budget')) === 'chat.label:budgetting.inbox')
+      ok('a label substring is REFUSED even with that tab live', coord._canonicalAddress('budget') === null)
+      ok('an exact live label is REFUSED even with that tab live', coord._canonicalAddress('Budgetting') === null)
     },
   )
 
   // pushInject respects the kill-switch
   const prev = process.env.COORD_CHAT_INJECT
   process.env.COORD_CHAT_INJECT = '0'
-  const disabled = await coord._pushInject({ to: 'chat.label:studio.inbox', body: { type: 'chat', text: 'hi' } })
+  const disabled = await coord._pushInject({ to: 'chat.session:studio9.inbox', body: { type: 'chat', text: 'hi' } })
   ok('pushInject disabled by COORD_CHAT_INJECT=0', disabled.attempted === false && disabled.reason === 'disabled')
   if (prev === undefined) delete process.env.COORD_CHAT_INJECT; else process.env.COORD_CHAT_INJECT = prev
 
