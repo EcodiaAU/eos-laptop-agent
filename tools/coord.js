@@ -444,9 +444,17 @@ function readInboxForTopic(topic, sinceMs, limit) {
     if (sinceMs && new Date(m.created_at).getTime() <= sinceMs) continue
     out.push(m)
   }
-  // Order by created_at asc
+  // 2026-08-28. Order ascending, then take the TAIL: the newest N, not the oldest N.
+  // This used to slice the HEAD, so any topic carrying an unseen backlog served its
+  // OLDEST messages forever. chat.conductor.inbox held 5,836 unseen going back to
+  // 2026-07-20, so every read_inbox / peek_inbox returned July worker reports and a
+  // signal_done from today sat ~117 pages out of reach - the conductor was blind to
+  // every worker completion for 39 days while the calls all returned 200. An inbox
+  // read answers "what is waiting for me NOW", so the tail is the correct page.
+  // `since` still filters; output stays ascending so existing callers read in order.
+  // Doctrine: patterns/an-inbox-that-serves-oldest-first-goes-blind-as-it-fills-2026-08-28.md
   out.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-  return out.slice(0, limit || 50)
+  return out.slice(-(limit || 50))
 }
 
 // 2026-06-18 scheduler-completion-race fix. The scheduler's completionPass and
