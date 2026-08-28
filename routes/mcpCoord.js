@@ -154,7 +154,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.report_progress',
-    description: 'Sugar for sending a progress message to chat.conductor.inbox. body = {type:"progress", task_id, summary}.',
+    description: 'Record a one-line progress note on YOUR scheduled task row (os_scheduled_tasks.progress_summary). Advisory only: nothing in the dispatch path reads it, it exists so an operator can see a long worker is still moving. Single-valued - each call REPLACES the previous note, it is not a log. Writes nothing to any inbox. The write is refused unless the row is currently dispatched to your tab; a refusal returns {ok:false, error} and is not a failure of your task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -178,7 +178,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.signal_done',
-    description: 'Sugar for signalling task completion to chat.conductor.inbox. If terminate=true, marks your worker row terminated_at. result_pointer can name a file path or status_board row id holding the full output.',
+    description: 'Signal task completion. Writes the completion onto YOUR scheduled task row (done_at/done_status/done_summary/done_pointer) - that row write is what the scheduler acts on, and the write is REFUSED unless the row is currently dispatched to your tab. Also posts a human-facing {type:"worker_report"} notice to chat.conductor.inbox so the conductor wake surfaces it; nothing machine-readable depends on that notice. status is load-bearing: omit it and success is assumed; pass "failed" to route through markFailed, or "stood_down" for a terminal non-failure. If terminate=true, marks your worker row terminated_at. result_pointer can name a file path or status_board row id holding the full output. Returns {ok, signal, message_id} where ok reflects whether the SCHEDULER-VISIBLE completion landed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -192,7 +192,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.signal_bound',
-    description: 'Send a launch-confirmation signal to chat.conductor.inbox. Call this on your FIRST turn to confirm you launched, read your brief, and connected to MCP. Sends body={type:"bound", task_id, parent_conductor_tab_id} to the conductor inbox. Does NOT terminate your worker row or unlink your .spawned marker (those happen at signal_done). Returns {message_id, created_at}.',
+    description: 'Confirm you launched, read your brief and reached MCP. Call this on your FIRST turn: it releases the scheduler launch-lock, which is held serially across the whole fleet, so a missing bound stalls every other pending dispatch for the full timeout. Stamps bound_at on YOUR scheduled task row; posts NO message. The write is REFUSED unless the row is currently dispatched to your tab, so a stale worker cannot release a lock it does not hold. Does NOT terminate your worker row or unlink your .spawned marker (those happen at signal_done). Returns {ok, task_id, tab_id} or {ok:false, error}.',
     inputSchema: {
       type: 'object',
       properties: {

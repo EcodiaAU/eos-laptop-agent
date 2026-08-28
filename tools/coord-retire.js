@@ -48,7 +48,30 @@ const CONDUCTOR_TOPIC = 'chat.conductor.inbox'
 
 // Machine telemetry about a scheduler row's lifecycle. Retirable once that row
 // is finished, because the row itself is the durable record of what happened.
-const LIFECYCLE_TYPES = new Set(['bound', 'progress', 'done', 'account_switch'])
+//
+// 2026-08-28 lane R1 item 2 reshaped this set, and the reasoning per member
+// matters more than the membership:
+//
+//   'bound', 'progress', 'done'  LEGACY DRAIN. Nothing produces these any more.
+//     A worker's handshake is now a WRITE to its own os_scheduled_tasks row
+//     (tools/task-signals.js), not a message. They stay in the set because
+//     ~5,578 of them are still on disk and this sweep is the only thing that
+//     will ever clear them. Removing them would strand exactly the backlog this
+//     module was written to drain.
+//
+//   'worker_report'  THE LIVE MEMBER. signal_done still posts one purely so the
+//     conductor wake surfaces "a worker finished" to a human. It accumulates at
+//     the same rate `done` did, so it needs the same retirement rule; leaving it
+//     out would rebuild the 5,838-message backlog under a new name.
+//
+//   'account_switch'  REMOVED, and it was never lifecycle. scripts/switch-run.js
+//     posts one when the live Claude account rotates. It describes an ACCOUNT,
+//     not a scheduler row, so it carries no task_id and rule 2 could never
+//     retire it: all 17 were being walked and skipped on every sweep. As an
+//     attention message it now reaches digest(), which writes its content
+//     somewhere durable before retiring it. That is the correct home for a
+//     message no row will ever settle.
+const LIFECYCLE_TYPES = new Set(['bound', 'progress', 'done', 'worker_report'])
 
 // A scheduler row in one of these states will never produce another event, so
 // every lifecycle message about it is history. 'running' and 'active' are

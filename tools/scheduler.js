@@ -35,6 +35,10 @@ let _credsModule = require('./creds')
 function getCreds() { return _credsModule }
 exports._setCredsModule = function (m) { _credsModule = m }
 const coord = require('./coord')
+// 2026-08-28 lane R1 item 2: owns the worker-lifecycle columns on
+// os_scheduled_tasks and the SET fragment dispatchOne uses to clear them, so
+// the writer (coord.signal_*) and the reader (here) cannot drift apart.
+const taskSignals = require('./task-signals')
 // Injection seam: tests pass a stub coord implementing { list_workers }.
 // Only the stale-lease liveness check routes through getCoord(); the other
 // coord call sites (completionPass) read coord directly to avoid behaviour
@@ -1792,60 +1796,107 @@ exports.dispatchOne = async function dispatchOne(row) {
     // workers actually started.
     if (breakerRowName) exports.breakerRecordDispatch(breakerRowName, Date.now())
 
+    // 3b. CLAIM THE ROW FOR THIS DISPATCH, AND BLANK THE LIFECYCLE SLATE.
+    //
+    // 2026-08-28 lane R1 item 2. This single guarded statement is what makes the
+    // whole handshake race-free, and it has to happen HERE - after the tab
+    // provably exists, before the worker can signal anything.
+    //
+    // It does two inseparable things:
+    //   (a) writes dispatched_tab_id NOW rather than at the running-flip below.
+    //       That column is the discriminator every worker signal is guarded on
+    //       (`WHERE dispatched_tab_id = <caller tab>`), so until it names THIS
+    //       tab, this dispatch's own bound would be refused and the PREVIOUS
+    //       fire's worker could still write. It has to lead the wait, not follow it.
+    //   (b) clears bound_at / done_* / progress_*, so the row carries no signal
+    //       from any earlier fire. task_id equals the row id and is STABLE across
+    //       cron fires, which is precisely why the old bus needed a leased_at
+    //       freshness gate with a 30s back-margin. Clearing at dispatch makes a
+    //       stale signal structurally impossible instead of heuristically filtered.
+    //
+    // GUARDED on still owning the lease, same predicate as the running-flip below
+    // and for the same reason: staleLeaseRecovery may have reclaimed this row
+    // while dispatch_worker was spawning. If it did, rowCount is 0 and we must
+    // NOT proceed - writing our tab id onto a row someone else now owns is how a
+    // double-dispatch gets laundered into looking legitimate.
+    //
+    // Writing dispatched_tab_id during 'dispatching' is safe for every reader of
+    // that column: worker-liveness.js only selects status='running', and
+    // startupCleanup / sweepStaleWorkers select their own statuses. It is also
+    // strictly better on the error path, where the row previously kept a DEAD
+    // tab id from an earlier fire while a real orphan tab went unnamed.
+    const claimRes = await pool.query(
+      `UPDATE os_scheduled_tasks
+          SET dispatched_tab_id = $1, ${taskSignals.CLEAR_SQL_FRAGMENT}, updated_at = NOW()
+        WHERE id = $2
+          AND status = 'dispatching'
+          AND leased_by IS NOT DISTINCT FROM $3`,
+      [tabId, row.id, row.leased_by || null]
+    )
+    if (!claimRes || claimRes.rowCount === 0) {
+      process.stderr.write('[scheduler] dispatchOne: lease for task ' + row.id +
+        ' was reclaimed before the bind wait (tab ' + tabId +
+        '); not stamping dispatch ownership\n')
+      return
+    }
+
     // 4. Wait for signal_bound (inside launch-lock).
-    // Poll coord inbox for a message with body.type==='bound' && body.task_id === row.id
-    const taskIdStr = String(row.id)
+    // Poll THIS ROW for bound_at / done_at. No inbox, no shared seen flag, no
+    // oldest-first window: the worker writes the row it was dispatched from, and
+    // its write is refused unless dispatched_tab_id still names its tab.
     const start = Date.now()
     let bound = false
-    // 2026-07-17 fast-worker completion race fix. A short task (e.g. the
-    // dispatch selftest: "signal_done immediately") can signal DONE without
-    // ever signalling BOUND, well inside this wait. The old loop only matched
-    // 'bound', so the wait ran the full SIGNAL_BOUND_TIMEOUT_MS, and the
-    // running-flip below then re-stamped leased_at = NOW() - which made
-    // completionPass's freshness gate (doneMs < leasedMs - 30s -> skip) reject
-    // the already-landed done forever. The row rotted at status=running until
-    // the 6h orphan sweep despite a clean success signal. Live evidence
-    // 2026-07-17: selftest 973d712e done at 02:08:22Z, running-flip 02:17:58Z,
-    // completionPass skipping. Fix: treat a done for THIS dispatch (created at
-    // or after dispatch start) as terminal - exit the wait and complete the
-    // row inline right after the guarded running-flip.
+    // 2026-07-17 fast-worker completion race, now structural rather than patched.
+    // A short task (the dispatch selftest signals done immediately) can finish
+    // without ever signalling bound. On the old bus that made the wait run its
+    // full SIGNAL_BOUND_TIMEOUT_MS, and the running-flip below then re-stamped
+    // leased_at = NOW(), which made completionPass's freshness gate classify the
+    // already-landed done as a prior fire's stale signal and skip it FOREVER -
+    // the row rotted at status=running until the 6h orphan sweep despite a clean
+    // success. Live evidence 2026-07-17: selftest 973d712e done 02:08:22Z,
+    // running-flip 02:17:58Z, completionPass skipping.
+    //
+    // Reading done_at from the row keeps that case correct for a simpler reason:
+    // a done written before bound is just a column that is already set when the
+    // first poll runs. There is no ordering to get wrong.
     let doneSignal = null
-    const dispatchStartMs = Date.now()
-    // 2026-07-17 peek-window starvation fix. peek_inbox returns the OLDEST
-    // unseen messages (created_at asc, limit 50). The conductor inbox had
-    // accumulated 525 unseen messages spanning a week, so every bind wait's
-    // window showed only 2026-07-09 backlog and NEVER the fresh bound/done -
-    // every dispatch logged signal_bound timeout even when its worker bound
-    // and finished within seconds. Pass `since` scoped to this dispatch so
-    // backlog depth can never blind the wait again.
-    const peekSinceIso = new Date(dispatchStartMs - 60_000).toISOString()
+    // 2026-08-28. The three compensations this loop used to need are GONE, and
+    // each one is gone because of a property of the row rather than a heuristic:
+    //   - the `since` window (peek_inbox served oldest-unseen-first, so 525
+    //     messages of backlog blinded every wait): a column has no backlog.
+    //   - ack_message by id (read_inbox({limit:1}) marked the OLDEST unread seen,
+    //     silently eating a DIFFERENT task's done under back-to-back dispatch):
+    //     reading a column consumes nothing.
+    //   - the freshness comparison against dispatchStartMs: 3b cleared these
+    //     columns for this dispatch, and the worker's write is refused unless
+    //     dispatched_tab_id still names its tab.
     while (Date.now() - start < SIGNAL_BOUND_TIMEOUT_MS) {
-      const inbox = await coord.peek_inbox({ topic: 'chat.conductor.inbox', limit: 50, since: peekSinceIso })
-      if (inbox && inbox.messages) {
-        for (const msg of inbox.messages) {
-          const body = msg.body
-          if (body && body.type === 'bound' && String(body.task_id) === taskIdStr) {
-            bound = true
-            // 2026-05-29 ultracode audit H4 fix. Was read_inbox({limit:1})
-            // which marks the OLDEST unread seen (not the matched bound -
-            // bound arrives late, sorts last). Under back-to-back dispatch
-            // the oldest unread is often a DIFFERENT task's done signal that
-            // gets silently consumed, orphaning that task for 6h. Use
-            // ack_message by id - addresses exactly the matched message.
-            try { await coord.ack_message({ message_id: msg.id }) } catch (e) {}
-            break
+      let sig = null
+      try {
+        const sigRes = await pool.query(
+          `SELECT bound_at, done_at, done_status, done_summary, done_pointer
+             FROM os_scheduled_tasks WHERE id = $1`,
+          [row.id]
+        )
+        sig = (sigRes && sigRes.rows && sigRes.rows[0]) || null
+      } catch (e) {
+        // A transient pool error must not be read as "not bound". Log and retry
+        // inside the same budget; the loop's own timeout is the backstop.
+        process.stderr.write('[scheduler] dispatchOne: bind-wait poll error for task ' +
+          row.id + ': ' + e.message + '\n')
+      }
+      if (sig) {
+        if (sig.done_at) {
+          // Terminal beats bound. Whether or not the worker also bound, it has
+          // finished, and holding the launch lock any longer serves nothing.
+          bound = true
+          doneSignal = {
+            status: sig.done_status || 'success',
+            result_summary: sig.done_summary,
+            result_pointer: sig.done_pointer,
           }
-          if (body && body.type === 'done' && String(body.task_id) === taskIdStr) {
-            const createdMs = new Date(msg.created_at).getTime()
-            // Freshness: only THIS dispatch's done counts (task_id is stable
-            // across cron fires; a days-old done must not complete a fresh
-            // dispatch). 60s back-margin tolerates clock skew.
-            if (!isNaN(createdMs) && createdMs >= dispatchStartMs - 60_000) {
-              bound = true
-              doneSignal = body
-              break
-            }
-          }
+        } else if (sig.bound_at) {
+          bound = true
         }
       }
       if (bound) break
@@ -2124,70 +2175,53 @@ exports.markComplete = async function markComplete(row, signal) {
 exports.completionPass = async function completionPass() {
   const pool = getPool()
 
-  // Fetch all running rows (need leased_at for the freshness gate below).
+  // 2026-08-28 lane R1 item 2. The completion is now a column on the row, so
+  // the SELECT is the whole detection: a running row with done_at set has been
+  // signalled by the tab that currently owns it, and nothing else can have
+  // written it. Filtering in SQL also means the common case (no worker has
+  // finished this tick) costs one indexless-but-tiny scan and zero further work,
+  // where the old path read every running row and then walked the entire
+  // in-memory inbox index for each of them, every 5 seconds, forever.
   const result = await pool.query(
-    `SELECT * FROM os_scheduled_tasks WHERE status = 'running' LIMIT 50`
+    `SELECT * FROM os_scheduled_tasks
+      WHERE status = 'running' AND done_at IS NOT NULL LIMIT 50`
   )
   if (!result.rows.length) return
 
-  // 2026-06-18 scheduler-completion-race fix. Was: coord.peek_inbox on
-  // chat.conductor.inbox, which only returns UNSEEN messages. The interactive
-  // conductor reads the SAME inbox via coord.read_inbox (its wake /
-  // UserPromptSubmit hook), which marks a worker's `done` signal seen within
-  // ~1s of arrival. completionPass (every 5s) then lost the race: the done was
-  // already seen, and peek_inbox can never return a seen message, so
-  // markComplete never fired and the row rotted in status=running until the 6h
-  // orphan timer. Live evidence 2026-06-18: external-blocker-freshness-probe
-  // done created 06:23:38.505Z, marked seen 06:23:39.117Z (0.6s later), row
-  // still running 4h on. Fix: scan the FULL inbox index (seen or unseen) for the
-  // newest done per running task_id - completion detection is now independent of
-  // whoever else drains the inbox. See
-  // [[scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18]].
-  const runningIds = result.rows.map(r => String(r.id))
-  let doneByTask
-  try {
-    doneByTask = coord.scanTopicByType('chat.conductor.inbox', 'done', runningIds)
-  } catch (e) {
-    process.stderr.write('[scheduler] completionPass scan error: ' + e.message + '\n')
-    return
-  }
-  if (!doneByTask || !doneByTask.size) return
-
   for (const row of result.rows) {
-    const msg = doneByTask.get(String(row.id))
-    if (!msg) continue
-    // Freshness gate. task_id == row.id is STABLE across cron fires, so the
-    // inbox accumulates many done signals with the same task_id over a row's
-    // lifetime. Only THIS dispatch's done counts: leased_at is set to NOW() when
-    // dispatchOne flips the row to running, so a prior fire's done has
-    // created_at < leased_at and must be ignored (else a fresh dispatch would be
-    // completed instantly by a days-old signal, before its worker even runs).
-    // 30s back-margin tolerates a fast worker that signals done microseconds
-    // before the running-flip timestamp; cron intervals are >= minutes and
-    // one-shot task_ids are unique, so no cross-fire collision fits that margin.
-    //
-    // 2026-07-08 phantom-completion-class guard. A legitimately-running row
-    // ALWAYS carries a lease: dispatchOne stamps leased_at = NOW() when it flips
-    // the row to running (line ~812) and refreshes it at dispatch-start. A
-    // running row with leased_at IS NULL is a half-state (a recovery race per the
-    // 2026-06-18 dispatch half-state note), NOT a completable run. The prior gate
-    // was `if (row.leased_at) { freshness-check }` - a NULL leased_at SKIPPED the
-    // check entirely, so ANY matching done in the inbox would complete the row.
-    // Because task_id == row.id is STABLE across cron fires, a stale prior-fire
-    // done could then flip an unleased running row to completed with no worker
-    // having run this dispatch - the phantom-completion class. Require a lease
-    // before completing; freshness-gate against it; leave an unleased running row
-    // for staleLeaseRecovery's orphan path. See
-    // [[scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18]].
+    // 2026-07-08 phantom-completion-class guard, RETAINED and now the only gate
+    // left. A legitimately-running row ALWAYS carries a lease: dispatchOne
+    // stamps leased_at = NOW() on the running-flip. A running row with
+    // leased_at IS NULL is a recovery half-state, not a completable run, and
+    // completing it would advance a row whose lease someone else reclaimed.
+    // This is orthogonal to signal identity, which is why it survives the
+    // migration: it is about the LEASE, not about the signal.
     if (!row.leased_at) {
       process.stderr.write('[scheduler] completionPass: skip unleased running row ' + row.id + ' (leased_at NULL; leaving for staleLeaseRecovery)\n')
       continue
     }
-    const doneMs = new Date(msg.created_at).getTime()
-    const leasedMs = new Date(row.leased_at).getTime()
-    if (!isNaN(doneMs) && !isNaN(leasedMs) && doneMs < leasedMs - 30_000) continue
+    // THE FRESHNESS GATE IS DELETED, and its absence is the point.
+    //
+    // It compared the done's created_at against leased_at with a 30s back-margin,
+    // because task_id equals the row id and is STABLE across cron fires, so an
+    // append-only inbox accumulated many done signals per row and a days-old one
+    // could complete a fresh dispatch. Two heuristics were stacked on that: the
+    // margin (to tolerate a worker finishing microseconds before the flip) and
+    // the assumption that cron intervals always exceed it.
+    //
+    // done_at is now cleared by dispatchOne at spawn and writable only by the tab
+    // that currently owns the row. A stale signal cannot be present to be
+    // filtered, so there is nothing left to compare against a clock. Restoring a
+    // time comparison here would re-open the 2026-07-17 case it used to cause,
+    // where a fast worker's done landed BEFORE the running-flip re-stamped
+    // leased_at and was then rejected forever for being "too old".
+    const signal = {
+      status: row.done_status || 'success',
+      result_summary: row.done_summary,
+      result_pointer: row.done_pointer,
+    }
     try {
-      await exports.markComplete(row, msg.body)
+      await exports.markComplete(row, signal)
     } catch (e) {
       process.stderr.write('[scheduler] completionPass markComplete error for ' + row.id + ': ' + e.message + '\n')
     }

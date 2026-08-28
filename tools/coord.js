@@ -74,7 +74,15 @@ const DEFAULT_WAKE_POLICY = Object.freeze({
   // messages via coord.send_message instead of opening a fresh CC tab on
   // every inbound. The conductor's wake substrate (flash/toast/auto_type)
   // then surfaces the new message in the existing tab.
-  notify_types: ['done', 'error', 'inbound_sms', 'inbound_telegram'],
+  // 2026-08-28 lane R1 item 2: 'done' left this list because nothing posts a
+  // `done` message any longer. A worker's completion is now a WRITE to its
+  // os_scheduled_tasks row (tools/task-signals.js), and signal_done posts a
+  // separate, purely human-facing `worker_report` notice for this wake. The
+  // two are deliberately different objects: the row is what the scheduler
+  // acts on, the notice is what a person reads, and a lost notice can no
+  // longer cost a completion. 'progress' was never in this list (it floods),
+  // and no longer reaches the bus at all.
+  notify_types: ['worker_report', 'error', 'inbound_sms', 'inbound_telegram'],
   toast_duration_ms: 6000,
   rate_limit_ms: 2000,                 // suppress consecutive wakes within this window
 })
@@ -255,13 +263,15 @@ function buildWakeNotice(msg) {
   // Title kept short for Win10/11 toast truncation tolerance.
   const title = 'EcodiaOS: ' + t + (taskId ? ' [' + taskId.slice(0, 32) + ']' : '')
   let line2 = ''
-  if (t === 'done') {
+  // 'worker_report' carries the same fields the retired 'done' message did;
+  // only its type changed, so the toast a human sees is unchanged. 'done' is
+  // still read here because ~2,568 of them sit in the historical inbox and a
+  // legacy message must not render as a raw JSON blob when it surfaces.
+  if (t === 'worker_report' || t === 'done') {
     line2 = (body.result_summary || '').slice(0, 200)
     if (body.result_pointer) line2 += (line2 ? '  ->  ' : '') + body.result_pointer
   } else if (t === 'error') {
     line2 = (body.error || body.result_summary || '').slice(0, 200)
-  } else if (t === 'progress') {
-    line2 = (body.summary || '').slice(0, 200)
   } else {
     line2 = JSON.stringify(body).slice(0, 200)
   }
@@ -457,38 +467,28 @@ function readInboxForTopic(topic, sinceMs, limit) {
   return out.slice(-(limit || 50))
 }
 
-// 2026-06-18 scheduler-completion-race fix. The scheduler's completionPass and
-// the interactive conductor are BOTH consumers of chat.conductor.inbox, but a
-// message carries a single per-message seen flag. The conductor's read_inbox
-// marks a worker's `done` signal seen within ~1s of arrival; readInboxForTopic
-// (used by peek_inbox) then skips it forever via the `if (m.seen_at) continue`
-// filter, so completionPass never matches it and the os_scheduled_tasks row
-// rots in status=running until the 6h orphan timer - silently dropping up to
-// five fires of an hourly cron with zero alarm. scanTopicByType reads the FULL
-// in-memory index (seen or unseen), does NOT mark seen, and returns the NEWEST
-// matching message per task_id so the scheduler can detect completion
-// independently of whoever else drains the inbox. The in-memory index is fully
-// hydrated from disk on boot, so this is restart-safe. Doctrine:
-// patterns/scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18.md
-function scanTopicByType(topic, type, taskIds) {
-  const slug = safeTopicSlug(topic)
-  const ids = inboxIndex.get(slug) || new Set()
-  const wantTasks = (taskIds && taskIds.length) ? new Set(taskIds.map(String)) : null
-  const byTask = new Map()  // task_id -> newest matching msg
-  for (const id of ids) {
-    const m = messagesById.get(id)
-    if (!m || !m.body || m.body.type !== type) continue
-    const tid = m.body.task_id != null ? String(m.body.task_id)
-      : (m.task_id != null ? String(m.task_id) : null)
-    if (!tid) continue
-    if (wantTasks && !wantTasks.has(tid)) continue
-    const prev = byTask.get(tid)
-    if (!prev || new Date(m.created_at).getTime() > new Date(prev.created_at).getTime()) {
-      byTask.set(tid, m)
-    }
-  }
-  return byTask
-}
+// scanTopicByType: DELETED 2026-08-28, lane R1 item 2.
+//
+// It existed for exactly one caller, tools/scheduler.js completionPass, and for
+// exactly one reason: the scheduler and the interactive conductor were both
+// consumers of chat.conductor.inbox, but a message carries a SINGLE per-message
+// seen flag. The conductor's read_inbox marked a worker's `done` seen ~0.6s
+// after it landed, peek_inbox then skipped it forever, completionPass never
+// matched it, and the row rotted at status=running until the 6h orphan timer -
+// silently dropping up to five fires of an hourly cron with no alarm
+// (2026-06-18). This function's answer was to read the FULL in-memory index,
+// seen or unseen, and never mark.
+//
+// That was a correct patch on an incorrect shape. The scheduler was asking coord
+// about the scheduler's own rows, so it inherited coord's read-state, coord's
+// ordering and coord's backlog. A worker's completion is now a WRITE to its
+// os_scheduled_tasks row (tools/task-signals.js) and completionPass reads that
+// column, so there is no shared seen flag to be immune to. The 2026-06-18
+// doctrine file records the race; this deletion records that the race is no
+// longer expressible rather than merely worked around.
+//
+// Doctrine: patterns/scheduler-completion-must-not-share-seen-flag-with-conductor-inbox-2026-06-18.md
+//           patterns/a-handshake-on-a-shared-bus-cannot-be-made-race-free-2026-08-28.md
 
 function markSeen(messages) {
   const now = new Date().toISOString()
@@ -1648,14 +1648,22 @@ function _touchHeartbeatForTab(tab_id) {
   return true
 }
 
+// report_progress - advisory. 2026-08-28 lane R1 item 2: this no longer posts a
+// message. It writes progress_summary onto the worker's own scheduled row, so a
+// long-running worker is visible in one `select` against the table an operator
+// already reads, instead of adding to a 5,838-message backlog that nothing
+// consumed. 213 historical `progress` messages exist and are the last of them.
+// Single-valued by design: the LAST line, not a log. A worker wanting a durable
+// trail writes it to the substrate its brief names.
 async function report_progress(params, ctx) {
   params = params || {}
   ctx = ctx || {}
-  return send_message({
-    to: 'chat.conductor.inbox',
-    body: { type: 'progress', task_id: params.task_id, summary: params.summary },
+  const taskSignals = require('./task-signals')
+  return taskSignals.recordProgress({
     task_id: params.task_id,
-  }, ctx)
+    tab_id: ctx.tab_id,
+    summary: params.summary,
+  })
 }
 
 async function signal_done(params, ctx) {
@@ -1673,16 +1681,43 @@ async function signal_done(params, ctx) {
   // into last_error. Audit found 48/48 rows with last_error set, 0 clean
   // successes - every cron looked like a failure since this field was lost.
   // See [[scheduler-signal-done-status-must-survive-coord-to-inbox-2026-06-09]].
+  // 2026-08-28 lane R1 item 2. TWO writes, and the split is the whole point.
+  //
+  // (a) THE AUTHORITATIVE ONE: the completion lands on the scheduled row itself,
+  //     guarded on this tab currently owning that row. This is what
+  //     completionPass reads and what markComplete acts on. It cannot be
+  //     consumed by another reader, cannot be starved by inbox depth, and a
+  //     signal from a prior fire's worker is refused instead of laundered.
+  //
+  // (b) THE INFORMATIONAL ONE: a `worker_report` notice on the conductor inbox,
+  //     purely so the wake substrate still surfaces "a worker finished" to a
+  //     human. Deleting it would have silently removed wake-on-worker-finish,
+  //     which is live behaviour. NOTHING in the scheduler reads it.
+  //
+  // A refused (a) does NOT suppress (b). The worker really has stopped, and a
+  // human learning that from the toast is strictly better than silence while the
+  // row waits for the orphan sweep. The refusal is returned to the caller and
+  // named in the notice so it is visible rather than swallowed.
+  const taskSignals = require('./task-signals')
+  const signalRes = await taskSignals.recordDone({
+    task_id: params.task_id,
+    tab_id: ctx.tab_id,
+    status: params.status || 'success',
+    result_summary: params.result_summary,
+    result_pointer: params.result_pointer || null,
+  })
   const r = await send_message({
     to: 'chat.conductor.inbox',
     body: {
-      type: 'done',
+      type: 'worker_report',
       task_id: params.task_id,
       status: params.status || 'success',
       result_summary: params.result_summary,
       result_pointer: params.result_pointer || null,
       terminate: !!params.terminate,
       parent_conductor_tab_id: parent_conductor_tab_id,
+      signal_recorded: !!(signalRes && signalRes.ok),
+      signal_error: (signalRes && signalRes.ok) ? null : (signalRes && signalRes.error) || null,
     },
     task_id: params.task_id,
   }, ctx)
@@ -1696,7 +1731,13 @@ async function signal_done(params, ctx) {
     // (Cursor sweeper) gets a correct gone-is-not-running answer.
     try { fs.unlinkSync(path.join(STATE_DIR, ctx.tab_id + '.spawned')) } catch (e) {}
   }
-  return r
+  // ok reflects whether the SCHEDULER-VISIBLE completion landed, not whether the
+  // toast was written. A worker that reads ok:true and stops has a right to
+  // expect its row will complete; tying ok to the notice would make that a lie.
+  return Object.assign({}, r, {
+    ok: !!(signalRes && signalRes.ok),
+    signal: signalRes,
+  })
 }
 
 // close_my_tab - worker self-closes its IDE chat tab after signal_done.
@@ -1994,33 +2035,31 @@ async function close_my_tab(params, ctx) {
 
 // signal_bound - sent by a spawned worker on first turn to confirm it launched
 // successfully, read its brief, and connected to MCP. Releases the scheduler's
-// launch-lock (dispatch_worker's worker_acknowledgment_timeout_ms window).
+// launch-lock, which is held serially across the whole fleet, so a bound that
+// does not land costs every other pending dispatch a full
+// SIGNAL_BOUND_TIMEOUT_MS of waiting.
 //
-// Mirrors signal_done in structure: posts to chat.conductor.inbox with a typed
-// body so the conductor can filter by body.type === "bound". Does NOT terminate
-// the worker row or unlink the .spawned marker - those are done-specific side
-// effects. The .spawned marker must stay alive until the worker signals done.
+// 2026-08-28 lane R1 item 2. This posts NO message. bound is a pure machine
+// handshake between one worker and the scheduler: no human ever wanted a toast
+// for it, the wake policy never listed it, and 2,797 of them had accumulated on
+// the conductor inbox as pure sediment. It now stamps bound_at on the worker's
+// own scheduled row, guarded on this tab currently owning that row, and
+// dispatchOne polls that column instead of an inbox it shares with a human.
+//
+// The guard is what makes this different from a rename. A bound from a tab that
+// does not own the row matches zero rows and is REFUSED by name, so a stale
+// worker from a previous fire can no longer release a lock it does not hold.
+//
+// Does NOT terminate the worker row or unlink the .spawned marker: those are
+// done-specific. The marker must stay alive until the worker signals done.
 async function signal_bound(params, ctx) {
   params = params || {}
   ctx = ctx || {}
-  // Look up parent_conductor_tab_id from the worker row, same as signal_done.
-  let parent_conductor_tab_id = null
-  if (ctx.tab_id && workers.has(ctx.tab_id)) {
-    parent_conductor_tab_id = workers.get(ctx.tab_id).parent_conductor_tab_id || null
-  }
-  const r = await send_message({
-    to: 'chat.conductor.inbox',
-    body: {
-      type: 'bound',
-      task_id: params.task_id,
-      parent_conductor_tab_id: parent_conductor_tab_id,
-    },
+  const taskSignals = require('./task-signals')
+  return taskSignals.recordBound({
     task_id: params.task_id,
-  }, ctx)
-  // No worker-row termination and no .spawned unlink here.
-  // The worker is confirming it is ALIVE and has read its brief; it will
-  // keep running until it sends signal_done.
-  return r
+    tab_id: ctx.tab_id,
+  })
 }
 
 // ── kill_worker (conductor-callable HARD stop) ───────────────────────────
@@ -2654,7 +2693,6 @@ module.exports = {
   list_channels: list_channels,
   read_inbox: read_inbox,
   peek_inbox: peek_inbox,
-  scanTopicByType: scanTopicByType,
   wait_for_inbox: wait_for_inbox,
   ack_message: ack_message,
   list_workers: list_workers,
