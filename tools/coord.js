@@ -55,6 +55,10 @@ const INBOX_DIR = path.join(COORD_ROOT, 'inbox')
 const STATE_DIR = path.join(COORD_ROOT, 'state')  // already used by dispatcher for .spawned markers
 const CONDUCTORS_DIR = path.join(COORD_ROOT, 'conductors')  // conductor registration rows
 const WAKE_POLICY_FILE = path.join(COORD_ROOT, 'wake_policy.json')
+// Durable record of what the LAST wake attempt actually achieved, per tier.
+// Separate from the policy: the policy is what we asked for, this is what the
+// host could do about it. Read by get_conductor_state and by health probes.
+const WAKE_STATE_FILE = path.join(COORD_ROOT, 'wake_state.json')
 
 const DEAD_HEARTBEAT_MS = 90 * 1000  // 90s without heartbeat = dead
 const MAX_WAIT_TIMEOUT_S = 600       // 10min cap on long-poll
@@ -188,6 +192,7 @@ loadFromDisk()
 //   - Notify-types filter: 'progress' floods, 'done' is the load-bearing one.
 
 let _lastWakeAt = 0  // in-memory rate-limit (across requests this process serves)
+let _lastWakeResult = null  // what the last wake attempt actually achieved, per tier
 
 const IN_TURN_TTL_MS = 10 * 60 * 1000  // 10min: auto-clear in_turn if Stop hook never fired
 
@@ -300,11 +305,35 @@ function buildWakeNotice(msg) {
 // Non-blocking. Errors swallowed - wake is best-effort, message persist must succeed
 // even if notification path is wedged (high memory pressure, PS daemon dead, etc).
 async function wakeConductor(msg) {
+  // Every tier records what it actually did. The empty catches this replaces
+  // are how a wake path that had NEVER once worked on this host stayed
+  // invisible: tiers B and C are pure Win32 PowerShell (tools/window.js
+  // P/Invokes user32.dll through lib/ps-daemon, which hardcodes
+  // powershell.exe), the Mac has no PowerShell, and every resulting throw was
+  // swallowed. Measured 2026-08-28: policy set to auto_type, last_wake_at
+  // advanced, conductor last_seen_at did not move.
+  const tiers = {}
+  const record = (verdict) => {
+    try {
+      atomicWriteJson(WAKE_STATE_FILE, {
+        at: new Date().toISOString(),
+        message_id: (msg && msg.id) || null,
+        message_type: ((msg && msg.body) || {}).type || null,
+        mode: verdict.mode || null,
+        tiers: tiers,
+        platform: process.platform,
+        gui_wake_supported: _guiWakeSupported().ok,
+        gui_wake_reason: _guiWakeSupported().ok ? null : _guiWakeSupported().reason,
+        skipped: verdict.skipped || null,
+      })
+    } catch (e) {}
+    _lastWakeResult = { at: new Date().toISOString(), mode: verdict.mode || null, tiers: tiers, skipped: verdict.skipped || null }
+  }
   try {
     const policy = loadWakePolicy()
-    if (!shouldWake(msg, policy)) return
+    if (!shouldWake(msg, policy)) { record({ mode: policy.mode, skipped: 'policy_filtered' }); return }
     const now = Date.now()
-    if (now - _lastWakeAt < (policy.rate_limit_ms || 0)) return
+    if (now - _lastWakeAt < (policy.rate_limit_ms || 0)) { record({ mode: policy.mode, skipped: 'rate_limited' }); return }
     _lastWakeAt = now
     const notice = buildWakeNotice(msg)
 
@@ -313,18 +342,42 @@ async function wakeConductor(msg) {
       const notification = require('./notification')
       // Don't await - toast can take 6s+ under load; persistMessage must not wait.
       notification.toast({ title: notice.title, body: notice.body, durationMs: policy.toast_duration_ms || 6000 })
-        .catch(() => {})
-    } catch (e) {}
+        .then((r) => { tiers.toast = { ok: !(r && r.ok === false), detail: r && r.reason ? r.reason : null }; record({ mode: policy.mode }) })
+        .catch((e) => { tiers.toast = { ok: false, error: e && e.message }; record({ mode: policy.mode }) })
+      tiers.toast = { ok: null, note: 'dispatched, not awaited' }
+    } catch (e) { tiers.toast = { ok: false, error: e && e.message } }
 
     // Tier B + C only if conductor is registered.
     const conductor = loadConductorRegistration()
-    if (!conductor) return
+    if (!conductor) { record({ mode: policy.mode, skipped: 'conductor_unregistered' }); return }
+
+    // The GUI tiers below CANNOT work off win32. Say so once, loudly, instead
+    // of letting each call throw into a swallow.
+    const guiCap = _guiWakeSupported()
 
     if (policy.mode === 'flash' || policy.mode === 'auto_type') {
-      try {
-        const notification = require('./notification')
-        notification.flash_window({ titleContains: conductor.title_match || '', count: 4 }).catch(() => {})
-      } catch (e) {}
+      if (!guiCap.ok) {
+        tiers.flash = { ok: false, reason: guiCap.reason, error: guiCap.error }
+      } else {
+        try {
+          const notification = require('./notification')
+          notification.flash_window({ titleContains: conductor.title_match || '', count: 4 })
+            .then((r) => { tiers.flash = { ok: !(r && r.ok === false), detail: r && r.reason ? r.reason : null }; record({ mode: policy.mode }) })
+            .catch((e) => { tiers.flash = { ok: false, error: e && e.message }; record({ mode: policy.mode }) })
+          tiers.flash = { ok: null, note: 'dispatched, not awaited' }
+        } catch (e) { tiers.flash = { ok: false, error: e && e.message } }
+      }
+    }
+
+    if (policy.mode === 'auto_type' && !guiCap.ok) {
+      // Refuse rather than pretend. The Mac-native equivalent of this tier
+      // already exists as tools/chat-inject.injectTurn (activate / select /
+      // paste / submit over AppleScript), but auto_type focus-steals and is
+      // policy-banned on this host, so porting it is a DECISION, not a
+      // silently-taken fix. Surfaced in the lane B1 report 2026-08-29.
+      tiers.auto_type = { ok: false, reason: guiCap.reason, error: guiCap.error }
+      record({ mode: policy.mode })
+      return
     }
 
     if (policy.mode === 'auto_type') {
@@ -344,12 +397,34 @@ async function wakeConductor(msg) {
           await input.type({ text: wakeText })
           await new Promise(r => setTimeout(r, 200))
           await input.key({ key: 'enter' })
+          tiers.auto_type = { ok: true, note: 'keystrokes dispatched; landing NOT verified here' }
+        } else {
+          tiers.auto_type = { ok: true, note: 'conductor already foreground, no wake needed' }
         }
-      } catch (e) {}
+      } catch (e) { tiers.auto_type = { ok: false, error: e && e.message } }
+    }
+    record({ mode: policy.mode })
+  } catch (e) {
+    // Never let wake break persistMessage, but never lose the reason either.
+    tiers.wake = { ok: false, error: e && e.message }
+    record({ mode: null, skipped: 'wake_threw' })
+  }
+}
+
+// Can the GUI wake tiers (flash / auto_type) physically run on this host? They
+// route through tools/window.js -> lib/ps-daemon -> powershell.exe. Asking the
+// daemon directly keeps one source of truth for the platform verdict.
+function _guiWakeSupported() {
+  try {
+    const psd = require('../lib/ps-daemon')
+    if (typeof psd.psSupported === 'function') {
+      const r = psd.psSupported()
+      return r.ok ? { ok: true } : { ok: false, reason: r.reason || 'unsupported_platform', error: r.error || null }
     }
   } catch (e) {
-    // Never let wake break persistMessage
+    return { ok: false, reason: 'ps_daemon_unavailable', error: e && e.message }
   }
+  return { ok: process.platform === 'win32', reason: process.platform === 'win32' ? null : 'unsupported_platform' }
 }
 
 // ── core ops (no auth here - that's the route layer's job) ───────────────
@@ -553,6 +628,9 @@ function inboxTopicFor(ctx) {
 
 let _chatInject = null
 try { _chatInject = require('./chat-inject') } catch (e) { _chatInject = null }
+// Injection seam for the test suite, which must never touch the live IDE
+// bridge, the clipboard, or window focus. Mirrors coord-retire's _setPool.
+function _setChatInject(stub) { _chatInject = stub }
 let _ttm = null
 try { _ttm = require('./tab-title-match') } catch (e) { _ttm = null }
 
@@ -1440,6 +1518,61 @@ function _injectAllowedNow(topic) {
 }
 function _noteInject(topic) { const now = Date.now(); _injectWindow.push(now); _lastInjectAt.set(topic, now) }
 
+// ── inject landing gate (2026-08-29, Co-Exist lane B1 pass 5) ────────────
+//
+// chat-inject's injectTurn() returns ok as soon as the AppleScript Return
+// keystroke executes without error. That is NOT proof a turn landed: its only
+// verify-gate (verifyActiveIsTarget) runs BEFORE the paste, and nothing at all
+// runs after the submit. pushInject then treated that unverified ok as delivery
+// and called markSeen(), which CONSUMES the message out of the target's unread
+// queue. So a false green did not just mis-report, it destroyed the message's
+// last chance of being read.
+//
+// Measured live 2026-08-28: coord message 19:31:28.232Z was marked seen 17.5s
+// later (an inject-time mark, not a read) while the conductor's last_seen_at
+// stayed pinned at 18:39:25.006Z. No turn landed, the push it asked for never
+// happened, and the message was gone.
+//
+// THE OBSERVABLE. conductor_heartbeat.py is a UserPromptSubmit hook, so it
+// writes last_seen_at at turn-START. last_seen_at ADVANCING past a pre-inject
+// baseline is the one discriminating proof that a turn landed. Only the
+// conductor has such a stamp, so the gate is conductor-target-only and every
+// other target keeps prior behaviour unchanged.
+//
+// KNOWN RESIDUAL, stated rather than solved: a DIFFERENT prompt landing inside
+// the poll window (Tate typing, a peer inject) reads as a false positive. That
+// degrades to exactly today's behaviour, never worse. The message id is already
+// embedded in the injected text if a stricter transcript-grep verifier is ever
+// wanted.
+//
+// FAILS SAFE. Unproven landing leaves the message UNSEEN, so the durable inbox
+// still serves it. pushInject has exactly one caller (message_chat's send path)
+// and nothing re-injects unseen messages on a timer, so the worst case is a
+// message visible twice, never an inject storm.
+const LANDING_TIMEOUT_MS = Number(process.env.COORD_INJECT_LANDING_TIMEOUT_MS || 12000)
+const LANDING_POLL_MS = Number(process.env.COORD_INJECT_LANDING_POLL_MS || 500)
+
+function _conductorLastSeenMs() {
+  const c = loadConductorRegistration()
+  if (!c || !c.last_seen_at) return null
+  const t = Date.parse(c.last_seen_at)
+  return Number.isFinite(t) ? t : null
+}
+
+// Poll the conductor registration for last_seen_at to move PAST the baseline.
+// Strictly greater: a stamp rewritten at the same value is not a new turn.
+async function _awaitTurnLanded(baselineMs, timeoutMs, pollMs) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const seen = _conductorLastSeenMs()
+    if (seen != null && (baselineMs == null || seen > baselineMs)) {
+      return { landed: true, last_seen_ms: seen }
+    }
+    if (Date.now() >= deadline) return { landed: false, last_seen_ms: seen }
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
+}
+
 // pushInject(msg) -> {attempted, ok?, reason?, resolved_label?, kind?}. Best-
 // effort: on success marks the message seen so the target's own poll/drain does
 // not double-process; on any failure leaves it unseen so inbox delivery still
@@ -1469,14 +1602,43 @@ async function pushInject(msg) {
     const tgt = await resolveLiveTargetTab(topic)
     if (!tgt.ok) return { attempted: true, ok: false, reason: tgt.reason }
     _noteInject(topic)
+    // Sample the landing observable BEFORE the inject, so the comparison is
+    // against a value that predates the keystroke.
+    const landingGated = tgt.kind === 'conductor'
+    const baselineMs = landingGated ? _conductorLastSeenMs() : null
     let r
     try { r = await _chatInject.injectTurn({ label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text }) }
     catch (e) { return { attempted: true, ok: false, reason: 'inject_threw', error: e.message } }
-    if (r && r.ok) {
-      try { markSeen([msg]) } catch (e) {}
-      return { attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind, via: r.via || 'gui' }
+    if (!(r && r.ok)) {
+      return { attempted: true, ok: false, reason: (r && r.reason) || 'inject_failed', detail: r }
     }
-    return { attempted: true, ok: false, reason: (r && r.reason) || 'inject_failed', detail: r }
+    if (landingGated) {
+      const land = await _awaitTurnLanded(baselineMs, LANDING_TIMEOUT_MS, LANDING_POLL_MS)
+      if (!land.landed) {
+        // Deliberately NOT markSeen. The keystroke fired into nothing; the
+        // message stays in the durable inbox for the conductor's next read.
+        return {
+          attempted: true,
+          ok: false,
+          reason: 'submit_did_not_land',
+          inject_reported_ok: true,
+          resolved_label: r.label,
+          kind: tgt.kind,
+          last_seen_at_baseline: baselineMs == null ? null : new Date(baselineMs).toISOString(),
+          landing_timeout_ms: LANDING_TIMEOUT_MS,
+        }
+      }
+      try { markSeen([msg]) } catch (e) {}
+      return {
+        attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind,
+        via: r.via || 'gui', landed: true,
+        landed_at: new Date(land.last_seen_ms).toISOString(),
+      }
+    }
+    // Non-conductor target: no landing observable exists, so behaviour is
+    // unchanged. `landed: null` says "not asserted", never "asserted false".
+    try { markSeen([msg]) } catch (e) {}
+    return { attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind, via: r.via || 'gui', landed: null }
   }
   _injectChain = _injectChain.then(run, run)
   return _injectChain
@@ -2889,6 +3051,22 @@ async function get_conductor_state(_params) {
     wake_policy: policy,
     wake_topic_prefixes: WAKE_TOPIC_PREFIXES,
     last_wake_at: _lastWakeAt ? new Date(_lastWakeAt).toISOString() : null,
+    // What the last wake ACHIEVED, not just that it was attempted. Before this
+    // existed, `last_wake_at` advancing was read as "the conductor was woken",
+    // and on a Mac that inference was never once true for the flash/auto_type
+    // tiers. Falls back to the durable file so an agent restart does not erase
+    // the verdict.
+    last_wake_result: _lastWakeResult || readJsonSafe(WAKE_STATE_FILE) || null,
+    // Static capability of THIS host, readable without waiting for a wake.
+    wake_capabilities: {
+      platform: process.platform,
+      toast: true,
+      flash: _guiWakeSupported().ok,
+      auto_type: _guiWakeSupported().ok,
+      gui_wake_reason: _guiWakeSupported().ok ? null : _guiWakeSupported().reason,
+      // The only delivery path proven to land a turn on this host.
+      chat_inject: !!_chatInject,
+    },
   }
 }
 
@@ -3050,6 +3228,8 @@ module.exports = {
   _buildChatInjectionText: buildChatInjectionText,
   _resolveLiveTargetTab: resolveLiveTargetTab,
   _pushInject: pushInject,
+  _setChatInject: _setChatInject,
+  _awaitTurnLanded: _awaitTurnLanded,
   _readSessionTab: _readSessionTab,
   // Worker-row map, for tests that need to age or terminate a row directly.
   _workersMap: function () { return workers },
