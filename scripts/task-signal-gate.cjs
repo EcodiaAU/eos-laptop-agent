@@ -347,6 +347,86 @@ async function main() {
     ok(String(r.last_result || '').indexOf('e done') !== -1, 'E3. the summary reaches last_result')
     scheduler._resetWorktreeFns()
 
+    // ── G. the signal is CONSUMED at the terminal transition ────────────────
+    //
+    // completionPass selects `status='running' AND done_at IS NOT NULL` and its
+    // comment asserts nothing else can have written it. That is true of the WRITE
+    // path and was false of the ROW: the only thing that ever cleared these
+    // columns was dispatchOne's step 3b, and the ADOPT path (step 2d, the
+    // 2026-07-17 double-spawn guard) flips a row to running and RETURNS before
+    // reaching it. A consumed done therefore survived to complete a second time.
+    //
+    // BOTH DIRECTIONS ARE GATED HERE, because a fix that simply blanked the
+    // columns at adopt would pass the phantom legs and silently LOSE a legitimate
+    // completion (staleLeaseRecovery branch 1 reclaims a lease without touching
+    // dispatched_tab_id, so a reclaimed worker's done still lands while the row
+    // sits active). G7 is that control: it must still complete.
+    console.log('\nG. a completion is consumed at the terminal transition, and only then')
+    const gIns = await client.query(
+      `INSERT INTO os_scheduled_tasks (name, type, prompt, status, next_run_at, run_count, cron_expression, tz)
+       VALUES ($1, 'cron', 'task-signal-gate adopt probe', 'active', $2, 0, '0 3 * * *', 'Australia/Brisbane')
+       RETURNING id`,
+      [LANE + '-adopt-probe', FAR_FUTURE]
+    )
+    const gId = gIns.rows[0].id
+    const gRow = async () => (await client.query('SELECT * FROM os_scheduled_tasks WHERE id = $1', [gId])).rows[0]
+    const gKilled = []
+    scheduler._setDispatcher({ kill_worker: async (a) => { gKilled.push(a && a.tab_id); return { closed: false } } })
+    scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
+
+    // first fire: a normal, legitimate completion
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(),
+         leased_by='lease-g', dispatched_tab_id='tab_g1' WHERE id=$1`, [gId])
+    await taskSignals.recordDone({ task_id: gId, tab_id: 'tab_g1', status: 'success', result_summary: 'g first fire' })
+    await scheduler.completionPass()
+    let g = await gRow()
+    ok(g.status === 'active' && g.run_count === 1,
+      'G1. POSITIVE: the first fire completes normally (status=' + g.status + ' run_count=' + g.run_count + ')')
+    ok(g.done_at === null,
+      'G2. ABSENCE: the terminal transition consumed done_at')
+    ok(g.done_status === null && g.done_summary === null && g.done_pointer === null,
+      'G3. ABSENCE: it consumed done_status/summary/pointer with it')
+
+    // the ADOPT path, byte-for-byte what dispatchOne step 2d writes: a flip to
+    // running against a DIFFERENT live tab, with no claim and no clear.
+    await client.query(
+      `UPDATE os_scheduled_tasks
+         SET status='running', dispatched_tab_id=$1, leased_at=NOW(), updated_at=NOW()
+       WHERE id=$2`, ['tab_g2_live', gId])
+    const gBefore = (await gRow()).run_count
+    gKilled.length = 0
+    await scheduler.completionPass()
+    g = await gRow()
+    ok(g.run_count === gBefore,
+      'G4. NEGATIVE: an adopted row does not re-complete off the prior fire (run_count ' + gBefore + ' -> ' + g.run_count + ')')
+    ok(gKilled.indexOf('tab_g2_live') === -1,
+      'G5. ABSENCE: the live worker the row just adopted was not killed (killed=' + JSON.stringify(gKilled) + ')')
+    ok(g.status === 'running',
+      'G6. the adopted row is still running, not falsely advanced (status=' + g.status + ')')
+
+    // THE CONTROL. An overcorrected fix that cleared at adopt would pass G4-G6
+    // and lose this. The adopted worker's OWN done must still complete the row.
+    await taskSignals.recordDone({ task_id: gId, tab_id: 'tab_g2_live', status: 'success', result_summary: 'g adopted fire' })
+    await scheduler.completionPass()
+    g = await gRow()
+    ok(g.run_count === gBefore + 1,
+      'G7. CONTROL: the adopted worker\'s OWN done still completes the row (run_count ' + gBefore + ' -> ' + g.run_count + ')')
+    ok(String(g.last_result || '').indexOf('g adopted fire') !== -1,
+      'G8. CONTROL: and it is THAT done that landed, not the consumed one')
+
+    // markFailed is the other terminal transition and needs the same consume, or
+    // a failed row carries its signal into the next adopt exactly the same way.
+    await client.query(
+      `UPDATE os_scheduled_tasks SET status='running', leased_at=NOW(),
+         leased_by='lease-g', dispatched_tab_id='tab_g3', retry_count=0 WHERE id=$1`, [gId])
+    await taskSignals.recordDone({ task_id: gId, tab_id: 'tab_g3', status: 'failed', result_summary: 'g failed fire' })
+    await scheduler.completionPass()
+    g = await gRow()
+    ok(g.done_at === null && g.done_status === null,
+      'G9. ABSENCE: markFailed consumes the signal too (done_at=' + g.done_at + ' done_status=' + g.done_status + ')')
+    scheduler._resetWorktreeFns()
+
     // ── F. the retired bus types are genuinely gone, not renamed ─────────────
     console.log('\nF. the retired message types are not produced anywhere')
     ok(typeof coord.scanTopicByType !== 'function',
