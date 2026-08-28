@@ -889,6 +889,234 @@ async function _closeAnchorTarget(anchorTarget, conductor, guardCtx) {
   } catch (e) { return { closed: false, refused: 'session_anchor_close_threw:' + (e.message || String(e)) } }
 }
 
+// ── stable IDE tab id (2026-08-29) ───────────────────────────────────────────
+//
+// THE LEAK THIS CLOSES. Every handle the close path had was volatile or
+// collidable, and a RECURRING CRON breaks all of them by construction:
+//   1. tabIndex captured at spawn. Measured shifting 13 -> 15 and 59 -> 61
+//      inside three minutes as sibling worker tabs opened.
+//   2. label_at_spawn, stored as the literal 'Claude Code' and flagged
+//      captured_label_is_provisional. Never an identity (see isGenericLabel).
+//   3. sentinel_prefix + autotitle_fingerprint, both DERIVED FROM THE BRIEF
+//      TEXT. One os_scheduled_tasks cron row re-fires a byte-identical brief
+//      every night, so fire N and fire N+1 carry the same sentinel, the same
+//      fingerprint, and the same Claude Code auto-summary title. The
+//      fingerprint tier is then GUARANTEED ambiguous, not unluckily so.
+// The resolver refuses on ambiguity, which is right (closing a stranger kills a
+// live worker mid-run), so from fire 2 onward every cron worker leaked its tab.
+// Leaked webviews are ~50-200MB each; enough of them OOM the IDE, which crashes
+// the Claude Code tabs, which ends the scheduler's ability to spawn at all.
+//
+// THE HANDLE THAT WORKS. The IDE bridge already mints a stable per-tab id
+// (ttab_...) and reconciles it across a retitle and a reorder
+// (cursor-preview-extension/ide-bridge.js assignStableTabIds). Coord threw it
+// away. It is captured at signal_bound (the tab still carries its unique spawn
+// sentinel at that moment, before Claude Code summarises it away) and resolved
+// at close time on the EXACT id.
+//
+// NO FALLTHROUGH is the load-bearing half. A stored id that is not in the live
+// listing REFUSES; it never drops back to index / label / fingerprint. The id
+// store is a file the bridge reconciles from, so absent means the tab is gone.
+// Refusing is never worse than the status quo (today a cron worker leaks the tab
+// anyway) and it keeps the never-close-on-a-guess invariant that the 2026-07-21
+// mass-close incident bought. The reaper is the backstop for the leak.
+const _STABLE_ID_CAPTURE_TIMEOUT_MS = Number(process.env.COORD_STABLE_ID_CAPTURE_TIMEOUT_MS || 4000)
+
+// Flatten the live CC chat tabs, carrying the bridge's stable tabId. Used by
+// both capture and close resolution so the two agree on one coordinate space.
+async function _liveCcTabsWithIds(idePort) {
+  const ide = require('./ide')
+  const tabsResult = await ide.tabs({ ide_port: idePort })
+  const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+  const out = []
+  for (const g of groups) {
+    const vc = g.viewColumn
+    const gtabs = g.tabs || []
+    gtabs.forEach((t, i) => {
+      const vt = t.viewType || (t.input && t.input.viewType) || null
+      if (vt !== _CC_CHAT_VIEW_TYPE) return
+      out.push({
+        tabId: t.tabId || null,
+        label: t.label,
+        viewColumn: vc != null ? vc : 1,
+        index: typeof t.index === 'number' ? t.index : i,
+        active: t.isActive === true || t.active === true,
+      })
+    })
+  }
+  return out
+}
+
+// Every stable tabId already owned by SOME OTHER worker row, terminated or not.
+// A terminated row still owns its id: its corpse tab is exactly what a later
+// fire of the same cron must not claim. Reads the in-memory map and the disk
+// rows, because a row written across the HTTP boundary is only on disk.
+function _claimedStableTabIds(exceptTabId) {
+  const claimed = new Set()
+  const take = (id, row) => {
+    if (!row || id === exceptTabId) return
+    const t = row.tab_handle && row.tab_handle.tabId
+    if (t) claimed.add(t)
+  }
+  for (const [id, w] of workers.entries()) take(id, w)
+  try {
+    for (const f of fs.readdirSync(WORKERS_DIR)) {
+      if (!f.endsWith('.json')) continue
+      const id = f.slice(0, -5)
+      if (id === exceptTabId || workers.has(id)) continue
+      try { take(id, JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, f), 'utf8'))) } catch (e) {}
+    }
+  } catch (e) {}
+  return claimed
+}
+
+// Stamp the captured id onto this worker's session anchor too, so the anchor
+// record carries the same stable handle the registry row does. Best-effort.
+function _stampAnchorTabId(workerTabId, tabId) {
+  try {
+    const dir = path.join(COORD_ROOT, 'chat-tabs')
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.json') || f[0] === '_') continue
+      const p = path.join(dir, f)
+      let rec
+      try { rec = JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { continue }
+      if (!rec || rec.tab_id !== workerTabId) continue
+      if (rec.tabId === tabId) return true
+      rec.tabId = tabId
+      try { fs.writeFileSync(p, JSON.stringify(rec)) } catch (e) {}
+      return true
+    }
+  } catch (e) {}
+  return false
+}
+
+// Resolve THIS worker's live tab and persist its stable id onto the registry row.
+//
+// Called at signal_bound, which is the one moment the tab is positively
+// identifiable: it still shows its unique spawn sentinel, because Claude Code
+// has not yet summarised the brief into a title.
+//
+// The cron collision is handled rather than refused. At fire N+1's bind, fire N's
+// corpse tab is often still open carrying the SAME sentinel, so a naive
+// uniqueness gate would find 2 and capture nothing, and the fix would never
+// engage for exactly the lanes that leak. So on a multi-hit, ids already claimed
+// by another worker row are excluded first; a single survivor is ours. Two
+// UNCLAIMED same-sentinel tabs are genuinely undecidable and still refuse.
+// During the transition the accreted corpses hold no id and so cannot be
+// excluded; the backlog reaper drains them and the system converges.
+async function _captureStableTabId(tab_id, opts) {
+  opts = opts || {}
+  try {
+    if (!tab_id) return { ok: false, reason: 'no_tab_id' }
+    const w = loadWorkerRegistry(tab_id)
+    if (!w) return { ok: false, reason: 'unknown_worker' }
+    const th = w.tab_handle
+    if (!th) return { ok: false, reason: 'no_tab_handle' }
+    if (th.tabId && !opts.force) return { ok: true, tabId: th.tabId, reason: 'already_set' }
+    const conductor = loadConductorRegistration()
+    if (!conductor || !conductor.ide_bridge_port) return { ok: false, reason: 'no_conductor_ide_port' }
+    let tabs
+    try { tabs = await _liveCcTabsWithIds(conductor.ide_bridge_port) }
+    catch (e) { return { ok: false, reason: 'bridge_unreachable:' + (e.message || String(e)) } }
+    if (!tabs || !tabs.length) return { ok: false, reason: 'no_live_tabs' }
+
+    const pool = tabs.filter((t) => t.tabId && (th.viewColumn == null || t.viewColumn === th.viewColumn))
+    if (!pool.length) return { ok: false, reason: 'no_tabs_with_ids' }
+    // Truncation-aware throughout: CC renders a 40-char sentinel as 24 chars
+    // plus an ellipsis, so the live label is SHORTER than the stored one.
+    let via = 'sentinel'
+    let hits = pool.filter((t) => _labelMatchesStored(t.label, th.sentinel_prefix))
+    if (!hits.length) {
+      const spawnLabel = th.label || th.label_at_spawn
+      if (spawnLabel && !isGenericLabelStr(spawnLabel)) {
+        hits = pool.filter((t) => _labelMatchesStored(t.label, spawnLabel))
+        via = 'spawn_label'
+      }
+    }
+    if (!hits.length) return { ok: false, reason: 'no_sentinel_match', pool: pool.length }
+    if (hits.length > 1) {
+      const claimed = _claimedStableTabIds(tab_id)
+      const unclaimed = hits.filter((t) => !claimed.has(t.tabId))
+      if (unclaimed.length !== 1) {
+        return { ok: false, reason: 'ambiguous_sentinel', candidates: hits.length, unclaimed: unclaimed.length }
+      }
+      hits = unclaimed
+      via = via + '_unclaimed'
+    }
+    const tab = hits[0]
+    th.tabId = tab.tabId
+    th.tabId_captured_at = new Date().toISOString()
+    th.tabId_captured_label = tab.label
+    th.tabId_captured_via = via
+    w.tab_handle = th
+    workers.set(tab_id, w)
+    try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+    _stampAnchorTabId(tab_id, tab.tabId)
+    return { ok: true, tabId: tab.tabId, via: via, label: tab.label }
+  } catch (e) {
+    return { ok: false, reason: 'threw:' + ((e && e.message) || String(e)) }
+  }
+}
+
+// Resolve a stored stable id to its live tab. Three outcomes and they are NOT
+// interchangeable: {none} means no id is stored and the legacy ladder should run
+// unchanged (older rows); {tab} means resolved; {refused} means an id IS stored
+// and did not resolve, which STOPS the close - it must never soften into a
+// fingerprint guess.
+async function _resolveStableIdCloseTarget(tab_id, idePort) {
+  const w = loadWorkerRegistry(tab_id)
+  const th = w && w.tab_handle
+  const want = th && th.tabId
+  if (!want) return { none: true }
+  if (!idePort) return { refused: 'stable_id_no_ide_port:' + want }
+  let tabs
+  try { tabs = await _liveCcTabsWithIds(idePort) }
+  catch (e) { return { refused: 'stable_id_bridge_unreachable:' + ((e && e.message) || String(e)) } }
+  const hits = (tabs || []).filter((t) => t.tabId === want)
+  if (hits.length === 1) return { tab: hits[0], tabId: want }
+  // Ids are unique per snapshot, so this is a bridge invariant break, not a
+  // resolvable state. Refuse loudly rather than pick one.
+  if (hits.length > 1) return { refused: 'stable_id_ambiguous:' + want + ' n=' + hits.length }
+  return { refused: 'stable_id_not_live:' + want }
+}
+
+// Close a stable-id-resolved target through the shared guard. The strategy
+// string is non-fuzzy, so tab-close-guard treats it as a positive identity;
+// belt 2 (never the registered conductor tab) still applies unconditionally.
+async function _closeStableIdTarget(resolved, conductor, guardCtx) {
+  const tab = resolved && resolved.tab
+  const strategy = 'stable_tab_id:' + (resolved && resolved.tabId)
+  if (!tab) return { closed: false, strategy: null, refused: 'no_stable_target' }
+  try {
+    const decision = require('./tab-close-guard').evaluateClose(
+      strategy,
+      { label: tab.label, index: tab.index, viewColumn: tab.viewColumn, active: tab.active },
+      conductor,
+      guardCtx || undefined
+    )
+    if (!decision.allow) {
+      return { closed: false, strategy: 'refused:' + decision.reason, refused: decision.reason + ':' + strategy + '|label=' + tab.label }
+    }
+    const ide = require('./ide')
+    const closeResult = await ide.tabs_close({
+      viewColumn: tab.viewColumn,
+      viewType: _CC_CHAT_VIEW_TYPE,
+      exactLabel: tab.label,   // race guard: the bridge refuses if the slot moved
+      tabIndex: tab.index,     // live index from the probe above -> single close
+      ide_port: conductor && conductor.ide_bridge_port,
+    })
+    const inner = (closeResult && closeResult.result) || closeResult || {}
+    const closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+    return {
+      closed: closed,
+      strategy: closed ? strategy : 'match_found_but_close_failed:' + strategy,
+      refused: closed ? null : ('stable_id_close_no_close:' + (inner.refused || 'closed=0')),
+    }
+  } catch (e) {
+    return { closed: false, strategy: null, refused: 'stable_id_close_threw:' + ((e && e.message) || String(e)) }
+  }
+}
+
 // A message pushes (injects a turn) iff it is an explicit chat message that has
 // not opted out of push. Everything else is inbox-only (machine signals, etc).
 function isChatDeliver(msg) {
@@ -1815,6 +2043,32 @@ async function close_my_tab(params, ctx) {
 
   const stored = workers.has(ctx.tab_id) ? workers.get(ctx.tab_id).tab_handle : null
 
+  // Tier -1 (2026-08-29): the bridge's STABLE tab id, captured at signal_bound.
+  // Runs ahead of every other tier because it is the only handle a recurring
+  // cron cannot collide, and it is TERMINAL: a stored id that does not resolve
+  // REFUSES here and the ladder below never runs. See the _captureStableTabId
+  // header for why no-fallthrough is the load-bearing half of this fix.
+  let stableSettled = false
+  try {
+    const st = await _resolveStableIdCloseTarget(ctx.tab_id, conductor.ide_bridge_port)
+    if (st.refused) {
+      stableSettled = true
+      refused = st.refused
+      close_strategy = 'refused:' + st.refused
+      try { process.stderr.write('[coord] close_my_tab stable-id refused: ' + st.refused + '\n') } catch (e) {}
+    } else if (st.tab) {
+      stableSettled = true
+      const res = await _closeStableIdTarget(st, conductor, GUARD_SELF_CLOSE)
+      closed = res.closed
+      close_strategy = res.strategy
+      if (!closed) refused = res.refused
+    }
+  } catch (e) {
+    // A throw here must not silently promote the fuzzy ladder on a row that has
+    // a stored id. Only a row with NO id (st.none) reaches the tiers below.
+    try { const w0 = loadWorkerRegistry(ctx.tab_id); if (w0 && w0.tab_handle && w0.tab_handle.tabId) { stableSettled = true; refused = 'stable_id_threw:' + ((e && e.message) || String(e)) } } catch (e2) {}
+  }
+
   // Tier 0 (T2, 2026-08-14): session anchor. The worker anchored its OWN tab by
   // its stable CC session_id on its genuine turns (conductor_heartbeat T2b) - a
   // POSITIVE, non-fuzzy identity, stronger than the autotitle fingerprint that
@@ -1823,7 +2077,7 @@ async function close_my_tab(params, ctx) {
   // shared close guard. Not uniquely resolvable -> `closed` stays false and the
   // existing tab_handle path below runs UNCHANGED (additional primary signal, not
   // a replacement). Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
-  try {
+  if (!stableSettled) try {
     const anchorTarget = await _resolveWorkerAnchorCloseTarget(ctx.tab_id, conductor.ide_bridge_port)
     if (anchorTarget) {
       const res = await _closeAnchorTarget(anchorTarget, conductor, GUARD_SELF_CLOSE)
@@ -1850,7 +2104,7 @@ async function close_my_tab(params, ctx) {
   //
   // Doctrine: cowork-kill-worker-tab-handle-from-foreground-after-spawn-
   // is-unsafe-2026-05-28.md + this patch's new pattern (TODO).
-  if (!closed) try {
+  if (!closed && !stableSettled) try {
     if (!stored || stored.viewType !== CC_CHAT_VIEW_TYPE || stored.viewColumn == null) {
       refused = 'no_stored_tab_handle_or_incomplete:' + JSON.stringify(stored || null).slice(0, 200)
     } else {
@@ -2070,14 +2324,36 @@ async function close_my_tab(params, ctx) {
 //
 // Does NOT terminate the worker row or unlink the .spawned marker: those are
 // done-specific. The marker must stay alive until the worker signals done.
+// 2026-08-29: bind is also where the STABLE tab id is captured. This is the one
+// moment the worker's tab is positively identifiable, because it still shows the
+// unique spawn sentinel that Claude Code will shortly summarise away.
+//
+// Capture runs AFTER recordBound and can never delay or fail it. bound releases
+// a launch lock held serially across the whole fleet, so a capture that hung
+// would cost every pending dispatch a full SIGNAL_BOUND_TIMEOUT_MS. It is
+// therefore time-boxed, fully caught, and its result is advisory in the reply.
 async function signal_bound(params, ctx) {
   params = params || {}
   ctx = ctx || {}
   const taskSignals = require('./task-signals')
-  return taskSignals.recordBound({
+  const out = await taskSignals.recordBound({
     task_id: params.task_id,
     tab_id: ctx.tab_id,
   })
+  try {
+    let timer = null
+    const capped = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, reason: 'capture_timeout' }), _STABLE_ID_CAPTURE_TIMEOUT_MS)
+      if (timer && typeof timer.unref === 'function') timer.unref()
+    })
+    const cap = await Promise.race([_captureStableTabId(ctx.tab_id), capped])
+    if (timer) clearTimeout(timer)
+    if (out && typeof out === 'object') {
+      out.stable_tab_id = (cap && cap.ok) ? cap.tabId : null
+      out.stable_tab_id_reason = (cap && (cap.reason || cap.via)) || null
+    }
+  } catch (e) { /* advisory only: a missed capture degrades to the legacy ladder */ }
+  return out
 }
 
 // ── kill_worker (conductor-callable HARD stop) ───────────────────────────
@@ -2180,7 +2456,31 @@ async function kill_worker(params, ctx) {
   // chat), the conductor-label belt protects the conductor, and only a POSITIVE
   // strategy closes. Not uniquely resolvable -> fall through to cowork.kill_worker
   // unchanged. Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
+  // Tier -1 (2026-08-29): the bridge's STABLE tab id, same resolver close_my_tab
+  // uses, and TERMINAL in the same way. guardCtx is {} here, not GUARD_SELF_CLOSE:
+  // a conductor-driven kill keeps the active-tab belt, so a focused tab is never
+  // closed out from under whoever is looking at it.
+  let stableSettled = false
   if (conductorRow && conductorRow.ide_bridge_port) {
+    try {
+      const st = await _resolveStableIdCloseTarget(target_tab_id, conductorRow.ide_bridge_port)
+      if (st.refused) {
+        stableSettled = true
+        refused = st.refused
+        strategy = 'refused:' + st.refused
+      } else if (st.tab) {
+        stableSettled = true
+        const res = await _closeStableIdTarget(st, conductorRow, {})
+        closed = res.closed
+        strategy = res.strategy
+        if (!closed) refused = res.refused
+      }
+    } catch (e) {
+      try { const w0 = loadWorkerRegistry(target_tab_id); if (w0 && w0.tab_handle && w0.tab_handle.tabId) { stableSettled = true; refused = 'stable_id_threw:' + ((e && e.message) || String(e)) } } catch (e2) {}
+    }
+  }
+
+  if (!stableSettled && conductorRow && conductorRow.ide_bridge_port) {
     try {
       const anchorTarget = await _resolveWorkerAnchorCloseTarget(target_tab_id, conductorRow.ide_bridge_port)
       if (anchorTarget) {
@@ -2191,7 +2491,7 @@ async function kill_worker(params, ctx) {
     } catch (e) { /* fall through to cowork delegation */ }
   }
 
-  if (!closed) try {
+  if (!closed && !stableSettled) try {
     const cowork = require('./cowork')
     const res = await cowork.kill_worker({ tab_id: target_tab_id })
     closed = !!(res && res.closed)
@@ -2756,6 +3056,11 @@ module.exports = {
   _recentActiveSession: _recentActiveSession,
   _resolveWorkerAnchorCloseTarget: _resolveWorkerAnchorCloseTarget,
   _closeAnchorTarget: _closeAnchorTarget,
+  // Stable IDE tab id (2026-08-29): capture at bind, resolve at close.
+  _captureStableTabId: _captureStableTabId,
+  _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
+  _liveCcTabsWithIds: _liveCcTabsWithIds,
+  _claimedStableTabIds: _claimedStableTabIds,
   _allSessionAnchors: _allSessionAnchors,
   _freshAnchors: _freshAnchors,
   _canonicalAddress: _canonicalAddress,

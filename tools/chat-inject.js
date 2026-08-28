@@ -87,6 +87,12 @@ async function listChatTabs() {
       const vt = t.viewType || (t.input && t.input.viewType) || null
       if (vt !== CC_VIEW_TYPE) return
       tabs.push({
+        // The bridge's stable per-tab id (ttab_...), minted and reconciled by
+        // ide-bridge.assignStableTabIds so it survives a retitle AND a reorder.
+        // It is the only handle in this object that a recurring cron cannot
+        // collide: label, index and any fingerprint of the brief are identical
+        // across two fires of one scheduled row. null on a pre-2026-08-23 bridge.
+        tabId: t.tabId || null,
         label: t.label,
         viewColumn: viewColumn != null ? viewColumn : 1,
         index: typeof t.index === 'number' ? t.index : i,
