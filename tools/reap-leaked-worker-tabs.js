@@ -92,7 +92,28 @@ function allWorkerAnchors() {
   return out
 }
 
-;(async () => {
+// RUN ONLY WHEN INVOKED DIRECTLY (2026-08-29, live P0).
+//
+// index.js autoloads EVERY .js in tools/ (lib/tool-autoload.js), and its skip
+// regex covers test harness names only. This file exports nothing and is a
+// top-level async IIFE ending in process.exit(0) on its default dry-run path, so
+// merely requiring it RAN it and then killed the host process with a clean exit
+// code. launchd (KeepAlive, ThrottleInterval=10) respawned every 10s forever:
+// the agent booted, printed the full tool list, printed this reaper's dry-run
+// JSON, exited 0, repeat. 92 runs, no scheduler, no dispatch, no coord server.
+//
+// It was a delayed-action landmine. The running agent had booted BEFORE this
+// file was added to tools/, so it held a module set that never contained it and
+// stayed healthy for hours. Nothing detonated until the next restart, which made
+// the restart look like the cause and this file look innocent.
+//
+// A one-shot CLI script dropped into an autoloaded directory is a boot-time
+// hazard, and self-executing plus process.exit makes it a fatal one. The
+// require.main guard is the fix at the source: direct `node tools/reap-leaked-
+// worker-tabs.js` is unchanged, and a require is inert.
+if (require.main === module) main()
+
+async function main() {
   const report = {
     at: new Date().toISOString(),
     mode: APPLY ? 'apply' : 'dry-run',
@@ -235,4 +256,13 @@ function allWorkerAnchors() {
   report.closed_count = report.closed.length
   report.failed_count = report.failed.length
   console.log(JSON.stringify(report, null, 2))
-})().catch((e) => { console.error('THREW: ' + ((e && e.stack) || e)); process.exit(1) })
+}
+
+// Kept identical to the prior tail: a throw still reports and exits non-zero,
+// but only on the direct-invocation path above.
+if (require.main === module) {
+  process.on('unhandledRejection', (e) => {
+    console.error('THREW: ' + ((e && e.stack) || e))
+    process.exit(1)
+  })
+}
