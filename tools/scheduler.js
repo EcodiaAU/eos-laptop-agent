@@ -3548,6 +3548,31 @@ exports.start = function start() {
     }
   }, STALE_LEASE_INTERVAL_MS)
 
+  // 2026-08-28 R1. The inbox retirement sweep, in-process on an hourly timer.
+  // It is deliberately NOT a scheduled cron row: a cron row costs a dispatched
+  // tab and a model turn to run a pure bookkeeping pass, and the last drain
+  // (2026-07-21) was a hand-run one-off precisely because nothing owned it. The
+  // whole point of this fix is that retirement is a mechanism, not an errand.
+  // Attention is digested weekly-equivalent (anything past 7 days) so a stale
+  // escalation lands in a file and a pointer rather than sitting unread forever.
+  const retireInterval = setInterval(async () => {
+    try {
+      const retire = require('./coord-retire')
+      const r = await retire.sweep({})
+      if (r.retired) {
+        process.stderr.write('[scheduler] coord-retire.sweep: retired=' + r.retired +
+          ' remaining=' + r.unseen_after + '\n')
+      }
+      const d = await retire.digest({ older_than_days: 7 })
+      if (d.digested) {
+        process.stderr.write('[scheduler] coord-retire.digest: digested=' + d.digested +
+          ' -> ' + d.digest_file + '\n')
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] coord-retire error: ' + e.message + '\n')
+    }
+  }, 60 * 60 * 1000)
+
   // Usage-cap observer.
   const capObserverInterval = setInterval(async () => {
     try {
