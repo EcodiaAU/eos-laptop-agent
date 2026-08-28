@@ -1203,7 +1203,7 @@ exports.markFailed = async function markFailed(row, err) {
   // coord is unreachable), so a coord outage preserves the previous behaviour
   // rather than leaking every tree.
   try {
-    const liveWorker = await hasLiveWorkerForTask(String(row.id))
+    const liveWorker = await hasLiveWorkerForTask(String(row.id), PROTECT_LIVE_WORKERS)  // a prune is never urgent; skipping one leaks a dir reapOrphanWorktrees collects
     if (liveWorker) {
       process.stderr.write(
         '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
@@ -2319,7 +2319,72 @@ exports.completionPass = async function completionPass() {
 // dead and let the scheduler thunder-herd the same row.
 const STALE_WORKER_LIVENESS_MS = 180_000
 
-async function hasLiveWorkerForTask(taskId) {
+// Passed by the call sites that DESTROY work (prune a worktree, kill a tab), so a
+// coord-silent worker gets a second chance to be found alive from transcript
+// mtime. Frozen: it is shared across call sites and must stay a constant.
+// The two sites that deliberately do NOT pass it, and why, are documented on
+// hasLiveWorkerForTask.
+const PROTECT_LIVE_WORKERS = Object.freeze({ transcriptFallback: true })
+
+// 2026-08-29 (status_board 8d28c32d, P1). A SECOND CHANCE TO FIND THE WORKER
+// ALIVE, from a signal the worker cannot forget to send.
+//
+// The coord heartbeat below was this gate's ONLY liveness signal, and it is wrong
+// in the unsafe direction. Measured: 78 of 114 coord worker rows carry
+// last_heartbeat_at EXACTLY equal to registered_at. They beat once at boot and
+// never again, so 68.4 pct of workers go invisible here 180 seconds after they
+// start. The gate then answers "no live worker" for a worker that is running, and
+// four of its six call sites act on that by rm -rf'ing the worker's isolated
+// worktree (pruneWorktreeForRow) with its uncommitted work inside.
+// Proven instance 2026-08-28: cron row f0c904df (status-board-execute-top) took
+// 'running orphan-timeout' at 18:41Z while its tab tab_1787940597108_afd2c194 ran
+// on until 18:44:56Z. 55 cron rows carry that last_error, 37 of them live.
+//
+// The right oracle was already in the repo and already used ONE FUNCTION AWAY:
+// livenessReapPass reads tools/worker-liveness.js, which derives a verdict from
+// transcript mtime, a file the Claude Code harness writes every turn with no
+// cooperation from the model, with a worktree-mtime fallback. That function's own
+// header argues this about hasLiveWorkerForTask BY NAME ("a signal that wrong in
+// the unsafe direction cannot be the thing that decides to kill a worker"). The
+// judgement was written and never applied to the gate that destroys.
+//
+// SEMANTICS. The oracle can only ever find a worker ALIVE. It is never a new
+// reason to kill one:
+//   coord says live                 -> live, unchanged.
+//   coord silent / stale / down     -> ask the oracle.
+//       'live'    -> live, refuse the reclaim.
+//       'unknown' -> live, refuse the reclaim. Not-reaping is always the safe
+//                    direction on a gate whose false negative deletes work, and
+//                    the refusal is BOUNDED: a genuinely dead worker ages past
+//                    worker-liveness DEFAULT_CONFIRM_WINDOW_MIN and reads 'dead'.
+//       'dead'    -> fall through, the reclaim proceeds exactly as today.
+//   probe throws                    -> refuse, and say why on stderr.
+//
+// OPT-IN, and the two call sites deliberately left OUT. Default off, so any
+// caller not passing transcriptFallback is byte-identical to before.
+//   ON  markFailed, staleLeaseRecovery 2a, 2b and 3: every one of these prunes a
+//       worktree or kills a tab, so a false 'dead' destroys work. Skipping a
+//       prune only leaks a directory that reapOrphanWorktrees later collects.
+//   OFF dispatchOne's double-spawn guard: it ADOPTS the found worker as running
+//       instead of spawning. Its row carries a FRESH leased_at and the PREVIOUS
+//       fire's dispatched_tab_id, so the oracle reads the boot race and answers
+//       'unknown' on every fire. Worse, transcript mtime persists for the whole
+//       window after a tab closes, and a cron's row id IS its task id, so a fire
+//       that just ended reads 'live' for the next fire of the same row. Either
+//       way the scheduler would adopt a dead tab and never spawn, wedging every
+//       cron. That contamination is also why no registry ownership check helps:
+//       fires of one cron share the task id, so the registry cannot tell them
+//       apart.
+//   OFF staleLeaseRecovery branch 1: pure recovery, no prune and no kill, so
+//       there is no work to protect and refusing only delays a re-dispatch.
+//
+// COORD UNREACHABLE. The old catch returned null (fail open) so a coord outage
+// could not block stale-lease recovery. The oracle now runs in that catch too at
+// the enabled callers: it reads local disk and does not depend on coord, and an
+// outage is exactly when a blind rm -rf is least defensible. Recovery is still
+// not blocked, because 'dead' and the no-tab-id case both fall through.
+async function hasLiveWorkerForTask(taskId, opts) {
+  opts = opts || {}
   try {
     // include_dead:true is REQUIRED, and dropping the w.dead test with it.
     // coord.list_workers defaults include_dead=false and filters server-side on
@@ -2342,14 +2407,78 @@ async function hasLiveWorkerForTask(taskId) {
       if (typeof w.stale_ms === 'number' && w.stale_ms >= STALE_WORKER_LIVENESS_MS) continue
       return w
     }
-    return null
   } catch (e) {
-    // Fail-open: if coord is unreachable, do not block stale-lease recovery.
-    // A stuck recovery loop is worse than a single thundering-herd re-dispatch.
+    // Coord unreachable. Do not block stale-lease recovery on it (see COORD
+    // UNREACHABLE above); the transcript oracle below still gets its say.
     process.stderr.write('[scheduler] hasLiveWorkerForTask coord error for ' + taskId + ': ' + e.message + '\n')
-    return null
+  }
+  return await transcriptLivenessFallback(taskId, opts)
+}
+
+// liveTabs walks the transcript tree (measured 0.17s in worker-liveness's own
+// header). The orphan sweep can ask about tens of rows inside one pass, so memo
+// the map for a few seconds rather than re-walking it per row. The TTL is far
+// shorter than every window the oracle reasons about (boot grace 10min, live
+// window 30min), so memoising cannot change a verdict.
+let _liveTabsMemo = null
+const LIVE_TABS_MEMO_MS = 15_000
+exports._resetLiveTabsMemo = function () { _liveTabsMemo = null }
+
+async function transcriptLivenessFallback(taskId, opts) {
+  if (!opts || !opts.transcriptFallback) return null
+  try {
+    // Fetch the row HERE rather than trusting the caller's. Branch 3's own SELECT
+    // is (id, dispatched_tab_id, type, cron_expression, tz) with NO leased_at, and
+    // probeRows reads a null leased_at as the boot race and answers 'unknown'
+    // forever. Fetching keeps every caller's SELECT untouched and makes the four
+    // enabled sites behave identically.
+    const res = await getPool().query(
+      `SELECT id, name, leased_at, dispatched_tab_id FROM os_scheduled_tasks WHERE id = $1`,
+      [taskId]
+    )
+    const row = res && res.rows && res.rows[0]
+    if (!row) return null
+
+    // NO TAB ID, NO KEY. probeRows answers 'unknown' for a row carrying no
+    // dispatched_tab_id, and that verdict can NEVER change: it is an absence, not
+    // a margin. Refusing on it would wedge this row's only reclaim path forever,
+    // and a verdict that cannot change is not a safety margin. This is the one
+    // deliberate deviation from treating every 'unknown' as live. Nothing is lost:
+    // coord keys on task_id rather than tab, so it already covers these rows.
+    if (!row.dispatched_tab_id) return null
+
+    const liveness = opts.liveness || require('./worker-liveness')
+    const windowMin = typeof opts.window_minutes === 'number'
+      ? opts.window_minutes : liveness.DEFAULT_WINDOW_MIN
+    const now = Date.now()
+    if (!_liveTabsMemo || _liveTabsMemo.windowMin !== windowMin ||
+        (now - _liveTabsMemo.at) >= LIVE_TABS_MEMO_MS) {
+      _liveTabsMemo = { at: now, windowMin, map: liveness.liveTabs(windowMin) }
+    }
+    const v = liveness.probeRows([row], Object.assign({}, opts, { live_tabs: _liveTabsMemo.map }))[0]
+    if (!v || v.verdict === 'dead') return null
+
+    process.stderr.write(
+      '[scheduler] task ' + taskId + ' coord-silent but transcript oracle says ' + v.verdict +
+      ' (' + v.reason + '); refusing the reclaim so its worktree is not destroyed\n')
+    return {
+      task_id: taskId,
+      tab_id: row.dispatched_tab_id,
+      source: 'transcript-mtime',
+      verdict: v.verdict,
+      reason: v.reason,
+      evidence: v.evidence,
+    }
+  } catch (e) {
+    // A probe failure is not evidence of death. Refuse, and say why.
+    process.stderr.write('[scheduler] hasLiveWorkerForTask transcript probe error for ' + taskId +
+      ' (refusing the reclaim, which is the safe direction): ' + e.message + '\n')
+    return { task_id: taskId, tab_id: null, source: 'transcript-probe-error',
+      verdict: 'unknown', reason: 'probe error: ' + e.message }
   }
 }
+
+exports._hasLiveWorkerForTask = hasLiveWorkerForTask
 
 exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   const pool = getPool()
@@ -2392,7 +2521,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
         ' is in-flight in this process, skipping stale-lease retry reclaim\n')
       continue
     }
-    const liveWorker = await hasLiveWorkerForTask(row.id)
+    const liveWorker = await hasLiveWorkerForTask(row.id)  // NOT protected: pure recovery, no prune and no kill_worker
     if (liveWorker) {
       process.stderr.write(
         '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
@@ -2443,7 +2572,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
         ' is in-flight in this process, skipping stale-lease cron-defer\n')
       continue
     }
-    const liveWorker = await hasLiveWorkerForTask(row.id)
+    const liveWorker = await hasLiveWorkerForTask(row.id, PROTECT_LIVE_WORKERS)  // this branch prunes the worktree below
     if (liveWorker) {
       process.stderr.write(
         '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
@@ -2492,7 +2621,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
         ' is in-flight in this process, skipping stale-lease fail\n')
       continue
     }
-    const liveWorker = await hasLiveWorkerForTask(row.id)
+    const liveWorker = await hasLiveWorkerForTask(row.id, PROTECT_LIVE_WORKERS)  // this branch prunes the worktree below
     if (liveWorker) {
       process.stderr.write(
         '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
@@ -2565,7 +2694,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     // Doctrine: [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]] -
     // a guard wired into N parallel branches must cover ALL branches of the
     // same routine.
-    const liveWorker = await hasLiveWorkerForTask(row.id)
+    const liveWorker = await hasLiveWorkerForTask(row.id, PROTECT_LIVE_WORKERS)  // THE 30min cron reclaim: kill_worker + prune. status_board 8d28c32d
     if (liveWorker) {
       process.stderr.write(
         '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
