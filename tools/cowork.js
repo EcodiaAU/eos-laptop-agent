@@ -373,13 +373,10 @@ async function dispatch_worker(params) {
   // recorded on the worker row so a later `to:"conductor"` send from the worker
   // resolves to that chat rather than the shared singleton slot.
   // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+  // EXPLICIT ONLY - see the note in mac-dispatcher.dispatch_worker. A
+  // most-recently-active fallback would adopt an unrelated chat as the parent
+  // whenever the dispatch is not driven by a chat taking a turn right now.
   let parent_session = params.parent_session || null
-  if (!parent_session) {
-    try {
-      const coord = require('./coord')
-      parent_session = (coord._recentActiveSession && coord._recentActiveSession()) || null
-    } catch (e) {}
-  }
 
   if (!brief_body) throw new Error('brief required')
 

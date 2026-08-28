@@ -56,6 +56,23 @@ for (const [modName, modPath] of [['mac-dispatcher', './mac-dispatcher'], ['cowo
     noParent.indexOf('conductor="chat.conductor.inbox"') !== -1, noParent.slice(0, 400))
 }
 
+// --- parent_session must be EXPLICIT-only, never inferred ------------------
+// The most-recently-active chat is NOT the dispatcher for a scheduler-leased
+// row: that row was armed minutes or hours earlier, so at lease time the
+// recently-active chat is whoever is typing now. Binding it would silently
+// adopt an unrelated chat as a worker's parent, which is the same defect this
+// field exists to close. This asserts the source text, because the failure is
+// a future edit reaching for the convenient fallback, not a runtime branch.
+const fsrc = require('fs')
+for (const [name, file] of [['mac-dispatcher', 'mac-dispatcher.js'], ['cowork', 'cowork.js']]) {
+  const src = fsrc.readFileSync(path.join(__dirname, file), 'utf8')
+  // find the parent_session assignment line(s), ignoring comments
+  const assigns = src.split('\n').filter((l) => /^\s*(const|let)\s+parent_session\s*=/.test(l))
+  ok(name + ': assigns parent_session exactly once', assigns.length === 1, assigns)
+  ok(name + ': parent_session is not derived from _recentActiveSession',
+    assigns.length === 1 && assigns[0].indexOf('_recentActiveSession') === -1, assigns[0])
+}
+
 console.log('\n' + passed + ' passed, ' + failed + ' failed')
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }) } catch (e) {}
 process.exit(failed ? 1 : 0)

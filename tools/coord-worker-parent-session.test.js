@@ -102,6 +102,24 @@ async function main() {
   ok('terminated worker does not rewrite (its parent claim is stale)',
     r4.to_address === 'chat.conductor.inbox' && !r4.parent_rewrite, r4.to_address)
 
+  // --- case 4b: resolve_only must report the SAME address the send would use --
+  // A dry-run that answers a different question than the real send is worse than
+  // no dry-run. Caught live 2026-08-28: the rewrite sat BELOW the resolve_only
+  // early return, so `resolve_only` told a worker its `conductor` message would
+  // go to chat.conductor.inbox while the real send rewrote it to the parent.
+  const dry = await coord.message_chat(
+    { to: 'conductor', text: 'x', resolve_only: true },
+    { tab_id: 'tab_parent_known' }
+  )
+  const wet = await coord.message_chat(
+    { to: 'conductor', text: 'x' },
+    { tab_id: 'tab_parent_known' }
+  )
+  ok('resolve_only reports the parent address, not the pre-rewrite slot',
+    dry.would_send_to === 'chat.session:' + PARENT + '.inbox', dry.would_send_to)
+  ok('resolve_only agrees with the real send',
+    dry.would_send_to === wet.to_address, { dry: dry.would_send_to, wet: wet.to_address })
+
   // --- case 5: an explicit session: target is never overridden ---------------
   const r5 = await coord.message_chat(
     { to: 'session:' + SLOT_HOLDER, text: 'deliberately to that chat' },

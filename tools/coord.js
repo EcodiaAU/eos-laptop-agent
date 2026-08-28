@@ -1415,18 +1415,6 @@ async function message_chat(params, ctx) {
       }
     }
   }
-  if (resolveOnly) {
-    return {
-      ok: true,
-      resolve_only: true,
-      would_send_to: to_address,
-      resolved_by: resolved_by,
-      name: resolvedTarget ? (resolvedTarget.name || null) : null,
-      matched_label: resolvedTarget && resolvedTarget.target ? resolvedTarget.target.label : null,
-      score: resolvedTarget ? (resolvedTarget.score || null) : null,
-      to: params.to,
-    }
-  }
   // WORKER -> `conductor` REWRITE (2026-08-28). `conductor` is a SINGLE global
   // slot that EVERY non-worker chat's turn-start heartbeat overwrites with its
   // own label, so it does not mean "the chat that dispatched me", it means
@@ -1458,6 +1446,22 @@ async function message_chat(params, ctx) {
       } else {
         parent_rewrite = { was: to_address, now: to_address, reason: 'worker_parent_unknown_queue_only' }
       }
+    }
+  }
+  if (resolveOnly) {
+    return {
+      ok: true,
+      resolve_only: true,
+      would_send_to: to_address,
+      // A dry-run that hid the worker-parent rewrite would answer a different
+      // question than the real send, which is the one thing resolve_only exists
+      // to prevent. Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+      parent_rewrite: parent_rewrite || undefined,
+      resolved_by: resolved_by,
+      name: resolvedTarget ? (resolvedTarget.name || null) : null,
+      matched_label: resolvedTarget && resolvedTarget.target ? resolvedTarget.target.label : null,
+      score: resolvedTarget ? (resolvedTarget.score || null) : null,
+      to: params.to,
     }
   }
   const reply_to_address = params.from_address || (ctx.tab_id ? addressForWorker(ctx.tab_id) : addressForConductor())

@@ -331,6 +331,15 @@ async function dispatch_worker(params) {
     const m = brief_body.match(/^\s*REPORT-BACK:\s*(.+?)\s*$/mi)
     if (m) report_back = m[1].trim()
   }
+  // Captured BEFORE the branch below, which rewrites an `origin|parent|self|
+  // conductor` directive into a session address derived from _recentActiveSession.
+  // parent_session must NOT inherit that: for a scheduler-leased row the recently-
+  // active chat is whoever is typing at LEASE time, not whoever armed the row, and
+  // adopting it would make an unrelated chat the worker's parent. Only a directive
+  // that NAMED a session counts as an explicit parent.
+  const rbExplicitSession = (report_back && /^\s*session:/i.test(String(report_back)))
+    ? String(report_back).trim().slice('session:'.length)
+    : null
   if (report_back) {
     const rb = String(report_back).trim()
     if (/^none$/i.test(rb)) {
@@ -359,21 +368,19 @@ async function dispatch_worker(params) {
 
   // parent_session (2026-08-28): the stable session_id of the chat DISPATCHING
   // this worker, recorded on the worker row so a later ad-hoc `to:"conductor"`
-  // send resolves to that chat instead of the shared singleton slot (which every
-  // chat's turn-start heartbeat overwrites). Prefer the already-resolved
-  // report_back target; otherwise the most-recently-anchored chat, which at
-  // dispatch time is the dispatcher by construction.
-  // Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
-  let parent_session = null
-  if (report_back && /^session:/i.test(String(report_back))) {
-    parent_session = String(report_back).slice('session:'.length)
-  }
-  if (!parent_session) {
-    try {
-      const coord = require('./coord')
-      parent_session = (coord._recentActiveSession && coord._recentActiveSession()) || null
-    } catch (e) {}
-  }
+  // send resolves to that chat instead of the shared singleton slot that every
+  // chat's turn-start heartbeat overwrites.
+  //
+  // EXPLICIT SOURCES ONLY: a caller-passed session, or a REPORT-BACK directive
+  // that NAMED one. The tempting fallback - "the most-recently-active anchored
+  // chat is the dispatcher" - is false for the population that dominates this
+  // dispatcher: a scheduler-leased row was armed minutes or hours earlier, so
+  // the recently-active chat at LEASE time is whoever is typing now. Adopting it
+  // would reintroduce the exact defect this field closes, one layer down. No
+  // explicit parent means null, and null means the worker's `conductor` sends
+  // QUEUE to the durable inbox. Late and correct beats prompt and wrong.
+  // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+  const parent_session = params.parent_session || rbExplicitSession || null
 
   if (!brief_body) throw new Error('brief required')
   ensureDirs()
