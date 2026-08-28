@@ -8,6 +8,13 @@
 
 'use strict'
 
+// 2026-08-28 lane R1 item 2. The bind wait polls the row until bound_at or
+// done_at appears, defaulting to a 600s budget. A test that deliberately never
+// binds would hold that budget, so bound it here. This MUST run before
+// require('./scheduler'): the constant is read once at module load.
+process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS =
+  process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS || '2500'
+
 let passed = 0
 let failed = 0
 const tests = []  // array of { name, fn } - run sequentially
@@ -43,12 +50,36 @@ function makeRow(overrides) {
   }, overrides)
 }
 
-function makeStubPool(rowsForSelect) {
+// opts.lifecycle models what the bind-wait SELECT reads back from the row.
+// Default: bound immediately, which is the happy path. Pass null to model a
+// worker that never signals (the wait then runs its bounded budget and the
+// dispatch proceeds unbound, exactly as production does). Pass
+// { done_at, done_status, ... } to model a fast worker that finished without
+// ever binding - the 2026-07-17 case.
+function makeStubPool(rowsForSelect, opts) {
+  opts = opts || {}
+  const lifecycle = Object.prototype.hasOwnProperty.call(opts, 'lifecycle')
+    ? opts.lifecycle
+    : { bound_at: new Date().toISOString(), bound_tab_id: 'tab_test_abc', done_at: null }
   const queries = []
   const pool = {
     _queries: queries,
     query(sql, params) {
       queries.push({ sql, params: params || [] })
+      // The bind-wait read. Answered from opts.lifecycle, NOT from
+      // rowsForSelect: a test seeding a due row for leaseDueRows must not
+      // accidentally also be answering the handshake.
+      if (/^\s*SELECT\s+bound_at/i.test(sql)) {
+        return Promise.resolve({ rows: lifecycle ? [lifecycle] : [], rowCount: lifecycle ? 1 : 0 })
+      }
+      // The dispatch claim: stamps this dispatch's tab and blanks the lifecycle
+      // slate. In production it matches the held dispatching row (rowCount 1).
+      // Model that, or dispatchOne correctly bails as lease-reclaimed and the
+      // running-flip never happens. makeReclaimBailPool returns 0 for every
+      // non-SELECT and is the variant that exercises the bail.
+      if (/UPDATE\s+os_scheduled_tasks\s+SET dispatched_tab_id = \$1, bound_at = NULL/i.test(sql)) {
+        return Promise.resolve({ rows: [], rowCount: 1 })
+      }
       if (sql.trim().toUpperCase().startsWith('SELECT') || sql.includes('RETURNING')) {
         return Promise.resolve({ rows: rowsForSelect || [], rowCount: (rowsForSelect || []).length })
       }
@@ -239,13 +270,19 @@ test('dispatchOne happy path: dispatches on the LIVE account (no rotate), row ->
     kill_worker: async () => {}
   })
 
-  // Stub coord.peek_inbox to return a bound signal immediately.
+  // 2026-08-28 lane R1 item 2. The bind signal is a COLUMN now, answered by the
+  // stub pool's lifecycle. These stubs are the NEGATIVE CONTROL: if dispatchOne
+  // still reads the coord bus for any part of the handshake, one of them fires
+  // and the assertion below fails. Without this leg the test would pass equally
+  // well against the old bus-reading code, which is the shape that lets a
+  // migration score itself green.
   const origPeekInbox = coordModule.peek_inbox
   const origReadInbox = coordModule.read_inbox
-  coordModule.peek_inbox = async () => ({
-    messages: [{ body: { type: 'bound', task_id: 'task-dispatch-happy' } }]
-  })
-  coordModule.read_inbox = async () => ({ messages: [] })
+  const origAck = coordModule.ack_message
+  let busTouched = []
+  coordModule.peek_inbox = async () => { busTouched.push('peek_inbox'); return { messages: [] } }
+  coordModule.read_inbox = async () => { busTouched.push('read_inbox'); return { messages: [] } }
+  coordModule.ack_message = async () => { busTouched.push('ack_message'); return {} }
 
   const row = makeRow({ id: 'task-dispatch-happy', preferred_account: 'code' })
 
@@ -269,6 +306,34 @@ test('dispatchOne happy path: dispatches on the LIVE account (no rotate), row ->
     runningUpdate && runningUpdate.params.includes('code'),
     'dispatchOne: actual_account=code (the live account) in UPDATE params'
   )
+  assert(
+    busTouched.length === 0,
+    'dispatchOne: reads NO coord inbox during the handshake (touched: ' + (busTouched.join(',') || 'nothing') + ')'
+  )
+
+  // The claim: this dispatch's tab is stamped and the lifecycle slate is blanked
+  // BEFORE the wait, because dispatched_tab_id is the predicate every worker
+  // signal is guarded on. If it lagged the wait, this dispatch's own bound would
+  // be refused and the previous fire's worker could still write.
+  const claim = pool._queries.find(q => /SET dispatched_tab_id = \$1, bound_at = NULL/.test(q.sql))
+  assert(!!claim, 'dispatchOne: claim UPDATE stamps dispatched_tab_id and clears the lifecycle columns')
+  assert(
+    claim && claim.sql.includes('done_at = NULL') && claim.sql.includes('progress_at = NULL') &&
+    claim.sql.includes('done_status = NULL') && claim.sql.includes('done_summary = NULL') &&
+    claim.sql.includes('done_pointer = NULL') && claim.sql.includes('bound_tab_id = NULL') &&
+    claim.sql.includes('progress_summary = NULL'),
+    'dispatchOne: claim clears ALL EIGHT lifecycle columns (a missed one is a stale signal that survives)'
+  )
+  assert(
+    claim && claim.params[0] === 'tab_test_abc',
+    'dispatchOne: claim stamps THIS dispatch tab id'
+  )
+  const claimIdx = pool._queries.findIndex(q => /SET dispatched_tab_id = \$1, bound_at = NULL/.test(q.sql))
+  const waitIdx = pool._queries.findIndex(q => /^\s*SELECT\s+bound_at/i.test(q.sql))
+  assert(
+    claimIdx >= 0 && waitIdx > claimIdx,
+    'dispatchOne: the claim is issued BEFORE the first bind-wait read (ordering is load-bearing)'
+  )
 
   // Restore.
   credsModule.pick_healthiest_account = origPick
@@ -276,6 +341,7 @@ test('dispatchOne happy path: dispatches on the LIVE account (no rotate), row ->
   credsModule.current_account = origCurrent
   coordModule.peek_inbox = origPeekInbox
   coordModule.read_inbox = origReadInbox
+  coordModule.ack_message = origAck
 })
 
 // ── 2026-06-21 dispatch-start reclaim guard: bail before spawn when lease lost ──
@@ -905,108 +971,131 @@ test('markComplete one_shot: sets status=completed', async () => {
   assert(!!completedUpdate, 'markComplete one_shot: status set to completed')
 })
 
-// ── 2026-06-18: completionPass scans seen+unseen, freshness-gated ─────────────
+// ── completionPass reads the ROW, not an inbox (2026-08-28, lane R1 item 2) ───
 //
-// Root-cause of the scheduler completion gap: completionPass used peek_inbox,
-// which only returns UNSEEN messages. The interactive conductor drains the same
-// chat.conductor.inbox via read_inbox and marks done signals seen within ~1s, so
-// completionPass lost the race and rows rotted in status=running. The fix scans
-// the full index (seen or unseen) via coord.scanTopicByType, gated on
-// created_at >= leased_at so a prior cron fire's stale done cannot complete a
-// fresh dispatch.
+// HISTORY, because these tests replace three that encoded the old contract.
+// completionPass used to call coord.scanTopicByType against chat.conductor.inbox
+// looking for a `done` message per running task_id. That existed because
+// peek_inbox only returns UNSEEN messages and the interactive conductor drains
+// the same inbox, marking a worker's done seen ~0.6s after it landed; the
+// scheduler lost the race and rows rotted at status=running until the 6h orphan
+// timer (2026-06-18). On top of that sat a freshness gate comparing the done's
+// created_at to leased_at with a 30s back-margin, because task_id equals the row
+// id and is stable across cron fires, so a days-old done could complete a fresh
+// dispatch (2026-07-08).
+//
+// Both are gone, and the deleted freshness test is NOT a lowered bar. Its
+// property is now enforced upstream and more strongly: dispatchOne clears
+// done_at at spawn, and a worker's write is refused unless dispatched_tab_id
+// still names its tab. A prior fire's done cannot be PRESENT to be filtered.
+// The tests below pin that, plus the one gate that survives (the unleased
+// phantom-completion guard, which is about the LEASE, not the signal).
 
-test('completionPass: fresh done (created_at >= leased_at) completes a running cron row', async () => {
-  const leasedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString()  // 1h ago
-  const doneAt = new Date(Date.now() - 30 * 1000).toISOString()         // 30s ago (after lease)
+test('completionPass: a running row carrying done_at completes (cron row rescheduled)', async () => {
   const runningRow = makeRow({
     id: 'task-comp-fresh',
     type: 'cron',
     cron_expression: '0 9 * * *',
     status: 'running',
-    leased_at: leasedAt,
-    dispatched_tab_id: null,
+    leased_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    dispatched_tab_id: 'tab_comp_fresh',
+    done_at: new Date(Date.now() - 30 * 1000).toISOString(),
+    done_status: 'success',
+    done_summary: 'ok',
   })
   const pool = makeStubPool([runningRow])
   scheduler._setPool(pool)
   scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
   scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
 
-  const origScan = coordModule.scanTopicByType
-  coordModule.scanTopicByType = () => new Map([
-    ['task-comp-fresh', { created_at: doneAt, body: { type: 'done', task_id: 'task-comp-fresh', status: 'success', result_summary: 'ok' } }],
-  ])
-
   await scheduler.completionPass()
 
   const rescheduled = pool._queries.find(q =>
     q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
   )
-  assert(!!rescheduled, 'completionPass fresh: running cron row rescheduled to active (loop closed)')
-
-  coordModule.scanTopicByType = origScan
+  assert(!!rescheduled, 'completionPass: running cron row rescheduled to active (loop closed)')
+  assert(
+    rescheduled && rescheduled.params.some(v => v === 'ok'),
+    'completionPass: done_summary reaches last_result (the column IS the signal now)'
+  )
   scheduler._resetWorktreeFns()
 })
 
-test('completionPass: stale done (created_at < leased_at) does NOT complete (freshness gate)', async () => {
-  const leasedAt = new Date(Date.now() - 60 * 1000).toISOString()        // leased 60s ago
-  const staleDoneAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()  // 3h-old done from a prior fire
+test('completionPass: done_status drives success-vs-failure, not the presence of done_at', async () => {
+  // 2026-06-09 regression class, re-pinned on the new surface. When status was
+  // dropped on the way to the inbox, EVERY signal_done was misclassified as a
+  // failure: 48 of 48 rows carried last_error and there were zero clean
+  // successes. done_status is its own column for exactly that reason, so a
+  // failure must still route through markFailed.
   const runningRow = makeRow({
-    id: 'task-comp-stale',
+    id: 'task-comp-failed',
     type: 'cron',
     cron_expression: '0 9 * * *',
     status: 'running',
-    leased_at: leasedAt,
-    dispatched_tab_id: null,
+    leased_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    dispatched_tab_id: 'tab_comp_failed',
+    done_at: new Date().toISOString(),
+    done_status: 'failed',
+    done_summary: 'the probe returned 500',
   })
   const pool = makeStubPool([runningRow])
   scheduler._setPool(pool)
   scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
   scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
 
-  const origScan = coordModule.scanTopicByType
-  coordModule.scanTopicByType = () => new Map([
-    ['task-comp-stale', { created_at: staleDoneAt, body: { type: 'done', task_id: 'task-comp-stale', status: 'success' } }],
-  ])
-
   await scheduler.completionPass()
 
-  const rescheduled = pool._queries.find(q =>
-    q.sql.includes("status = 'active'") && q.sql.includes('next_run_at')
+  const errored = pool._queries.find(q => q.sql.includes('last_error'))
+  assert(!!errored, 'completionPass: done_status=failed routes through markFailed (last_error written)')
+  assert(
+    errored && errored.params.some(v => typeof v === 'string' && v.indexOf('the probe returned 500') !== -1),
+    'completionPass: the failure summary survives into last_error'
   )
-  assert(!rescheduled, 'completionPass stale: prior-fire done ignored, row left running for its own worker')
-
-  coordModule.scanTopicByType = origScan
   scheduler._resetWorktreeFns()
 })
 
+test('completionPass: the SELECT itself filters on done_at IS NOT NULL', async () => {
+  // The detection is the query. A row with no completion is never read, so there
+  // is no per-row heuristic left that could mistake one signal for another. This
+  // asserts the SHAPE rather than an outcome, because with a stub pool the
+  // filter cannot be observed behaviourally, and an unfiltered SELECT plus a
+  // permissive stub would look identical to a correct one.
+  const pool = makeStubPool([])
+  scheduler._setPool(pool)
+  scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
+
+  await scheduler.completionPass()
+
+  const sel = pool._queries.find(q => q.sql.includes("status = 'running'") && q.sql.trim().toUpperCase().startsWith('SELECT'))
+  assert(!!sel, 'completionPass: issues its running-row SELECT')
+  assert(sel && /done_at IS NOT NULL/i.test(sel.sql),
+    'completionPass: SELECT is gated on done_at IS NOT NULL (detection lives in the query)')
+})
+
 test('completionPass: unleased running row (leased_at NULL) is NOT completed (phantom-completion guard)', async () => {
-  // A running row with no lease is a half-state, never a completable run. A
-  // matching done in the inbox must not flip it to completed with no worker
-  // having run this dispatch. 2026-07-08 phantom-completion-class guard.
-  const doneAt = new Date(Date.now() - 30 * 1000).toISOString()
+  // A running row with no lease is a recovery half-state, never a completable
+  // run: its lease was reclaimed by someone else. This guard is about the LEASE,
+  // not about signal identity, which is why it survives the migration intact.
+  // 2026-07-08 phantom-completion-class guard.
   const runningRow = makeRow({
     id: 'task-comp-unleased',
     type: 'delayed',
     status: 'running',
     leased_at: null,
-    dispatched_tab_id: null,
+    dispatched_tab_id: 'tab_comp_unleased',
+    done_at: new Date(Date.now() - 30 * 1000).toISOString(),
+    done_status: 'success',
+    done_summary: 'stale-or-phantom',
   })
   const pool = makeStubPool([runningRow])
   scheduler._setPool(pool)
   scheduler._setDispatcher({ kill_worker: async () => ({ closed: true }) })
   scheduler._setWorktreeFns({ allocate: async () => null, prune: async () => {} })
 
-  const origScan = coordModule.scanTopicByType
-  coordModule.scanTopicByType = () => new Map([
-    ['task-comp-unleased', { created_at: doneAt, body: { type: 'done', task_id: 'task-comp-unleased', status: 'success', result_summary: 'stale-or-phantom' } }],
-  ])
-
   await scheduler.completionPass()
 
   const completed = pool._queries.find(q => q.sql.includes("status = 'completed'"))
   assert(!completed, 'completionPass unleased: running row with NULL leased_at NOT flipped to completed')
-
-  coordModule.scanTopicByType = origScan
   scheduler._resetWorktreeFns()
 })
 
