@@ -1372,6 +1372,76 @@ exports.dispatchOne = async function dispatchOne(row) {
       }
     }
 
+    // 0a. CONDUCTOR CLAIM INTERLOCK (2026-08-28, lane R1 coord rebuild).
+    //
+    // The one duplication hole every other guard is blind to by construction.
+    // Migration 147's INSERT arm, the 148/149/150 revive arm and the 2026-08-28
+    // leaseDueRows NOT EXISTS defer all compare one ROW against another ROW. When
+    // the conductor arms a row and then does that same work on its own thread,
+    // there is no second row to compare against, so all of them stay silent.
+    //
+    // Measured on lane cowork.ecodiaos-lane-R1: row armed 06:16:01Z, tab opened
+    // 07:07:38Z, and inside that 51-minute launch lag the conductor landed five
+    // commits doing the dispatched job itself. The tab opened onto finished work.
+    //
+    // WHY HERE AND NOT IN leaseDueRows. The claim is normally stamped DURING the
+    // launch lag, which is to say AFTER the lease. A lease-time predicate cannot
+    // see a fact that does not exist yet. This is the fresh read under the
+    // launch-lock, the last point before a tab is spawned, so it is the only
+    // check that covers the window the incident actually happened in.
+    //
+    // DISPOSITION IS A TERMINAL SETTLE, NOT A PRE-SPAWN-BAIL. Releasing the lease
+    // back to 'active' is right for a SUPPRESSION, which lifts. A claim does not
+    // lift: the conductor is doing the work now, so the row would be re-leased and
+    // re-checked on every 30s poll forever. That spin is not hypothetical in this
+    // file (28,197 of 169,876 stderr lines from one row, 2026-08-26). The row
+    // settles terminal, and `result` names the claiming tab so the row reads in
+    // every audit as work-that-went-somewhere rather than work-that-vanished.
+    //
+    // FAILS OPEN, DELIBERATELY, IN ITS OWN QUERY. If the agent is restarted before
+    // migration 151 applies, these columns do not exist and this SELECT throws. It
+    // is kept OUT of the austerity guard's SELECT above so that failure can never
+    // take the austerity gate down with it, and the catch degrades to exactly
+    // today's behaviour with a loud line rather than killing every dispatch.
+    // Precedent: hasLiveWorkerForTask fails open the same way.
+    {
+      let claim = null
+      try {
+        const cr = await pool.query(
+          `SELECT claimed_by_tab_id, claimed_at FROM os_scheduled_tasks WHERE id = $1`,
+          [row.id]
+        )
+        claim = cr.rows[0] || null
+      } catch (e) {
+        process.stderr.write('[scheduler] dispatchOne: conductor-claim check UNAVAILABLE for ' +
+          row.id + ' (' + (row.name || '?') + ') - ' + e.message +
+          '; proceeding (migration 151 not applied?)\n')
+      }
+      if (claim && claim.claimed_by_tab_id) {
+        const claimedBy = String(claim.claimed_by_tab_id)
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'cancelled',
+               last_status = 'cancelled',
+               austerity_paused = false,
+               leased_by = NULL, leased_at = NULL,
+               result = $3,
+               updated_at = NOW()
+           WHERE id = $1
+             AND status = 'dispatching'
+             AND leased_by IS NOT DISTINCT FROM $2`,
+          [row.id, row.leased_by || null,
+           'claimed-by-conductor: ' + claimedBy + ' took this work onto its own thread at ' +
+           (claim.claimed_at ? new Date(claim.claimed_at).toISOString() : 'unknown time') +
+           '; no worker tab opened']
+        )
+        process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
+          (row.name || '?') + ') - conductor-claim interlock [claimed by ' + claimedBy +
+          ']; settled cancelled, no tab spawned\n')
+        return
+      }
+    }
+
     // 0b. Runaway circuit breaker (Hunter 4 #7, 2026-08-13). Two brakes CHECKED
     // under the launch-lock, BEFORE any cred pick / worktree / tab spawn, so a
     // runaway is stopped before it spends a single token. Like the austerity gate
