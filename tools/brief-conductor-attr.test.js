@@ -73,6 +73,26 @@ for (const [name, file] of [['mac-dispatcher', 'mac-dispatcher.js'], ['cowork', 
     assigns.length === 1 && assigns[0].indexOf('_recentActiveSession') === -1, assigns[0])
 }
 
+// --- a BARE report-back directive must not resolve to an inferred chat -------
+// `REPORT-BACK: conductor` used to resolve through _recentActiveSession. That is
+// only true when a chat arms a row and it fires at once; for a scheduler-leased
+// row the recently-active chat is whoever is typing at LEASE time. Proven live
+// 2026-08-28: worker 790d5247's whole verified-close was addressed to an
+// unrelated "Open my travel itinerary" chat. Neither dispatcher may infer a
+// report-back target from activity.
+{
+  const src = fsrc.readFileSync(path.join(__dirname, 'mac-dispatcher.js'), 'utf8')
+  // strip comments so the doctrine note explaining the removal does not pass as code
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !/^\s*\/\//.test(l)).join('\n')
+  ok('mac-dispatcher: no live call to _recentActiveSession remains',
+    code.indexOf('_recentActiveSession') === -1,
+    code.split('\n').filter((l) => l.indexOf('_recentActiveSession') !== -1))
+  ok('mac-dispatcher: a bare origin|parent|self|conductor directive disables report_back',
+    /\/\^\(origin\|parent\|self\|conductor\)\$\/i\.test\(rb\)\)\s*\{[\s\S]{0,80}?report_back = null/.test(code),
+    code.slice(code.indexOf('origin|parent|self|conductor'), code.indexOf('origin|parent|self|conductor') + 200))
+}
+
 console.log('\n' + passed + ' passed, ' + failed + ' failed')
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }) } catch (e) {}
 process.exit(failed ? 1 : 0)

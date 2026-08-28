@@ -331,12 +331,10 @@ async function dispatch_worker(params) {
     const m = brief_body.match(/^\s*REPORT-BACK:\s*(.+?)\s*$/mi)
     if (m) report_back = m[1].trim()
   }
-  // Captured BEFORE the branch below, which rewrites an `origin|parent|self|
-  // conductor` directive into a session address derived from _recentActiveSession.
-  // parent_session must NOT inherit that: for a scheduler-leased row the recently-
-  // active chat is whoever is typing at LEASE time, not whoever armed the row, and
-  // adopting it would make an unrelated chat the worker's parent. Only a directive
-  // that NAMED a session counts as an explicit parent.
+  // Captured BEFORE the branch below, which nulls a bare `origin|parent|self|
+  // conductor` directive. Only a directive that NAMED a session counts as an
+  // explicit parent; nothing here may infer one from which chat was recently
+  // active. Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
   const rbExplicitSession = (report_back && /^\s*session:/i.test(String(report_back)))
     ? String(report_back).trim().slice('session:'.length)
     : null
@@ -349,18 +347,27 @@ async function dispatch_worker(params) {
       // named its own stable session_id. Pass through verbatim.
       report_back = rb
     } else if (/^(origin|parent|self|conductor)$/i.test(rb)) {
-      // Default report-back: wake the chat that scheduled this. Resolve to the
-      // most-recently-active anchored chat (the one the user most recently typed
-      // in, which is almost always the dispatcher) as a session:<id> address. If
-      // no chat is anchored yet, DISABLE report-back (null) rather than fall back
-      // to the ambiguous shared conductor slot that caused the 2026-08-13 misroute.
-      // Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13.
-      let sess = null
-      try {
-        const coord = require('./coord')
-        sess = coord._recentActiveSession && coord._recentActiveSession()
-      } catch (e) {}
-      report_back = sess ? ('session:' + sess) : null
+      // A BARE `origin|parent|self|conductor` names no chat, and there is no
+      // honest way to infer one here.
+      //
+      // This used to resolve through _recentActiveSession, on the reasoning that
+      // the chat the user most recently typed in is the dispatcher. That is true
+      // only when a chat arms a row and it fires immediately. For a
+      // scheduler-leased row it is false, and the failure is not theoretical:
+      // on 2026-08-28 worker 790d5247 (current-cause lane M1 verify) was
+      // dispatched at 11:43 from a row armed earlier, the recently-active chat
+      // at that moment was "Open my travel itinerary", and the worker's entire
+      // verified-close was addressed to that unrelated chat. Same defect class
+      // as the `conductor` slot itself: an address inferred from "who was
+      // active" rather than bound to who actually dispatched.
+      //
+      // So a bare directive now DISABLES the report-back push. signal_done
+      // remains the durable record and the conductor-inbox peek still surfaces
+      // it. An author who wants the push writes `REPORT-BACK: session:<id>`
+      // with their own session id, which the dispatcher passes through verbatim
+      // and which cannot drift.
+      // Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
+      report_back = null
     } else {
       report_back = rb
     }
