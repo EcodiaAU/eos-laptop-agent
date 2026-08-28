@@ -1352,10 +1352,11 @@ test('start() schedules 6 setIntervals and returns an API-safe object', async ()
   global.setInterval = origSetInterval
   global.clearInterval = origClearInterval
 
-  assert(callCount === 6, 'start(): setInterval called 6 times (got ' + callCount + ')')
+  assert(callCount === 7, 'start(): setInterval called 7 times (got ' + callCount + ')')
   // API-safe return: plain object, no raw Timeout handles (would be circular over HTTP).
   assert(ret && ret.ok === true && ret.armed === true, 'start(): returns {ok:true, armed:true}')
-  assert(Array.isArray(ret.intervals) && ret.intervals.length === 6, 'start(): lists 6 interval names')
+  assert(Array.isArray(ret.intervals) && ret.intervals.length === 7, 'start(): lists 7 interval names')
+  assert(ret.intervals.includes('retire'), "start(): reports the 'retire' timer (04dd65d armed it without listing it)")
   JSON.stringify(ret)  // must not throw (the circular-JSON regression guard)
   // Handles stashed for the watchdog / callers that need them.
   assert(scheduler._intervals && scheduler._intervals.dispatchInterval, 'start(): stashes dispatchInterval on _intervals')

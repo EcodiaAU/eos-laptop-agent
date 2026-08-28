@@ -50,31 +50,53 @@ const ok = (c, l) => { c ? (pass++, console.log('  ok   ' + l)) : (fail++, conso
 const SRC = scheduler.dispatchOne.toString()
 const MARK = '0a. CONDUCTOR CLAIM INTERLOCK'
 const iMark = SRC.indexOf(MARK)
+// BOUND THE SEARCH TO THE INTERLOCK BLOCK (2026-08-28, lane R1).
+// The extractors used to scan from iMark to the end of dispatchOne. When the
+// deliberate-breakage control reverted the cron branch, the "cron defer" extractor
+// did not go null as intended - it walked past the interlock and matched a totally
+// unrelated later `UPDATE ... SET status = 'active'` in the same function, which
+// takes a different parameter count. The gate then died on a Postgres 08P01 bind
+// error instead of reporting a failed leg. An extractor that can wander outside the
+// block it is named for is testing something other than what it claims.
+const iEnd = (() => {
+  const e = SRC.indexOf('0b. Runaway circuit breaker', iMark < 0 ? 0 : iMark)
+  return e > -1 ? e : SRC.length
+})()
+const BLOCK = iMark < 0 ? '' : SRC.slice(iMark, iEnd)
 // Anchor on the STATEMENT TEXT, never on block position. Counting backtick
 // blocks broke the first time this ran, because the interlock's own comment
 // quotes a column name in backticks and shifted every index by two. An
 // extractor that can be fooled by a comment is not testing the shipped source.
-function shippedStatement(prefix) {
-  if (iMark < 0) return null
-  let i = iMark
+// The interlock now ships THREE dispositions, so selecting "the first UPDATE" would
+// silently test whichever one happens to be written first. Each is picked by the
+// content that makes it that branch.
+function shippedStatementWhere(prefix, pred) {
+  if (iMark < 0 || !BLOCK) return null
+  let i = 0
   for (;;) {
-    const a = SRC.indexOf('`', i); if (a < 0) return null
-    const b = SRC.indexOf('`', a + 1); if (b < 0) return null
-    const body = SRC.slice(a + 1, b)
-    if (body.trim().startsWith(prefix)) return body
+    const a = BLOCK.indexOf('`', i); if (a < 0) return null
+    const b = BLOCK.indexOf('`', a + 1); if (b < 0) return null
+    const body = BLOCK.slice(a + 1, b)
+    if (body.trim().startsWith(prefix) && pred(body)) return body
     i = b + 1
   }
 }
-const SEL_CLAIM = shippedStatement('SELECT claimed_by_tab_id')
-const UPD_SETTLE = shippedStatement('UPDATE os_scheduled_tasks')
+function shippedStatement(prefix) {
+  return shippedStatementWhere(prefix, () => true)
+}
+const SEL_CLAIM  = shippedStatement('SELECT claimed_by_tab_id')
+const UPD_CANCEL = shippedStatementWhere('UPDATE os_scheduled_tasks', b => /SET status = 'cancelled'/.test(b))
+const UPD_DEFER  = shippedStatementWhere('UPDATE os_scheduled_tasks', b => /SET status = 'active'/.test(b))
+const UPD_CLEAR  = shippedStatementWhere('UPDATE os_scheduled_tasks', b => /SET claimed_by_tab_id = NULL/.test(b))
+const UPD_SETTLE = UPD_CANCEL
 
 ;(async () => {
   // -- source legs: the interlock exists, precedes the spawn, settles terminal --
   ok(iMark > -1, 'S1. dispatchOne ships the conductor-claim interlock')
   ok(!!SEL_CLAIM && /claimed_by_tab_id/.test(SEL_CLAIM),
      'S2. the claim read is a real statement extracted from the shipped source')
-  ok(!!UPD_SETTLE && /SET status = 'cancelled'/.test(UPD_SETTLE),
-     'S3. the settle is a real statement extracted from the shipped source')
+  ok(!!UPD_CANCEL && /SET status = 'cancelled'/.test(UPD_CANCEL),
+     'S3. the one-shot terminal settle is a real statement extracted from the shipped source')
   ok(/catch \(e\)[\s\S]{0,400}conductor-claim check UNAVAILABLE/.test(SRC),
      'S4. the claim read fails OPEN in its own catch, so an unapplied migration 151 cannot kill every dispatch')
   {
@@ -82,8 +104,50 @@ const UPD_SETTLE = shippedStatement('UPDATE os_scheduled_tasks')
     ok(iMark > -1 && iSpawn > -1 && iMark < iSpawn,
        'S5. the interlock sits BEFORE the spawn, so a claimed row never reaches a tab')
   }
-  ok(!!UPD_SETTLE && !/SET status = 'active'/.test(UPD_SETTLE),
-     "S6. the disposition is a TERMINAL settle, not a release back to 'active' (which would spin every poll)")
+  ok(!!UPD_CANCEL && !/SET status = 'active'/.test(UPD_CANCEL),
+     "S6. the ONE-SHOT disposition is a TERMINAL settle, not a release back to 'active' (which would spin every poll)")
+  // S7-S10 added 2026-08-28 (lane R1). The first cut of this interlock had exactly
+  // one disposition - terminal cancel - applied to every row type. For a CRON row
+  // that is a permanent kill: leaseDueRows drops last_status IN ('paused','cancelled')
+  // and schedule_resume refuses anything not last_status='paused', so no exposed tool
+  // could revive it. Same family as the 2026-06-09 stranding of 23 corpus rows.
+  ok(!!UPD_DEFER && /SET status = 'active'/.test(UPD_DEFER) && /next_run_at/.test(UPD_DEFER),
+     'S7. a CRON disposition exists and DEFERS (status active + a recomputed next_run_at), rather than killing the cadence')
+  ok(!!UPD_DEFER && /last_status = NULL/.test(UPD_DEFER),
+     "S8. the cron defer clears last_status, so leaseDueRows' ('paused','cancelled') filter cannot strand it")
+  ok(/row\.type === 'cron'/.test(SRC) && /cron_expression/.test(SRC),
+     'S9. the branch is chosen by the row TYPE, so a one-shot still settles terminal and a cron never does')
+  ok(!!UPD_CLEAR && /claimed_at = NULL/.test(UPD_CLEAR) && /ORPHAN_TIMEOUT_MS/.test(SRC),
+     'S10. an ABANDONED claim (older than the orphan timeout) is cleared, so a dead conductor cannot suppress a row forever')
+
+  // A missing statement must FAIL, never THROW. When an extractor returns null the
+  // DB legs below would call pool.query(null) and the whole gate dies with a stack
+  // trace - and a crash and a refusal are both "non-zero exit with stderr", which is
+  // exactly how this lane's conductor-claim.cjs scored a crash as green on 2026-08-28.
+  // Guarding here means a deleted disposition is reported as the specific legs it
+  // breaks, with a real pass/fail count, instead of as an abort.
+  const MISSING = [
+    ['SELECT claimed_by_tab_id', SEL_CLAIM],
+    ["the one-shot cancel", UPD_CANCEL],
+    ["the cron defer", UPD_DEFER],
+    ["the abandoned-claim clear", UPD_CLEAR],
+  ].filter(([, v]) => !v).map(([k]) => k)
+  // Arity check. A statement that extracted but takes a different number of binds
+  // than the leg passes it produces a Postgres 08P01 protocol error mid-run, which
+  // reads as a crash rather than as a failed assertion.
+  const arity = (q) => { const m = String(q||'').match(/\$(\d+)/g) || []; return m.length ? Math.max(...m.map(x => +x.slice(1))) : 0 }
+  const ARITY = [['the one-shot cancel', UPD_CANCEL, 3], ['the cron defer', UPD_DEFER, 4], ['the abandoned-claim clear', UPD_CLEAR, 1]]
+  for (const [label, q, want] of ARITY) {
+    if (q && arity(q) !== want) MISSING.push(label + ' (extracted but takes $' + arity(q) + ', the leg binds ' + want + ')')
+  }
+  if (MISSING.length) {
+    for (const m of MISSING) ok(false, 'PRE. shipped statement missing from dispatchOne: ' + m)
+    console.log('')
+    console.log(pass + ' passed, ' + fail + ' failed')
+    console.log('ABORTING the database legs: they exercise the statements above, and running them')
+    console.log('with a null statement would crash rather than report. Fix the source and re-run.')
+    process.exit(1)
+  }
 
   const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 30000, max: 1 })
   const c = await pool.connect()
@@ -150,6 +214,80 @@ const UPD_SETTLE = shippedStatement('UPDATE os_scheduled_tasks')
     due = (await c.query(DUE, [[A, B, C]])).rows.map(r => r.id)
     ok(due.includes(C),
        'G8. the settled claim FREES the lane: a row armed on it afterwards leases normally')
+
+    // -- CRON legs (added 2026-08-28, lane R1) ---------------------------------
+    // The defect these exist for: the interlock cancelled every claimed row, and a
+    // cancelled CRON is unrecoverable by any exposed tool. Each leg below is paired
+    // with the control that separates "deferred correctly" from "broken in a way
+    // that happens to look quiet".
+    const mkCron = async (name, claim, claimAgeSql) => (await c.query(
+      `INSERT INTO os_scheduled_tasks (type,name,prompt,status,cron_expression,tz,next_run_at,claimed_by_tab_id,claimed_at)
+       VALUES ('cron',$1,'claim gate cron probe','active','*/5 * * * *','Australia/Brisbane',
+               NOW() - interval '1 minute',$2,
+               CASE WHEN $2::text IS NULL THEN NULL ELSE ${claimAgeSql} END)
+       RETURNING id`, [name, claim])).rows[0].id
+
+    const CR = await mkCron(LANE_A + '-cron-claimed', CLAIM_TAB, 'NOW()')
+    const CU = await mkCron(LANE_B + '-cron-control', null, 'NOW()')
+    const cronIds = [CR, CU]
+    let cdue = (await c.query(DUE, [cronIds])).rows.map(r => r.id)
+    ok(cdue.includes(CR) && cdue.includes(CU),
+       'C0. BASELINE: claimed and unclaimed CRON rows are BOTH due before the interlock runs')
+
+    await c.query(`UPDATE os_scheduled_tasks SET status='dispatching', leased_by=$2, leased_at=NOW()
+                    WHERE id = ANY($1::uuid[])`, [cronIds, 'gate-lease-cron'])
+
+    const nextIso = scheduler.computeNextRunAt({ cron_expression: '*/5 * * * *', tz: 'Australia/Brisbane' })
+    await c.query(UPD_DEFER, [CR, 'gate-lease-cron', nextIso,
+      'claimed-by-conductor: ' + CLAIM_TAB + ' took this occurrence onto its own thread; cron deferred'])
+    const cr = (await c.query(
+      'SELECT status,last_status,next_run_at,claimed_by_tab_id,result FROM os_scheduled_tasks WHERE id=$1', [CR])).rows[0]
+    ok(cr.status === 'active' && cr.last_status === null,
+       'C1. the claimed CRON is DEFERRED (active, last_status cleared), not terminally cancelled')
+    ok(new Date(cr.next_run_at).getTime() > Date.now(),
+       'C2. the deferred cron got a FUTURE next_run_at, so it skips this occurrence rather than spinning on the same one')
+    ok(cr.claimed_by_tab_id === CLAIM_TAB,
+       'C3. the claim is RETAINED across the defer, so a conductor arc spanning intervals keeps suppressing the tab')
+    cdue = (await c.query(DUE, [cronIds])).rows.map(r => r.id)
+    ok(!cdue.includes(CR),
+       'C4. RESIDUAL: the deferred cron is not due right now, so no tab opens for this occurrence')
+
+    // THE leg that would have caught the original defect. A terminally-cancelled
+    // cron also fails C4 - "not due now" is satisfied by a dead row just as well as
+    // by a deferred one. Survival is what separates them: wind next_run_at back and
+    // the row must return. A cancelled row never would.
+    await c.query(`UPDATE os_scheduled_tasks SET next_run_at = NOW() - interval '1 minute' WHERE id=$1`, [CR])
+    cdue = (await c.query(DUE, [cronIds])).rows.map(r => r.id)
+    ok(cdue.includes(CR),
+       'C5. POSITIVE CONTROL: the deferred cron IS leasable again at its next interval. The cadence survived the claim.')
+
+    const cu = (await c.query('SELECT status,result FROM os_scheduled_tasks WHERE id=$1', [CU])).rows[0]
+    ok(cu.status === 'dispatching' && !cu.result,
+       'C6. NEGATIVE CONTROL: the unclaimed cron is untouched by the interlock')
+
+    // Abandoned-claim escape hatch: nothing expires a claim, so a conductor that
+    // dies mid-arc would otherwise suppress this row for all time.
+    const CS = await mkCron(LANE_A + '-cron-stale', CLAIM_TAB, "NOW() - interval '7 hours'")
+    const stale = (await c.query(SEL_CLAIM, [CS])).rows[0]
+    ok(stale && (Date.now() - new Date(stale.claimed_at).getTime()) > 6 * 60 * 60 * 1000,
+       'C7. a 7h-old claim is past the 6h orphan bound the interlock treats as abandoned')
+    await c.query(UPD_CLEAR, [CS])
+    const cleared = (await c.query(SEL_CLAIM, [CS])).rows[0]
+    ok(cleared && !cleared.claimed_by_tab_id && !cleared.claimed_at,
+       'C8. the shipped clear statement actually releases an abandoned claim, so the row can dispatch again')
+
+    // schedule_resume must clear the claim, or a resume reports ok and changes nothing.
+    const RS = await mkCron(LANE_B + '-cron-resume', CLAIM_TAB, 'NOW()')
+    await c.query(`UPDATE os_scheduled_tasks SET last_status='paused', status='paused' WHERE id=$1`, [RS])
+    await c.query(`UPDATE os_scheduled_tasks
+                      SET last_status = NULL, next_run_at = $2,
+                          claimed_by_tab_id = NULL, claimed_at = NULL, updated_at = NOW()
+                    WHERE id = $1`, [RS, nextIso])
+    const rs = (await c.query('SELECT last_status,claimed_by_tab_id FROM os_scheduled_tasks WHERE id=$1', [RS])).rows[0]
+    ok(rs && rs.last_status === null && !rs.claimed_by_tab_id,
+       'C9. schedule_resume clears the conductor claim too, so a resumed row is not silently re-suppressed on its next fire')
+    ok(/claimed_by_tab_id = NULL, claimed_at = NULL/.test(scheduler.schedule_resume.toString()),
+       'C10. that clear is in the SHIPPED schedule_resume, not just in this probe')
   } finally {
     await c.query('ROLLBACK')
     c.release()

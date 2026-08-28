@@ -1419,26 +1419,89 @@ exports.dispatchOne = async function dispatchOne(row) {
       }
       if (claim && claim.claimed_by_tab_id) {
         const claimedBy = String(claim.claimed_by_tab_id)
-        await pool.query(
-          `UPDATE os_scheduled_tasks
-           SET status = 'cancelled',
-               last_status = 'cancelled',
-               austerity_paused = false,
-               leased_by = NULL, leased_at = NULL,
-               result = $3,
-               updated_at = NOW()
-           WHERE id = $1
-             AND status = 'dispatching'
-             AND leased_by IS NOT DISTINCT FROM $2`,
-          [row.id, row.leased_by || null,
-           'claimed-by-conductor: ' + claimedBy + ' took this work onto its own thread at ' +
-           (claim.claimed_at ? new Date(claim.claimed_at).toISOString() : 'unknown time') +
-           '; no worker tab opened']
-        )
-        process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
-          (row.name || '?') + ') - conductor-claim interlock [claimed by ' + claimedBy +
-          ']; settled cancelled, no tab spawned\n')
-        return
+        const claimedAtMs = claim.claimed_at ? new Date(claim.claimed_at).getTime() : null
+        const claimAgeMs = claimedAtMs ? (Date.now() - claimedAtMs) : null
+        const claimedAtIso = claimedAtMs ? new Date(claimedAtMs).toISOString() : 'unknown time'
+        const isCron = row.type === 'cron' && !!row.cron_expression
+
+        // 1. ABANDONED CLAIM. A claim is only ever released by hand
+        // (scripts/conductor-claim.cjs --release); nothing expires it. A conductor
+        // that claims a row and then dies - a crashed tab, a usage cap, a machine
+        // reboot - would otherwise suppress that row FOREVER, and for a cron that is
+        // a silent permanent death of a recurring job. Bounded by the same 6h the
+        // orphan sweep uses for a one-shot worker: past it, no conductor is still
+        // plausibly holding the work, so the claim is treated as abandoned, cleared,
+        // and the row dispatches normally. Fail-safe direction: the worst case is one
+        // duplicate arc after 6h, versus a job that never runs again.
+        if (claimAgeMs !== null && claimAgeMs > ORPHAN_TIMEOUT_MS) {
+          await pool.query(
+            `UPDATE os_scheduled_tasks
+             SET claimed_by_tab_id = NULL, claimed_at = NULL, updated_at = NOW()
+             WHERE id = $1`, [row.id]
+          )
+          process.stderr.write('[scheduler] dispatchOne: conductor-claim on ' + row.id + ' (' +
+            (row.name || '?') + ') is ABANDONED (claimed by ' + claimedBy + ' at ' + claimedAtIso +
+            ', age ' + Math.round(claimAgeMs / 60000) + 'min > ' +
+            Math.round(ORPHAN_TIMEOUT_MS / 60000) + 'min); cleared, dispatching normally\n')
+          // fall through to normal dispatch
+        } else if (isCron) {
+          // 2. CRON ROWS NEVER PERMANENTLY FAIL. Terminal-cancelling a cron here was
+          // a permanent kill: leaseDueRows excludes last_status IN ('paused','cancelled'),
+          // and schedule_resume refuses anything whose last_status is not 'paused', so a
+          // claimed cron could not be revived by ANY exposed scheduler tool. Same class as
+          // the 2026-06-09 incident that stranded 23 corpus rows, and as the quarantineRow
+          // status/last_status bug of 2026-08-26. Per
+          // [[scheduler-no-ide-defer-and-cron-rows-never-permanently-fail-2026-06-02]] a
+          // cron DEFERS to its next interval; only one-shot rows settle terminal. The claim
+          // is deliberately RETAINED so a conductor arc spanning several intervals keeps
+          // suppressing the tab (that suppression is the whole point of the interlock), and
+          // the abandoned-claim branch above is what stops retention becoming permanent.
+          let nextRunAt
+          try { nextRunAt = exports.computeNextRunAt(row) }
+          catch (e) { nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() }
+          await pool.query(
+            `UPDATE os_scheduled_tasks
+             SET status = 'active',
+                 last_status = NULL,
+                 next_run_at = $3,
+                 leased_by = NULL, leased_at = NULL,
+                 result = $4,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = 'dispatching'
+               AND leased_by IS NOT DISTINCT FROM $2`,
+            [row.id, row.leased_by || null, nextRunAt,
+             'claimed-by-conductor: ' + claimedBy + ' took this occurrence onto its own thread at ' +
+             claimedAtIso + '; no worker tab opened, cron deferred to ' + nextRunAt]
+          )
+          process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
+            (row.name || '?') + ') - conductor-claim interlock [claimed by ' + claimedBy +
+            ']; CRON DEFERRED to ' + nextRunAt + ' (claim retained, age ' +
+            (claimAgeMs === null ? '?' : Math.round(claimAgeMs / 60000) + 'min') +
+            '), no tab spawned\n')
+          return
+        } else {
+          // 3. ONE-SHOT. The conductor is doing this specific job; terminal is correct.
+          await pool.query(
+            `UPDATE os_scheduled_tasks
+             SET status = 'cancelled',
+                 last_status = 'cancelled',
+                 austerity_paused = false,
+                 leased_by = NULL, leased_at = NULL,
+                 result = $3,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = 'dispatching'
+               AND leased_by IS NOT DISTINCT FROM $2`,
+            [row.id, row.leased_by || null,
+             'claimed-by-conductor: ' + claimedBy + ' took this work onto its own thread at ' +
+             claimedAtIso + '; no worker tab opened']
+          )
+          process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' +
+            (row.name || '?') + ') - conductor-claim interlock [claimed by ' + claimedBy +
+            ']; settled cancelled, no tab spawned\n')
+          return
+        }
       }
     }
 
@@ -3109,9 +3172,16 @@ exports.schedule_resume = async function schedule_resume(params) {
   }
 
   const pool = getPool()
+  // Clears the conductor claim too (2026-08-28, lane R1). schedule_resume is the
+  // documented "un-stick this row" path, and a claim it left behind would have the
+  // dispatcher suppress the row again on the very next fire - a resume that reports
+  // ok:true and changes nothing observable. Same reasoning as the lease columns:
+  // whatever was holding the row is released here, or the resume is a lie.
   const result = await pool.query(
     `UPDATE os_scheduled_tasks
-     SET last_status = NULL, next_run_at = $2, updated_at = NOW()
+     SET last_status = NULL, next_run_at = $2,
+         claimed_by_tab_id = NULL, claimed_at = NULL,
+         updated_at = NOW()
      WHERE id = $1
      RETURNING id, name, next_run_at, updated_at`,
     [row.id, nextRunAt.toISOString()]
@@ -3690,10 +3760,20 @@ exports.start = function start() {
   if (capObserverInterval.unref) capObserverInterval.unref()
   if (cleanupOrphanInterval.unref) cleanupOrphanInterval.unref()
   if (watchdogInterval.unref) watchdogInterval.unref()
+  // 2026-08-28 (lane R1): retireInterval was armed by 04dd65d and then left out of
+  // all three of these. Un-unref'd it holds the event loop open so the process
+  // cannot exit; absent from exports._intervals neither the watchdog nor a test can
+  // see or clear it; absent from the returned list, introspection under-reports what
+  // is running. A seventh timer that no surface admits to is the shape of a leak
+  // nobody can find later. The count regression this caused (start() calls
+  // setInterval 7 times against an assertion of 6) sat undetected because the
+  // commit gate was reporting 34 fabricated failures at the time - see the trap
+  // note in scripts/run-tests.sh.
+  if (retireInterval.unref) retireInterval.unref()
 
   // Handles live on exports._intervals for the watchdog + tests. The API caller
   // gets a plain, serialisable object - returning the raw Timeout handles made
   // `scheduler.start` over HTTP throw "Converting circular structure to JSON".
-  exports._intervals = { dispatchInterval, completionInterval, staleInterval, capObserverInterval, cleanupOrphanInterval, watchdogInterval }
-  return { ok: true, armed: true, intervals: ['dispatch', 'completion', 'stale', 'capObserver', 'cleanupOrphan', 'watchdog'] }
+  exports._intervals = { dispatchInterval, completionInterval, staleInterval, capObserverInterval, cleanupOrphanInterval, watchdogInterval, retireInterval }
+  return { ok: true, armed: true, intervals: ['dispatch', 'completion', 'stale', 'capObserver', 'cleanupOrphan', 'watchdog', 'retire'] }
 }

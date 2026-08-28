@@ -25,8 +25,27 @@ ROOT="$(pwd)"
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/eos-agent-tests.XXXXXX")"
 # cred-refresher.test.js copies live Keychain material into fixtures - the trap wipes it
 # even on interrupt, so a sandbox never outlives the run.
+#
+# THE SIGNAL HANDLER MUST EXIT, NOT FALL THROUGH (fixed 2026-08-28, lane R1).
+# It was `trap cleanup EXIT INT TERM` with a cleanup() that only rm -rf'd. A bash
+# trap handler that does not exit RESUMES the script, so a single stray SIGTERM
+# wiped $SANDBOX and then let the remaining suites keep running against a deleted
+# directory. Every one of them failed on `out.NNN: No such file or directory` and
+# was counted as a genuine FAIL. Measured this arc: one SIGTERM at suite 7 of 42
+# turned a real `pass=40 fail=2` into a reported `pass=6 fail=36`, i.e. 34 fabricated
+# failures, in the script that IS this repo's commit gate. A gate that reports red
+# for a reason unrelated to the code under test is worse than no gate: it trains
+# every reader to ignore it, and it hid a live regression (04dd65d added a 13th
+# setInterval while scheduler.test.js still asserted 6 in start()).
 cleanup() { rm -rf "$SANDBOX"; }
-trap cleanup EXIT INT TERM
+on_signal() {
+  echo "" >&2
+  echo "[run-tests] ABORTED by signal - results up to this point are incomplete." >&2
+  cleanup
+  exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 mkdir -p "$SANDBOX/coord" "$SANDBOX/tmp"
 # Stub text-tate: records the call, never sends. cred-refresher.test.js case 4 shells this.
@@ -41,7 +60,7 @@ export TMPDIR="$SANDBOX/tmp"
 export TEXT_TATE_PATH="$SANDBOX/stub-text-tate.js"
 
 TIMEOUT_S="${TEST_TIMEOUT_S:-120}"
-fails=0; passes=0; timeouts=0
+fails=0; passes=0; timeouts=0; suite_n=0
 
 # REDACTION IS MANDATORY, NOT HYGIENE. cred-refresher.test.js seeds its fixtures from the
 # LIVE Keychain, and its assertion messages print the value they compared ("got <token>").
@@ -68,7 +87,15 @@ redact() {
 run_bounded() {
   local file="$1" label="$2"
   local out rc
-  local tmpout="$SANDBOX/out.$$"
+  # Fail LOUD if the sandbox went away mid-run. Without this the redirect below
+  # fails per suite and every remaining suite reports FAIL(1) for a reason that has
+  # nothing to do with the code under test (see the trap note above).
+  if [ ! -d "$SANDBOX" ]; then
+    echo "[run-tests] FATAL: sandbox $SANDBOX vanished mid-run; aborting rather than reporting fabricated failures" >&2
+    exit 3
+  fi
+  suite_n=$((suite_n+1))
+  local tmpout="$SANDBOX/out.$$.$suite_n"
   node "$file" >"$tmpout" 2>&1 &
   local pid=$!
   ( sleep "$TIMEOUT_S"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
