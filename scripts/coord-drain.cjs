@@ -1,3 +1,12 @@
+// coord-drain.cjs - BOOTSTRAP AND DIAGNOSTIC ONLY.
+//
+// The canonical sweep is the hourly in-process pass in scheduler.start(). Run
+// this script out-of-process and you get a SPLIT BRAIN: it marks messages seen on
+// disk, but the running laptop-agent holds its own hydrated copy of the store and
+// will keep serving them until it restarts (observed 2026-08-28: disk said 138
+// unseen while the live process said 149). Use it to drain a backlog before the
+// agent has the tool loaded, or to inspect state; otherwise call
+// coord-retire.sweep through /api/tool so one process owns the mutation.
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') })
 const retire = require('../tools/coord-retire.js')
 ;(async () => {
