@@ -478,9 +478,35 @@ function _guiWakeSupported() {
 // On this host the win32 tiers cannot run at all, and the darwin toast is
 // suppressed by a live Focus assertion plus an unregistered posting bundle
 // (both measured 2026-08-29 and both now reported by notification.capability).
-// So a banner is not a wake here even after the port. The only mechanism on
-// this Mac PROVEN to put a turn into an idle chat is the chat-inject position
-// chain, which is the same machinery chat-to-chat push already uses.
+// So a banner is not a wake here even after the port. The chat-inject position
+// chain below is the only mechanism on this Mac that lands a turn in a chat at
+// all, and it is the same machinery chat-to-chat push already uses.
+//
+// IT IS NOT "PROVEN", AND THE WORD USED TO SIT HERE. Measured over the whole
+// transcript corpus 2026-08-29: 433 distinct coord chat messages, 227 landed as
+// a real user turn, 206 queued and never drained. 52 pct delivered, 47 pct lost,
+// bimodal - an inject either lands immediately or becomes a queued_command
+// attachment, and once queued it is lost about 5 times in 6. A returned
+// {ok:true, steps:[...paste,submit]} means the submit KEYSTROKE fired, not that
+// a turn landed; two conductor probes that day returned exactly that and both
+// only enqueued.
+//
+// It is also not a choice. Re-probed live 2026-08-29 (lane N1, worker 60565ca7)
+// against the CURRENT bridge, not inherited from the 2026-08-21 note:
+//   - GET /ide/commands enumerates 3497 registered commands. NOT ONE claude-vscode.*
+//     command sends a message into an existing session. Same in 2.1.241 and 2.1.251.
+//   - claude-vscode.editor.open(session, prompt) opens a tab and PREFILLS the input
+//     (tabs 17 -> 18) and does not submit: a corpus-wide grep for the probe marker
+//     found zero user-role turns anywhere.
+//   - workbench.action.chat.openSessionWithPrompt.claude-code belongs to VS Code's
+//     BUILT-IN copilot extension, addresses claude-code:/<sessionId>, and is a
+//     different surface from our webview tabs. It hung past 2 minutes and delivered
+//     nothing.
+//   - The vscode://anthropic.claude-code/open?session=&prompt= URI handler just
+//     re-calls primaryEditor.open, so it inherits the same no-submit behaviour.
+// There is no API submit primitive to move to. The keystroke stays until one of
+// us builds the mechanism, which is why this comment now carries the measurement
+// instead of the word PROVEN. Doctrine: coord-no-api-submit-primitive-2026-08-29.
 
 function _darwinInjectWakeReason() {
   if (process.platform !== 'darwin') return 'not_darwin'

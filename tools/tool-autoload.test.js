@@ -246,6 +246,62 @@ ok('blankNonCode preserves length and line structure', () => {
   assert.ok(!/\/\/ c/.test(out) && !/b \*\//.test(out), 'comment bodies blanked: ' + JSON.stringify(out))
 })
 
+ok('a backtick inside an interpolation does not end the template', () => {
+  // The tools/reflex.js:328 shape. The interpolation holds a regex AND a
+  // single-quoted string containing a backtick. A scanner that does not track
+  // ${ } lets that backtick close the template, then reads the rest of the file
+  // in the wrong state, so the real process.exit below goes entirely unseen.
+  const src = [
+    'module.exports = { isEditorWindowUp }',
+    'function isEditorWindowUp (titleHint) {',
+    '  return spawnSync(\'powershell.exe\', [\'-Command\',',
+    '    `Get-Process | Where-Object { $_.MainWindowTitle -like "*${titleHint.replace(/"/g, \'`"\')}*" }`])',
+    '}',
+    'process.exit(1)',
+    '',
+  ].join('\n')
+  const code = blankNonCode(src)
+  assert.ok(/process\.exit\(1\)/.test(code),
+    'the scan desynced and blanked real code after the template: ' + JSON.stringify(code.split('\n')[5]))
+  assert.strictEqual(screenSource(src).reason, 'process-exit-without-require-main-guard')
+  assert.strictEqual(code.length, src.length, 'length preserved')
+  assert.strictEqual(code.split('\n').length, src.split('\n').length, 'line count preserved')
+})
+
+ok('interpolation edges: nesting, escaping, and braces in the expression', () => {
+  const nested = 'module.exports = {}\nconst s = `a${`b${c}`}d`\nprocess.exit(1)\n'
+  assert.strictEqual(screenSource(nested).reason, 'process-exit-without-require-main-guard',
+    'a nested template must leave the scan in code state')
+  const escaped = 'module.exports = {}\nconst s = `a\\${notAnInterp}b`\nprocess.exit(1)\n'
+  assert.strictEqual(screenSource(escaped).reason, 'process-exit-without-require-main-guard',
+    'an escaped dollar-brace opens no interpolation')
+  // One lone backtick inside a string inside the interpolation. It makes the
+  // template's backtick count odd, which is what actually desyncs the rest of
+  // the file, and it isolates that from the regex in the test above.
+  const loneTick = 'module.exports = {}\nconst s = `x${ y.replace(sep, \'`\') }z`\nprocess.exit(1)\n'
+  assert.strictEqual(screenSource(loneTick).reason, 'process-exit-without-require-main-guard',
+    'a lone backtick inside an interpolated string must not close the template')
+  const braced = 'module.exports = {}\nconst s = `a${ (() => { return { x: 1 } })() }b`\nprocess.exit(1)\n'
+  assert.strictEqual(screenSource(braced).reason, 'process-exit-without-require-main-guard',
+    'braces inside the expression must not close the interpolation early')
+  // Depth has to be COUNTED, not just noticed. Here the object's closing brace
+  // is followed by a lone backtick inside a string. Pop on that first brace and
+  // the scan re-enters the template, reads the backtick as the template's end,
+  // opens a string on the quote after it, and swallows the rest of the file. A
+  // scanner that merely returns to the template on any brace still passes every
+  // other case in this test, so this one is what proves the counter.
+  const depth = 'module.exports = {}\nconst s = `a${ f({ k: 1 }) + g(\'`\') }b`\nprocess.exit(1)\n'
+  assert.strictEqual(screenSource(depth).reason, 'process-exit-without-require-main-guard',
+    'the interpolation must survive a nested brace before a backtick-bearing string')
+  // Template TEXT is still not code: this one must stay clean.
+  const textOnly = 'module.exports = {}\nconst s = `process.exit(9)`\n'
+  assert.strictEqual(screenSource(textOnly), null,
+    'a process.exit sitting in template text is not a call')
+  for (const src of [nested, escaped, loneTick, braced, depth, textOnly]) {
+    assert.strictEqual(blankNonCode(src).length, src.length, 'length preserved')
+  }
+})
+
 // =============================================================================
 // REAL-DIR REGRESSION GATE - the screen must cost the live agent nothing. Run it
 // over the actual tools/ dir with require STUBBED so nothing executes here, and

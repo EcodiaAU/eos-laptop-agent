@@ -165,10 +165,34 @@ async function injectTurn(opts) {
     return { ok: false, reason: 'empty_text' }
   }
 
-  // NOTE (2026-08-21): the extension's ide.chat_send_message primitive was tried
-  // as a session-addressed delivery path. It reports opened_tab + submit_command_ok
-  // but does NOT actually land a turn (transcript-verified: 0 turns delivered; its
-  // opened_tab is an echo, via:"active_fallback"). It is NOT used for delivery.
+  // NOTE (2026-08-21, MECHANISM ADDED 2026-08-29): the extension's
+  // ide.chat_send_message primitive was tried as a session-addressed delivery
+  // path. It reports opened_tab + submit_command_ok but does NOT actually land a
+  // turn (transcript-verified: 0 turns delivered; its opened_tab is an echo,
+  // via:"active_fallback"). It is NOT used for delivery.
+  //
+  // WHY, so pass N+1 stops re-deriving it. Re-probed live 2026-08-29 (lane N1,
+  // worker 60565ca7) against the CURRENT bridge and the CURRENT extension, and
+  // the answer is not a bridge defect: THERE IS NO SUBMIT PRIMITIVE TO CALL.
+  //   - GET /ide/commands enumerated 3497 registered commands. Every claude-vscode.*
+  //     entry opens, focuses, blurs, or inserts an @-mention. Not one sends a
+  //     message into an existing session. Identical in 2.1.241 and 2.1.251.
+  //   - editor.open(session, prompt) PREFILLS the input and stops there; a
+  //     corpus-wide marker grep after a live call found zero user-role turns.
+  //   - workbench.action.chat.openSessionWithPrompt.claude-code is contributed by
+  //     VS Code's BUILT-IN copilot extension, not by Anthropic's. It addresses
+  //     claude-code:/<sessionId> and drives Copilot's own Claude runtime, a
+  //     different surface from these webview tabs. Called correctly it hung past
+  //     2 minutes and delivered nothing.
+  //   - The vscode://anthropic.claude-code/open?session=&prompt= URI handler is
+  //     literally executeCommand("claude-vscode.primaryEditor.open", session,
+  //     prompt), so it inherits the same behaviour.
+  // Each chat tab is a claude child process rendered in the ANTHROPIC extension's
+  // webview; our bridge shares the extension host but cannot postMessage into
+  // another extension's webview iframe, which is why workbench.action.chat.submit
+  // (Copilot's surface) leaves submit_command_ok false. The keystroke below is not
+  // a shortcut anyone took, it is the only submit that exists.
+  // Doctrine: coord-no-api-submit-primitive-2026-08-29.
   // The real, transcript-PROVEN delivery is the position chain below, with the ONE
   // fix that matters: select the tab with the GENERIC workbench.action.
   // openEditorAtIndex + an index ARG (works at ANY index), not the numbered
