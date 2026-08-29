@@ -159,10 +159,20 @@ function setTabId(tab_id, ttab) {
     moved.closed === true && closeCalls.length === 1 && closeCalls[0].tabIndex === 3,
     JSON.stringify({ moved: moved, calls: closeCalls }))
 
-  console.log('\n== Part 4: safety. A stored id that is not live REFUSES, never falls through ==')
-  // The fallthrough this guards: give the worker a UNIQUE live sentinel tab that
-  // the legacy ladder WOULD resolve and close. With a stored-but-dead tabId the
-  // resolver must refuse anyway. Without the control tab the refusal is vacuous.
+  console.log('\n== Part 4: a stored id that is not live RE-CAPTURES, and never steals ==')
+  // 2026-08-29 lane W1-verify. CONTRACT CHANGED, deliberately. This part used to
+  // assert that a stored-but-dead id refuses even with the worker's OWN tab
+  // sitting right there under a UNIQUE sentinel. That refusal was not safety, it
+  // was the leak: measured on the live agent, the sweep reported
+  // stable_id_not_live on 26 rows every pass for hours, permanently, and
+  // close_my_tab logged the same refusal per worker, because NOTHING re-runs
+  // capture once a row has bound and the bridge re-mints an id whenever a tab
+  // retitles and reorders.
+  //
+  // The no-fallthrough rule in the resolver is untouched. What changed is that a
+  // PROVEN-DEAD id now gets one re-capture before it is treated as terminal. The
+  // property that actually matters is kept and is asserted below in 4b: a
+  // re-capture must never claim a tab another registry row owns.
   coord._registerWorkerInternal({ tab_id: 'tab_gone', task_id: 't-gone', tab_credential: 'c-gone' })
   coord.setWorkerTabHandle('tab_gone', {
     sentinel_prefix: '[9999 unique lane sentinel]',
@@ -179,10 +189,57 @@ function setTabId(tab_id, ttab) {
   setTabId('tab_gone', 'ttab_that_no_longer_exists')
   closeCalls.length = 0
   const dead = await coord.close_my_tab({}, { tab_id: 'tab_gone' })
-  ok('a stored id absent from the live listing REFUSES',
-    dead.closed === false && /stable_id_not_live/.test(String(dead.refused || '')), JSON.stringify(dead))
-  ok('and it closed NOTHING despite a resolvable legacy sentinel sitting right there',
-    closeCalls.length === 0, JSON.stringify(closeCalls))
+  ok('a stored id absent from the live listing RE-CAPTURES instead of leaking',
+    dead.closed === true && /stable_tab_id/.test(String(dead.strategy || '')), JSON.stringify(dead))
+  ok('and it closed the tab bearing ITS OWN unique sentinel, not some other tab',
+    closeCalls.length === 1 && closeCalls[0].exactLabel === '[9999 unique lane sentinel]',
+    JSON.stringify(closeCalls))
+  const goneRow = coord.loadWorkerRegistry('tab_gone')
+  ok('and the row records the dead id it dropped, so the churn stays auditable',
+    goneRow.tab_handle.tabId_stale_dropped === 'ttab_that_no_longer_exists',
+    JSON.stringify(goneRow.tab_handle))
+
+  // ── 4b. THE DANGER THE OLD REFUSAL WAS REALLY GUARDING, now tested directly.
+  // A recurring cron re-fires a byte-identical brief, so fire A's corpse and
+  // fire B's LIVE tab carry the same sentinel. If A's id dies and B is the only
+  // match, a naive re-capture hands B's id to A and the next close shuts a
+  // RUNNING worker down. _captureStableTabId used to consult the claimed-set
+  // only when two or more tabs matched, so this single-hit case was unguarded.
+  // It was unreachable while capture ran solely at signal_bound; re-capturing
+  // from the close path is what makes it reachable.
+  coord._registerWorkerInternal({ tab_id: 'tab_fireA', task_id: 't-fa', tab_credential: 'c-fa' })
+  coord.setWorkerTabHandle('tab_fireA', {
+    sentinel_prefix: '[7777 nightly cron lane]',
+    viewColumn: 1, viewType: CC, label_at_spawn: 'Claude Code', tabIndex: 0,
+  })
+  coord._registerWorkerInternal({ tab_id: 'tab_fireB', task_id: 't-fb', tab_credential: 'c-fb' })
+  coord.setWorkerTabHandle('tab_fireB', {
+    sentinel_prefix: '[7777 nightly cron lane]',
+    viewColumn: 1, viewType: CC, label_at_spawn: 'Claude Code', tabIndex: 1,
+  })
+  // B is alive and OWNS the one live tab showing that sentinel.
+  setTabId('tab_fireB', 'ttab_fireB_live')
+  setTabId('tab_fireA', 'ttab_fireA_dead')
+  LIVE_TABS = [{ tabId: 'ttab_fireB_live', label: '[7777 nightly cron lane]' }]
+
+  closeCalls.length = 0
+  const w1capFireA = await coord._captureStableTabId('tab_fireA')
+  ok('SAFETY: a lone sentinel match already claimed by a live sibling is REFUSED',
+    w1capFireA.ok === false && w1capFireA.reason === 'sentinel_all_claimed', JSON.stringify(w1capFireA))
+  const w1rowFireB = coord.loadWorkerRegistry('tab_fireB')
+  ok("SAFETY: and the sibling keeps its own id, it was not reassigned",
+    w1rowFireB.tab_handle.tabId === 'ttab_fireB_live', JSON.stringify(w1rowFireB.tab_handle))
+  const w1closeFireA = await coord.close_my_tab({}, { tab_id: 'tab_fireA' })
+  // The failed re-capture must NOT demote the row to "no id". If it did, Pass 0
+  // would stand down and the legacy ladder would match this same sentinel onto
+  // fire B's live tab. That is not hypothetical: an earlier cut of this fix did
+  // exactly that and closed the sibling by 'tabIndex+sentinel:0'.
+  ok('SAFETY: the dead fire REFUSES, it does not fall through to the ladder',
+    w1closeFireA.closed === false && /stable_id_not_live|stable_id_dropped_not_recaptured/.test(String(w1closeFireA.refused || '')),
+    JSON.stringify(w1closeFireA))
+  ok('SAFETY: and no close was attempted against the live sibling tab',
+    !closeCalls.some((c) => c.exactLabel === '[7777 nightly cron lane]'),
+    JSON.stringify(closeCalls))
 
   console.log('\n== Part 5: safety. The conductor belt still applies to the stable id ==')
   coord._registerWorkerInternal({ tab_id: 'tab_conf', task_id: 't-conf', tab_credential: 'c-conf' })
@@ -453,12 +510,20 @@ function setTabId(tab_id, ttab) {
   ok('an undecidable re-capture still refuses rather than guessing',
     ambig.ok === false && ambig.reason === 'ambiguous_sentinel', JSON.stringify(ambig))
   const wAmb = coord.loadWorkerRegistry('w-stale-ambig')
-  ok('but the proven-dead id is GONE, so the close falls to the ladder not a hard refusal',
+  ok('the proven-dead id is GONE from the row, and the drop is recorded',
     !wAmb.tab_handle.tabId && wAmb.tab_handle.tabId_stale_dropped === 'ttab_preautotitle_2_1',
     JSON.stringify(wAmb.tab_handle))
   const settles = await coord._resolveStableIdCloseTarget('w-stale-ambig', 65535)
-  ok('and that row resolves {none}, which is what lets the legacy tiers run',
-    settles && settles.none === true && !settles.refused, JSON.stringify(settles))
+  // 2026-08-29 lane W1-verify. CONTRACT CORRECTED. This used to assert that a
+  // dropped id resolves {none} so "the legacy tiers run". That is the hazard, not
+  // the feature, and THIS FIXTURE IS THE PROOF: the two corpses here share a
+  // retitled label, the exact input the ladder cannot tell apart. Handing this row
+  // to the ladder is how a cleanup closes a live sibling fire. A row that HAD an id
+  // and lost it stays terminal; only a row that never had one earns the ladder.
+  ok('and that row stays TERMINAL, it is not promoted to the legacy tiers',
+    !!settles && !settles.none
+      && /stable_id_dropped_not_recaptured/.test(String(settles.refused || '')),
+    JSON.stringify(settles))
 
   // 9d. FAIL-SAFE, the direction that matters. An empty or failed listing proves
   //     NOTHING about the stored id. Dropping it there would discard a good id

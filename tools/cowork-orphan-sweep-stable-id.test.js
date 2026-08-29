@@ -125,6 +125,14 @@ function readRow(tab_id) {
 function reset() {
   for (const f of fs.readdirSync(WORKERS_DIR)) fs.unlinkSync(path.join(WORKERS_DIR, f))
   closeCalls.length = 0
+  // 2026-08-29 lane W1-verify. coord.loadWorkerRegistry reads its in-memory
+  // workers Map BEFORE disk (the same-process hot path), and this reset only
+  // ever deleted files. Any case that makes coord WRITE the registry therefore
+  // leaked a stale row into the next case, which read as a fresh fixture
+  // resolving {none}. Latent since the map existed; it first bit when the close
+  // path started re-capturing. Clear both halves or the controls below are
+  // measuring the previous case.
+  try { require('./coord')._workersMap().clear() } catch (e) {}
 }
 
 function resultFor(res, tab_id) {
@@ -182,8 +190,14 @@ async function main() {
   const gone = resultFor(res, 'tab_gone')
   ok('stored-but-not-live id refuses instead of closing', res.closed === 0,
      'closed=' + res.closed + ' ' + JSON.stringify(res.results))
-  ok('refusal names the stable-id reason, not a ladder miss',
-     !!gone && gone.action === 'leak' && /stable_id_not_live/.test(String(gone.reason)),
+  // 2026-08-29 lane W1-verify: the sweep now RE-CAPTURES a proven-dead id before
+  // refusing on it, so the terminal reason is either the id still being not-live or
+  // the re-capture having failed to replace it. Both are stable-id reasons and both
+  // are terminal. What must never appear here is a LADDER outcome, because the
+  // ladder would resolve this corpse's sentinel onto the live stranger below.
+  ok('refusal names a stable-id reason, not a ladder miss',
+     !!gone && gone.action === 'leak'
+       && /stable_id_not_live|stable_id_dropped_not_recaptured/.test(String(gone.reason)),
      JSON.stringify(gone))
   ok('NO close was attempted at the bridge at all', closeCalls.length === 0,
      JSON.stringify(closeCalls))

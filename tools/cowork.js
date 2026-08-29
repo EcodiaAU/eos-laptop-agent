@@ -1209,11 +1209,17 @@ async function cleanup_orphan_workers(params) {
     }
   }
 
+  // 2026-08-29 lane W1-verify. One set of every live tab id, from the SAME single
+  // probe above. Used only to decide whether a stored id is worth re-capturing,
+  // so this costs zero extra bridge calls.
+  const liveIdSet = new Set()
+  for (const g of groups) for (const t of (g.tabs || [])) if (t && t.tabId) liveIdSet.add(t.tabId)
+
   const results = []
   let closedCount = 0
 
   for (const { filePath, worker } of orphans) {
-    const th = worker.tab_handle
+    let th = worker.tab_handle
     const sp = th.sentinel_prefix || null
     const labelAtSpawn = th.label || th.label_at_spawn || null
     const ti = (typeof th.tabIndex === 'number') ? th.tabIndex : null
@@ -1254,6 +1260,41 @@ async function cleanup_orphan_workers(params) {
     // sentinel onto a sibling fire's live tab. Refuse and leak: a cosmetic ghost
     // tab is cheaper than closing a live worker or Tate's chat.
     // Doctrine: a-handle-derived-from-the-brief-collides-with-every-fire-of-its-cron-2026-08-29.
+    // 2026-08-29 lane W1-verify. RE-CAPTURE A PROVEN-DEAD ID, WITHOUT EVER
+    // HANDING THE ROW TO THE LADDER.
+    //
+    // This sweep is the ONLY recurring close path for a worker that never called
+    // close_my_tab, and it was refusing on stable_id_not_live for 26 rows on
+    // every pass, for hours, permanently: nothing re-runs capture once a row has
+    // bound, so an id the bridge re-minted stayed wrong forever and Pass 0's
+    // no-fallthrough rule turned that into a GUARANTEED leak.
+    //
+    // Only a SUCCESSFUL listing that lacks the id proves it dead, so this is
+    // gated on a non-empty liveIdSet built from the single probe above; a failed
+    // or empty probe proves nothing and leaves the stored value alone.
+    //
+    // The re-capture may REPLACE the id and may not REMOVE it. _captureStableTabId
+    // drops an id it proves dead, and a dropped id would let this row fall to the
+    // ladder below, which on a cron resolves a byte-identical sentinel onto a
+    // SIBLING FIRE'S LIVE TAB. Measured: even with the claimed-set guard refusing
+    // the capture, the ladder still closed the live sibling by tabIndex+sentinel.
+    // So when re-capture fails to produce a replacement, the original id is put
+    // back and Pass 0 refuses on it exactly as before. A ghost tab is cheap; a
+    // killed running worker is not.
+    if (th.tabId && liveIdSet.size && !liveIdSet.has(th.tabId)) {
+      const deadId = th.tabId
+      let coordMod0 = null
+      try { coordMod0 = require('./coord') } catch (e) {}
+      if (coordMod0 && coordMod0._captureStableTabId) {
+        try { await coordMod0._captureStableTabId(worker.tab_id) } catch (e) {}
+        try {
+          const fresh = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+          if (fresh && fresh.tab_handle) th = fresh.tab_handle
+        } catch (e) {}
+        if (!th.tabId) th = Object.assign({}, th, { tabId: deadId })
+      }
+    }
+
     if (th.tabId) {
       let coordMod = null
       try { coordMod = require('./coord') } catch (e) {}

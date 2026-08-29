@@ -1164,14 +1164,31 @@ async function _captureStableTabId(tab_id, opts) {
       }
     }
     if (!hits.length) return { ok: false, reason: 'no_sentinel_match', pool: pool.length }
-    if (hits.length > 1) {
+    // 2026-08-29 lane W1-verify. FILTER CLAIMED IDS UNCONDITIONALLY, not just on
+    // a multi-hit. The old shape only consulted the claimed-set when two or more
+    // tabs matched, which left the single-hit case completely unguarded, and the
+    // single-hit case is the DANGEROUS one on a recurring cron: fire A's corpse
+    // has a dead id, fire B of the same row is LIVE and still showing the
+    // byte-identical sentinel, and B is the only match. Old code captured B's id
+    // onto A's row and the next close would have shut a live worker down.
+    //
+    // It never fired before because capture only ran at signal_bound, when a
+    // worker legitimately owns the one tab showing its sentinel. Re-running
+    // capture from the close path (the fix this file ships) is what makes the
+    // hole reachable, so it is closed here rather than worked around at the call
+    // sites. A tab another registry row already claims is by definition not
+    // mine, whether one tab matched or five.
+    {
       const claimed = _claimedStableTabIds(tab_id)
       const unclaimed = hits.filter((t) => !claimed.has(t.tabId))
-      if (unclaimed.length !== 1) {
-        return { ok: false, reason: 'ambiguous_sentinel', candidates: hits.length, unclaimed: unclaimed.length }
+      if (!unclaimed.length) {
+        return { ok: false, reason: 'sentinel_all_claimed', candidates: hits.length }
       }
+      if (unclaimed.length !== hits.length) via = via + '_unclaimed'
       hits = unclaimed
-      via = via + '_unclaimed'
+    }
+    if (hits.length > 1) {
+      return { ok: false, reason: 'ambiguous_sentinel', candidates: hits.length, unclaimed: hits.length }
     }
     const tab = hits[0]
     th.tabId = tab.tabId
@@ -1197,7 +1214,27 @@ async function _resolveStableIdCloseTarget(tab_id, idePort) {
   const w = loadWorkerRegistry(tab_id)
   const th = w && w.tab_handle
   const want = th && th.tabId
-  if (!want) return { none: true }
+  if (!want) {
+    // 2026-08-29 lane W1-verify. A row that ONCE held an id and lost it is NOT a
+    // virgin legacy row, and only a virgin row has earned the legacy ladder.
+    //
+    // 05cb54a taught capture to DROP an id it proves dead, which is right, and
+    // shipped a hazard with it: drop-then-failed-recapture leaves the row with
+    // no id, {none} promotes it to the ladder, and on a recurring cron the
+    // ladder resolves a byte-identical sentinel onto a SIBLING FIRE'S LIVE TAB.
+    // Reproduced here: with the claimed-set guard correctly refusing to steal
+    // the sibling's id, close_my_tab still closed that sibling by
+    // 'tabIndex+sentinel:0'. A cleanup killing a running worker is the worst
+    // outcome this whole subsystem can produce, worse by far than the ghost tab
+    // it was trying to tidy.
+    //
+    // tabId_stale_dropped is the durable marker of "had one, lost it", so the
+    // property holds no matter which call path dropped it or how long ago.
+    if (th && th.tabId_stale_dropped) {
+      return { refused: 'stable_id_dropped_not_recaptured:' + th.tabId_stale_dropped }
+    }
+    return { none: true }
+  }
   if (!idePort) return { refused: 'stable_id_no_ide_port:' + want }
   let tabs
   try { tabs = await _liveCcTabsWithIds(idePort) }
@@ -1208,6 +1245,69 @@ async function _resolveStableIdCloseTarget(tab_id, idePort) {
   // resolvable state. Refuse loudly rather than pick one.
   if (hits.length > 1) return { refused: 'stable_id_ambiguous:' + want + ' n=' + hits.length }
   return { refused: 'stable_id_not_live:' + want }
+}
+
+// Resolve the stored stable id, and when it is PROVEN DEAD, re-capture once
+// before answering. 2026-08-29 lane W1-verify.
+//
+// 05cb54a repaired capture and left close alone, on the reading that capture
+// runs at signal_bound and the id is good from there on. It is not. The bridge
+// mints ttab_ ids by reconciling each listing against the previous one on
+// (viewColumn+label) then (viewColumn+index); a tab that RETITLES and REORDERS
+// between two listings matches neither pass and is minted a new id. Bind-time
+// capture only survives until the next tab closes above this one in the same
+// column, which on a fleet that opens and closes tabs continuously is minutes,
+// not hours. So 05cb54a narrowed the failure from always-wrong to
+// wrong-if-re-minted-after-bind and left the dominant case live: measured
+// 2026-08-29T03:1xZ, the sweep reported stable_id_not_live=26 on every pass for
+// hours, permanently, because nothing re-runs capture on a row after it binds.
+//
+// The no-fallthrough rule below is still right and is untouched. What changes is
+// that a dead id gets ONE chance to be replaced by a live one before it is
+// treated as terminal. _captureStableTabId already does exactly the right thing
+// with a proven-dead id: it drops it, re-matches the sentinel against CURRENT
+// labels, and leaves the row with NO id when it cannot. A row with no id
+// resolves {none}, which both callers below treat as "not settled" and hand to
+// the legacy ladder. So the three outcomes are: live id -> close it; re-captured
+// id -> close it; unresolvable -> ladder, instead of the hard refusal that
+// GUARANTEED the leak.
+//
+// Cost is on the failing path only. The happy path is one listing, unchanged.
+async function _resolveStableIdCloseTargetRecapturing(tab_id, idePort) {
+  const st = await _resolveStableIdCloseTarget(tab_id, idePort)
+  const notLive = st && typeof st.refused === 'string' && st.refused.indexOf('stable_id_not_live:') === 0
+  if (!notLive) return st
+  try {
+    let timer = null
+    const capped = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, reason: 'capture_timeout' }), _STABLE_ID_CAPTURE_TIMEOUT_MS)
+      if (timer && typeof timer.unref === 'function') timer.unref()
+    })
+    await Promise.race([_captureStableTabId(tab_id), capped])
+    if (timer) clearTimeout(timer)
+  } catch (e) {
+    // Capture is advisory. A throw leaves the original refusal standing, which
+    // is the pre-existing behaviour and still fail-safe.
+    return st
+  }
+  const after = await _resolveStableIdCloseTarget(tab_id, idePort)
+  // THE HALF THAT MAKES THIS SAFE, measured 2026-08-29 lane W1-verify.
+  //
+  // _captureStableTabId DROPS an id it proves dead, so a failed re-capture
+  // leaves the row with none and this resolves {none}. {none} is the callers'
+  // signal to run the legacy ladder, and the ladder is exactly what must not
+  // run here: on a recurring cron every handle it owns is derived from a
+  // byte-identical brief, so it happily resolves fire A's dead corpse onto fire
+  // B's LIVE tab. Proven, not theorised: with the claimed-set guard already
+  // refusing the capture, close_my_tab still went on to close the live sibling
+  // by 'tabIndex+sentinel:0'. That is a running worker killed by a cleanup.
+  //
+  // So a re-capture may only ever REPLACE one id with a better one. It may
+  // never demote a row from "has an id" to "has none", because that promotion
+  // to the ladder is a privilege only a row that NEVER had an id has earned.
+  // Failed re-capture therefore restores the original terminal refusal.
+  if (after && after.none) return st
+  return after
 }
 
 // Close a stable-id-resolved target through the shared guard. The strategy
@@ -2264,7 +2364,7 @@ async function close_my_tab(params, ctx) {
   // header for why no-fallthrough is the load-bearing half of this fix.
   let stableSettled = false
   try {
-    const st = await _resolveStableIdCloseTarget(ctx.tab_id, conductor.ide_bridge_port)
+    const st = await _resolveStableIdCloseTargetRecapturing(ctx.tab_id, conductor.ide_bridge_port)
     if (st.refused) {
       stableSettled = true
       refused = st.refused
@@ -2677,7 +2777,7 @@ async function kill_worker(params, ctx) {
   let stableSettled = false
   if (conductorRow && conductorRow.ide_bridge_port) {
     try {
-      const st = await _resolveStableIdCloseTarget(target_tab_id, conductorRow.ide_bridge_port)
+      const st = await _resolveStableIdCloseTargetRecapturing(target_tab_id, conductorRow.ide_bridge_port)
       if (st.refused) {
         stableSettled = true
         refused = st.refused
@@ -3291,6 +3391,7 @@ module.exports = {
   // Stable IDE tab id (2026-08-29): capture at bind, resolve at close.
   _captureStableTabId: _captureStableTabId,
   _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
+  _resolveStableIdCloseTargetRecapturing: _resolveStableIdCloseTargetRecapturing,
   // Exported 2026-08-29 for cowork.cleanup_orphan_workers, the recurring sweep
   // that is the ONLY close path for a worker killed or usage-capped mid-run (77
   // of 111 terminated rows). It must share this exact close, not a copy: the
