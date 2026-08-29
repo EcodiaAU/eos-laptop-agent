@@ -35,7 +35,7 @@ const { execFileSync } = require('child_process')
 // A test that pollutes the log it is testing makes that log unreadable.
 process.env.DOCTRINE_HARVEST_LOG = path.join(os.tmpdir(), 'doctrine-harvest-test-audit.jsonl')
 
-const { harvestDoctrine } = require('./doctrine-harvest')
+const { harvestDoctrine, BUILD } = require('./doctrine-harvest')
 
 let passed = 0, failed = 0
 function ok (name, cond, detail) {
@@ -111,6 +111,13 @@ function filesOnMain (shared) {
 
 function readDisk (shared, rel) {
   return fs.readFileSync(path.join(shared, rel), 'utf8')
+}
+
+// Absence is an assertion in its own right here: a refusal that still wrote the
+// file would pass every reason-string check while doing the exact damage the
+// refusal exists to prevent.
+function onDisk (shared, rel) {
+  return fs.existsSync(path.join(shared, rel))
 }
 
 async function main () {
@@ -297,7 +304,7 @@ async function main () {
     const { root, shared } = setup()
     const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/does-not-exist', rowId: 'row-stamp' })
     ok('every result carries the build stamp, even a no-op',
-      res.build === 'toplevel-baseline-2026-08-30', JSON.stringify(res))
+      res.build === BUILD && typeof BUILD === 'string' && BUILD.length > 0, JSON.stringify(res))
     fs.rmSync(root, { recursive: true, force: true })
   }
 
@@ -434,6 +441,84 @@ async function main () {
       readDisk(shared, 'patterns/race-2026-08-27.md') === '# exactly one copy\n',
       JSON.stringify(readDisk(shared, 'patterns/race-2026-08-27.md')))
     ok('both invocations report ok', r1.ok === true && r2.ok === true, JSON.stringify([r1.reason, r2.reason]))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 9. BRANCH-NAME MISMATCH (2026-08-30 lane H1). The scheduler asks for
+  //    'worker/' + row.id, but a worker may commit on a ref of its own naming.
+  //    Row 5fd046e8-8e0b-4a13-923f-16198b7acd07 used worker/5fd0-seedtree-lane-N1-pass4,
+  //    so harvest resolved an empty ref and logged 'no commits off main' while the
+  //    doctrine sat one ref away. RED before the resolveBranch fallback: landed
+  //    was empty and the reason read as a clean no-op.
+  {
+    const { root, shared } = setup()
+    const rowId = '5fd046e8-8e0b-4a13-923f-16198b7acd07'
+    plantWorkerBranch(shared, root, 'worker/5fd0-seedtree-lane-N1-pass4',
+      { 'patterns/mismatched-branch-2026-08-30.md': '# found via the id prefix\n' })
+    const res = await harvestDoctrine({
+      sharedTree: shared, branch: 'worker/' + rowId, rowId,
+    })
+    ok('a branch named off-convention is still found by the row id',
+      res.landed.length === 1, JSON.stringify(res))
+    ok('the mismatched file reaches disk',
+      readDisk(shared, 'patterns/mismatched-branch-2026-08-30.md') === '# found via the id prefix\n',
+      JSON.stringify(res))
+    ok('the audit names the ref it actually harvested and the one it was asked for',
+      res.branch === 'worker/5fd0-seedtree-lane-N1-pass4' &&
+      res.requestedBranch === 'worker/' + rowId &&
+      /^id-prefix:/.test(res.resolvedVia || ''), JSON.stringify(res))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 10. AMBIGUITY REFUSES RATHER THAN GUESSES. Harvesting the wrong branch writes
+  //     real files into the corpus under a real basename, so two candidates at the
+  //     same prefix must produce a named refusal, not a coin flip.
+  {
+    const { root, shared } = setup()
+    const rowId = '7ab12cde-1111-2222-3333-444455556666'
+    plantWorkerBranch(shared, root, 'worker/7ab1-lane-A1', { 'patterns/amb-a-2026-08-30.md': '# a\n' })
+    plantWorkerBranch(shared, root, 'worker/7ab1-lane-B2', { 'patterns/amb-b-2026-08-30.md': '# b\n' })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/' + rowId, rowId })
+    ok('two candidates at one prefix refuse instead of guessing',
+      res.landed.length === 0 && /ambiguous/.test(res.reason || ''), JSON.stringify(res))
+    ok('the refusal names both candidates so a human can pick',
+      /7ab1-lane-A1/.test(res.reason || '') && /7ab1-lane-B2/.test(res.reason || ''), JSON.stringify(res))
+    ok('neither ambiguous file was written to disk',
+      !onDisk(shared, 'patterns/amb-a-2026-08-30.md') &&
+      !onDisk(shared, 'patterns/amb-b-2026-08-30.md'), 'one of them landed')
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 11. ANOTHER ROW'S WORKER BRANCH IS NEVER A CANDIDATE. 'worker/<other-uuid>'
+  //     can share a 4-char prefix by chance, and landing its files under this row's
+  //     audit line would misattribute doctrine to the wrong job.
+  {
+    const { root, shared } = setup()
+    const rowId = '9c3d0a11-0000-1111-2222-333344445555'
+    const other = '9c3d0a99-8888-7777-6666-555544443333'
+    plantWorkerBranch(shared, root, 'worker/' + other, { 'patterns/other-row-2026-08-30.md': '# not mine\n' })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/' + rowId, rowId })
+    ok('a sibling row\'s worker branch is excluded from the id-prefix search',
+      res.landed.length === 0 && res.reason === 'branch does not exist (nothing to harvest)',
+      JSON.stringify(res))
+    ok('the sibling row\'s file did not land',
+      !onDisk(shared, 'patterns/other-row-2026-08-30.md'), 'it landed')
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 12. CONTROL: the exact branch still wins and is never re-resolved. Without
+  //     this the fallback could quietly take over the common path.
+  {
+    const { root, shared } = setup()
+    const rowId = 'aa11bb22-cccc-dddd-eeee-ffff00001111'
+    plantWorkerBranch(shared, root, 'worker/' + rowId, { 'patterns/exact-wins-2026-08-30.md': '# exact\n' })
+    plantWorkerBranch(shared, root, 'worker/aa11-decoy', { 'patterns/decoy-2026-08-30.md': '# decoy\n' })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/' + rowId, rowId })
+    ok('the exact branch is used when it has commits',
+      res.resolvedVia === 'exact' && res.branch === 'worker/' + rowId, JSON.stringify(res))
+    ok('the decoy branch was not harvested',
+      !onDisk(shared, 'patterns/decoy-2026-08-30.md') &&
+      readDisk(shared, 'patterns/exact-wins-2026-08-30.md') === '# exact\n', JSON.stringify(res))
     fs.rmSync(root, { recursive: true, force: true })
   }
 

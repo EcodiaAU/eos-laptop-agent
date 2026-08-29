@@ -330,6 +330,38 @@ async function defaultAllocateWorktreeForRow(row) {
   await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
 
   const branchName = 'worker/' + String(row.id)
+
+  // 2026-08-30 lane H1. -B RESETS THE BRANCH REF, AND A RE-DISPATCH IS A SILENT
+  // DESTRUCTION. defaultPruneWorktreeForRow harvests on the way OUT, which covers
+  // completion, failure, orphan and stale-lease. It does not cover the way back
+  // IN: the dead-row reaper re-arms rows, the row is leased again, and this
+  // function opens with `worktree remove --force` and then `worktree add -B`,
+  // which moves the ref to origin/main and drops every commit the prior attempt
+  // made. No prune ran, so no harvest ran, and the doctrine is gone with no audit
+  // line naming it. Harvesting here is the same add-only, em-dash-refusing,
+  // never-commits call made one step earlier, and it is the ONLY point where the
+  // prior attempt's commits are still reachable.
+  //
+  // Failure never blocks the allocation, for the same reason it never blocks the
+  // prune: a worker that cannot start is a worse outcome than doctrine that stays
+  // stranded one more cycle.
+  try {
+    const { harvestDoctrine } = require('./doctrine-harvest')
+    const res = await harvestDoctrine({
+      sharedTree: SHARED_TREE,
+      branch: branchName,
+      rowId: String(row.id),
+    })
+    if (res && res.landed && res.landed.length) {
+      process.stderr.write('[scheduler] doctrine-harvest (pre-realloc): rescued ' +
+        res.landed.length + ' pattern file(s) from ' + (res.branch || branchName) +
+        ' before -B reset it\n')
+    }
+  } catch (e) {
+    process.stderr.write('[scheduler] doctrine-harvest (pre-realloc) failed for ' + row.id +
+      ': ' + (e && e.message || e) + ' (allocating anyway)\n')
+  }
+
   await runGit(['worktree', 'add', '-B', branchName, wtPath, 'origin/main'])
   return wtPath
 }

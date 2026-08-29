@@ -92,7 +92,7 @@ const MAX_FILES = 25
 // only when something lands. A prune that lands nothing is the common case, so
 // that proof was unavailable most of the time. Bump this string with any change
 // whose liveness a later session has to establish from the log alone.
-const BUILD = 'toplevel-baseline-2026-08-30'
+const BUILD = 'branch-resolve-2026-08-30'
 // Escaped, never a literal: this file is itself subject to the character-level ban.
 const EM_DASH = '\u2014'
 
@@ -125,6 +125,79 @@ function makeGit (sharedTree) {
 
 // Commits on `branch` that are not reachable from origin/main, oldest first, so
 // a file added then superseded on the same branch resolves to its LAST version.
+// 2026-08-30 lane H1. THE BRANCH NAME IS A GUESS, AND A WRONG GUESS LOOKS LIKE
+// AN EMPTY BRANCH. The scheduler hands harvest 'worker/' + row.id because that is
+// what defaultAllocateWorktreeForRow creates, but a worker is free to commit on a
+// ref of its own choosing and several do. Row 5fd046e8-8e0b-4a13-923f-16198b7acd07
+// committed on worker/5fd0-seedtree-lane-N1-pass4, so harvest resolved the exact
+// name, found it empty, and logged 'no commits off main' while the real commits
+// sat one ref away. The audit line was truthful about the ref it was given and
+// silent about the doctrine it missed, which is the worst shape a log can take.
+//
+// The fallback searches refs/heads for a branch carrying this row's id, and it
+// REFUSES rather than guesses. Three rails make a wrong attribution hard:
+//   - Longest prefix wins. The full uuid is tried, then 8 chars, then 4. A match
+//     at a longer prefix is never overridden by a shorter one.
+//   - A candidate shaped like ANOTHER row's worker branch is excluded outright.
+//     'worker/5fd0abcd-...' contains '5fd0' and belongs to somebody else; landing
+//     its files under this row's audit line would misattribute doctrine.
+//   - Exactly one survivor, or nothing. Two candidates at the same prefix is
+//     ambiguous by construction and returns a named refusal, because harvesting
+//     the wrong branch writes real files into the corpus under a real basename.
+// Doctrine: patterns/a-baseline-that-counts-the-archived-copy-refuses-the-un-archival-2026-08-30.md
+const WORKER_BRANCH_UUID_RE = /^refs\/heads\/worker\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
+
+async function branchHasCommits (git, branch) {
+  try {
+    const shas = await commitsOffMain(git, branch)
+    return shas.length > 0
+  } catch (_e) {
+    return false
+  }
+}
+
+// resolveBranch(git, branch, rowId) -> { branch, via, ambiguous }
+// `via` is 'exact' when the given name carried the commits, 'id-prefix:<n>' when
+// the fallback found them elsewhere, and null when there is nothing to harvest.
+async function resolveBranch (git, branch, rowId) {
+  if (await branchHasCommits(git, branch)) return { branch, via: 'exact', ambiguous: null }
+  const id = String(rowId || '').toLowerCase()
+  if (!/^[0-9a-f]{8}-/.test(id)) return { branch, via: null, ambiguous: null }
+
+  let refs = []
+  try {
+    const out = await git(['for-each-ref', '--format=%(refname)', 'refs/heads/'])
+    refs = out.split('\n').map((s2) => s2.trim()).filter(Boolean)
+  } catch (_e) {
+    return { branch, via: null, ambiguous: null }
+  }
+
+  const givenRef = 'refs/heads/' + branch
+  for (const len of [id.length, 8, 4]) {
+    const needle = id.slice(0, len)
+    if (!needle) continue
+    const hits = refs.filter((ref) => {
+      if (ref === givenRef) return false
+      if (!ref.toLowerCase().includes(needle)) return false
+      // Exclude a ref that is another row's worker branch by construction.
+      const m = WORKER_BRANCH_UUID_RE.exec(ref.toLowerCase())
+      if (m && m[1] !== id) return false
+      return true
+    })
+    if (!hits.length) continue
+    const withCommits = []
+    for (const ref of hits) {
+      if (await branchHasCommits(git, ref)) withCommits.push(ref)
+    }
+    if (!withCommits.length) continue
+    if (withCommits.length > 1) {
+      return { branch, via: null, ambiguous: withCommits.map((r) => r.replace('refs/heads/', '')) }
+    }
+    return { branch: withCommits[0].replace('refs/heads/', ''), via: 'id-prefix:' + len, ambiguous: null }
+  }
+  return { branch, via: null, ambiguous: null }
+}
+
 async function commitsOffMain (git, branch) {
   const out = await git(['rev-list', '--reverse', branch, '--not', 'origin/main'])
   return out.split('\n').map((s) => s.trim()).filter(Boolean)
@@ -245,7 +318,7 @@ async function existingBasenames (git, sharedTree) {
  */
 async function _harvest (opts) {
   const sharedTree = opts && opts.sharedTree
-  const branch = opts && opts.branch
+  let branch = opts && opts.branch
   const rowId = (opts && opts.rowId) || 'unknown'
   const dryRun = !!(opts && opts.dryRun)
   const result = { ok: false, landed: [], skipped: [], refused: [], unarchived: [], commit: null, reason: null, rowId, branch, build: BUILD }
@@ -256,17 +329,44 @@ async function _harvest (opts) {
   }
   const git = makeGit(sharedTree)
 
+  // origin/main is the base every commits-off-main question is asked against, so
+  // it is refreshed BEFORE the branch is resolved, not after. Resolution now runs
+  // rev-list itself (that is how it tells a live branch from an empty one), and
+  // against a stale base every candidate looks full.
+  await git(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
+
   // The branch must exist. A worktree whose allocation failed has no ref, and
-  // that is a clean no-op rather than an error.
+  // that is a clean no-op rather than an error. A MISSING ref is still worth the
+  // id-prefix search: the commits may be on a name the worker chose.
+  let exactExists = true
   try {
     await git(['rev-parse', '--verify', '--quiet', branch + '^{commit}'])
   } catch (_e) {
-    result.ok = true
-    result.reason = 'branch does not exist (nothing to harvest)'
-    return result
+    exactExists = false
   }
 
-  await git(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
+  const resolved = await resolveBranch(git, branch, rowId)
+  if (resolved.ambiguous) {
+    result.ok = true
+    result.branch = branch
+    result.resolvedVia = null
+    result.reason = 'branch id-prefix search was ambiguous, refusing to guess (' +
+      resolved.ambiguous.join(', ') + ')'
+    return result
+  }
+  if (!resolved.via) {
+    result.ok = true
+    result.reason = exactExists
+      ? 'no commits off main'
+      : 'branch does not exist (nothing to harvest)'
+    return result
+  }
+  if (resolved.branch !== branch) {
+    result.branch = resolved.branch
+    result.requestedBranch = branch
+  }
+  result.resolvedVia = resolved.via
+  branch = resolved.branch
 
   let shas
   try {
@@ -430,4 +530,8 @@ async function harvestDoctrine (opts) {
   return result
 }
 
-module.exports = { harvestDoctrine, MAX_FILES }
+// BUILD is exported so a test can assert the stamp is PRESENT on every result
+// path without hardcoding its value. The literal was hardcoded in the test until
+// 2026-08-30, which meant every bump of a field that exists TO BE BUMPED broke a
+// test, and a stamp that is annoying to change is a stamp that stops being changed.
+module.exports = { harvestDoctrine, MAX_FILES, BUILD }

@@ -58,6 +58,44 @@ async function main() {
   const list = git(SHARED, ['worktree', 'list', '--porcelain'])
   assert(list.includes(wtPath), 'worktree is now REGISTERED (self-heal succeeded where raw git failed)')
   assert(!fs.existsSync(path.join(wtPath, 'leftover.mjs')), 'stale leftover artifact was cleared')
+
+  // 2026-08-30 lane H1: THE RE-DISPATCH DESTRUCTION PATH.
+  // `worktree add -B` resets the branch ref to origin/main, so a second dispatch
+  // of the same row silently discards every commit the first attempt made. The
+  // prune-side harvest never sees it: no prune runs on the way back IN. Row
+  // cbade3a0 completed with zero harvest lines and two stranded pattern files,
+  // and the dead-row reaper re-arms rows, so this path is live rather than
+  // theoretical. Plant a pattern file on the row's branch exactly as a worker
+  // leaves one, re-allocate, and assert the file was rescued to the corpus BEFORE
+  // -B threw the commit away.
+  {
+    const patternsDir = path.join(SHARED, 'patterns')
+    fs.mkdirSync(patternsDir, { recursive: true })
+    // Commit the worker's doctrine inside its own worktree, the way a real one does.
+    const rel = 'patterns/rescued-before-the-reset-2026-08-30.md'
+    fs.mkdirSync(path.join(wtPath, 'patterns'), { recursive: true })
+    fs.writeFileSync(path.join(wtPath, rel), '# rescued before -B reset the ref\n')
+    git(wtPath, ['config', 'user.email', 'test@ecodia.au'])
+    git(wtPath, ['config', 'user.name', 'wt-alloc-test'])
+    git(wtPath, ['add', '-A'])
+    git(wtPath, ['commit', '-q', '-m', 'doctrine a re-dispatch would have destroyed'])
+
+    const onBranchBefore = git(SHARED, ['ls-tree', '-r', '--name-only', 'worker/' + ROW_ID]).includes(rel)
+    assert(onBranchBefore, 'precondition: the doctrine is on the worker branch and nowhere else')
+    assert(!fs.existsSync(path.join(SHARED, rel)), 'precondition: not yet in the corpus on disk')
+
+    // The re-dispatch.
+    await scheduler.allocateWorktreeForRow({ id: ROW_ID })
+
+    assert(fs.existsSync(path.join(SHARED, rel)),
+      're-dispatch harvests the prior attempt BEFORE -B resets the branch')
+    assert(fs.readFileSync(path.join(SHARED, rel), 'utf8') === '# rescued before -B reset the ref\n',
+      'the rescued file carries the worker\'s bytes, not a placeholder')
+    // The negative that proves the destruction was real: -B did reset the ref, so
+    // without the rescue above the commit would now be unreachable from the branch.
+    const onBranchAfter = git(SHARED, ['ls-tree', '-r', '--name-only', 'worker/' + ROW_ID]).includes(rel)
+    assert(!onBranchAfter, 'control: -B did reset the branch, so the rescue was the only copy')
+  }
 }
 
 main()
