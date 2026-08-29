@@ -1033,7 +1033,32 @@ function isGenericLabelStr(s) { return GENERIC_TAB_LABELS.has(String(s || '').tr
 // a label-derived address, and sixteen commits since 2026-08-18 each named a
 // different root cause without removing the derivation itself.
 function addressForConductor() { return 'chat.conductor.inbox' }
-function addressForWorker(tabId) { return 'chat.' + tabId + '.inbox' }
+// 2026-08-29. THE FOURTH HAND-BUILT COPY OF THIS ADDRESS, and the one that
+// mattered most. It used to return 'chat.' + tabId + '.inbox' unconditionally.
+// When the mailbox became lane-keyed the RECEIVER moved (inboxTopicFor resolves
+// lane first) and every SENDER addressing a worker by tab_id or task_id kept
+// writing to the per-tab topic, so a reply to a lane-bearing worker landed in a
+// mailbox that worker no longer reads. The send still returned ok:true and
+// delivered:false, which reads as "queued, will be seen", and it never would be.
+// Measured 2026-08-29T13:5xZ on a live registry row: message 427fab8b sent to
+// tab_lanetest_1788011002843 landed in chat.tab_lanetest_1788011002843.inbox
+// while that worker's own read path returned chat.lane.cowork.daycrew-lane-s2.inbox
+// and did NOT contain it.
+// Same defect class already fixed in routes/comms.js (2026-08-28) and in both
+// composeBrief headers (2026-08-29). This is the third recurrence, which is why
+// the rule is now: NOTHING builds this string by hand. inboxTopicFor is the one
+// opinion, and the fallback inside it still returns the per-tab form for a worker
+// with no lane, so every pre-lane address is byte-identical.
+// To reach ONE SPECIFIC TAB rather than its work lane, pass the literal
+// 'chat.<tab_id>.inbox' as `to`: _canonicalAddress returns an explicit
+// chat.*.inbox address verbatim, so that escape hatch is unchanged.
+function addressForWorker(tabId) { return inboxTopicFor({ tab_id: tabId }) }
+
+// The RAW per-tab address. addressForWorker used to be this and is now
+// lane-aware, so the lane branch of resolveLiveTargetTab needs the unresolved
+// form to hand back a tab-shaped topic; calling addressForWorker there would
+// resolve straight back to the lane topic and recurse forever.
+function addressForWorkerTab(tabId) { return 'chat.' + tabId + '.inbox' }
 
 function chatTopicMid(topic) {
   const m = /^chat\.(.+)\.inbox$/.exec(String(topic || ''))
@@ -2242,6 +2267,33 @@ async function resolveLiveTargetTab(topic) {
   // _canonicalAddress refuses the prefix, so nothing mints one any more; an old
   // chat.label: topic left on disk from before this commit now falls through to
   // target_unresolved and stays queued rather than being injected into a stranger.
+
+  // LANE TOPIC -> the live worker currently holding that lane (2026-08-29).
+  // Without this, making addressForWorker lane-aware would have traded an
+  // invisible message for an undeliverable one: mid is 'lane.<key>', which is
+  // not a tab_id, so loadWorkerRegistry below returns nothing and every send to
+  // a lane mailbox falls to target_unresolved and is never pushed as a live
+  // turn. The durable half would work and the wake half would silently stop.
+  //
+  // A lane is a WORK identity, not a tab identity, so it can legitimately name
+  // more than one live tab (a predecessor still closing while its successor
+  // boots). Uniqueness-gated for exactly that reason, and refusing leaves the
+  // message queued in the lane mailbox where BOTH of them read it, which is the
+  // fail-safe this file uses everywhere else. Terminated rows are excluded
+  // before counting, so a dead predecessor never makes a live successor
+  // ambiguous, and never inherits a delivery (closed-tab identity is never
+  // reused, same rule as the worker branch below).
+  if (/^lane\./.test(mid)) {
+    const laneKey = mid.slice('lane.'.length)
+    const holders = []
+    for (const [tabId, row] of workers.entries()) {
+      if (!row || row.terminated_at) continue
+      if (laneKeyOf(row.lane_name) === laneKey) holders.push(tabId)
+    }
+    if (holders.length === 0) return { ok: false, kind: 'lane', reason: 'lane_no_live_holder' }
+    if (holders.length > 1) return { ok: false, kind: 'lane', reason: 'lane_ambiguous_holder' }
+    return resolveLiveTargetTab(addressForWorkerTab(holders[0]))
+  }
 
   const w = loadWorkerRegistry(mid)
   // A TERMINATED worker is never a delivery target. Its on-disk row is reaped
