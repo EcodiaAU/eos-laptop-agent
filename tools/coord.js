@@ -1333,17 +1333,57 @@ function _looksLikeWorkerTab(tab, liveWorkers) {
 // conductor -> the conductor's active CC tab; label:<slug> -> the unique tab
 // whose label slugs to <slug>; a worker tab_id -> the proven fingerprint match
 // (close_my_tab's resolver). Ambiguity refuses rather than guesses.
-// Is this live tab the conductor's OWN chat tab? Uses exactly the identity the
-// conductor branch below accepts (stored label first, then the title
-// fingerprint), so a tab that branch would call the conductor is recognised here
-// no matter which address form reached it.
+// Is this live tab the conductor's OWN chat tab? Two legs: the stored label
+// first, then the title fingerprint.
 //
-// FALSE POSITIVES ARE THE SAFE DIRECTION, AND THEY WILL HAPPEN. Nine live anchors
-// in COORD_ROOT/chat-tabs carry the conductor's registered label "Claude Code",
+// THE FINGERPRINT LEG IS BROADER THAN THE CONDUCTOR BRANCH BELOW. An earlier
+// version of this comment claimed it "uses exactly the identity the conductor
+// branch below accepts", and that is not true for this leg. pickByFingerprint
+// applies its decisive-winner uniqueness test only inside `if (scored.length > 1)`,
+// so calling it here with a ONE-ELEMENT array silently degrades that gate to the
+// bare threshold (hits >= 2, coverage >= 0.6). The conductor branch passes the
+// whole pool and does get the uniqueness test. So this predicate accepts tabs
+// that branch would refuse outright. Pinned by CASE K2 and CASE L in
+// tools/coord-inject-gate-adversarial.test.js.
+//
+// FALSE POSITIVES ARE THE SAFE DIRECTION, AND THEY WILL HAPPEN. Nine anchors in
+// COORD_ROOT/chat-tabs carry the conductor's registered label "Claude Code",
 // so an unrelated chat wearing that label is treated as the conductor: its
 // message is left UNSEEN unless a turn is proven to land, which means it is shown
 // twice rather than consumed once. Do not narrow this predicate to stop that.
 // Consumed once is the defect; shown twice is the fail-safe.
+//
+// THE ONE REAL COST of a false positive is the global _conductorLandingInFlight
+// flag (see pushInject): the impostor holds it for a full landing timeout, and
+// every genuine conductor inject in that window is refused with
+// conductor_landing_in_flight and attempted:false. The message is left unseen so
+// it is DELAYED, not lost, but on this host the inject IS the wake (the flash and
+// auto_type tiers are Win32 and no-op on a Mac), so the cost is a delayed
+// conductor wake.
+//
+// MEASURED 2026-08-29 AND LEFT AS IS DELIBERATELY. A census of all 1921 anchors
+// in COORD_ROOT/chat-tabs found ZERO labels that clear the fingerprint bar
+// without ALSO being exactly "Claude Code", so the fingerprint-only class has
+// never occurred once. That census is the exposure census, not a proxy for it: a
+// chat with no anchor returns session_unregistered and can never reach the gate
+// or hold the flag, so the anchored set IS the exposed set. The exact-label class
+// costs no denial either, because two live tabs sharing the label make the
+// conductor branch refuse with conductor_ambiguous_label, so no genuine
+// conductor-addressed message reaches the gate to be denied.
+//
+// TRIPWIRE, and the fix to apply when it trips: if an anchor ever clears the
+// fingerprint bar WITHOUT an exact label match, replace this boolean with a
+// three-way strength. Resolve the conductor branch against the same pool once;
+// if it resolves and its position equals this tab's, return 'conductor'; if only
+// the loose bar is cleared, return 'suspected'. Then give pushInject two
+// INDEPENDENT in-flight slots, each cleared by its own holder, so a suspected
+// holder never denies a genuine one while two genuine ones still exclude each
+// other. That closes the hazard completely, because when the conductor branch is
+// ambiguous no genuine conductor-addressed message reaches the gate at all.
+// Do NOT instead simply give this leg the pool-wide uniqueness gate. The leg
+// exists for the window where the conductor was auto-retitled between beats, and
+// pool ambiguity there would ungate the REAL conductor and re-open the
+// consumed-message defect precisely where the leg was built to help.
 function _tabIsConductorTab(tab, conductor) {
   if (!tab || !conductor) return false
   const tm = conductor.title_match ? String(conductor.title_match) : ''
