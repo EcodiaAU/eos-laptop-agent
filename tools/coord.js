@@ -644,7 +644,7 @@ async function _wakeByChatInject(notice) {
 
 // ── core ops (no auth here - that's the route layer's job) ───────────────
 
-function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session, account_active_when_spawned }) {
+function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session, account_active_when_spawned, lane_name }) {
   if (!tab_id) throw new Error('tab_id required')
   if (!tab_credential) throw new Error('tab_credential required')
   ensureDirs()
@@ -663,6 +663,13 @@ function registerWorkerInternal({ tab_id, task_id, tab_credential, parent_conduc
     // coord-conductor-addressing-per-tab-identity-2026-08-13.
     parent_session: parent_session || null,
     account_active_when_spawned: account_active_when_spawned || null,
+    // 2026-08-29. The os_scheduled_tasks row name this worker was dispatched
+    // from, e.g. 'cowork.daycrew-lane-S2-verify6'. Stored so inboxTopicFor can
+    // derive a LANE-keyed mailbox that outlives this tab: the lane key strips
+    // the trailing suffix, so the next pass of the same job inherits this
+    // worker's inbox instead of starting empty. Null for a worker dispatched
+    // without a lane-shaped name, which then keeps the legacy per-tab topic.
+    lane_name: lane_name || null,
     registered_at: now,
     last_heartbeat_at: now,
     status: null,
@@ -806,12 +813,63 @@ function markSeen(messages) {
   }
 }
 
-// Compute an inbox topic for the caller. Worker -> 'chat.<tab_id>.inbox'.
-// Conductor (no tab_id) -> 'chat.conductor.inbox'.
+// LANE KEY. JS twin of the Postgres os_sched_lane_key(text) used by migration
+// 147's one-live-row-per-lane trigger and by leaseDueRows. Kept character-exact
+// against the SQL source so the two can never disagree about what lane a row is
+// in; laneKeyFixtures.test.js asserts it against rows pulled from the live DB.
+//   SELECT lower(substring(p_name from
+//     '^(cowork\.[a-z0-9][a-z0-9._-]*-lane-[A-Za-z]{1,3}[0-9]+[A-Za-z0-9]*)(-.*)?$'))
+// The property that matters here: the trailing suffix is STRIPPED, so
+// cowork.daycrew-lane-S2-deploy-verify and cowork.daycrew-lane-S2-verify6 yield
+// the same key. That is mailbox inheritance, for free.
+const LANE_KEY_RE = /^(cowork\.[a-z0-9][a-z0-9._-]*-lane-[A-Za-z]{1,3}[0-9]+[A-Za-z0-9]*)(-.*)?$/
+function laneKeyOf(name) {
+  if (!name || typeof name !== 'string') return null
+  const m = LANE_KEY_RE.exec(name)
+  return m ? m[1].toLowerCase() : null
+}
+
+// Compute an inbox topic for the caller.
+//
+// 2026-08-29, THE TOMBSTONE FIX. This function used to key a chat's entire
+// mailbox to its tab_id and nothing else. A tab_id dies with its tab, so every
+// message sent to a finished chat became unreachable, and a SUCCESSOR working
+// the very same job started with an empty inbox while its predecessor's mail
+// sat in a directory nothing would ever open again. 500 orphaned topic dirs on
+// disk are that failure, accumulated one dead tab at a time. It is also why
+// "chats across time" did not work: the address had a shorter life than the work.
+//
+// Resolution order, most durable first:
+//   1. LANE  -> 'chat.lane.<lane_key>.inbox'   survives tab death AND retitles,
+//              because the lane key strips the row-name suffix, so the verify
+//              pass of a job inherits the mailbox of the pass that armed it.
+//   2. TAB   -> 'chat.<tab_id>.inbox'          the legacy address. Still returned
+//              when no lane is known, so nothing that worked before breaks.
+//   3. CONDUCTOR -> 'chat.conductor.inbox'     hardcoded in the two live drain
+//              hooks (coord_events_pending.py at turn-start,
+//              coord_events_midturn.py at every tool-call boundary) and in
+//              conductor_heartbeat.py. It MUST keep resolving exactly as before
+//              or the conductor goes deaf; the conductor never has a lane.
+//
+// Existing per-tab topics stay readable: this only changes what a NEW message
+// resolves to for a lane-bearing worker, and read_inbox/peek_inbox/wait_for_inbox
+// all accept an explicit `topic` override for reaching any of the 500 old ones.
 function inboxTopicFor(ctx) {
   const tab = ctx && ctx.tab_id
-  if (tab && tab !== 'conductor') return 'chat.' + tab + '.inbox'
-  return 'chat.conductor.inbox'
+  if (!tab || tab === 'conductor') return 'chat.conductor.inbox'
+  // ctx.lane_name wins when a caller supplies it; otherwise fall back to what
+  // the worker registered with, so an ordinary read_inbox with no extra args
+  // still resolves to the durable lane mailbox.
+  let laneName = ctx && ctx.lane_name
+  if (!laneName) {
+    try {
+      const w = workers.get(tab)
+      if (w && w.lane_name) laneName = w.lane_name
+    } catch (e) { /* registry unreadable: fall through to the per-tab topic */ }
+  }
+  const lane = laneKeyOf(laneName)
+  if (lane) return 'chat.lane.' + lane + '.inbox'
+  return 'chat.' + tab + '.inbox'
 }
 
 // ── chat-to-chat push delivery ───────────────────────────────────────────
@@ -1343,6 +1401,48 @@ function _stampAnchorTabId(workerTabId, tabId) {
 // UNCLAIMED same-sentinel tabs are genuinely undecidable and still refuse.
 // During the transition the accreted corpses hold no id and so cannot be
 // excluded; the backlog reaper drains them and the system converges.
+// Is the stored stable id CONTRADICTED by the live listing?
+//
+// 2026-08-29 lane W1-verify3, written after a real wrong-close: a worker's own
+// close_my_tab closed the human chat labelled "Crons" and left its own tab open.
+// The row arrived carrying that chat's id (the dispatcher's spawn-diff stamp,
+// measured 0 of 10 still resolving correctly) and every check between there and
+// the close asked only whether the id was ALIVE. It was alive. It belonged to
+// someone else. LIVENESS IS NOT IDENTITY, and the difference is the safety
+// property: a dead id expires on its own, while a wrong-but-alive id is kept
+// alive by its real owner and so never expires.
+//
+// The obvious repair, "confirm the held tab still wears my sentinel", is WRONG
+// and the suites caught it. The stable id exists precisely BECAUSE Claude Code
+// autotitles a worker's tab away from its sentinel within ~11s; demanding a
+// label match to trust the id reduces it to the label ladder it was built to
+// replace, and it refused every legitimate cron close.
+//
+// So judge by CONTRADICTION, not confirmation. Override the stored id only on
+// positive evidence that a DIFFERENT live tab is the real owner of this
+// identity:
+//   a. another registry row already claims the held tab (decisive, whatever the
+//      labels read), or
+//   b. some OTHER live tab wears my sentinel while the held tab does not.
+// An autotitled tab with nothing else wearing its sentinel contradicts nothing,
+// so it is trusted, which is the whole point of the id. A row carrying no
+// identity signal at all contradicts nothing either.
+function _storedIdContradicted(th, tabs, tab_id, want) {
+  if (!th || !tabs || !tabs.length || !want) return false
+  const held = tabs.find((t) => t.tabId === want)
+  if (!held) return false                       // not live: the not_live path owns this
+  try { if (_claimedStableTabIds(tab_id).has(want)) return true } catch (e) {}
+  const spawnLabel = th.label || th.label_at_spawn
+  const haveSentinel = !!th.sentinel_prefix
+  const haveSpawn = !!(spawnLabel && !isGenericLabelStr(spawnLabel))
+  if (!haveSentinel && !haveSpawn) return false // nothing to judge with
+  const wearsMyIdentity = (t) =>
+    (haveSentinel && _labelMatchesStored(t.label, th.sentinel_prefix)) ||
+    (haveSpawn && _labelMatchesStored(t.label, spawnLabel))
+  if (wearsMyIdentity(held)) return false       // the held tab IS wearing my identity
+  return tabs.some((t) => t.tabId !== want && wearsMyIdentity(t))
+}
+
 async function _captureStableTabId(tab_id, opts) {
   opts = opts || {}
   try {
@@ -1387,12 +1487,57 @@ async function _captureStableTabId(tab_id, opts) {
       // that does not contain it proves it dead. A bridge error or an empty
       // listing proves nothing and keeps the stored value untouched.
       let liveIds = null
+      let liveById = null
       try {
         const probe = await _liveCcTabsWithIds(conductor.ide_bridge_port)
-        if (probe && probe.length) liveIds = new Set(probe.map((t) => t.tabId).filter(Boolean))
+        if (probe && probe.length) {
+          liveIds = new Set(probe.map((t) => t.tabId).filter(Boolean))
+          liveById = new Map(probe.filter((t) => t.tabId).map((t) => [t.tabId, t]))
+        }
       } catch (e) { liveIds = null }
       if (!liveIds) return { ok: true, tabId: th.tabId, reason: 'already_set_liveness_unknown' }
-      if (liveIds.has(th.tabId)) return { ok: true, tabId: th.tabId, reason: 'already_set' }
+      // 2026-08-29 lane W1-verify3, found by a WRONG-CLOSE in the field: this
+      // worker's own close_my_tab closed the human chat labelled "Crons" and
+      // left its own tab open, because the row arrived carrying that chat's id
+      // and this branch waved it through.
+      //
+      // LIVENESS IS NOT IDENTITY. The check above only asks whether the stored
+      // id still names SOME live tab. A dead id is caught; an id that is alive
+      // and belongs to SOMEONE ELSE is not, and it never expires, because the
+      // other tab keeps it alive. The dispatcher's spawn-diff stamp is what
+      // makes a wrong-but-alive id common rather than exotic (measured 0 of 10
+      // spawn-diff ids still resolving), and the close path treats a stored id
+      // as TERMINAL, so this branch is the last thing standing between a bad
+      // stamp and closing a stranger's chat.
+      //
+      // So ask the identity question the capture below already knows how to ask,
+      // against the tab that actually holds the id. Fail-safe direction is the
+      // file's standing one: dropping a CORRECT id costs a leak (re-capture
+      // misses, the row ends with no id, the label ladder runs), while keeping a
+      // WRONG one costs a live chat. Only judge when there is something to judge
+      // with; a row carrying neither a sentinel nor a non-generic spawn label
+      // has no identity signal, so it keeps the old liveness-only behaviour.
+      if (liveIds.has(th.tabId)) {
+        const liveList = liveById ? Array.from(liveById.values()) : []
+        const held = liveById && liveById.get(th.tabId)
+        if (!held || !_storedIdContradicted(th, liveList, tab_id, th.tabId)) {
+          return { ok: true, tabId: th.tabId, reason: 'already_set' }
+        }
+        const wrongId = th.tabId
+        delete th.tabId
+        th.tabId_wrong_dropped = wrongId
+        // Earn the same ladder ban a stale drop earns: a row that HAD an id and
+        // lost it is not a virgin legacy row, and the ladder resolves a
+        // byte-identical sentinel onto a sibling's LIVE tab.
+        th.tabId_stale_dropped = wrongId
+        th.tabId_wrong_dropped_at = new Date().toISOString()
+        th.tabId_wrong_dropped_label = held.label
+        th.tabId_wrong_dropped_why = 'another_live_tab_wears_my_identity'
+        w.tab_handle = th
+        workers.set(tab_id, w)
+        try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+        // fall through and re-capture against the CURRENT labels
+      }
       // Proven dead. Drop it so a re-capture that cannot resolve unambiguously
       // leaves the row with NO id ({none}) and the legacy ladder runs, rather
       // than leaving a value we have just proven wrong to hard-refuse the close.
@@ -1501,7 +1646,16 @@ async function _resolveStableIdCloseTarget(tab_id, idePort) {
   try { tabs = await _liveCcTabsWithIds(idePort) }
   catch (e) { return { refused: 'stable_id_bridge_unreachable:' + ((e && e.message) || String(e)) } }
   const hits = (tabs || []).filter((t) => t.tabId === want)
-  if (hits.length === 1) return { tab: hits[0], tabId: want }
+  if (hits.length === 1) {
+    // The id resolves to exactly one live tab, which says only that the id is
+    // alive. Ask whether that tab is OURS before handing it to a close. A wrong
+    // id here is not a leak, it is someone else's chat closing. Treated like
+    // not-live so the recapturing wrapper gets its one repair attempt.
+    if (_storedIdContradicted(th, tabs, tab_id, want)) {
+      return { refused: 'stable_id_not_mine:' + want + ' label=' + JSON.stringify(String(hits[0].label || '')) }
+    }
+    return { tab: hits[0], tabId: want }
+  }
   // Ids are unique per snapshot, so this is a bridge invariant break, not a
   // resolvable state. Refuse loudly rather than pick one.
   if (hits.length > 1) return { refused: 'stable_id_ambiguous:' + want + ' n=' + hits.length }
@@ -1536,8 +1690,9 @@ async function _resolveStableIdCloseTarget(tab_id, idePort) {
 // Cost is on the failing path only. The happy path is one listing, unchanged.
 async function _resolveStableIdCloseTargetRecapturing(tab_id, idePort) {
   const st = await _resolveStableIdCloseTarget(tab_id, idePort)
-  const notLive = st && typeof st.refused === 'string' && st.refused.indexOf('stable_id_not_live:') === 0
-  if (!notLive) return st
+  const repairable = st && typeof st.refused === 'string' &&
+    (st.refused.indexOf('stable_id_not_live:') === 0 || st.refused.indexOf('stable_id_not_mine:') === 0)
+  if (!repairable) return st
   try {
     let timer = null
     const capped = new Promise((resolve) => {
@@ -3837,6 +3992,7 @@ module.exports = {
   // Internal API for the /api/comms/register-worker route - NOT exposed as a tool.
   _registerWorkerInternal: registerWorkerInternal,
   _inboxTopicFor: inboxTopicFor,
+  _laneKeyOf: laneKeyOf,
   _loadConductorRegistration: loadConductorRegistration,
   // Sweep API for tests and for the daemon harness.
   _sweepStaleWorkers: sweepStaleWorkers,
@@ -3874,6 +4030,7 @@ module.exports = {
   _closeAnchorTarget: _closeAnchorTarget,
   // Stable IDE tab id (2026-08-29): capture at bind, resolve at close.
   _captureStableTabId: _captureStableTabId,
+  _storedIdContradicted: _storedIdContradicted,
   _captureConductorStableTabId: _captureConductorStableTabId,
   _hasSpawningUnclaimedWorker: _hasSpawningUnclaimedWorker,
   _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
