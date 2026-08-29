@@ -169,6 +169,15 @@ const COMPLETION_POLL_INTERVAL_MS = 5_000
 // below, so queue wait can no longer age a lease into reclaim eligibility.
 const STALE_DISPATCHING_MS = 15 * 60 * 1000   // 15 min -> retry (> 600s bind timeout); dispatch-prep grace ceiling
 const MAX_RETRY_COUNT = 3
+// 2026-08-29 lane D1 pass 4. Settle window for a row SUSPENDED MID-LEASE, i.e.
+// status still 'dispatching' or 'running' while last_status says 'paused'.
+// Deliberately LONGER than STALE_DISPATCHING_MS and not derived from it: the
+// observed p99 cold-bind tail is ~21min, so a 15min settle could retire the row
+// out from under a tab that is still legitimately launching, and a signal_bound
+// refused against a settled row holds the SERIAL fleet-wide launch-lock until it
+// times out. 30min clears that tail with margin. The strand this settles is
+// PERMANENT, so waiting is free.
+const SUSPENDED_LEASE_SETTLE_MS = parseInt(process.env.SCHEDULER_SUSPENDED_LEASE_SETTLE_MS, 10) || 30 * 60 * 1000
 // 2026-06-19 next_run_at-recompute fix. staleLeaseRecovery branch 1 (retryable
 // stale-dispatch) used to free the row back to 'active' while leaving next_run_at
 // at its past-due value, so the row was due on the very next 30s poll and re-fired
@@ -1445,9 +1454,18 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
 // independently of status, so the suspension holds regardless.
 //
 // RESIDUAL, named rather than hidden: the row is left at status='running' with its
-// lease. That is pre-existing and orthogonal - a row paused mid-flight is already
-// in a half-state - and staleLeaseRecovery branch 3 is its designed recovery at
-// ORPHAN_TIMEOUT_MS. What this removes is the 5-second storm, not the half-state.
+// lease. What this removes is the 5-second storm, not the half-state.
+//
+// CORRECTED 2026-08-29 (lane D1 pass 4). This block used to name staleLeaseRecovery
+// branch 3 as the designed recovery for that half-state at ORPHAN_TIMEOUT_MS. It is
+// not, and never was. Branch 3's SELECT carries no last_status filter so it DOES
+// select the row, but both of its UPDATEs re-assert
+// `last_status NOT IN ('paused','cancelled')`, so every pass probes liveness, fires
+// kill_worker on the tab and prunes the worktree, then no-ops the write. The row
+// never settles, and while it sits in 'running' it holds its LANE against every
+// future row on that lane. The real recovery is staleLeaseRecovery branch 0
+// (suspended-lease settle), which settles the row to status=last_status once it is
+// past SUSPENDED_LEASE_SETTLE_MS with no live worker.
 async function consumeSuspendedSignal(pool, rowId) {
   await pool.query(
     `UPDATE os_scheduled_tasks
@@ -2784,6 +2802,114 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // an UPDATE predicate can close.
   // [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]]
 
+  // 0. SUSPENDED MID-LEASE -> settle. (lane D1 pass 4, 2026-08-29.)
+  //
+  // Every branch below re-asserts `last_status NOT IN ('paused','cancelled')`, and
+  // that guard is right for the branches that RESURRECT a row (branch 1, branch 2a
+  // and branch 3's cron arm all set status='active'): a paused row must not be
+  // flipped back to active. But the SAME guard rides on the two branches that
+  // SETTLE a row (2b sets 'failed', branch 3's non-cron arm sets 'orphaned'), and
+  // there it does not aim the branch, it disables it. "Do not resurrect" silently
+  // became "can never settle".
+  //
+  // The result is a row nothing can move, and it is reachable through a SHIPPED
+  // TOOL: schedule_pause writes last_status='paused' and deliberately does not
+  // touch status, refusing only archived rows, so pausing a task inside its
+  // dispatch or run window leaves `status IN ('dispatching','running') AND
+  // last_status='paused' AND archived_at IS NULL`. From there:
+  //   - leaseDueRows will not lease it (its arrival guard excludes last_status
+  //     'paused'/'cancelled'), so it never runs again;
+  //   - but leaseDueRows' HOLDER predicate tests only `status IN ('running',
+  //     'dispatching')` with no last_status test, so the row keeps holding its
+  //     LANE and every future row on that lane defers behind it FOREVER. A lane
+  //     is how the fleet stops two tabs opening on one job, so a permanently
+  //     held lane is silent, permanent work stoppage for that lane;
+  //   - branches 1/2b select nothing (their SELECTs carry the guard) and
+  //     branch 2a + branch 3 select it, run the liveness probe, fire kill_worker
+  //     and pruneWorktreeForRow, then no-op the UPDATE, on EVERY pass, forever.
+  //     That churn is the same shape the 2026-08-29 completionPass fix removed
+  //     (see consumeSuspendedSignal), at this routine's cadence instead of 5s.
+  // The comment on consumeSuspendedSignal used to name branch 3 as the designed
+  // recovery for the running half of this state. It is not and never was; branch
+  // 3's UPDATEs carry the guard. This branch is that recovery.
+  //
+  // SETTLE TARGET is `status = last_status`, not 'failed' or 'orphaned'. That is
+  // quarantineRow's 2026-08-26 lesson (task daead163): a row suspended in one
+  // column while status reads healthy is the most invisible failure in the fleet,
+  // because every ordinary status query calls it fine. status='paused' is a valid
+  // enum value, it releases the lane, it keeps the operator's pause (leaseDueRows
+  // still refuses it on last_status), and schedule_resume clears BOTH columns, so
+  // the row stays resumable by the normal path.
+  //
+  // DISJOINT from the population the pass-3 guards protect. A breaker-quarantined
+  // row already sits at status='paused' (quarantineRow sets both columns), so it
+  // is not in ('dispatching','running') and this SELECT cannot see it. Nothing
+  // here loosens any guard below; it is additive.
+  //
+  // TWO independent signals separate an abandoned row from a healthy launching
+  // one, because either alone is wrong: SUSPENDED_LEASE_SETTLE_MS (30min, past the
+  // ~21min p99 cold-bind tail) AND the per-row liveness gate, which is what makes
+  // freeing the lane safe. A row with a live worker is left strictly alone, so
+  // this can never open a second tab on a job someone is still doing.
+  //
+  // done_at IS NULL mirrors branch 3: completionPass owns a row that has signalled
+  // done, and consumeSuspendedSignal clears that signal for exactly this suspended
+  // population every 5s, so the two converge instead of racing.
+  const dispatcherForSuspended = getDispatcher()
+  const suspendedRows = await pool.query(
+    `SELECT id, name, type, dispatched_tab_id FROM os_scheduled_tasks
+     WHERE status IN ('dispatching', 'running')
+       AND archived_at IS NULL
+       AND last_status IN ('paused', 'cancelled')
+       AND done_at IS NULL
+       AND leased_at IS NOT NULL
+       AND leased_at < NOW() - ($1 || ' milliseconds')::interval`,
+    [SUSPENDED_LEASE_SETTLE_MS]
+  )
+  for (const row of suspendedRows.rows) {
+    // 2026-07-17 self-lease-steal shield (see _inFlightDispatchIds).
+    if (_inFlightDispatchIds.has(String(row.id))) {
+      process.stderr.write('[scheduler] task ' + row.id +
+        ' is in-flight in this process, skipping suspended-lease settle\n')
+      continue
+    }
+    const liveWorker = await hasLiveWorkerForTask(row.id, PROTECT_LIVE_WORKERS)  // this branch prunes the worktree below
+    if (liveWorker) {
+      process.stderr.write(
+        '[scheduler] task ' + row.id + ' has live worker ' + liveWorker.tab_id +
+        ' (stale_ms=' + liveWorker.stale_ms + '), skipping suspended-lease settle\n'
+      )
+      continue
+    }
+    let closeOk = false
+    if (row.dispatched_tab_id && dispatcherForSuspended && dispatcherForSuspended.kill_worker) {
+      try {
+        const r = await dispatcherForSuspended.kill_worker({ tab_id: row.dispatched_tab_id })
+        closeOk = !!(r && r.closed)
+      } catch (e) {
+        process.stderr.write('[scheduler] suspended-lease settle kill_worker tolerated error for ' +
+          row.id + ': ' + e.message + '\n')
+      }
+    }
+    const tabFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
+    // Re-assert every column the SELECT matched: this loop awaits a coord network
+    // call per row, so the row moves under us (lane D1 pass 3 note above).
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       SET status = last_status,
+           last_error = 'suspended mid-lease: paused/cancelled while status was ' ||
+                        status || '; settled so the lane releases (resume with schedule_resume)',
+           leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
+       WHERE id = $1
+         AND status IN ('dispatching', 'running')
+         AND archived_at IS NULL
+         AND last_status IN ('paused', 'cancelled')
+         AND done_at IS NULL`,
+      [row.id]
+    )
+    try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
+  }
+
   // 1. Stale dispatching, retryable. 2026-06-21 reclaim-vs-bind race fix
   // (status_board 128b7c82): converted from a bulk UPDATE to SELECT + per-row
   // UPDATE so this branch consults coord worker liveness BEFORE reclaiming, exactly
@@ -2850,13 +2976,22 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // Marking a cron row permanently failed loses every future interval of
   // recurring work. markFailed already handles this for the dispatchOne path;
   // this branch fixes the parallel path through the stale-lease sweep.
+  // 2026-08-29 lane D1 pass 4: this SELECT was the one of the four missing the
+  // `archived_at IS NULL` + last_status guards its own UPDATE re-asserts (branches
+  // 1 and 2b carry them on both halves). An archived or suspended cron row was
+  // selected, cost a coord liveness call, no-opped the UPDATE, and then still ran
+  // pruneWorktreeForRow, which sits OUTSIDE the guarded write. Every pass, forever.
+  // Branch 0 above is what actually settles the suspended half.
+  // [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]]
   const staleCronRows = await pool.query(
     `SELECT id, cron_expression, tz FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
        AND ${exports.EFFECTIVE_RETRY_COUNT_SQL} >= $2
        AND type = 'cron'
-       AND cron_expression IS NOT NULL`,
+       AND cron_expression IS NOT NULL
+       AND archived_at IS NULL
+       AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
   for (const row of staleCronRows.rows) {

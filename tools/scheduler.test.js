@@ -1110,15 +1110,21 @@ test('completionPass: unleased running row (leased_at NULL) is NOT completed (ph
 // rows then liveness-gates each per-row UPDATE. With empty stub rows all four
 // branches are SELECT-only, so the routine emits 4 SELECTs (no per-row UPDATE),
 // still exactly 4 queries.
+// 2026-08-29 (lane D1 pass 4): FIVE. Branch 0 (suspended-lease settle) landed in
+// front of them, so the empty-stub shape is 5 SELECTs. Repinning the number is the
+// whole fix; the branch is new work, not a behaviour change to the four below.
+// This fixture fingerprints a COUNT, which is why an additive branch reads as a
+// regression here, the same way the wake-stall fixture broke on the literal
+// 'retry_count <' in pass 2. Asserting the SHAPES (below) is the load-bearing half.
 
-test('staleLeaseRecovery: issues 4 SQL queries with correct shapes', async () => {
+test('staleLeaseRecovery: issues 5 SQL queries with correct shapes', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
   scheduler._setCoord({ list_workers: async () => ({ count: 0, workers: [] }) })
 
   await scheduler.staleLeaseRecovery()
 
-  assert(pool._queries.length === 4, 'staleLeaseRecovery: exactly 4 queries issued (got ' + pool._queries.length + ')')
+  assert(pool._queries.length === 5, 'staleLeaseRecovery: exactly 5 queries issued (got ' + pool._queries.length + ')')
 
   // Branch 1 retryable stale-dispatch is now a liveness-gated SELECT (status='dispatching'
   // AND retry_count < $2), distinct from the cron/non-cron max-retry SELECTs (>= $2) and
