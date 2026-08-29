@@ -187,6 +187,40 @@ ok('4. CONTROL stale file: an outage last deferred 31min ago is discarded, not a
   assert.strictEqual(st.defers, 1, 'the stale defer count must not carry into the new outage')
 })
 
+ok('5. the temp-and-rename persist leaks no scratch file and always commits whole JSON', () => {
+  // HONEST SCOPE. This asserts the INVARIANTS of the temp-and-rename write: no
+  // .tmp.<pid> is left behind, exactly one file exists, and the committed bytes
+  // parse. It does NOT prove atomicity, and it passes against the old bare
+  // writeFileSync too, because a write that SUCCEEDS looks identical either way.
+  // The atomicity claim rests on rename(2) being atomic within a filesystem, not
+  // on this test: forcing a genuine torn write needs a full disk or a kill landed
+  // inside the write syscall, and a probabilistic race test here would be flaky
+  // without being more convincing. What IS tested is the consequence that matters
+  // when the write fails anyway, in case 6.
+  const home = scratchHome('atomic')
+  runChild(home, T0, T0)
+  const dir = path.dirname(statePathFor(home))
+  const left = fs.readdirSync(dir).filter(f => f.includes('.tmp.'))
+  assert.deepStrictEqual(left, [], 'a scratch file was left behind in ' + dir + ': ' + left.join(', '))
+  assert.deepStrictEqual(fs.readdirSync(dir), ['scheduler-capped-outage.json'],
+    'exactly one file should exist after a persist')
+  // The committed state must always be whole, which is what rename buys.
+  JSON.parse(fs.readFileSync(statePathFor(home), 'utf8'))
+})
+
+ok('6. a torn file from BEFORE this fix still degrades to in-memory, it does not throw', () => {
+  const home = scratchHome('torn')
+  const p = statePathFor(home)
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  fs.writeFileSync(p, '{"firstDeferAt":178799')   // cut off mid-number, as a full disk leaves it
+  const r = runChild(home, T0, NOW)
+  assert.deepStrictEqual(r.out.adoptedAtLoad, { firstDeferAt: null, defers: 0, sent: false },
+    'a corrupt file must adopt nothing rather than crash the dispatcher')
+  assert.strictEqual(r.out.paged, false, 'nothing adopted means a fresh clock, so no page on defer 1')
+  const st = JSON.parse(fs.readFileSync(p, 'utf8'))
+  assert.strictEqual(st.defers, 1, 'the torn file must be replaced by a whole one on the next persist')
+})
+
 console.log('')
 if (failures) { console.error(failures + ' FAILED'); process.exit(1) }
 console.log('ALL PASS')

@@ -683,18 +683,36 @@ function cappedStatePath() {
 exports._setCappedStatePath = function (p) { _cappedStatePath = p }
 
 function persistCappedOutageState() {
+  // WRITE TO A TEMP FILE AND RENAME. (lane D1 pass 3, 2026-08-29.) The reader's
+  // fallback is correct: a truncated or corrupt file fails JSON.parse, is caught,
+  // and the latch degrades to in-memory, which is the pre-persistence behaviour.
+  // Verified by handing it a file cut off mid-number: it adopted nothing and did
+  // not throw. But that correct fallback is a LOSS, and it fires exactly when it
+  // costs most, because the restart that most needs the persisted clock is the one
+  // during an outage. A bare writeFileSync is not atomic, so a full disk, a kill
+  // mid-write, or the agent and a test writing at once all leave a torn file and
+  // spend the latch. rename(2) on the same filesystem is atomic, so a reader sees
+  // either the whole previous state or the whole new one and never a partial. The
+  // temp name carries the pid so two writers cannot share a scratch file; the last
+  // rename wins, which is the same outcome as the last write winning, minus the
+  // window where a reader can catch it half-done.
+  let tmp = null
   try {
     const fs = require('fs')
     const p = cappedStatePath()
     if (_cappedFirstDeferAt === null) { try { fs.unlinkSync(p) } catch (_e) {} ; return }
     fs.mkdirSync(require('path').dirname(p), { recursive: true })
-    fs.writeFileSync(p, JSON.stringify({
+    tmp = p + '.tmp.' + process.pid
+    fs.writeFileSync(tmp, JSON.stringify({
       firstDeferAt: _cappedFirstDeferAt,
       defers: _cappedDefers,
       pageSent: _cappedPageSent,
       lastDeferAt: _cappedLastDeferAt,
     }))
+    fs.renameSync(tmp, p)
+    tmp = null
   } catch (e) {
+    if (tmp) { try { require('fs').unlinkSync(tmp) } catch (_e) {} }
     process.stderr.write('[scheduler] capped outage state persist failed (' + (e && e.message || e) +
       '); falling back to in-memory latch for this outage\n')
   }
