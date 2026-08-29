@@ -183,6 +183,34 @@ test('win32 keystroke tier is intact', () => {
   assert.ok(src.indexOf('_guiWakeSupported') !== -1)
 })
 
+// ---- the wrong-tab hole the retry loop cannot close --------------------
+//
+// FAILING-FIRST, verify pass 2026-08-29: coord._labelVerifiableForWake did not
+// exist (TypeError: not a function). Found by the independent second pass, not
+// by the build.
+//
+// chat-inject verifies the active tab IS the target before pasting, but it
+// SKIPS that guard for a GENERIC label, because "Claude Code" identifies no
+// particular tab. On the push path a blind paste is a tolerable best-effort. On
+// the wake path it would type a wake notice into whatever chat holds focus.
+// Reachable: conductor_heartbeat captures title_match from the live active tab,
+// and a Claude Code tab is titled "Claude Code" until its first turn renames it,
+// so a heartbeat that lands inside that window stores a generic handle. Latent
+// on this host today (the stored label is specific), which is exactly when a
+// guard is cheap.
+test('a conductor label that cannot be verified refuses instead of pasting blind', () => {
+  assert.strictEqual(typeof coord._labelVerifiableForWake, 'function')
+  for (const generic of ['Claude Code', 'claude code', 'New Chat', 'Cursor', 'chat', 'Untitled', '', '   ']) {
+    assert.strictEqual(coord._labelVerifiableForWake(generic), false,
+      'a generic label is not an identity and injectTurn will not verify it: ' + JSON.stringify(generic))
+  }
+  // The control: a real conductor label must still be accepted, or the guard
+  // would simply disable the tier rather than protect it.
+  for (const real of ['We are officially retiri\u2026', '[88cd wakesubstrate lane\u2026', 'Take3']) {
+    assert.strictEqual(coord._labelVerifiableForWake(real), true, 'guard rejected a real label: ' + real)
+  }
+})
+
 ;(async () => {
   let pass = 0, fail = 0, skip = 0
   for (const [name, fn] of tests) {

@@ -539,6 +539,14 @@ function wakeCapabilities() {
   }
 }
 
+// Kept in lockstep with chat-inject GENERIC_LABEL_RE. A label in this set (or
+// empty) is not an identity, so injectTurn skips its active-tab verification for
+// it and a paste can land in the wrong chat.
+const _WAKE_GENERIC_LABEL_RE = /^(claude code|new chat|cursor|chat|untitled)?$/i
+function _labelVerifiableForWake(label) {
+  return !_WAKE_GENERIC_LABEL_RE.test(String(label || '').trim())
+}
+
 // _wakeByChatInject(notice) -> the SAME verdict shape pushInject returns, so a
 // wake and a push are read the same way. Serialised onto _injectChain: one
 // clipboard and one focus exist on this machine, and a wake racing a chat push
@@ -556,6 +564,19 @@ async function _wakeByChatInject(notice) {
 
     const tgt = await resolveLiveTargetTab(addressForConductor())
     if (!tgt.ok) return { ok: false, reason: tgt.reason }
+
+    // A GENERIC label is one injectTurn cannot verify. Its active-tab guard is
+    // skipped for generic labels (chat-inject GENERIC_LABEL_RE), because such a
+    // label identifies nothing, so the paste goes wherever focus happens to be.
+    // On the PUSH path that is a tolerable best-effort. On the WAKE path it
+    // would type a wake notice into an unrelated chat, and this is reachable:
+    // conductor_heartbeat captures title_match from the live active tab, and a
+    // Claude Code tab is titled "Claude Code" until its first turn renames it,
+    // so a heartbeat landing in that window stores a generic handle. Refuse.
+    // The message is untouched in the durable inbox either way.
+    if (!_labelVerifiableForWake(tgt.label)) {
+      return { ok: false, reason: 'conductor_label_not_verifiable', label: tgt.label || null }
+    }
 
     // Sample the landing observable BEFORE the keystroke, so the comparison is
     // against a value that predates it.
@@ -3638,6 +3659,7 @@ module.exports = {
   // without a handle; _wakeByChatInject is the darwin auto_type tier itself.
   _wakeConductor: wakeConductor,
   _wakeByChatInject: _wakeByChatInject,
+  _labelVerifiableForWake: _labelVerifiableForWake,
   _wakeCapabilities: wakeCapabilities,
   _darwinInjectWakeReason: _darwinInjectWakeReason,
   _awaitTurnLanded: _awaitTurnLanded,
