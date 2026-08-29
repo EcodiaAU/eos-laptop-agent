@@ -304,6 +304,32 @@ async function main() {
      res.closed === 0 && (resultFor(res, 'tab_dry') || {}).action === 'would_close' && LIVE_TABS.length === 1,
      JSON.stringify(res.results))
 
+  // ---------------------------------------------------------------------
+  // 10. THE CROSS-PASS HOLE. A row whose re-capture failed is PERSISTED with its
+  //     dead id dropped, so on the NEXT sweep it reads back with no tabId at all.
+  //     A bare `if (th.tabId)` gate would skip the stable block entirely and hand
+  //     it to the ladder, which is the exact promotion the coord-side resolver
+  //     guard exists to stop; the sweep never reaches that guard when it declines
+  //     to call the resolver. Found by running pass 2 rather than reasoning about
+  //     it. The live stranger below is what makes the assertion mean something.
+  // ---------------------------------------------------------------------
+  reset()
+  LIVE_TABS = [{ tabId: 'ttab_stranger_same_sentinel', label: AUTOTITLE }]
+  writeCorpse('tab_dropped_last_pass', {
+    tabId_stale_dropped: 'ttab_died_on_a_previous_pass',
+    tabId_stale_dropped_at: new Date(Date.now() - 30_000).toISOString(),
+  })
+  res = await cowork.cleanup_orphan_workers({ max_age_days: 7 })
+  const dropped = resultFor(res, 'tab_dropped_last_pass')
+  ok('a row dropped on an EARLIER pass is still TERMINAL, not ladder-eligible',
+     !!dropped && dropped.action === 'leak'
+       && /stable_id_dropped_not_recaptured/.test(String(dropped.reason)),
+     JSON.stringify(dropped))
+  ok('and the live same-sentinel stranger was never closed',
+     res.closed === 0 && closeCalls.length === 0
+       && LIVE_TABS.length === 1 && LIVE_TABS[0].tabId === 'ttab_stranger_same_sentinel',
+     JSON.stringify({ closed: res.closed, calls: closeCalls, live: LIVE_TABS }))
+
   console.log('')
   if (fails) { console.log(fails + ' FAILED'); process.exit(1) }
   console.log('all assertions passed')

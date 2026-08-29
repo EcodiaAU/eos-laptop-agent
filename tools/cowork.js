@@ -1282,7 +1282,6 @@ async function cleanup_orphan_workers(params) {
     // back and Pass 0 refuses on it exactly as before. A ghost tab is cheap; a
     // killed running worker is not.
     if (th.tabId && liveIdSet.size && !liveIdSet.has(th.tabId)) {
-      const deadId = th.tabId
       let coordMod0 = null
       try { coordMod0 = require('./coord') } catch (e) {}
       if (coordMod0 && coordMod0._captureStableTabId) {
@@ -1291,11 +1290,17 @@ async function cleanup_orphan_workers(params) {
           const fresh = JSON.parse(fs.readFileSync(filePath, 'utf8'))
           if (fresh && fresh.tab_handle) th = fresh.tab_handle
         } catch (e) {}
-        if (!th.tabId) th = Object.assign({}, th, { tabId: deadId })
       }
     }
 
-    if (th.tabId) {
+    // 2026-08-29 lane W1-verify. The gate admits tabId_stale_dropped too, and that
+    // is load-bearing across PASSES, not within one. A failed re-capture persists
+    // the row with its dead id dropped. On the NEXT sweep this row reads back with
+    // no tabId at all, and a bare `if (th.tabId)` would skip this whole block and
+    // hand it to the ladder, which is the exact promotion the coord-side resolver
+    // guard exists to stop. The sweep bypasses that guard whenever it declines to
+    // call the resolver, so the gate has to let the row IN to be refused.
+    if (th.tabId || th.tabId_stale_dropped) {
       let coordMod = null
       try { coordMod = require('./coord') } catch (e) {}
       const canResolve = coordMod && coordMod._resolveStableIdCloseTarget && coordMod._closeStableIdTarget
