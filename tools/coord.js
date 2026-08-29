@@ -1957,6 +1957,71 @@ function _looksLikeWorkerTab(tab, liveWorkers) {
 // conductor -> the conductor's active CC tab; label:<slug> -> the unique tab
 // whose label slugs to <slug>; a worker tab_id -> the proven fingerprint match
 // (close_my_tab's resolver). Ambiguity refuses rather than guesses.
+// Is this live tab the conductor's OWN chat tab? Two legs: the stored label
+// first, then the title fingerprint.
+//
+// THE FINGERPRINT LEG IS BROADER THAN THE CONDUCTOR BRANCH BELOW. An earlier
+// version of this comment claimed it "uses exactly the identity the conductor
+// branch below accepts", and that is not true for this leg. pickByFingerprint
+// applies its decisive-winner uniqueness test only inside `if (scored.length > 1)`,
+// so calling it here with a ONE-ELEMENT array silently degrades that gate to the
+// bare threshold (hits >= 2, coverage >= 0.6). The conductor branch passes the
+// whole pool and does get the uniqueness test. So this predicate accepts tabs
+// that branch would refuse outright. Pinned by CASE K2 and CASE L in
+// tools/coord-inject-gate-adversarial.test.js.
+//
+// FALSE POSITIVES ARE THE SAFE DIRECTION, AND THEY WILL HAPPEN. Nine anchors in
+// COORD_ROOT/chat-tabs carry the conductor's registered label "Claude Code",
+// so an unrelated chat wearing that label is treated as the conductor: its
+// message is left UNSEEN unless a turn is proven to land, which means it is shown
+// twice rather than consumed once. Do not narrow this predicate to stop that.
+// Consumed once is the defect; shown twice is the fail-safe.
+//
+// THE ONE REAL COST of a false positive is the global _conductorLandingInFlight
+// flag (see pushInject): the impostor holds it for a full landing timeout, and
+// every genuine conductor inject in that window is refused with
+// conductor_landing_in_flight and attempted:false. The message is left unseen so
+// it is DELAYED, not lost, but on this host the inject IS the wake (the flash and
+// auto_type tiers are Win32 and no-op on a Mac), so the cost is a delayed
+// conductor wake.
+//
+// MEASURED 2026-08-29 AND LEFT AS IS DELIBERATELY. A census of all 1921 anchors
+// in COORD_ROOT/chat-tabs found ZERO labels that clear the fingerprint bar
+// without ALSO being exactly "Claude Code", so the fingerprint-only class has
+// never occurred once. That census is the exposure census, not a proxy for it: a
+// chat with no anchor returns session_unregistered and can never reach the gate
+// or hold the flag, so the anchored set IS the exposed set. The exact-label class
+// costs no denial either, because two live tabs sharing the label make the
+// conductor branch refuse with conductor_ambiguous_label, so no genuine
+// conductor-addressed message reaches the gate to be denied.
+//
+// TRIPWIRE, and the fix to apply when it trips: if an anchor ever clears the
+// fingerprint bar WITHOUT an exact label match, replace this boolean with a
+// three-way strength. Resolve the conductor branch against the same pool once;
+// if it resolves and its position equals this tab's, return 'conductor'; if only
+// the loose bar is cleared, return 'suspected'. Then give pushInject two
+// INDEPENDENT in-flight slots, each cleared by its own holder, so a suspected
+// holder never denies a genuine one while two genuine ones still exclude each
+// other. That closes the hazard completely, because when the conductor branch is
+// ambiguous no genuine conductor-addressed message reaches the gate at all.
+// Do NOT instead simply give this leg the pool-wide uniqueness gate. The leg
+// exists for the window where the conductor was auto-retitled between beats, and
+// pool ambiguity there would ungate the REAL conductor and re-open the
+// consumed-message defect precisely where the leg was built to help.
+function _tabIsConductorTab(tab, conductor) {
+  if (!tab || !conductor) return false
+  const tm = conductor.title_match ? String(conductor.title_match) : ''
+  if (tm && !tm.startsWith('[') && tab.label === tm) return true
+  const fp = conductor.title_fingerprint || null
+  if (fp && _ttm && typeof _ttm.pickByFingerprint === 'function') {
+    try {
+      const r = _ttm.pickByFingerprint([tab], fp, null)
+      if (r && r.match) return true
+    } catch (e) {}
+  }
+  return false
+}
+
 async function resolveLiveTargetTab(topic) {
   const mid = chatTopicMid(topic)
   if (!mid) return { ok: false, reason: 'not_chat_topic' }
@@ -2121,7 +2186,15 @@ async function resolveLiveTargetTab(topic) {
     // that does not depend on labels at all; until VS Code exposes one, the
     // honest position is that this is rare, narrower than what it replaced, and
     // not papered over. Doctrine: conductor-is-a-slot-not-an-identity-2026-08-28.
-    return Object.assign({ ok: true, kind: 'session' }, _pos(cand))
+    // is_conductor_tab travels with the resolution so the caller can gate on WHAT
+    // this resolved to rather than on how it was addressed. Before this, the
+    // landing gate keyed on kind === 'conductor', which this branch never sets,
+    // so the conductor's own tab reached through its session address was
+    // markSeen on an unverified inject.
+    return Object.assign(
+      { ok: true, kind: 'session', is_conductor_tab: _tabIsConductorTab(cand, conductor) },
+      _pos(cand)
+    )
   }
 
   // The label: branch is DELETED with the chat.label: address scheme. A slug of a
@@ -2290,6 +2363,16 @@ async function _awaitTurnLanded(baselineMs, timeoutMs, pollMs) {
 // effort: on success marks the message seen so the target's own poll/drain does
 // not double-process; on any failure leaves it unseen so inbox delivery still
 // happens. Serialised so two injects never fight over the clipboard + focus.
+// While a conductor landing poll is in flight, no SECOND inject may fire at the
+// conductor. The observable the poll reads (last_seen_at) is global to the
+// conductor, so a second turn landing inside the first poll's window is read as
+// proof the FIRST message landed, and that first message is then markSeen on
+// someone else's turn: the same consumed-message defect the gate exists to kill,
+// re-entered through concurrency. The serialised chain used to make this
+// impossible by accident; taking the poll off the chain has to keep it
+// impossible on purpose. Refusal is fail-safe, the message stays inbox-queued.
+let _conductorLandingInFlight = false
+
 async function pushInject(msg) {
   if (process.env.COORD_CHAT_INJECT === '0') return { attempted: false, reason: 'disabled' }
   if (!isChatDeliver(msg)) return { attempted: false, reason: 'not_chat' }
@@ -2299,11 +2382,27 @@ async function pushInject(msg) {
   if (!gate.ok) return { attempted: false, reason: gate.reason }   // stays inbox-queued
 
   const mid = chatTopicMid(topic)
-  const conductor = loadConductorRegistration()
-  const isConductor = mid === 'conductor' || (conductor && conductor.tab_id && mid === conductor.tab_id)
-  if (isConductor && conductor && conductor.in_turn) return { attempted: false, reason: 'conductor_in_turn' }
+  const conductor0 = loadConductorRegistration()
+  const isConductorAddr = mid === 'conductor' || (conductor0 && conductor0.tab_id && mid === conductor0.tab_id)
+  if (isConductorAddr && conductor0 && conductor0.in_turn) return { attempted: false, reason: 'conductor_in_turn' }
 
+  // PHASE 1, SERIALISED. Resolve, paste, submit. The clipboard and the window
+  // focus are process-global, so exactly one of these may be in flight at a time.
+  // The landing poll is deliberately NOT in here: it reads one file and needs
+  // neither clipboard nor focus, and holding the chain across it made every
+  // concurrent caller wait out every earlier caller's FULL timeout. Measured
+  // 2026-08-29 (pass 6) at a 2000ms timeout: five concurrent injects finished at
+  // 2046/4069/6087/8107/10119ms, 10119ms total against 2000ms of real work.
   const run = async () => {
+    // Re-check the rate window at DEQUEUE. It was checked at ENQUEUE, before any
+    // earlier caller in the same burst had reached _noteInject, so a burst passed
+    // the per-target limit wholesale and every caller injected. Checking again
+    // here is what makes COORD_INJECT_PER_TARGET_MS mean anything. The stamp
+    // itself stays AFTER resolution, so a failed resolveLiveTargetTab still does
+    // not burn a rate window (the common conductor_unresolved case).
+    const gate2 = _injectAllowedNow(topic)
+    if (!gate2.ok) return { attempted: false, reason: gate2.reason }
+
     const text = buildChatInjectionText(msg)
     // Resolve the target tab (label + CURRENT viewColumn/index) and deliver via the
     // position chain in injectTurn. That chain now selects any index (generic
@@ -2314,10 +2413,22 @@ async function pushInject(msg) {
     // coord-deliver-by-session-not-editor-index-2026-08-21.
     const tgt = await resolveLiveTargetTab(topic)
     if (!tgt.ok) return { attempted: true, ok: false, reason: tgt.reason }
+
+    // Gate on the RESOLVED TAB, never on the address form. `conductor`,
+    // the conductor's tab_id, and chat.session:<conductor-session>.inbox are three
+    // addresses for one physical tab, and only the first two set kind:'conductor'.
+    const landingGated = tgt.kind === 'conductor' || tgt.is_conductor_tab === true
+    if (landingGated) {
+      if (_conductorLandingInFlight) return { attempted: false, reason: 'conductor_landing_in_flight' }
+      // in_turn is re-read here for the same reason the gate moved: the check
+      // above keyed on the address form, so a session-addressed conductor walked
+      // straight past it, and the snapshot it read is stale by dequeue anyway.
+      const cNow = loadConductorRegistration()
+      if (cNow && cNow.in_turn) return { attempted: false, reason: 'conductor_in_turn' }
+    }
     _noteInject(topic)
     // Sample the landing observable BEFORE the inject, so the comparison is
     // against a value that predates the keystroke.
-    const landingGated = tgt.kind === 'conductor'
     const baselineMs = landingGated ? _conductorLastSeenMs() : null
     let r
     try { r = await _chatInject.injectTurn({ label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text }) }
@@ -2326,35 +2437,51 @@ async function pushInject(msg) {
       return { attempted: true, ok: false, reason: (r && r.reason) || 'inject_failed', detail: r }
     }
     if (landingGated) {
-      const land = await _awaitTurnLanded(baselineMs, LANDING_TIMEOUT_MS, LANDING_POLL_MS)
-      if (!land.landed) {
-        // Deliberately NOT markSeen. The keystroke fired into nothing; the
-        // message stays in the durable inbox for the conductor's next read.
-        return {
-          attempted: true,
-          ok: false,
-          reason: 'submit_did_not_land',
-          inject_reported_ok: true,
-          resolved_label: r.label,
-          kind: tgt.kind,
-          last_seen_at_baseline: baselineMs == null ? null : new Date(baselineMs).toISOString(),
-          landing_timeout_ms: LANDING_TIMEOUT_MS,
-        }
-      }
-      try { markSeen([msg]) } catch (e) {}
-      return {
-        attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind,
-        via: r.via || 'gui', landed: true,
-        landed_at: new Date(land.last_seen_ms).toISOString(),
-      }
+      _conductorLandingInFlight = true
+      // Internal hand-off to phase 2. Never returned to a caller.
+      return { _await_landing: true, baselineMs: baselineMs, label: r.label, kind: tgt.kind, via: r.via || 'gui' }
     }
     // Non-conductor target: no landing observable exists, so behaviour is
     // unchanged. `landed: null` says "not asserted", never "asserted false".
     try { markSeen([msg]) } catch (e) {}
     return { attempted: true, ok: true, resolved_label: r.label, kind: tgt.kind, via: r.via || 'gui', landed: null }
   }
-  _injectChain = _injectChain.then(run, run)
-  return _injectChain
+
+  const chained = _injectChain.then(run, run)
+  // The chain is released as soon as the keystroke is done. Everything after this
+  // point is a file poll, so the NEXT caller may take the clipboard immediately.
+  _injectChain = chained.then(() => {}, () => {})
+  const out = await chained
+  if (!out || !out._await_landing) return out
+
+  // PHASE 2, CONCURRENT. Poll the conductor registration for last_seen_at to move
+  // past the baseline. Unproven landing leaves the message UNSEEN, so the durable
+  // inbox still serves it.
+  try {
+    const land = await _awaitTurnLanded(out.baselineMs, LANDING_TIMEOUT_MS, LANDING_POLL_MS)
+    if (!land.landed) {
+      // Deliberately NOT markSeen. The keystroke fired into nothing; the
+      // message stays in the durable inbox for the conductor's next read.
+      return {
+        attempted: true,
+        ok: false,
+        reason: 'submit_did_not_land',
+        inject_reported_ok: true,
+        resolved_label: out.label,
+        kind: out.kind,
+        last_seen_at_baseline: out.baselineMs == null ? null : new Date(out.baselineMs).toISOString(),
+        landing_timeout_ms: LANDING_TIMEOUT_MS,
+      }
+    }
+    try { markSeen([msg]) } catch (e) {}
+    return {
+      attempted: true, ok: true, resolved_label: out.label, kind: out.kind,
+      via: out.via, landed: true,
+      landed_at: new Date(land.last_seen_ms).toISOString(),
+    }
+  } finally {
+    _conductorLandingInFlight = false
+  }
 }
 
 // normalizeToAddress is DELETED (2026-08-28, lane R1 item 3). It had no
