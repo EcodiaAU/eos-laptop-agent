@@ -194,7 +194,88 @@ loadFromDisk()
 let _lastWakeAt = 0  // in-memory rate-limit (across requests this process serves)
 let _lastWakeResult = null  // what the last wake attempt actually achieved, per tier
 
-const IN_TURN_TTL_MS = 10 * 60 * 1000  // 10min: auto-clear in_turn if Stop hook never fired
+const IN_TURN_TTL_MS = 10 * 60 * 1000  // 10min: OUTER gate only, see loadConductorRegistration
+// How long the conductor's own transcript must be SILENT before a turn past the
+// TTL counts as crashed rather than long. A conductor mid-arc writes a record
+// every few seconds; the widest gap measured inside a live arc was 27s. Three
+// minutes is generous enough to cover one long Bash call (a build, a test
+// suite) without ever calling that arc dead.
+const IN_TURN_SILENCE_MS = 3 * 60 * 1000
+// Only a resolution this fresh is trustworthy. set_conductor_in_turn(true) runs
+// from the UserPromptSubmit hook, so the conductor has just written its
+// turn-start records and its transcript mtime is within a second or two of now.
+const TRANSCRIPT_RESOLVE_WINDOW_MS = 5000
+const CLAUDE_PROJECTS_DIR = process.env.EOS_TRANSCRIPTS_DIR ||
+  path.join(os.homedir(), '.claude', 'projects')
+// A dispatched worker's first turn always carries this envelope, and workers
+// share the conductor's project directory. In the raw jsonl the attribute is
+// JSON-encoded, so the quotes arrive backslash-escaped.
+const WORKER_ENVELOPE = '<dispatched role=\\"worker\\"'
+const TRANSCRIPT_HEAD_BYTES = 262144
+
+// Claude Code names a project directory after its workspace root with every
+// '/' and '.' replaced by '-'. Verified 2026-08-29:
+// /Users/ecodia/.code/ecodiaos/backend -> -Users-ecodia--code-ecodiaos-backend
+function conductorProjectDir(workspaceRoot) {
+  if (!workspaceRoot || typeof workspaceRoot !== 'string') return null
+  return path.join(CLAUDE_PROJECTS_DIR, workspaceRoot.replace(/[/.]/g, '-'))
+}
+
+// Resolve WHICH transcript belongs to the conductor, at the one moment the
+// answer is unambiguous: turn-start. Dispatched workers write into the same
+// project directory (3,478 files in the live one), so identity cannot come from
+// "newest file". It comes from the intersection of a 5s mtime window with the
+// absence of a worker boot envelope, and it must be UNIQUE or we return null.
+// Returns a path, or null when the answer is not certain.
+//
+// THE RESIDUAL RISK, named rather than hidden. If the conductor's own turn-start
+// record has not flushed yet AND exactly one other interactive tab in the same
+// workspace wrote inside the window, this resolves to that other tab. The
+// consequence is bounded and safe: in_turn stays set while that tab is busy, so
+// wakes DEFER rather than inject, the message stays untouched in the durable
+// inbox, and the conductor's own turn-end hook clears in_turn and flushes it.
+// A deferred wake is recoverable; an injected one that Claude Code queues is not,
+// which is why the bias runs this way.
+function resolveConductorTranscript(row) {
+  const dir = conductorProjectDir(row && row.workspace_root)
+  if (!dir) return null
+  let entries
+  try { entries = fs.readdirSync(dir) } catch (e) { return null }
+  const cutoff = Date.now() - TRANSCRIPT_RESOLVE_WINDOW_MS
+  const fresh = []
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue
+    const p = path.join(dir, name)
+    let st
+    try { st = fs.statSync(p) } catch (e) { continue }
+    if (st.mtimeMs < cutoff) continue
+    fresh.push({ p: p, size: st.size })
+  }
+  const candidates = []
+  for (const f of fresh) {
+    let head = ''
+    try {
+      const fd = fs.openSync(f.p, 'r')
+      try {
+        const buf = Buffer.alloc(Math.min(TRANSCRIPT_HEAD_BYTES, f.size))
+        fs.readSync(fd, buf, 0, buf.length, 0)
+        head = buf.toString('utf8')
+      } finally { fs.closeSync(fd) }
+    } catch (e) { continue }
+    if (head.indexOf(WORKER_ENVELOPE) !== -1) continue  // a dispatched worker
+    candidates.push(f.p)
+  }
+  return candidates.length === 1 ? candidates[0] : null
+}
+
+// The one observed liveness fact: mtime of the conductor's own transcript. The
+// harness appends on every turn with no cooperation from the model, so it
+// cannot be withheld while a turn runs nor emitted after it stops.
+function conductorNewestTurnMs(row) {
+  const p = row && row.transcript_path
+  if (!p || typeof p !== 'string') return null
+  try { return fs.statSync(p).mtimeMs } catch (e) { return null }
+}
 
 function loadConductorRegistration() {
   try {
@@ -209,15 +290,42 @@ function loadConductorRegistration() {
       if (!row) return null
     }
     // TTL escape on stuck in_turn (crashed turn, Stop hook never fired).
+    //
+    // 2026-08-29: the fixed TTL alone could not tell a CRASHED turn from a LONG
+    // one, and that is not a corner case. A conductor set in_turn at
+    // 10:06:06.763Z and was still writing assistant records at 10:24, one arc
+    // of 18-plus minutes. The TTL expired at 10:16:06 and coord then injected
+    // two wakes into that busy tab. Both were reported inject_reported_ok:true
+    // and both were QUEUED by Claude Code (attachment type queued_command at
+    // 10:20:47.250Z and 10:21:51.005Z); a queued command starts no turn, so
+    // both wakes were silently lost and last_seen_at never moved.
+    //
+    // So the TTL is now only the OUTER gate. What actually clears in_turn is
+    // the signal worker-liveness.js already reaps a silent lane holder on: the
+    // harness appends to the session transcript on every turn with no
+    // cooperation from the model, so it cannot be withheld while a turn runs
+    // nor emitted after it stops. A turn of ANY length that is still writing
+    // keeps in_turn set, which is what closes this defect for good.
+    //
+    // Fails toward the status quo: when the transcript cannot be identified
+    // (no resolution, file gone, stat throws) newestMs is null, stillWriting is
+    // false, and the TTL clears exactly as it did before this change. Deferring
+    // is safe either way, because a deferred message stays in the durable inbox
+    // and the conductor's own turn-end hook flushes it.
     if (row.in_turn && row.in_turn_set_at) {
       const ageMs = Date.now() - new Date(row.in_turn_set_at).getTime()
       if (ageMs > IN_TURN_TTL_MS) {
-        row.in_turn = false
-        row.in_turn_set_at = null
-        try {
-          atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), row)
-          atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), row)
-        } catch (e) {}
+        const newestMs = conductorNewestTurnMs(row)
+        const stillWriting = newestMs != null &&
+          (Date.now() - newestMs) < IN_TURN_SILENCE_MS
+        if (!stillWriting) {
+          row.in_turn = false
+          row.in_turn_set_at = null
+          try {
+            atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), row)
+            atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), row)
+          } catch (e) {}
+        }
       }
     }
     return row
@@ -3785,6 +3893,13 @@ async function set_conductor_in_turn(params, _ctx) {
   const desired = !!params.in_turn
   conductor.in_turn = desired
   conductor.in_turn_set_at = desired ? new Date().toISOString() : null
+  // Re-resolve the conductor's transcript on every turn-START, never reuse a
+  // stale answer: a resumed session writes a NEW jsonl, so a cached path would
+  // silently start measuring a file nobody writes to any more and report the
+  // conductor dead the moment it mattered. This is the only instant the answer
+  // is unambiguous, because the conductor has just written its turn-start
+  // records and no other tab in that workspace is likely to share the window.
+  if (desired) conductor.transcript_path = resolveConductorTranscript(conductor)
   try {
     atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), conductor)
     atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), conductor)
@@ -3994,6 +4109,11 @@ module.exports = {
   _inboxTopicFor: inboxTopicFor,
   _laneKeyOf: laneKeyOf,
   _loadConductorRegistration: loadConductorRegistration,
+  // in_turn liveness seams (lane W1, 2026-08-29): the fixed TTL alone could
+  // not tell a crashed turn from a long one, so transcript mtime decides.
+  _resolveConductorTranscript: resolveConductorTranscript,
+  _conductorNewestTurnMs: conductorNewestTurnMs,
+  _conductorProjectDir: conductorProjectDir,
   // Sweep API for tests and for the daemon harness.
   _sweepStaleWorkers: sweepStaleWorkers,
   _gcWorkerRow: _gcWorkerRow,
