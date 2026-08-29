@@ -106,12 +106,15 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.wait_for_inbox',
-    description: 'Long-poll for the next inbox message. Holds up to {timeout} seconds (default 300, max 600). Returns {trigger_message, also_unread[<=20], more_unread, hold_duration_ms, timed_out}.',
+    description: 'Long-poll for the next inbox message. Returns {trigger_message, also_unread[<=20], more_unread, hold_duration_ms, timed_out}. USE timeout<=45 AND LOOP. The server holds up to 600s, but an MCP CLIENT deadline kills the call between 45s and 60s: measured 2026-08-29 by two independent callers, 45s returned cleanly at 45075ms while 60s and 120s both returned a bare transport error with NO envelope. A caller past that wall loses the tool result AND any message that arrived during the hold, so a longer hold is strictly worse than a loop of short ones. The 600 ceiling below is the SERVER cap and is reachable only over direct HTTP, not through MCP.',
     inputSchema: {
       type: 'object',
       properties: {
         topic: { type: 'string' },
-        timeout: { type: 'integer', minimum: 1, maximum: 600, default: 300 },
+        // maximum stays 600 (the real server cap, valid over direct HTTP); default drops to
+        // 45 so an MCP caller that omits timeout lands UNDER the client wall instead of on
+        // the far side of it. The old default of 300 could never return through MCP.
+        timeout: { type: 'integer', minimum: 1, maximum: 600, default: 45 },
       },
       additionalProperties: true,
     },

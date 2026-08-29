@@ -324,13 +324,19 @@ function composeBrief(opts) {
     '     Read `delivered` in the result, NOT `ok`. ok:true with delivered:false\n' +
     '     means it persisted to an inbox and nothing woke anyone: still worth\n' +
     '     holding for, but do not report it as asked-and-answered.\n' +
-    '  2. mcp__coord__coord_wait_for_inbox({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", timeout:600})\n' +
-    '     This BLOCKS up to 10 minutes and returns the moment a reply lands. It\n' +
-    '     costs no tokens while it holds. Omit `topic` - it resolves to your own\n' +
-    '     durable mailbox, which is keyed to your work LANE and not to this tab.\n' +
-    '  3. On timed_out:true, hold ONCE more only if the answer is genuinely the\n' +
-    '     only thing left. Otherwise do every part of the job that does NOT depend\n' +
-    '     on the answer, then close with the question in your result_summary.\n' +
+    '  2. mcp__coord__coord_wait_for_inbox({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", timeout:45})\n' +
+    '     This BLOCKS and returns the moment a reply lands, costing no tokens while\n' +
+    '     it holds. Omit `topic` - it resolves to your own durable mailbox, which is\n' +
+    '     keyed to your work LANE and not to this tab.\n' +
+    '     45 IS A CEILING, NOT A PREFERENCE. The server holds up to 600s but an MCP\n' +
+    '     client deadline kills the call between 45s and 60s (measured 2026-08-29 by\n' +
+    '     two independent callers), and past that wall you lose the tool result AND\n' +
+    '     any message that arrived while you held. To wait longer, LOOP the 45s call;\n' +
+    '     never raise the number.\n' +
+    '  3. On timed_out:true, re-issue the 45s hold a few times if the answer is\n' +
+    '     genuinely the only thing left (that loop is how you wait minutes). Otherwise\n' +
+    '     do every part of the job that does NOT depend on the answer, then close with\n' +
+    '     the question in your result_summary.\n' +
     'Because your mailbox is lane-keyed it OUTLIVES this tab, so a reply that\n' +
     'arrives after you close is read by the next pass of this same job. That is\n' +
     'why closing with an unanswered question is now a handover and not a loss.\n' +

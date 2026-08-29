@@ -166,12 +166,25 @@ async function driveDispatch(row) {
   console.log('\nthe brief teaches the hold, which is what gives wait_for_inbox a caller:')
 
   for (const [label, compose] of [['mac-dispatcher', macBrief], ['cowork', coworkBrief]]) {
-    check(label + ': the brief names coord_wait_for_inbox with the 600s cap', () => {
+    check(label + ': the brief names coord_wait_for_inbox UNDER the MCP client wall', () => {
       const out = compose(Object.assign({}, BASE, { parent_session: 'sess-9' }))
       assert.ok(out.includes('coord_wait_for_inbox'),
         'no worker will call a tool no brief mentions')
-      assert.ok(/timeout:\s*600/.test(out),
-        'the cap is MAX_WAIT_TIMEOUT_S = 600 in coord.js; a larger number is silently clamped')
+      // THE REGRESSION THIS PINS. The first version of this block said timeout:600,
+      // reasoning from coord.js MAX_WAIT_TIMEOUT_S = 600, which is the SERVER cap.
+      // The tool's first-ever caller (worker on lane L1, 2026-08-29) proved an MCP
+      // CLIENT deadline kills the call between 45s and 60s: 45s returned cleanly at
+      // 45075ms, while 60s and 120s both returned a bare transport error with NO
+      // envelope. Reproduced independently from the conductor session the same hour.
+      // Past that wall a worker loses the tool result AND any message that arrived
+      // during the hold, so the documented protocol could never work. Wait longer by
+      // LOOPING short holds; never by raising this number.
+      const m = out.match(/timeout:\s*(\d+)/)
+      assert.ok(m, 'the brief must name an explicit timeout')
+      assert.ok(Number(m[1]) <= 45,
+        'timeout must be <= 45 (measured MCP client wall is in (45.1s, 60.3s]); got ' + m[1])
+      assert.ok(/LOOP|loop/.test(out),
+        'a 45s ceiling is only useful if the brief also says to loop it')
     })
 
     check(label + ': the brief says to read delivered, not ok', () => {

@@ -319,10 +319,15 @@ function composeBrief(opts) {
     'A question you post and then walk away from is a note left for nobody. Ask, then HOLD:\n' +
     '  1. mcp__coord__coord_message_chat({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", to:"' + (parent_session ? ('chat.session:' + parent_session + '.inbox') : 'conductor') + '", text:"<the question, the options, your recommendation>"})\n' +
     '     Read `delivered`, NOT `ok`. ok:true with delivered:false means it was queued and nobody woke.\n' +
-    '  2. mcp__coord__coord_wait_for_inbox({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", timeout:600})\n' +
-    '     Blocks up to 10 minutes, returns the moment a reply lands, costs no tokens while it holds.\n' +
-    '     Omit `topic`: it resolves to your own lane-keyed mailbox, which is not tied to this tab.\n' +
-    '  3. On timed_out:true, do every part of the job that does NOT depend on the answer, then\n' +
+    '  2. mcp__coord__coord_wait_for_inbox({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", timeout:45})\n' +
+    '     Returns the moment a reply lands, costing no tokens while it holds. Omit `topic`: it\n' +
+    '     resolves to your own lane-keyed mailbox, which is not tied to this tab.\n' +
+    '     45 IS A CEILING. An MCP client deadline kills the call between 45s and 60s (measured\n' +
+    '     2026-08-29), and past it you lose the tool result AND any message that arrived while\n' +
+    '     you held. To wait longer, LOOP the 45s call; never raise the number.\n' +
+    '  3. On timed_out:true, re-issue the 45s hold a few times if the answer is the only thing\n' +
+    '     left; that loop is how you wait minutes. Otherwise do every part of the job that does\n' +
+    '     NOT depend on the answer, then\n' +
     '     close with the question in your result_summary. The lane mailbox outlives this tab, so a\n' +
     '     late reply is read by the next pass of this job: closing is a handover, not a loss.\n' +
     'When you answer a message rather than ask one, pass its id as in_reply_to so the thread is followable.\n'
