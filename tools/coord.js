@@ -3470,7 +3470,31 @@ async function register_conductor(params, ctx) {
   // supplied title_match and the bridge probe above was therefore skipped - that
   // is the heartbeat hook's path and so the common one. Replace-only: a probe
   // that cannot decide carries the existing row's id forward untouched.
-  let stable_tab_id = (existing && existing.stable_tab_id) || null
+  //
+  // ...EXCEPT ACROSS A TAKEOVER, and that exception is load-bearing (2026-08-29
+  // lane W1 item 2). Replace-only is a rule about a probe that cannot decide; it
+  // is NOT a licence to inherit an id across a change of owner. `existing` on
+  // the took_over branch is the row we just ARCHIVED, and it earned its id from
+  // a DIFFERENT Claude Code chat - that is what took_over means, since it fires
+  // only on a differing claude_port. Seeding from it hands the new conductor row
+  // the OLD conductor tab's id, and replace-only then HOLDS that stale id
+  // through every undecidable probe (ambiguous_label, all_claimed_by_workers,
+  // no_label_match, bridge_unreachable, threw).
+  //
+  // The damage is a WRONG-CLOSE, not a leak, which is the direction this whole
+  // subsystem is built to never take. A generic new title_match CAUSES the
+  // undecidability by construction: many fresh CC tabs read "Claude Code", so
+  // the ambiguity guard returns prior forever. Belt 2 then compares a stale sid
+  // against the live conductor's tid, finds them unequal, sees a generic label
+  // that is evidence of nothing, and ALLOWS the close of the live conductor chat.
+  //
+  // Starting from null on a takeover fails safe in the other direction: if the
+  // capture decides, the row gets the RIGHT id; if it cannot, the row has no id
+  // and belt 2 falls back to the label ladder (branch b), which refuses. Leak a
+  // cosmetic ghost tab before closing a live chat - the governing preference,
+  // unchanged. Doctrine: takeover-must-not-inherit-identity-from-the-row-it-
+  // archives-2026-08-29.
+  let stable_tab_id = (!took_over && existing && existing.stable_tab_id) || null
   if (ide_bridge_port) {
     try {
       const cap = await _captureConductorStableTabId(title_match, ide_bridge_port, stable_tab_id)

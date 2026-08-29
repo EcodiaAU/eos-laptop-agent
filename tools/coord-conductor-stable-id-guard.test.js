@@ -135,6 +135,32 @@ console.log('Part 1: belt 2 decides on identity, falls back to label')
   assert(guard.isGenericLabel('Ecodia Site') === false, 'isGenericLabel false for a human label')
 })()
 
+// (r)+(s) THE NORMALISERS. Belt 2's identity compare trims BOTH sides before it
+// compares them, and neither trim had a test. They are the conjunct that decides
+// whether an id survives a round trip through a JSON row, a shell, or a bridge
+// payload that padded it. Isolate them from the label ladder by giving the
+// conductor a title_match that does NOT match the live label: if the trim is
+// dropped the ids stop matching, the label cannot cover, and the belt ALLOWS a
+// close of the conductor's own tab.
+;(() => {
+  const d = guard.evaluateClose(
+    'sentinel_prefix:EOS-W-x',
+    { label: 'Live Retitled Chat', active: false, tabId: 'ttab_cond_1_1' },
+    { title_match: 'Old Stored Title', stable_tab_id: '  ttab_cond_1_1  ' },
+    { selfClose: true })
+  assert(d.allow === false && d.reason === 'conductor_stable_id_protected',
+    'belt 2 TRIMS the STORED id before comparing (got ' + d.allow + '/' + d.reason + ')')
+})()
+;(() => {
+  const d = guard.evaluateClose(
+    'sentinel_prefix:EOS-W-x',
+    { label: 'Live Retitled Chat', active: false, tabId: '  ttab_cond_1_1  ' },
+    { title_match: 'Old Stored Title', stable_tab_id: 'ttab_cond_1_1' },
+    { selfClose: true })
+  assert(d.allow === false && d.reason === 'conductor_stable_id_protected',
+    'belt 2 TRIMS the LIVE tab id before comparing (got ' + d.allow + '/' + d.reason + ')')
+})()
+
 // ── Part 2: the CAPTURE half ─────────────────────────────────────────────────
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cond-stable-'))
 process.env.COORD_ROOT = tmpRoot
@@ -299,6 +325,131 @@ const coord = require('./coord.js')
   assert(r.tabId === 'ttab_prior_1_1' && r.reason === 'no_title_match',
     'REPLACE-ONLY: a blank title_match returns the PRIOR id')
 
+  // The three replace-only branches that had NO assertion anywhere (mutated
+  // 2026-08-29 lane W1 item 2 verification: prior -> null on each, and not one
+  // suite went red). All three are LEAK-only on their own - a null id demotes
+  // belt 2 to the label ladder, which refuses - but they are also the branches
+  // that HOLD an id, so they are exactly what turns a bad seed into a permanent
+  // one. That is the interaction with the takeover fix in Part 2c.
+
+  // AMBIGUOUS. Several tabs wear the label and none is focused, so the tie
+  // cannot break. This is the branch a GENERIC title_match reaches by
+  // construction, every single probe, because every fresh CC tab reads
+  // "Claude Code".
+  LIVE = [ tab('ttab_am1_1_1', 'Ecodia Site', false, 0), tab('ttab_am2_1_1', 'Ecodia Site', false, 1) ]
+  r = await cap('Ecodia Site', 7457, 'ttab_prior_1_1')
+  assert(r.tabId === 'ttab_prior_1_1' && r.reason === 'ambiguous_label',
+    'REPLACE-ONLY: an ambiguous label returns the PRIOR id, never null')
+
+  // ALL CLAIMED. Every tab wearing the label is already owned by a worker row.
+  // _claimedStableTabIds deliberately does NOT filter terminated rows (a corpse
+  // still owns its tab), and terminated rows accumulate, so this branch gets
+  // MORE reachable with every dispatch the fleet runs. tab_w1.json from (q)
+  // above is the claimant.
+  LIVE = [ tab('ttab_claimed_1_1', 'Ecodia Site', true, 0) ]
+  r = await cap('Ecodia Site', 7457, 'ttab_prior_1_1')
+  assert(r.tabId === 'ttab_prior_1_1' && r.reason === 'all_claimed_by_workers',
+    'REPLACE-ONLY: every hit claimed by a worker returns the PRIOR id, never null')
+
+  // THREW. The catch-all. A probe that blew up decided nothing, so it must not
+  // be read as a decision to blank the id. Forced deterministically through the
+  // String() coercion at the top of the helper, which sits outside every inner
+  // try - a malformed bridge payload degrades to no_live_tabs rather than
+  // throwing, so it cannot exercise this branch.
+  const boom = { toString: function () { throw new Error('coercion blew up') } }
+  r = await cap(boom, 7457, 'ttab_prior_1_1')
+  assert(r.tabId === 'ttab_prior_1_1' && r.reason === 'threw',
+    'REPLACE-ONLY: a THROW returns the PRIOR id, never null (got ' + r.tabId + '/' + r.reason + ')')
+
+  // ── Part 2c: a TAKEOVER must not inherit identity from the row it archives ──
+  // The defect this part exists for (2026-08-29 lane W1 item 2). register_
+  // conductor archives the old row when claude_port differs, and then seeded the
+  // NEW row's stable_tab_id from that archived row. Replace-only then HELD the
+  // dead tab's id through every undecidable probe. Belt 2 compared a stale sid
+  // against the live conductor's tid, found them unequal, saw a generic label
+  // that is evidence of nothing, and ALLOWED the close of the live conductor.
+  //
+  // A wrong-close, not a leak. Every other failure in this subsystem leaks; this
+  // one was the single path that could close Tate's live chat, and the generic
+  // title_match that makes it reachable is the COMMON registration, not a corner.
+  console.log('Part 2c: a takeover starts from no id, it does not inherit one')
+
+  // Establish an old conductor with a decidable, uniquely-labelled tab.
+  LIVE = [ tab('ttab_old_cond_1_1', 'Old Conductor Chat', true, 0) ]
+  let t = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 11111,
+    title_match: 'Old Conductor Chat',
+  })
+  assert(t.conductor.stable_tab_id === 'ttab_old_cond_1_1',
+    'takeover setup: the OLD conductor holds its own id (got ' + t.conductor.stable_tab_id + ')')
+
+  // Now a DIFFERENT chat takes over, registering in the ~11s generic-label
+  // window, with two tabs wearing that label and neither focused. Undecidable by
+  // construction - which is the whole point, because a generic label makes it
+  // undecidable on EVERY probe, not just this one.
+  LIVE = [ tab('ttab_new_cond_1_1', 'Claude Code', false, 0), tab('ttab_bystander_1_1', 'Claude Code', false, 1) ]
+  t = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 22222,
+    title_match: 'Claude Code',
+  })
+  assert(t.took_over === true, 'takeover premise: a differing claude_port archives the old row')
+  assert(!t.conductor.stable_tab_id,
+    'a TAKEOVER does not inherit the archived row\'s stable id (got ' + t.conductor.stable_tab_id + ')')
+
+  // THE GATE, at the level the fix actually lives. Ask the guard the question
+  // every close path asks about the LIVE conductor tab. Before the fix the row
+  // carried ttab_old_cond_1_1, the ids disagreed, the label was generic, and this
+  // returned allow=true - a wrong-close of the live conductor chat.
+  ;(() => {
+    const d = guard.evaluateClose(
+      'sentinel_prefix:EOS-W-x',
+      { label: 'Claude Code', active: false, tabId: 'ttab_new_cond_1_1' },
+      t.conductor, { selfClose: true })
+    assert(d.allow === false,
+      'post-takeover: the LIVE conductor tab is REFUSED, not closed (got ' + d.allow + '/' + d.reason + ')')
+  })()
+
+  // THE CONTROL the brief names: the same takeover with a NON-generic
+  // title_match must STAY refusing. It refuses either way - by the label ladder
+  // when there is no id, by the non-generic valve when there is - and that is
+  // the point: the fix moves nothing here.
+  LIVE = [ tab('ttab_ng1_1_1', 'Ecodia Site', false, 0), tab('ttab_ng2_1_1', 'Ecodia Site', false, 1) ]
+  t = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 33333,
+    title_match: 'Ecodia Site',
+  })
+  ;(() => {
+    const d = guard.evaluateClose(
+      'sentinel_prefix:EOS-W-x',
+      { label: 'Ecodia Site', active: false, tabId: 'ttab_ng1_1_1' },
+      t.conductor, { selfClose: true })
+    assert(d.allow === false && d.reason === 'conductor_label_protected',
+      'NON-generic control: a takeover with a real label still REFUSES (got ' + d.allow + '/' + d.reason + ')')
+  })()
+
+  // The fix must not overreach in the other direction. A takeover whose capture
+  // CAN decide still gets an id - the right one, from the new tab.
+  LIVE = [ tab('ttab_fresh_cond_1_1', 'Fresh Conductor', true, 0) ]
+  t = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 44444,
+    title_match: 'Fresh Conductor',
+  })
+  assert(t.conductor.stable_tab_id === 'ttab_fresh_cond_1_1',
+    'a takeover with a DECIDABLE probe captures the NEW id (got ' + t.conductor.stable_tab_id + ')')
+
+  // ...and replace-only itself is untouched on the NON-takeover path. Same
+  // claude_port, undecidable probe: the row keeps the id it had. Writing the fix
+  // as an unconditional `= null` would pass every assertion above and fail this
+  // one, which is what makes it the anti-overreach control.
+  LIVE = [ tab('ttab_ra_1_1', 'Claude Code', false, 0), tab('ttab_rb_1_1', 'Claude Code', false, 1) ]
+  t = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 44444,
+    title_match: 'Claude Code',
+  })
+  assert(t.took_over === false, 'anti-overreach premise: the same claude_port is NOT a takeover')
+  assert(t.conductor.stable_tab_id === 'ttab_fresh_cond_1_1',
+    'REPLACE-ONLY survives on the non-takeover path (got ' + t.conductor.stable_tab_id + ')')
+
   // ── Part 3: the two halves, end to end ─────────────────────────────────────
   console.log('Part 3: capture + belt together on the real close decision')
 
@@ -348,8 +499,8 @@ const coord = require('./coord.js')
   })()
   ;(() => {
     const r = src('reap-leaked-worker-tabs.js')
-    assert(/evaluateClose\('reaper_anchor_exact_label',[\s\S]{0,400}?tabId:/.test(r),
-      'the leaked-tab reaper passes tabId to evaluateClose')
+    assert(/evaluateClose\('reaper_anchor_exact_label',[\s\S]{0,400}?tabId: tab\.tabId/.test(r),
+      'the leaked-tab reaper passes the LIVE tab\'s tabId to evaluateClose')
   })()
   // The raw-object paths: assert the object handed over is the bridge tab itself,
   // so tabId rides along without threading.
@@ -365,6 +516,82 @@ const coord = require('./coord.js')
     assert(/ccTabs: \(g\.tabs \|\| \[\]\)\.filter\(t => t\.viewType === CC_CHAT_VIEW_TYPE\)/.test(w),
       'cowork ccTabs is an unmapped filter, so tabId survives into match')
   })()
+
+  // ── Part 5: the reaper's tabId, tested by BEHAVIOUR not by grep ───────────
+  // reap-leaked-worker-tabs.js:~208 `tabId: tab.tabId || ttab || null` was added
+  // by the item-1 commit itself and nothing tested it. The Part 4 assertion above
+  // is a source grep, and a source grep cannot tell `tabId: tab.tabId` from
+  // `tabId: null` unless it names the expression - which is why it now does. This
+  // part is the behavioural half: drive the real script, on the real guard, and
+  // assert the conductor's tab is PRESERVED by identity.
+  //
+  // The scenario is the one the identity conjunct exists for and the ONLY one
+  // where it is load-bearing in this script: Claude Code has retitled the
+  // conductor's chat, so the stored title_match no longer equals the live label
+  // and the label ladder cannot cover. A stale worker anchor happens to carry
+  // that new label. Without a tabId the guard has nothing left and ALLOWS the
+  // close of the conductor.
+  //
+  // The stubs are written to a TEMP dir and preloaded with -r. They must never
+  // land in tools/: index.js autoloads every .js there (lib/tool-autoload.js,
+  // and its skip regex covers test-harness names only), so a committed stub that
+  // overwrites ide.tabs would break every capture and close path in the live
+  // agent at the next boot. That is this very script's own 2026-08-29 P0.
+  console.log('Part 5: the leaked-tab reaper preserves the conductor by identity')
+  const { execFileSync } = require('child_process')
+  const reapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'reap-fix-'))
+  const REAP_TTAB = 'ttab_cond_reap_1_1'
+  const REAP_LABEL = 'Reaper Live Label'
+  fs.mkdirSync(path.join(reapRoot, 'conductors'), { recursive: true })
+  fs.mkdirSync(path.join(reapRoot, 'workers'), { recursive: true })
+  fs.mkdirSync(path.join(reapRoot, 'chat-tabs'), { recursive: true })
+  fs.writeFileSync(path.join(reapRoot, 'conductors', 'current.json'), JSON.stringify({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 1,
+    // RETITLED: the stored label is stale, so the label ladder is out of the game.
+    title_match: 'Old Stored Conductor Title',
+    stable_tab_id: REAP_TTAB,
+  }))
+  fs.writeFileSync(path.join(reapRoot, 'workers', 'tab_reapw.json'), JSON.stringify({
+    tab_id: 'tab_reapw', terminated_at: '2026-08-29T00:00:00.000Z',
+  }))
+  fs.writeFileSync(path.join(reapRoot, 'chat-tabs', 'tab_reapw.json'), JSON.stringify({
+    tab_id: 'tab_reapw', role: 'worker', label: REAP_LABEL, session_id: 'sess_reapw',
+  }))
+  const preload = path.join(reapRoot, 'stub-bridge.js')
+  fs.writeFileSync(preload, [
+    "'use strict'",
+    'const path = require("path")',
+    'const TOOLS = ' + JSON.stringify(__dirname),
+    'const CC = ' + JSON.stringify(CC_VT),
+    'const ide = require(path.join(TOOLS, "ide.js"))',
+    'ide.tabs = async function () { return { groups: [ { viewColumn: 1, tabs: [',
+    '  { tabId: ' + JSON.stringify(REAP_TTAB) + ', label: ' + JSON.stringify(REAP_LABEL) + ', active: false, index: 0, viewType: CC },',
+    '] } ] } }',
+    'const liveness = require(path.join(TOOLS, "worker-liveness.js"))',
+    'liveness.liveTabs = function () { return new Map() }',
+    '',
+  ].join('\n'))
+  let reapReport = null
+  let reapErr = null
+  try {
+    const out = execFileSync(process.execPath,
+      ['-r', preload, path.join(__dirname, 'reap-leaked-worker-tabs.js')],
+      { env: Object.assign({}, process.env, { COORD_ROOT: reapRoot, COORD_DISABLE_SWEEP: '1' }),
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    reapReport = JSON.parse(out)
+  } catch (e) { reapErr = (e && (e.stderr || e.message)) || String(e) }
+  assert(reapReport !== null, 'the reaper dry-run produced a JSON report (err=' + reapErr + ')')
+  if (reapReport) {
+    // Premise first: without this the assertions below pass vacuously on a report
+    // that never reached the guard at all.
+    assert(reapReport.live_tabs_seen === 1, 'reaper premise: the stubbed bridge listing reached it')
+    const reasons = (reapReport.preserved || []).map((x) => x.reason)
+    assert(reasons.indexOf('close_guard:conductor_stable_id_protected') !== -1,
+      'the reaper PRESERVES the conductor tab by stable id (preserved=' + JSON.stringify(reasons) + ')')
+    assert((reapReport.candidates || []).length === 0,
+      'the reaper proposes NOTHING to close (candidates=' + JSON.stringify(reapReport.candidates) + ')')
+  }
+  try { fs.rmSync(reapRoot, { recursive: true, force: true }) } catch (e) {}
 
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }) } catch (e) {}
   if (fails === 0) { console.log('ALL TESTS PASSED'); process.exit(0) } else { console.log(fails + ' TEST(S) FAILED'); process.exit(1) }
