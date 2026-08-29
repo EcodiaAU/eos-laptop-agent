@@ -540,6 +540,52 @@ function setTabId(tab_id, ttab) {
     wDark.tab_handle.tabId === 'ttab_unverifiable_1_1' && !wDark.tab_handle.tabId_stale_dropped,
     JSON.stringify(wDark.tab_handle))
 
+  // 10. THE WRONG-CLOSE THAT ACTUALLY HAPPENED, 2026-08-29 lane W1-verify3.
+  //     A worker bound carrying an id it had never earned (the dispatcher's
+  //     spawn-diff stamp, measured 0 of 10 still resolving), that id named the
+  //     LIVE HUMAN CHAT "Crons", and every check on the way to the close asked
+  //     only whether the id was alive. It was alive. It was not this worker's.
+  //     close_my_tab closed Tate's chat and left the worker's own tab open.
+  //
+  //     LIVENESS IS NOT IDENTITY. A dead id expires by itself; a wrong-but-alive
+  //     id is held alive by its real owner and never expires.
+  mkCronWorker('w-wrongid', 0)
+  setTabId('w-wrongid', 'ttab_someone_elses_chat')
+  LIVE_TABS = [
+    { tabId: 'ttab_someone_elses_chat', label: 'Crons', viewColumn: 1, index: 0 },
+    { tabId: 'ttab_my_real_tab', label: SENTINEL, viewColumn: 1, index: 1 },
+  ]
+  const wrong = await coord._resolveStableIdCloseTargetRecapturing('w-wrongid', 7457)
+  ok('a stored id naming a DIFFERENT live chat does not become a close target',
+    wrong.tabId !== 'ttab_someone_elses_chat', JSON.stringify(wrong))
+  ok('and it re-captures onto the tab actually wearing this worker sentinel',
+    wrong.tabId === 'ttab_my_real_tab', JSON.stringify(wrong))
+
+  //     THE CONTROL that makes the rule narrow, and the one an over-strict fix
+  //     breaks: an AUTOTITLED tab no longer wears its sentinel, and nothing else
+  //     does either. Nothing contradicts the stored id, so it is TRUSTED. This
+  //     is the entire reason the stable id exists, so demanding a positive label
+  //     match here would reduce it to the label ladder it replaced.
+  mkCronWorker('w-autotitled', 1)
+  setTabId('w-autotitled', 'ttab_autotitled_mine')
+  LIVE_TABS = [
+    { tabId: 'ttab_autotitled_mine', label: 'Pattern binding TTL sweep', viewColumn: 1, index: 0 },
+    { tabId: 'ttab_unrelated', label: 'Some human chat', viewColumn: 1, index: 1 },
+  ]
+  const auto = await coord._resolveStableIdCloseTargetRecapturing('w-autotitled', 7457)
+  ok('CONTROL: an autotitled tab that nothing contradicts KEEPS its stored id',
+    auto.tabId === 'ttab_autotitled_mine', JSON.stringify(auto))
+
+  //     And the claimed-set stays decisive whatever the labels read.
+  mkCronWorker('w-claimant', 2)
+  setTabId('w-claimant', 'ttab_owned_by_claimant')
+  mkCronWorker('w-thief', 3)
+  setTabId('w-thief', 'ttab_owned_by_claimant')
+  LIVE_TABS = [{ tabId: 'ttab_owned_by_claimant', label: 'Pattern binding TTL sweep', viewColumn: 1, index: 0 }]
+  const thief = await coord._resolveStableIdCloseTargetRecapturing('w-thief', 7457)
+  ok('a tab another registry row already claims is never closed as mine',
+    thief.tabId !== 'ttab_owned_by_claimant', JSON.stringify(thief))
+
   ide.tabs = realTabs
   ide.tabs_close = realClose
   console.log('\n' + (fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'))
