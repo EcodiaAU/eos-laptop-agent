@@ -645,6 +645,111 @@ function setTabId(tab_id, ttab) {
   ok('CONTROL: two live tabs wear the sentinel, so the corpse claim still filters and one survives',
     twohit.tabId === 'ttab_twohit_b', JSON.stringify(twohit))
 
+
+  console.log('\n== Part 10: the fossil claim must still CONTRADICT unless the held tab is mine ==')
+  // dbf8723 relaxed BOTH claim checks to liveOnly:true on the premise "a
+  // TERMINATED row is not another live worker". The premise is about the
+  // CLAIMANT and says nothing about the HELD TAB, and _storedIdContradicted is
+  // the one place that difference matters. Its job is to answer "is this id
+  // still MINE", and a corpse row naming the id is evidence that it is not,
+  // whoever is wearing it now. Dropping fossil claims here means: caller W's
+  // stored id was recycled onto a live tab, W's own tab is gone so nothing wears
+  // W's sentinel and arm (b) cannot fire, no live row claims the tab, and the
+  // close proceeds against a stranger who is working. The pre-dbf8723 all-rows
+  // check refused exactly that. Reachable from kill_worker and the orphan
+  // sweeps, which run this resolver against dead workers' rows continuously.
+  //
+  // The gate is IDENTITY, and it has to be measured rather than assumed, because
+  // the same identity-gating idea is recorded in this file's own history as the
+  // repair that broke every legitimate cron close. Measured on the live corpus
+  // 2026-08-29 (1587 worker-role anchors): every live worker tab still wears its
+  // sentinel, because the dispatcher writes the sentinel as the brief's first
+  // line and Claude Code titles the tab from it. The real hazard is the OTHER
+  // truncation direction: 309 of 1587 labels show the WHOLE sentinel plus
+  // spillover ("[600f morning pass]\n<dis…"), and _labelMatchesStored answers
+  // false on 278 of those 309 because it only tests full.startsWith(visible).
+  // Those 309 are the short-named recurring crons, i.e. exactly the population
+  // this whole lane exists to stop leaking. So the gate uses a bidirectional
+  // test that also accepts visible.startsWith(full): 309 of 309 recognised.
+
+  const SHORT = '[600f morning pass]'
+  const SPILL = '[600f morning pass]\n<dis…'   // whole sentinel visible + spillover
+  const STRANGER = 'Client onboarding notes…'
+
+  function mkNamed(tab_id, sentinel, spawnIndex) {
+    coord._registerWorkerInternal({ tab_id: tab_id, task_id: 'row-' + tab_id, tab_credential: 'cred-' + tab_id })
+    coord.setWorkerTabHandle(tab_id, {
+      sentinel_prefix: sentinel,
+      viewColumn: 1,
+      viewType: CC,
+      label_at_spawn: 'Claude Code',
+      tabIndex: spawnIndex,
+      autotitle_fingerprint: FINGERPRINT,
+    })
+  }
+  const kill = (tab_id) => { coord.loadWorkerRegistry(tab_id).terminated_at = new Date().toISOString() }
+  const th = (tab_id) => coord.loadWorkerRegistry(tab_id).tab_handle
+
+  // (c) THE WRONG-CLOSE. Fails first on the deployed code.
+  mkNamed('f-c-corpse', SENTINEL, 0); setTabId('f-c-corpse', 'ttab_fc'); kill('f-c-corpse')
+  mkNamed('f-c-caller', SENTINEL, 1)
+  th('f-c-caller').tabId = 'ttab_fc'                      // recycled onto a stranger's tab
+  LIVE_TABS = [{ tabId: 'ttab_fc', label: STRANGER, viewColumn: 1, index: 0 }]
+  const tabsC = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(c) a fossil claim on a tab wearing a STRANGER title CONTRADICTS',
+    coord._storedIdContradicted(th('f-c-caller'), tabsC, 'f-c-caller', 'ttab_fc') === true)
+  const resC = await coord._resolveStableIdCloseTarget('f-c-caller', 7457)
+  ok('(c) end to end: the resolver REFUSES stable_id_not_mine instead of handing over the stranger',
+    /^stable_id_not_mine:/.test(String(resC.refused || '')), JSON.stringify(resC))
+
+  // (a) POSITIVE CONTROL. Same fixture, one variable changed: the held tab wears
+  // the caller's sentinel, truncated mid-sentinel. Must NOT contradict.
+  mkNamed('f-a-corpse', SENTINEL, 0); setTabId('f-a-corpse', 'ttab_fa'); kill('f-a-corpse')
+  mkNamed('f-a-caller', SENTINEL, 1)
+  th('f-a-caller').tabId = 'ttab_fa'
+  LIVE_TABS = [{ tabId: 'ttab_fa', label: SENTINEL.slice(0, 24) + '…', viewColumn: 1, index: 0 }]
+  const tabsA = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(a) CONTROL: a fossil claim on a tab wearing my truncated sentinel does NOT contradict',
+    coord._storedIdContradicted(th('f-a-caller'), tabsA, 'f-a-caller', 'ttab_fa') === false)
+  const resA = await coord._resolveStableIdCloseTarget('f-a-caller', 7457)
+  ok('(a) CONTROL end to end: the resolver still hands over the tab', resA.tabId === 'ttab_fa', JSON.stringify(resA))
+
+  // (b) THE LEAK-REINTRODUCTION CONTROL, and the reason the gate is
+  // bidirectional. A short-named cron whose whole sentinel fits inside the
+  // 24-char window shows sentinel + spillover. One-directional matching answers
+  // false here and would refuse this close, which is the exact leak dbf8723 was
+  // removing. 309 of 1587 live-corpus labels are this shape.
+  mkNamed('f-b-corpse', SHORT, 0); setTabId('f-b-corpse', 'ttab_fb')
+  th('f-b-corpse').tabId_captured_label = SHORT; kill('f-b-corpse')
+  mkNamed('f-b-caller', SHORT, 1)
+  th('f-b-caller').tabId = 'ttab_fb'
+  LIVE_TABS = [{ tabId: 'ttab_fb', label: SPILL, viewColumn: 1, index: 0 }]
+  const tabsB = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(b) CONTROL: sentinel-plus-spillover is still MY identity, so no contradiction and no new leak',
+    coord._storedIdContradicted(th('f-b-caller'), tabsB, 'f-b-caller', 'ttab_fb') === false)
+  ok('(b) and the one-directional test is what would have got this wrong',
+    coord._labelMatchesStored(SPILL, SHORT) === false)
+  const resB = await coord._resolveStableIdCloseTarget('f-b-caller', 7457)
+  ok('(b) CONTROL end to end: the short-named cron still closes its own tab', resB.tabId === 'ttab_fb', JSON.stringify(resB))
+
+  // (d) NEGATIVE CONTROL. No claimant at all, stranger label. Nothing to
+  // contradict with, so behaviour is unchanged by this commit.
+  mkNamed('f-d-caller', SENTINEL, 0)
+  th('f-d-caller').tabId = 'ttab_fd'
+  LIVE_TABS = [{ tabId: 'ttab_fd', label: STRANGER, viewColumn: 1, index: 0 }]
+  const tabsD = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(d) CONTROL: an UNCLAIMED id on an autotitled tab still does not contradict',
+    coord._storedIdContradicted(th('f-d-caller'), tabsD, 'f-d-caller', 'ttab_fd') === false)
+
+  // (e) The live-claimant arm is untouched by this commit and must stay decisive.
+  mkNamed('f-e-live', SENTINEL, 0); setTabId('f-e-live', 'ttab_fe')
+  mkNamed('f-e-caller', SENTINEL, 1)
+  th('f-e-caller').tabId = 'ttab_fe'
+  LIVE_TABS = [{ tabId: 'ttab_fe', label: SENTINEL.slice(0, 24) + '…', viewColumn: 1, index: 0 }]
+  const tabsE = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(e) CONTROL: a LIVE row claiming the held tab still contradicts even when the label reads as mine',
+    coord._storedIdContradicted(th('f-e-caller'), tabsE, 'f-e-caller', 'ttab_fe') === true)
+
   ide.tabs = realTabs
   ide.tabs_close = realClose
   console.log('\n' + (fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'))

@@ -1662,6 +1662,28 @@ function _storedIdContradicted(th, tabs, tab_id, want) {
   const wearsMyIdentity = (t) =>
     (haveSentinel && _labelMatchesStored(t.label, th.sentinel_prefix)) ||
     (haveSpawn && _labelMatchesStored(t.label, spawnLabel))
+  // Arm (a2), restored 2026-08-29 lane C5 gen 3. The liveOnly relaxation above
+  // rests on "a TERMINATED row is not another live worker", which is true and is
+  // about the CLAIMANT. It says nothing about the HELD TAB, and that is the only
+  // thing this function is judging. Dropping fossil claims outright opens a
+  // wrong-close, reproduced end to end in Part 10 of
+  // coord-stable-tab-id-close.test.js against this exact code: caller W's stored
+  // id is recycled onto a live stranger's tab, W's own tab is gone so nothing
+  // wears W's sentinel and the identity arm below cannot fire, no LIVE row
+  // claims the tab, and _resolveStableIdCloseTarget hands the stranger to a
+  // close. kill_worker and the orphan sweeps run this resolver against dead
+  // workers' rows continuously, so the caller shape is the normal one.
+  //
+  // So a corpse's claim still counts as evidence the id is not mine, UNLESS the
+  // held tab is positively wearing my name. That is the narrow form of the
+  // identity check this file's own history records as too strict in its broad
+  // form; _labelWearsStored is what makes it survivable, and its header carries
+  // the measurement. This arm can only ADD refusals: refusing costs one leaked
+  // webview, closing costs someone else's running work.
+  if (!(haveSentinel && _labelWearsStored(held.label, th.sentinel_prefix)) &&
+      !(haveSpawn && _labelWearsStored(held.label, spawnLabel))) {
+    try { if (_claimedStableTabIds(tab_id).has(want)) return true } catch (e) {}
+  }
   if (wearsMyIdentity(held)) return false       // the held tab IS wearing my identity
   return tabs.some((t) => t.tabId !== want && wearsMyIdentity(t))
 }
@@ -2106,6 +2128,28 @@ function _labelMatchesStored(live, full) {
     return full.startsWith(vis)
   }
   return false
+}
+// Identity-strength variant, used ONLY by the fossil-claim gate in
+// _storedIdContradicted. _labelMatchesStored is a UNIQUENESS test: several call
+// sites filter a whole tab list with it and refuse on more than one hit, so it
+// stays strict and one-directional (full.startsWith(visible)) on purpose. The
+// gate below asks a different question about ONE known tab, "is this thing
+// wearing my name", and the strict direction answers it wrongly in the common
+// case. Measured 2026-08-29 over 1587 worker-role anchors: 309 labels show the
+// WHOLE sentinel plus spillover ("[600f morning pass]\n<dis…"), because the
+// sentinel is shorter than the 24-char title window, and _labelMatchesStored
+// says false on 278 of those 309. They are the short-named recurring crons, the
+// exact population the stable-id work exists to stop leaking. Accepting
+// visible.startsWith(full) too recognises 309 of 309. That direction is not a
+// loosening: it demands the ENTIRE stored sentinel be present, which is strictly
+// more matched characters than the truncated case already trusted.
+function _labelWearsStored(live, full) {
+  if (!live || !full) return false
+  if (live === full) return true
+  if (!_isTruncatedLabel(live)) return false
+  const vis = _visiblePrefix(live)
+  if (vis.length < _MIN_TRUNC_PREFIX) return false
+  return full.startsWith(vis) || vis.startsWith(full)
 }
 
 function _liveWorkerRows() {
@@ -3340,6 +3384,12 @@ async function close_my_tab(params, ctx) {
       closed = res.closed
       close_strategy = res.strategy
       if (!closed) refused = res.refused
+      // 2026-08-29 lane C5 gen 3, an instrument gap rather than a behaviour
+      // change. Only REFUSALS wrote to stderr, so the agent log could report
+      // this path failing and never report it working, and the lane's own verify
+      // gate ("read the recurring-cron close out of the log") was unsatisfiable
+      // on its named instrument. A landed close now says so.
+      else { try { process.stderr.write('[coord] close_my_tab CLOSED via ' + res.strategy + ' label=' + JSON.stringify(String((st.tab && st.tab.label) || '')) + '\n') } catch (e) {} }
     }
   } catch (e) {
     // A throw here must not silently promote the fuzzy ladder on a row that has
@@ -4572,6 +4622,7 @@ module.exports = {
   // Chat-to-chat push-delivery internals (exposed for tests).
   _isChatDeliver: isChatDeliver,
   _labelMatchesStored: _labelMatchesStored,
+  _labelWearsStored: _labelWearsStored,
   _isTruncatedLabel: _isTruncatedLabel,
   _matchWorkerRow: _matchWorkerRow,
   _chatTopicMid: chatTopicMid,
