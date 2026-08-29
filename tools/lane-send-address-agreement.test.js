@@ -150,6 +150,34 @@ function reg(tab_id, opts) {
     assert.strictEqual(r.index, 3)
   })
 
+  await acheck('a HEARTBEAT-DEAD holder does not make a live successor ambiguous', async () => {
+    // The 60-minute gap. sweepStaleWorkers stamps terminated_at only after 60 min,
+    // while list_workers has called a row dead after 90 s. In between, a worker
+    // that died WITHOUT signal_done (roughly one in eight: killed, capped, tab
+    // closed) still holds its lane. Without the staleness predicate this case
+    // returns lane_ambiguous_holder and the wake degrades to queue-only in exactly
+    // the predecessor-died case lane mailboxes exist to serve.
+    reg('tab_LANEDEAD', { lane_name: 'cowork.daycrew-lane-S2-earlier-pass' })
+    const dead = coord._workersForTest
+      ? coord._workersForTest().get('tab_LANEDEAD')
+      : null
+    assert.ok(dead, 'need registry access to age the row')
+    dead.last_heartbeat_at = new Date(Date.now() - 10 * 60 * 1000).toISOString()  // 10 min stale
+    assert.ok(!dead.terminated_at, 'fixture must be dead-but-NOT-terminated (registerWorkerInternal sets it null)')
+    const r = await resolveTarget(LANE_KEY_TOPIC)
+    assert.ok(r && r.ok, 'a heartbeat-dead predecessor must be skipped; got ' + JSON.stringify(r))
+    assert.strictEqual(r.index, 3, 'must resolve to the LIVE successor')
+  })
+
+  await acheck('CONTROL: a FRESH second holder still refuses (staleness did not weaken the guard)', async () => {
+    const dead = coord._workersForTest().get('tab_LANEDEAD')
+    dead.last_heartbeat_at = new Date().toISOString()   // it is alive again
+    const r = await resolveTarget(LANE_KEY_TOPIC)
+    assert.ok(r && !r.ok, 'two genuinely live holders must still refuse; got ' + JSON.stringify(r))
+    assert.strictEqual(r.reason, 'lane_ambiguous_holder')
+    dead.terminated_at = new Date().toISOString()       // tidy up for later cases
+  })
+
   await acheck('a lane nobody holds refuses rather than guessing', async () => {
     const r = await resolveTarget('chat.lane.cowork.nobody-lane-z9.inbox')
     assert.ok(r && !r.ok)

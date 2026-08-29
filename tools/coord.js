@@ -2285,9 +2285,26 @@ async function resolveLiveTargetTab(topic) {
   // reused, same rule as the worker branch below).
   if (/^lane\./.test(mid)) {
     const laneKey = mid.slice('lane.'.length)
+    // TERMINATED is not the only way to be gone, and the gap is 60 minutes wide.
+    // sweepStaleWorkers only stamps terminated_at after SWEEP_STALE_THRESHOLD_MS
+    // (60 min), while list_workers has called a row dead after DEAD_HEARTBEAT_MS
+    // (90 s) since long before this branch existed. Between those two numbers a
+    // worker that died WITHOUT signal_done still holds its lane, and roughly one
+    // worker in eight dies that way (killed, capped, or tab closed mid-run). Left
+    // to terminated_at alone, a dead predecessor beside a live successor reads as
+    // lane_ambiguous_holder for up to an hour, degrading the wake to queue-only in
+    // precisely the predecessor-died case lane mailboxes were built to serve.
+    // Reuse the SAME staleness predicate list_workers uses, so "dead" has one
+    // definition in this file rather than two that drift.
+    // Skipping a merely-quiet live worker is safe by construction: if every holder
+    // is skipped the branch returns lane_no_live_holder and the message queues in
+    // the lane mailbox that worker reads anyway, which is the same fail-safe.
     const holders = []
+    const nowMs = Date.now()
     for (const [tabId, row] of workers.entries()) {
       if (!row || row.terminated_at) continue
+      const lastHbMs = new Date(row.last_heartbeat_at || row.registered_at).getTime()
+      if (Number.isFinite(lastHbMs) && (nowMs - lastHbMs) > DEAD_HEARTBEAT_MS) continue
       if (laneKeyOf(row.lane_name) === laneKey) holders.push(tabId)
     }
     if (holders.length === 0) return { ok: false, kind: 'lane', reason: 'lane_no_live_holder' }
@@ -4362,6 +4379,12 @@ module.exports = {
   // Internal API for the /api/comms/register-worker route - NOT exposed as a tool.
   _registerWorkerInternal: registerWorkerInternal,
   _inboxTopicFor: inboxTopicFor,
+  // Test-only handle on the in-memory worker registry. Exists so a suite can
+  // AGE a row's heartbeat, which is the only way to build the dead-but-not-yet
+  // -terminated state that sweepStaleWorkers takes 60 minutes to reach. Without
+  // it the lane-holder staleness guard is untestable and would have to be taken
+  // on trust, which is how the 60-minute window went unnoticed in the first place.
+  _workersForTest: () => workers,
   _laneKeyOf: laneKeyOf,
   _loadConductorRegistration: loadConductorRegistration,
   // in_turn liveness seams (lane W1, 2026-08-29): the fixed TTL alone could
