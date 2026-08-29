@@ -28,9 +28,17 @@ scheduler._setPool({
     // staleLeaseRecovery branch-1 is the once-per-call fingerprint. Since 4cab6c3
     // (liveness gate) branch-1 is a SELECT of stale retryable dispatching rows +
     // a per-row UPDATE, not the old bulk UPDATE. The branch-1 SELECT fires exactly
-    // once per staleLeaseRecovery call regardless of matched rows; retry_count <
-    // distinguishes it from branch-2a (retry_count >=).
-    if (s.startsWith('SELECT id, name FROM os_scheduled_tasks') && s.includes("status = 'dispatching'") && s.includes('retry_count <')) {
+    // once per staleLeaseRecovery call regardless of matched rows.
+    // 2026-08-29 (lane D1 pass 2): the discriminator was the literal 'retry_count <',
+    // which stopped matching when the three branches moved to an effective-count
+    // CASE expression (scheduler.EFFECTIVE_RETRY_COUNT_SQL) and the text became
+    // 'COALESCE(retry_count, 0) END) < $2'. The fixture read 0 recoveries and
+    // failed while the code was correct. A string fingerprint over generated SQL
+    // is only as stable as the SQL's spelling, so pin it to the part that carries
+    // the meaning: the SELECT list already separates branch 1 (id, name) from
+    // branch 2a (id, cron_expression, tz) and branch 2b (id), and '< $2' keeps the
+    // retryable-versus-exhausted direction explicit.
+    if (s.startsWith('SELECT id, name FROM os_scheduled_tasks') && s.includes("status = 'dispatching'") && s.includes('< $2')) {
       recoveryRuns++
       return { rows: [], rowCount: 0 }
     }

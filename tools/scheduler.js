@@ -622,9 +622,112 @@ const CAPPED_PAGE_MIN_MS = parseInt(process.env.SCHEDULER_CAPPED_PAGE_MIN_MS, 10
 // which is the other half of keeping those two meanings apart.
 exports.CAPPED_RETRY_MARK = 2
 
+// The ONE spelling of the marker. The JS predicate below and the SQL expression
+// under it are both built from this, because they encode the same rule in two
+// languages and a hand-copied literal in either one drifts silently.
+exports.CAPPED_MARKER_TOKEN = 'AllAccountsCappedError'
+
+// The retry budget a row ACTUALLY has left, as SQL.
+//
+// retry_count carries two meanings at once. Its own is "how many times this row
+// has failed", which MAX_RETRY_COUNT spends to permanently fail a one-shot row.
+// The capped defer BORROWS it to make an outage visible to scheduler-health.sh's
+// capped_churn detector (retry_count >= 2 AND last_error ILIKE the marker).
+// A cap mark is not three failed attempts and must not be read as any.
+//
+// markFailed already reads it this way (see priorRetryCount). staleLeaseRecovery
+// is the PARALLEL path and did not, which is the hazard this expression closes:
+// leaseDueRows' UPDATE sets only status/leased_by/leased_at/updated_at, so a
+// cap-marked row re-enters 'dispatching' still carrying retry_count=2 and the
+// marker. Branch 1 then granted it ONE reclaim (2 -> 3) and the next stale pass
+// handed it to branch 2b, which permanently fails it. Three reclaims became one.
+// Measured 2026-08-29: 121 of the 128 unarchived rows carrying the marker are
+// type='delayed', exactly the type 2b fails. And a cap outage ENDS in a
+// thundering herd (~90 rows lease the moment it clears), which is when a spawn
+// is likeliest to go stale, so the correlation runs the wrong way.
+//
+// Why neutralise the count rather than clear last_error at lease time: the
+// detector greps last_error over a 24h window, so clearing it starves the very
+// alarm the mark exists to feed. Neutralising keeps the mark visible to the
+// detector and invisible to the budget.
+// [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]]
+exports.EFFECTIVE_RETRY_COUNT_SQL =
+  "(CASE WHEN last_error ILIKE '%" + exports.CAPPED_MARKER_TOKEN + "%' THEN 0 ELSE COALESCE(retry_count, 0) END)"
+
 let _cappedFirstDeferAt = null
 let _cappedDefers = 0
 let _cappedPageSent = false
+let _cappedLastDeferAt = null
+
+// THE LATCH USED TO DIE WITH THE DAEMON, and a cap outage is exactly when the
+// daemon restarts: a cap is what fires account-switch.sh and what wakes the
+// watchdogs. Both directions were wrong. Page at 10min, restart, clock zeroes,
+// page again at 20min. Or restart at 9min and the page is pushed out another 10.
+// The clock and the latch therefore live on disk, next to the canary heartbeats.
+//
+// Every transition mirrors to the file, not just the set points: the unlatch on
+// an unconfirmed send and the clear on a recovered dispatch both write. A
+// pageSent=true left behind by a finished outage would SILENCE the next one,
+// which is strictly worse than the double page this replaces, so
+// noteSuccessfulDispatch deletes the file and a persisted outage whose last
+// defer is older than CAPPED_OUTAGE_STALE_MS is discarded rather than adopted.
+// Every read and write is wrapped: the dispatcher must never crash-loop on its
+// own state file, so a corrupt or unwritable one degrades to in-memory
+// behaviour, which is exactly what shipped before this.
+const CAPPED_OUTAGE_STALE_MS = 30 * 60 * 1000
+let _cappedStatePath = null
+function cappedStatePath() {
+  if (_cappedStatePath) return _cappedStatePath
+  return require('path').join(require('os').homedir(), '.ecodiaos', 'canary-state', 'scheduler-capped-outage.json')
+}
+exports._setCappedStatePath = function (p) { _cappedStatePath = p }
+
+function persistCappedOutageState() {
+  try {
+    const fs = require('fs')
+    const p = cappedStatePath()
+    if (_cappedFirstDeferAt === null) { try { fs.unlinkSync(p) } catch (_e) {} ; return }
+    fs.mkdirSync(require('path').dirname(p), { recursive: true })
+    fs.writeFileSync(p, JSON.stringify({
+      firstDeferAt: _cappedFirstDeferAt,
+      defers: _cappedDefers,
+      pageSent: _cappedPageSent,
+      lastDeferAt: _cappedLastDeferAt,
+    }))
+  } catch (e) {
+    process.stderr.write('[scheduler] capped outage state persist failed (' + (e && e.message || e) +
+      '); falling back to in-memory latch for this outage\n')
+  }
+}
+
+function loadCappedOutageState(nowMs) {
+  try {
+    const st = JSON.parse(require('fs').readFileSync(cappedStatePath(), 'utf8'))
+    if (!st || typeof st.firstDeferAt !== 'number') return
+    const last = typeof st.lastDeferAt === 'number' ? st.lastDeferAt : st.firstDeferAt
+    if ((nowMs || Date.now()) - last > CAPPED_OUTAGE_STALE_MS) return  // that outage ended
+    _cappedFirstDeferAt = st.firstDeferAt
+    _cappedDefers = typeof st.defers === 'number' ? st.defers : 0
+    _cappedPageSent = st.pageSent === true
+    _cappedLastDeferAt = last
+    process.stderr.write('[scheduler] adopted an in-progress capped outage from disk (first defer ' +
+      new Date(_cappedFirstDeferAt).toISOString() + ', paged=' + _cappedPageSent + ')\n')
+  } catch (_e) { /* absent or corrupt: in-memory behaviour, which is the old behaviour */ }
+}
+exports._loadCappedOutageState = loadCappedOutageState
+// Adopt an outage already in progress. A restart mid-cap is the common case,
+// not the exotic one, because the cap is what triggered the restart.
+loadCappedOutageState()
+
+// Test seam: drop the in-memory latch and re-read from disk, which is exactly
+// what a daemon restart does.
+exports._simulateRestart = function (nowMs) {
+  _cappedFirstDeferAt = null
+  _cappedDefers = 0
+  _cappedPageSent = false
+  _cappedLastDeferAt = null
+  loadCappedOutageState(nowMs)
+}
 
 exports._getCappedOutageState = function () {
   return { firstDeferAt: _cappedFirstDeferAt, defers: _cappedDefers, sent: _cappedPageSent }
@@ -633,12 +736,28 @@ exports._resetCappedOutageState = function () {
   _cappedFirstDeferAt = null
   _cappedDefers = 0
   _cappedPageSent = false
+  _cappedLastDeferAt = null
+  persistCappedOutageState()   // clears the file; a stale latch silences the NEXT outage
 }
 
 // True when a row's last_error is the marker the capped defer writes. Used by
-// markFailed to tell a cap mark from a spent failure budget.
+// markFailed and by staleLeaseRecovery's SQL twin to tell a cap mark from a
+// spent failure budget.
 exports.isAllAccountsCappedMarker = function (lastError) {
-  return /AllAccountsCappedError/i.test(String(lastError || ''))
+  return new RegExp(exports.CAPPED_MARKER_TOKEN, 'i').test(String(lastError || ''))
+}
+
+// Tate reads these at 3am. Doctrine is AEST to humans, UTC to machines, and the
+// ISO stamp this used to print (2026-08-29T08:00:00.435Z) is neither readable
+// nor actionable at that hour.
+function aest(ms) {
+  try {
+    const p = new Intl.DateTimeFormat('en-AU', {
+      timeZone: 'Australia/Brisbane', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(new Date(ms)).reduce((a, x) => (a[x.type] = x.value, a), {})
+    return p.year + '-' + p.month + '-' + p.day + ' ' + p.hour + ':' + p.minute + ' AEST'
+  } catch (_e) { return new Date(ms).toISOString() }
 }
 
 // Counts one capped defer and, once the outage has persisted CAPPED_PAGE_MIN_MS
@@ -650,15 +769,17 @@ exports.noteAllAccountsCapped = function noteAllAccountsCapped(err, nowMs) {
   const now = nowMs || Date.now()
   if (_cappedFirstDeferAt === null) _cappedFirstDeferAt = now
   _cappedDefers += 1
+  _cappedLastDeferAt = now
   const persistedMs = now - _cappedFirstDeferAt
-  if (persistedMs < CAPPED_PAGE_MIN_MS || _cappedPageSent) return null
+  if (persistedMs < CAPPED_PAGE_MIN_MS || _cappedPageSent) { persistCappedOutageState(); return null }
   _cappedPageSent = true
+  persistCappedOutageState()
 
   let resetTxt = 'unknown (no reset time reported)'
   const resets = err && err.resets
   if (resets) {
     const times = Object.values(resets).filter(Boolean).map(t => new Date(t).getTime()).filter(t => !isNaN(t))
-    if (times.length) resetTxt = new Date(Math.min(...times)).toISOString()
+    if (times.length) resetTxt = aest(Math.min(...times))
   }
   const msg = 'ACCOUNT OUTAGE: every Claude account is capped. Dispatch has deferred ' +
     _cappedDefers + ' times over ~' + Math.round(persistedMs / 60000) +
@@ -669,6 +790,7 @@ exports.noteAllAccountsCapped = function noteAllAccountsCapped(err, nowMs) {
   _pagerSender(TEXT_TATE_SCRIPT, args, function (err2, code) {
     if (err2 || code !== 0) {
       _cappedPageSent = false
+      persistCappedOutageState()   // the unlatch mirrors to disk, or a restart adopts a page that never landed
       process.stderr.write('[scheduler] CAPPED OUTAGE PAGE send FAILED (code=' + code +
         (err2 ? ', err=' + (err2.message || err2) : '') + '); unlatched, will retry next defer\n')
     } else {
@@ -2637,7 +2759,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     `SELECT id, name FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
-       AND retry_count < $2
+       AND ${exports.EFFECTIVE_RETRY_COUNT_SQL} < $2
        AND archived_at IS NULL
        AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
@@ -2661,7 +2783,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     }
     await pool.query(
       `UPDATE os_scheduled_tasks
-       SET status = 'active', retry_count = retry_count + 1,
+       SET status = 'active', retry_count = ${exports.EFFECTIVE_RETRY_COUNT_SQL} + 1,
            last_error = 'stale lease recovered (next_run_at re-armed to bounded retry backoff)',
            next_run_at = NOW() + ($2 || ' milliseconds')::interval,
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
@@ -2683,7 +2805,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     `SELECT id, cron_expression, tz FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
-       AND retry_count >= $2
+       AND ${exports.EFFECTIVE_RETRY_COUNT_SQL} >= $2
        AND type = 'cron'
        AND cron_expression IS NOT NULL`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
@@ -2740,7 +2862,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     `SELECT id FROM os_scheduled_tasks
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
-       AND retry_count >= $2
+       AND ${exports.EFFECTIVE_RETRY_COUNT_SQL} >= $2
        AND (type != 'cron' OR cron_expression IS NULL)`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
