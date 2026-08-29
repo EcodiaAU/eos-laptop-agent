@@ -106,7 +106,7 @@ function composeBrief(opts) {
   const {
     tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session,
     brief_body, brief_size_bytes, brief_storage, brief_file_path,
-    report_back,
+    report_back, inbox_topic,
   } = opts
 
   const headerAttrs = [
@@ -114,7 +114,16 @@ function composeBrief(opts) {
     'tab_id="' + tab_id + '"',
     'task_id="' + task_id + '"',
     'tab_credential="' + tab_credential + '"',
-    'inbox="chat.' + tab_id + '.inbox"',
+    // 2026-08-29. This attribute used to be built by hand as
+    // 'chat.' + tab_id + '.inbox'. Once a worker carries a lane the resolver
+    // serves it a LANE mailbox instead, and a hand-built attribute would have
+    // told the worker one address while the substrate used another: the
+    // caller/callee disagreement already found once in routes/comms.js, and
+    // worse than either address alone because the brief is the document a
+    // worker is instructed to trust over its own chat. inbox_topic is whatever
+    // /api/comms/register-worker just answered, which IS the resolver's output.
+    // The fallback keeps every pre-lane dispatch byte-identical.
+    'inbox="' + (inbox_topic || ('chat.' + tab_id + '.inbox')) + '"',
     // The address a worker copies when it wants to reach "the conductor". It MUST
     // be its own dispatching chat, not the shared `chat.conductor.inbox` slot:
     // that slot is rewritten by every chat's turn-start heartbeat, so a worker
@@ -293,7 +302,42 @@ function composeBrief(opts) {
     'outage, sealed credential, a Tate-gated step): name it in result_summary, and where\n' +
     'the block has a known reset, arm a re-check successor at that time.\n'
 
-  return [header, '', identity, '', verifyFirst, '', standDown, '', taskBlock, '', selfContinuation, '', closing].join('\n')
+
+  // 2026-08-29. THE FIRST CALLER OF coord.wait_for_inbox, which shipped with a
+  // 600s long-poll and zero callers, so a worker's only way to ask anything was
+  // to post and end its turn. That is not a question, it is a note left for
+  // nobody: this very conductor woke to three worker gate-questions already
+  // dead in its inbox, each from a tab that had finished and closed.
+  //
+  // Two facts make holding correct NOW and not before. (1) message_chat returns
+  // ok:true with delivered:false when the parent cannot be injected into, so a
+  // worker that checks `ok` believes it was heard when it was merely queued
+  // (measured: five verify passes each escalating into a queue nobody drained).
+  // (2) the mailbox is lane-keyed as of this same commit, so an answer arriving
+  // after this tab dies is still READ by the next pass of this job. Before that,
+  // holding was the only option because the answer was otherwise lost forever.
+  const gateQuestion =
+    'IF YOU HIT A GENUINELY BLOCKING QUESTION (do not end your turn on one):\n' +
+    'A question you post and then walk away from is a note left for nobody. The\n' +
+    'answer lands in a mailbox after your tab is gone. Ask, then HOLD:\n' +
+    '  1. mcp__coord__coord_message_chat({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", to:"' + (parent_session ? ('chat.session:' + parent_session + '.inbox') : 'conductor') + '", text:"<the question, the options you see, and your recommendation>"})\n' +
+    '     Read `delivered` in the result, NOT `ok`. ok:true with delivered:false\n' +
+    '     means it persisted to an inbox and nothing woke anyone: still worth\n' +
+    '     holding for, but do not report it as asked-and-answered.\n' +
+    '  2. mcp__coord__coord_wait_for_inbox({tab_id:"' + tab_id + '", tab_credential:"' + tab_credential + '", timeout:600})\n' +
+    '     This BLOCKS up to 10 minutes and returns the moment a reply lands. It\n' +
+    '     costs no tokens while it holds. Omit `topic` - it resolves to your own\n' +
+    '     durable mailbox, which is keyed to your work LANE and not to this tab.\n' +
+    '  3. On timed_out:true, hold ONCE more only if the answer is genuinely the\n' +
+    '     only thing left. Otherwise do every part of the job that does NOT depend\n' +
+    '     on the answer, then close with the question in your result_summary.\n' +
+    'Because your mailbox is lane-keyed it OUTLIVES this tab, so a reply that\n' +
+    'arrives after you close is read by the next pass of this same job. That is\n' +
+    'why closing with an unanswered question is now a handover and not a loss.\n' +
+    'When you answer a message rather than ask one, pass its id as in_reply_to so\n' +
+    'the thread is followable.\n'
+
+  return [header, '', identity, '', verifyFirst, '', standDown, '', gateQuestion, '', taskBlock, '', selfContinuation, '', closing].join('\n')
 }
 
 // ── Stable tab id, stamped at spawn ──────────────────────────────────────────
@@ -408,6 +452,11 @@ async function dispatch_worker(params) {
     } catch (e) {}
   }
   const coord_url = params.coord_url || 'http://localhost:7456'
+  // Raw scheduled-row name (e.g. cowork.daycrew-lane-S2-deploy-verify).
+  // Forwarded untouched: laneKeyOf in coord.js is the ONE place that decides
+  // what a lane is, and it is a character-exact twin of the Postgres
+  // os_sched_lane_key the scheduler's own trigger uses.
+  const lane_name = params.lane_name || null
 
   // 2026-08-13 (report-back v2). Resolve the report-back address. A dispatching
   // chat asks the worker to push a completion turn back to it - the wake signal_done
@@ -542,6 +591,10 @@ async function dispatch_worker(params) {
         parent_conductor_tab_id,
         parent_session,
         account_active_when_spawned,
+        // The os_scheduled_tasks row name this worker came from. The registry
+        // derives a lane-keyed mailbox from it that outlives this tab, so the
+        // next pass of the same job inherits the inbox instead of starting deaf.
+        lane_name: lane_name,
       },
       loadLaptopAgentToken()
     )
@@ -557,6 +610,12 @@ async function dispatch_worker(params) {
   }
 
   // Compose brief.
+  // The address the REGISTRY resolved for this worker, taken from the
+  // registration response rather than re-derived here. Re-deriving would put a
+  // second implementation of lane resolution in the dispatcher, and the whole
+  // failure this fixes is two places disagreeing about one address.
+  const resolved_inbox = (register_result && register_result.body && register_result.body.inbox) || null
+
   const composedBriefInner = composeBrief({
     tab_id, task_id, tab_credential, parent_conductor_tab_id, parent_session,
     brief_body: brief_storage === 'inline' ? brief_body : '',
@@ -564,6 +623,7 @@ async function dispatch_worker(params) {
     brief_storage,
     brief_file_path: brief_storage === 'file' ? brief_file_path : null,
     report_back,
+    inbox_topic: resolved_inbox,
   })
   const composedBrief = sentinel_prefix + '\n' + composedBriefInner
 

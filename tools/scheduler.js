@@ -2114,6 +2114,18 @@ exports.dispatchOne = async function dispatchOne(row) {
       brief: brief,
       task_id: String(row.id),
       worker_name: workerName,
+      // 2026-08-29. THE SOURCE OF THE LANE MAILBOX. Every other link in the
+      // durable-addressing chain was already built - inboxTopicFor resolves a
+      // lane key, registerWorkerInternal stores a lane_name, routes/comms.js
+      // forwards one - and nothing ever SENT one, so lane mailboxes existed
+      // only for a worker registered by hand and the whole layer was reachable
+      // only from its own test. The name is passed RAW, not through laneKeyOf:
+      // the registry stores what it was given and the resolver normalises, so
+      // normalising here would put a second opinion about what a lane is into
+      // the system. Unconditional is correct - a name with no lane token yields
+      // a null key and falls back to per-tab addressing, which is the behaviour
+      // every pre-lane worker already had.
+      lane_name: (row && row.name) || null,
       ide: 'stable',
       // Set ack timeout to 0 so dispatch_worker returns immediately.
       // We do our own signal_bound wait below inside the launch-lock.
