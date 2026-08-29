@@ -264,9 +264,57 @@ async function injectTurn(opts) {
     // only; a generic/absent label cannot be verified and falls through - those
     // should be delivered by session, not reach here). Abort-to-inbox on mismatch.
     if (!GENERIC_LABEL_RE.test(String(resolvedLabel || '').trim())) {
-      const v = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
-      if (!v.ok) {
-        return { ok: false, reason: 'target_not_focused_after_select', steps, target: resolvedLabel, active_label: v.active_label }
+      // RE-RESOLVE AND RETRY ON MISMATCH (2026-08-29, lane W1). The guard below
+      // is unchanged and still absolute: nothing pastes until the active tab IS
+      // the target. What changed is that a mismatch is no longer terminal on the
+      // first try, because on this fleet the commonest cause is not a wrong
+      // target, it is TAB CHURN between resolve and select. The scheduler opens
+      // worker tabs continuously, a freshly-opened Claude Code tab is titled
+      // "Claude Code" until its first turn names it, and its arrival shifts every
+      // index after it.
+      //
+      // MEASURED 2026-08-29, two injects at the same target 90s apart: the first
+      // refused with active_label "Claude Code" (a tab that did not exist in the
+      // list 20s later), the second landed on its first attempt, steps
+      // clipboard/activate/select/verified/paste/submit. Same target, same code,
+      // different moment. A single-shot select therefore refuses for reasons that
+      // have nothing to do with correctness, and a refused wake is a wake that
+      // did not happen.
+      //
+      // Each retry re-reads the LIVE tab list rather than reusing the stale
+      // position, so it corrects for the shift instead of retrying into it.
+      let verified = false
+      let lastActive = null
+      for (let attempt = 0; attempt < 3 && !verified; attempt++) {
+        if (attempt > 0) {
+          let rr = { tab: null, ambiguous: false }
+          try { rr = await resolveTabByLabel(resolvedLabel) } catch (e) { rr = { tab: null, ambiguous: false } }
+          if (!rr.tab) {
+            // The target is genuinely gone or ambiguous now. Refuse; do not fall
+            // back to the stale position, which is how a paste lands in whatever
+            // took that index.
+            return { ok: false, reason: rr.ambiguous ? 'ambiguous_label_on_retry' : 'target_tab_gone_on_retry', steps, target: resolvedLabel, attempts: attempt + 1 }
+          }
+          viewColumn = rr.tab.viewColumn
+          index = rr.tab.index
+          const fg2 = focusGroupCmd(viewColumn)
+          if (fg2) { await ide.command({ cmd: fg2 }).catch(() => {}); await sleep(150) }
+          if (index >= 0 && index < 9) {
+            await ide.command({ cmd: 'workbench.action.openEditorAtIndex' + (index + 1) }).catch(() => {})
+          } else if (index >= 9 && index < 200) {
+            await ide.command({ cmd: 'workbench.action.openEditorAtIndex', args: [index] }).catch(() => {})
+          }
+          await sleep(150)
+          await ide.command({ cmd: 'workbench.action.focusActiveEditorGroup' }).catch(() => {})
+          steps.push('reselect')
+          await sleep(settleMs)
+        }
+        const v = await verifyActiveIsTarget(resolvedLabel, viewColumn, index)
+        lastActive = v.active_label
+        if (v.ok) { verified = true }
+      }
+      if (!verified) {
+        return { ok: false, reason: 'target_not_focused_after_select', steps, target: resolvedLabel, active_label: lastActive, attempts: 3 }
       }
       steps.push('verified')
     }
