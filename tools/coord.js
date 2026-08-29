@@ -937,6 +937,39 @@ function laneKeyOf(name) {
   return m ? m[1].toLowerCase() : null
 }
 
+// JOB KEY. The durable mailbox for a row that carries NO lane token.
+//
+// WHY THIS TIER EXISTS. Lane keying fixed one-shot dispatches (296 of 313 rows
+// armed in 24h parse a lane) and reached almost no cron: 1 of 77 ACTIVE cron
+// rows carries a lane token. A cron is the CANONICAL successor-on-the-same-job,
+// because today's fire and tomorrow's fire are the same work forever, and it was
+// the population inheriting nothing. Each fire registered a fresh tab_id and
+// fell back to per-tab addressing, so mail left for a recurring job died with
+// whichever tab happened to be running when it landed. That is exactly the
+// failure lane keying was built to end, surviving where it recurs most.
+//
+// A LANE TOKEN IS THE WRONG FIX HERE and was rejected deliberately. The token
+// exists for the migration-147 one-live-row-per-lane collision guard, and a cron
+// does not collide with itself, so retro-fitting one onto 76 rows would make the
+// token mean something it does not. It would also churn every classification
+// keyed on the exact row name (groupOf matches the name exactly; a lane token
+// broke that match once already and the always_on fallback hid it).
+//
+// A cron NAME is already stable, and more stable than a lane key: it never
+// changes at all while the cron exists. The one way it is weaker is a RENAME,
+// which silently moves the mailbox and strands whatever was left at the old
+// name. That is accepted rather than papered over: renaming a cron is rare,
+// deliberate, and already known to break other name-keyed machinery.
+//
+// Sanitised because a topic becomes a directory name on disk. Anything outside
+// [a-z0-9._-] collapses to '-', so two names cannot silently share a key unless
+// they were already the same modulo case and punctuation.
+function jobKeyOf(name) {
+  if (!name || typeof name !== 'string') return null
+  const k = name.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+  return k ? k.slice(0, 120) : null
+}
+
 // Compute an inbox topic for the caller.
 //
 // 2026-08-29, THE TOMBSTONE FIX. This function used to key a chat's entire
@@ -977,6 +1010,13 @@ function inboxTopicFor(ctx) {
   }
   const lane = laneKeyOf(laneName)
   if (lane) return 'chat.lane.' + lane + '.inbox'
+  // JOB tier (2026-08-30). A row with a stable NAME but no lane token still
+  // deserves a mailbox that outlives its tab; this is what finally reaches the
+  // 76 crons the lane tier could not. Ordered AFTER lane so nothing that
+  // resolves today changes, and BEFORE tab so the per-tab address becomes the
+  // last resort it was always meant to be rather than the default.
+  const job = jobKeyOf(laneName)
+  if (job) return 'chat.job.' + job + '.inbox'
   return 'chat.' + tab + '.inbox'
 }
 
@@ -2283,6 +2323,29 @@ async function resolveLiveTargetTab(topic) {
   // before counting, so a dead predecessor never makes a live successor
   // ambiguous, and never inherits a delivery (closed-tab identity is never
   // reused, same rule as the worker branch below).
+  // JOB TOPIC -> the live worker holding that job (2026-08-30). Same reasoning
+  // as the lane branch below, and shipped WITH the job tier rather than after
+  // it: an address is used in two directions, and teaching only the write side
+  // would leave the durable half working while every live wake to a cron's
+  // mailbox fell to target_unresolved.
+  if (/^job\./.test(mid)) {
+    const jobKey = mid.slice('job.'.length)
+    const jHolders = []
+    const jNow = Date.now()
+    for (const [tabId, row] of workers.entries()) {
+      if (!row || row.terminated_at) continue
+      const hb = new Date(row.last_heartbeat_at || row.registered_at).getTime()
+      if (Number.isFinite(hb) && (jNow - hb) > DEAD_HEARTBEAT_MS) continue
+      // A row with a LANE is addressed by its lane, never by its job key, or a
+      // lane-bearing worker would answer to two addresses.
+      if (laneKeyOf(row.lane_name)) continue
+      if (jobKeyOf(row.lane_name) === jobKey) jHolders.push(tabId)
+    }
+    if (jHolders.length === 0) return { ok: false, kind: 'job', reason: 'job_no_live_holder' }
+    if (jHolders.length > 1) return { ok: false, kind: 'job', reason: 'job_ambiguous_holder' }
+    return resolveLiveTargetTab(addressForWorkerTab(jHolders[0]))
+  }
+
   if (/^lane\./.test(mid)) {
     const laneKey = mid.slice('lane.'.length)
     // TERMINATED is not the only way to be gone, and the gap is 60 minutes wide.
@@ -4379,6 +4442,7 @@ module.exports = {
   // Internal API for the /api/comms/register-worker route - NOT exposed as a tool.
   _registerWorkerInternal: registerWorkerInternal,
   _inboxTopicFor: inboxTopicFor,
+  _jobKeyOf: jobKeyOf,
   // Test-only handle on the in-memory worker registry. Exists so a suite can
   // AGE a row's heartbeat, which is the only way to build the dead-but-not-yet
   // -terminated state that sweepStaleWorkers takes 60 minutes to reach. Without

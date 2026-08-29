@@ -94,8 +94,16 @@ check('conductor is NEVER lane-routed even if a lane is somehow passed', () => {
 check('a worker with no lane keeps its legacy per-tab topic', () => {
   assert.strictEqual(topicFor({ tab_id: 'tab_XYZ' }), 'chat.tab_XYZ.inbox')
 })
-check('a worker whose lane name does not parse keeps the per-tab topic', () => {
-  assert.strictEqual(topicFor({ tab_id: 'tab_XYZ', lane_name: 'not-a-lane' }), 'chat.tab_XYZ.inbox')
+// CONTRACT CHANGED 2026-08-30, deliberately, and this assertion is updated
+// rather than deleted because the half that still matters is unchanged: a name
+// that does not parse as a lane must NOT be given a lane topic. What changed is
+// where it goes instead. It used to fall to the per-tab address and die with the
+// tab; it now gets a JOB mailbox keyed on the stable row name, which is what
+// finally reaches the 76 active crons the lane tier could never see (1 of 77
+// carried a lane token). The per-tab address survives as the last resort, for a
+// worker with no usable name at all, pinned by the case above.
+check('a name that does not parse as a lane gets a JOB topic, not a lane one', () => {
+  assert.strictEqual(topicFor({ tab_id: 'tab_XYZ', lane_name: 'not-a-lane' }), 'chat.job.not-a-lane.inbox')
 })
 
 console.log('\nREGISTRY FALLBACK: an ordinary read_inbox with no args must still')
