@@ -579,6 +579,145 @@ exports.noteSuccessfulDispatch = function noteSuccessfulDispatch() {
   }
   _consecutiveTransientDefers = 0
   _outagePageSent = false
+  // A spawned tab proves an account was available, so it ends a capped outage too.
+  if (_cappedFirstDeferAt !== null || _cappedPageSent) {
+    process.stderr.write('[scheduler] dispatch recovered; clearing CAPPED outage tracker (was ' +
+      _cappedDefers + ' defers, paged=' + _cappedPageSent + ')\n')
+  }
+  exports._resetCappedOutageState()
+}
+
+// -- all-accounts-capped outage pager (2026-08-29 lane D1) ---------------------
+//
+// The failure this closes. When pick_healthiest_account throws
+// AllAccountsCappedError, dispatchOne deferred the row and returned. It emitted
+// no page, no status_board row and no stderr line: the only process.stderr.write
+// in that block was on a Postgres error. Three mechanisms exist to notice that
+// dispatch has stopped and every one of them missed this class.
+//   - The pager saw one failure class. noteTransientDefer had exactly ONE
+//     non-test call site, in the transient-IDE-bridge branch immediately below
+//     the capped branch. Fifteen minutes with no IDE texts Tate. Five weeks with
+//     no account texted nobody.
+//   - The runaway breaker cannot see it, correctly: breakerRecordDispatch runs
+//     AFTER the confirmed tab spawn (moved there 2026-08-26 so spawn outages stop
+//     manufacturing false quarantines), and the capped throw precedes the spawn.
+//   - scheduler-health.sh's capped_churn counts retry_count >= 2 AND last_error
+//     ILIKE AllAccountsCappedError. The defer touched neither, so the ONE
+//     detector named for this failure always read 0 and reported green.
+// Measured on the live agent log, 24.5MB over its whole lifetime: 36
+// AllAccountsCapped lines, 2,311 "breaker: recorded dispatch" lines, and ZERO
+// "OUTAGE PAGE" lines. The breaker instrumentation is demonstrably alive; the
+// capped path had never once produced a page.
+//
+// Why the page is TIME-gated, not count-gated like noteTransientDefer. A capped
+// defer fires once per DUE ROW, and 90-odd rows are dispatchable, so a count
+// threshold crosses in seconds and cannot honestly claim "this has persisted".
+// The elapsed clock since the first defer of THIS outage can. The count still
+// travels in the message because it says how much work is stalled.
+const CAPPED_PAGE_MIN_MS = parseInt(process.env.SCHEDULER_CAPPED_PAGE_MIN_MS, 10) || 10 * 60 * 1000
+// The defer's bound on retry_count. It MUST equal scheduler-health.sh:103's
+// threshold (retry_count >= 2): lower and the detector stays blind, higher and a
+// cap outage eats the MAX_RETRY_COUNT failure budget it is borrowing the column
+// from. markFailed refuses to inherit a count still carrying the cap marker,
+// which is the other half of keeping those two meanings apart.
+exports.CAPPED_RETRY_MARK = 2
+
+let _cappedFirstDeferAt = null
+let _cappedDefers = 0
+let _cappedPageSent = false
+
+exports._getCappedOutageState = function () {
+  return { firstDeferAt: _cappedFirstDeferAt, defers: _cappedDefers, sent: _cappedPageSent }
+}
+exports._resetCappedOutageState = function () {
+  _cappedFirstDeferAt = null
+  _cappedDefers = 0
+  _cappedPageSent = false
+}
+
+// True when a row's last_error is the marker the capped defer writes. Used by
+// markFailed to tell a cap mark from a spent failure budget.
+exports.isAllAccountsCappedMarker = function (lastError) {
+  return /AllAccountsCappedError/i.test(String(lastError || ''))
+}
+
+// Counts one capped defer and, once the outage has persisted CAPPED_PAGE_MIN_MS
+// and no page has been sent for THIS outage, fires exactly one. Returns the
+// constructed page (or null) so tests can assert on it, mirroring
+// noteTransientDefer. Latch semantics are the same: optimistic latch, unlatched
+// by a send that does not confirm exit 0, so a broken send path retries.
+exports.noteAllAccountsCapped = function noteAllAccountsCapped(err, nowMs) {
+  const now = nowMs || Date.now()
+  if (_cappedFirstDeferAt === null) _cappedFirstDeferAt = now
+  _cappedDefers += 1
+  const persistedMs = now - _cappedFirstDeferAt
+  if (persistedMs < CAPPED_PAGE_MIN_MS || _cappedPageSent) return null
+  _cappedPageSent = true
+
+  let resetTxt = 'unknown (no reset time reported)'
+  const resets = err && err.resets
+  if (resets) {
+    const times = Object.values(resets).filter(Boolean).map(t => new Date(t).getTime()).filter(t => !isNaN(t))
+    if (times.length) resetTxt = new Date(Math.min(...times)).toISOString()
+  }
+  const msg = 'ACCOUNT OUTAGE: every Claude account is capped. Dispatch has deferred ' +
+    _cappedDefers + ' times over ~' + Math.round(persistedMs / 60000) +
+    'min and ALL scheduled work is stalled. Earliest reset: ' + resetTxt +
+    '. This does not clear itself: switch or re-auth an account ' +
+    '(bash ~/.code/eos-laptop-agent/scripts/account-switch.sh <tate|code|money>).'
+  const args = ['--from', 'scheduler capped-outage', msg]
+  _pagerSender(TEXT_TATE_SCRIPT, args, function (err2, code) {
+    if (err2 || code !== 0) {
+      _cappedPageSent = false
+      process.stderr.write('[scheduler] CAPPED OUTAGE PAGE send FAILED (code=' + code +
+        (err2 ? ', err=' + (err2.message || err2) : '') + '); unlatched, will retry next defer\n')
+    } else {
+      process.stderr.write('[scheduler] CAPPED OUTAGE PAGE delivered (text-tate exit 0); latched for this outage\n')
+    }
+  })
+  process.stderr.write('[scheduler] CAPPED OUTAGE PAGE fired after ' + _cappedDefers +
+    ' capped defers over ' + Math.round(persistedMs / 60000) + 'min\n')
+  return { command: 'node ' + TEXT_TATE_SCRIPT + ' ' + args.map(a => JSON.stringify(a)).join(' '), args, message: msg }
+}
+
+// The whole AllAccountsCappedError arm of dispatchOne, extracted so a test can
+// drive the REAL branch rather than a lookalike. Defers the row to the earliest
+// reset (floored at 60s), marks retry_count so the health detector can see it,
+// and notes the outage for the pager. The row write and the page are independent
+// legs on purpose: a Postgres blip must not suppress the alert.
+exports.handleAllAccountsCappedDefer = async function handleAllAccountsCappedDefer(row, err, nowMs) {
+  const now = nowMs || Date.now()
+  let deferMs = 60 * 60 * 1000  // default 1h
+  if (err && err.resets) {
+    const times = Object.values(err.resets)
+      .filter(Boolean)
+      .map(t => new Date(t).getTime())
+      .filter(t => !isNaN(t))
+    if (times.length > 0) {
+      deferMs = Math.min(...times) - now + 60_000
+      if (deferMs < 60_000) deferMs = 60_000
+    }
+  }
+  const nextRun = new Date(now + deferMs)
+  try {
+    await getPool().query(
+      `UPDATE os_scheduled_tasks
+       SET status = 'active', leased_by = NULL, leased_at = NULL,
+           retry_count = LEAST(COALESCE(retry_count, 0) + 1, $4),
+           next_run_at = $1, last_error = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [nextRun.toISOString(), 'AllAccountsCappedError - deferred ' + Math.round(deferMs / 60000) + 'min',
+        row.id, exports.CAPPED_RETRY_MARK]
+    )
+  } catch (pgErr) {
+    process.stderr.write('[scheduler] capped-defer pg error: ' + pgErr.message + '\n')
+  }
+  try {
+    return exports.noteAllAccountsCapped(err, now)
+  } catch (pageErr) {
+    process.stderr.write('[scheduler] capped outage pager note error: ' + pageErr.message + '\n')
+    return null
+  }
 }
 
 // ── Runaway dispatch circuit breaker (Hunter 4 #7, 2026-08-13) ────────────────
@@ -1180,7 +1319,17 @@ async function consumeSuspendedSignal(pool, rowId) {
 
 exports.markFailed = async function markFailed(row, err) {
   const pool = getPool()
-  const newRetryCount = (row.retry_count || 0) + 1
+  // 2026-08-29 lane D1. The capped defer now WRITES retry_count so
+  // scheduler-health.sh:103's capped_churn detector can match at all. That
+  // borrows a column whose other meaning is the failure budget, and a cap outage
+  // defers every due row roughly once a minute, so an inherited count would hand
+  // the first real error after the outage a row already at MAX_RETRY_COUNT and
+  // permanently fail a one-shot row on try one. That correlation is not
+  // hypothetical: nothing dispatches during a cap, so the moment it clears is a
+  // thundering herd, which is exactly when a transient dispatch error is likeliest.
+  // A count still carrying the cap marker is a cap signal, not a spent budget.
+  const priorRetryCount = exports.isAllAccountsCappedMarker(row.last_error) ? 0 : (row.retry_count || 0)
+  const newRetryCount = priorRetryCount + 1
   const errMsg = String(err && err.message || err).slice(0, 2000)
 
   // 2026-06-10 branch-thrash guard cleanup: drop the per-row isolated worktree.
@@ -2012,30 +2161,11 @@ exports.dispatchOne = async function dispatchOne(row) {
   } catch (err) {
     const errMsg = err && err.message || ''
     if (err && err.name === 'AllAccountsCappedError') {
-      // Defer: find earliest reset + 1min, release lease, keep status=active.
-      let deferMs = 60 * 60 * 1000  // default 1h
-      if (err.resets) {
-        const times = Object.values(err.resets)
-          .filter(Boolean)
-          .map(t => new Date(t).getTime())
-          .filter(t => !isNaN(t))
-        if (times.length > 0) {
-          deferMs = Math.min(...times) - Date.now() + 60_000
-          if (deferMs < 60_000) deferMs = 60_000
-        }
-      }
-      const nextRun = new Date(Date.now() + deferMs)
-      try {
-        await pool.query(
-          `UPDATE os_scheduled_tasks
-           SET status = 'active', leased_by = NULL, leased_at = NULL,
-               next_run_at = $1, last_error = $2, updated_at = NOW()
-           WHERE id = $3`,
-          [nextRun.toISOString(), 'AllAccountsCappedError - deferred ' + Math.round(deferMs / 60000) + 'min', row.id]
-        )
-      } catch (pgErr) {
-        process.stderr.write('[scheduler] markFailed pg error: ' + pgErr.message + '\n')
-      }
+      // Defer to the earliest reset (floored at 60s), release the lease, keep
+      // status=active, mark retry_count for the health detector, and page once
+      // the outage has persisted. See handleAllAccountsCappedDefer for why all
+      // three legs are needed and why none of the three existing watchers saw this.
+      await exports.handleAllAccountsCappedDefer(row, err)
     } else if (exports.isTransientBridgeError(errMsg)) {
       // 2026-06-02 P0 fix, broadened 2026-06-20 (audit finding c). The
       // dispatch_worker editor.open path throws a transient error when no IDE has
