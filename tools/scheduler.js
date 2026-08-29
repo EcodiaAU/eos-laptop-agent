@@ -2978,7 +2978,11 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // this branch fixes the parallel path through the stale-lease sweep.
   // 2026-08-29 lane D1 pass 4: this SELECT was the one of the four missing the
   // `archived_at IS NULL` + last_status guards its own UPDATE re-asserts (branches
-  // 1 and 2b carry them on both halves). An archived or suspended cron row was
+  // 1 and 2b carry them on both halves). SCOPE, added by pass 5 so the next reader
+  // does not conclude the class was swept: "the four" counts only the
+  // status='dispatching' sweeps, 0 / 1 / 2a / 2b. Branch 3's status='running'
+  // SELECT has the SAME mismatch on three guards and is deliberately left alone;
+  // its own note below says why. An archived or suspended cron row was
   // selected, cost a coord liveness call, no-opped the UPDATE, and then still ran
   // pruneWorktreeForRow, which sits OUTSIDE the guarded write. Every pass, forever.
   // Branch 0 above is what actually settles the suspended half.
@@ -3104,6 +3108,21 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // RUNNING_CRON_ORPHAN_MS (30min); a one-shot (non-cron) keeps the 6h
   // ORPHAN_TIMEOUT_MS. Both still pass through the per-row liveness gate below,
   // so this only TIGHTENS eligibility for fast crons, never bypasses the gate.
+  // 2026-08-29 lane D1 pass 5: VERIFIED MISMATCHED, DELIBERATELY NOT TIGHTENED.
+  // The SELECT below carries NO `archived_at IS NULL`, NO `done_at IS NULL` and no
+  // last_status guard, and BOTH of its UPDATEs re-assert all three. So an archived,
+  // done or suspended running row past its timeout is selected, costs a coord
+  // liveness call, fires kill_worker on its tab, runs pruneWorktreeForRow, then
+  // no-ops the write, on every pass. That is branch 2a's fixed defect in a second
+  // place. Live population measured 2026-08-29T11:06Z: 0 archived, 0 done_at,
+  // 0 suspended, so it is latent rather than leaking.
+  // WHY IT IS NOT JUST FIXED: adding the three guards ALSO removes the kill_worker
+  // that this branch is today the only path performing on an archived row stuck in
+  // 'running'. Deleting a real (if repeating) cleanup to silence churn on a class
+  // with zero rows is a behaviour decision, not a tidy-up, so it is boarded on
+  // status_board 40fb5c8f rather than shipped inside a verification pass.
+  // The suspended slice of this population is already owned by branch 0 above,
+  // which pass 5 watched settle a REAL running row at 11:09:44Z.
   const orphans = await pool.query(
     `SELECT id, dispatched_tab_id, type, cron_expression, tz FROM os_scheduled_tasks
      WHERE status = 'running'
