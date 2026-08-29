@@ -2000,6 +2000,43 @@ async function resolveLiveTargetTab(topic) {
       const r = _ttm.pickByFingerprint(pool, fp, null)
       if (r && r.match) return Object.assign({ ok: true, kind: 'conductor' }, _pos(r.match))
     }
+    // (iii) stable tab id. LAST RESORT, and strictly additive (2026-08-29).
+    // Both tiers above key on the conductor's tab TITLE, and a title is not an
+    // identity: Claude Code retitles a chat as its conversation develops, while
+    // conductor_heartbeat only refreshes title_match on a genuine user turn
+    // whose single active non-worker tab is unambiguous. Under a busy fleet a
+    // freshly-spawned worker tab holds focus at the conductor's turn-start, so
+    // _active_chat_tab returns None, the refresh is skipped, and the stored
+    // label rots against a tab that is very much alive. That is a wake tier
+    // that decays precisely when the fleet is busiest, which is when a wake
+    // matters most. Measured live 2026-08-29T12:40Z: the registration held
+    // title_match 'Whats cron posture sitti...' while its OWN stable_tab_id
+    // ttab_mtecbdvm_1_1 sat live at index 16 wearing the label 'This is your
+    // context, an...'. Tier (i) matched 0 tabs, tier (ii) returned
+    // no_candidate_cleared_bar, and six investigation passes chased
+    // conductor_unresolved while the correct handle lay unread in the same
+    // record.
+    // The bridge's ttab id is the only handle that survives a retitle AND a
+    // reorder, which is why close_my_tab already resolves on it exclusively
+    // (see coord-stable-tab-id-close.test.js). Ordered AFTER the title tiers on
+    // purpose: this tier can only ever convert an outright conductor_unresolved
+    // into a resolution, so it adds no regression surface to any path that
+    // resolves today.
+    // Recycling guard: assignStableTabIds pass 2 re-homes a prior id onto
+    // whatever tab inherits a freed (viewColumn, index) slot, so a stored id can
+    // outlive the tab it was minted for. Require a UNIQUE hit drawn from `pool`,
+    // which already excludes dispatched-worker tabs, so an inherited id can
+    // never route a conductor wake into a worker. Absent, dead or non-unique
+    // falls through to exactly the same fail-safe as before.
+    // Doctrine: [[coord-stable-tab-id-close-2026-08-29]],
+    //           [[a-third-wake-failure-mode-conductor-unresolved-on-an-idle-tab-2026-08-29]].
+    const sid = conductor && conductor.stable_tab_id ? String(conductor.stable_tab_id) : ''
+    if (sid) {
+      const byId = pool.filter((t) => t.tabId === sid)
+      if (byId.length === 1) {
+        return Object.assign({ ok: true, kind: 'conductor', via: 'stable_tab_id' }, _pos(byId[0]))
+      }
+    }
     return { ok: false, kind: 'conductor', reason: 'conductor_unresolved' }
   }
 
