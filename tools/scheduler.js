@@ -2735,6 +2735,37 @@ exports._hasLiveWorkerForTask = hasLiveWorkerForTask
 exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   const pool = getPool()
 
+  // EVERY UPDATE BELOW RE-ASSERTS THE STATUS ITS SELECT MATCHED. (lane D1 pass 3,
+  // 2026-08-29.) Each branch is SELECT -> await hasLiveWorkerForTask -> UPDATE, and
+  // that await is not free: it is a coord.list_workers network call and, on the
+  // coord-unreachable path, a transcript-tree walk. The loop is serial, so the last
+  // row in a batch is written many seconds after it was read. In that window the row
+  // moves under us: dispatchOne flips 'dispatching' -> 'running' on bind (lines 2019
+  // and 2245), a worker signals done, the conductor cancels, migration 147 supersedes.
+  //
+  // Branch 1 has carried `AND status = 'dispatching'` since the 2026-06-21 reclaim-vs-
+  // bind fix. The other three never got it, and branch 2b carried no WHERE clause at
+  // all beyond the id, which is the worst place for it to be missing because 2b is the
+  // branch that PERMANENTLY FAILS a row.
+  //
+  // Measured against real Postgres 2026-08-29: the shipped 2b UPDATE, applied to four
+  // rows representing what the window can hand it, flipped ALL FOUR to 'failed' -
+  // a row that had already bound to 'running', an archived row, a breaker-quarantined
+  // row (last_status='paused'), and the one genuinely-stale row it is actually for.
+  // With the guards, only the genuinely-stale row failed and the other three were
+  // untouched, so the guard does not disable the branch, it aims it.
+  //
+  // Branch 3 additionally guards `done_at IS NULL`. completionPass selects
+  // `status='running' AND done_at IS NOT NULL`, so a row reclaimed out of 'running'
+  // after its worker signalled done is invisible to the pass that would record the
+  // success, and the fire is lost. The reverse ordering of that same race is live on
+  // the fleet right now: row 5db1448b cowork.armed-claim-audit-daily was reclaimed at
+  // 22:40:54Z, its worker then signalled done_status='success' at 22:44:32Z, and the
+  // row still reads run_count=0 / last_result=null. That ordering is the liveness
+  // gate's miss, not this one, and is boarded separately; this guard closes the half
+  // an UPDATE predicate can close.
+  // [[enumerate-all-trigger-paths-when-fixing-data-flow-bugs]]
+
   // 1. Stale dispatching, retryable. 2026-06-21 reclaim-vs-bind race fix
   // (status_board 128b7c82): converted from a bulk UPDATE to SELECT + per-row
   // UPDATE so this branch consults coord worker liveness BEFORE reclaiming, exactly
@@ -2844,6 +2875,7 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
            last_error = 'stale lease - max retries exhausted (cron: deferred to next interval per doctrine)',
            next_run_at = $1, leased_by = NULL, leased_at = NULL, updated_at = NOW()
        WHERE id = $2
+         AND status = 'dispatching'
          AND archived_at IS NULL
          AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [nextRunAt, row.id]
@@ -2863,7 +2895,9 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
      WHERE status = 'dispatching'
        AND leased_at < NOW() - ($1 || ' milliseconds')::interval
        AND ${exports.EFFECTIVE_RETRY_COUNT_SQL} >= $2
-       AND (type != 'cron' OR cron_expression IS NULL)`,
+       AND (type != 'cron' OR cron_expression IS NULL)
+       AND archived_at IS NULL
+       AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
     [STALE_DISPATCHING_MS, MAX_RETRY_COUNT]
   )
   for (const row of staleNonCronRows.rows) {
@@ -2886,7 +2920,10 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
        SET status = 'failed', retry_count = retry_count + 1,
            last_error = 'stale lease - max retries exhausted',
            leased_by = NULL, leased_at = NULL, updated_at = NOW()
-       WHERE id = $1`,
+       WHERE id = $1
+         AND status = 'dispatching'
+         AND archived_at IS NULL
+         AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
       [row.id]
     )
     // 2026-06-10 branch-thrash guard cleanup on permanent fail.
@@ -2978,6 +3015,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
              last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
              leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
          WHERE id = $2
+           AND status = 'running'
+           AND done_at IS NULL
            AND archived_at IS NULL
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [nextRunAt, row.id]
@@ -2986,7 +3025,11 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
       await pool.query(
         `UPDATE os_scheduled_tasks
          SET status = 'orphaned', last_run_at = NOW(), ${tabFrag} updated_at = NOW()
-         WHERE id = $1`,
+         WHERE id = $1
+           AND status = 'running'
+           AND done_at IS NULL
+           AND archived_at IS NULL
+           AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [row.id]
       )
     }
