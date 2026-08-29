@@ -139,6 +139,21 @@ function resultFor(res, tab_id) {
   return (res.results || []).find((r) => r.tab_id === tab_id) || null
 }
 
+// 2026-08-29 lane W1 registry GC. A stored id absent from a SUCCESSFUL non-empty
+// listing is now classified 'gone'/'gone_pending' and the row is unlinked after
+// two independent confirmations, instead of being re-counted as a leak on every
+// sweep forever. Both outcomes are TERMINAL and neither reaches the ladder,
+// which is the invariant these cases actually defend. Asserting the literal
+// string 'leak' pinned the old bookkeeping rather than the safety property, so
+// the predicate now accepts either terminal shape and still FAILS on any ladder
+// outcome (a close, or a refusal naming a ladder miss).
+function terminalStableIdOutcome(r) {
+  if (!r) return false
+  if (r.action === 'leak') return /stable_id_not_live|stable_id_dropped_not_recaptured/.test(String(r.reason))
+  if (r.action === 'gone' || r.action === 'gone_pending') return /tab_gone_confirmed/.test(String(r.reason))
+  return false
+}
+
 async function main() {
   console.log('cowork.cleanup_orphan_workers stable-tab-id close')
 
@@ -196,9 +211,7 @@ async function main() {
   // are terminal. What must never appear here is a LADDER outcome, because the
   // ladder would resolve this corpse's sentinel onto the live stranger below.
   ok('refusal names a stable-id reason, not a ladder miss',
-     !!gone && gone.action === 'leak'
-       && /stable_id_not_live|stable_id_dropped_not_recaptured/.test(String(gone.reason)),
-     JSON.stringify(gone))
+     terminalStableIdOutcome(gone), JSON.stringify(gone))
   ok('NO close was attempted at the bridge at all', closeCalls.length === 0,
      JSON.stringify(closeCalls))
   ok('the same-sentinel stranger tab is untouched',
@@ -322,9 +335,7 @@ async function main() {
   res = await cowork.cleanup_orphan_workers({ max_age_days: 7 })
   const dropped = resultFor(res, 'tab_dropped_last_pass')
   ok('a row dropped on an EARLIER pass is still TERMINAL, not ladder-eligible',
-     !!dropped && dropped.action === 'leak'
-       && /stable_id_dropped_not_recaptured/.test(String(dropped.reason)),
-     JSON.stringify(dropped))
+     terminalStableIdOutcome(dropped), JSON.stringify(dropped))
   ok('and the live same-sentinel stranger was never closed',
      res.closed === 0 && closeCalls.length === 0
        && LIVE_TABS.length === 1 && LIVE_TABS[0].tabId === 'ttab_stranger_same_sentinel',

@@ -3990,9 +3990,15 @@ function _orphanSweepBreakdown(r) {
     }
     const closed = tally((x) => x.action === 'closed', 'strategy')
     const leaked = tally((x) => x.action === 'leak', 'reason').slice(0, 4)
+    // 2026-08-29 lane W1 registry GC. A row proven dead by a successful listing
+    // is garbage, not a leak, and it now leaves the registry instead of being
+    // re-counted every pass. Reported separately so a real ghost tab (a leak we
+    // could still close) stays visible instead of drowning in corpses.
+    const gone = tally((x) => x.action === 'gone' || x.action === 'gone_pending', 'action')
     let out = ''
     if (closed.length) out += ' [closed: ' + closed.join(' ') + ']'
     if (leaked.length) out += ' [leak: ' + leaked.join(' ') + ']'
+    if (gone.length) out += ' [gc: ' + gone.join(' ') + ']'
     return out
   } catch (e) { return '' }
 }
@@ -4017,7 +4023,7 @@ function _orphanSweepBreakdown(r) {
           // gate took a forensic walk of ~107 registry .json files instead.
           // The per-row strategy was already in r.results and was simply not
           // being summarised. Attribution now lands in the line itself.
-          process.stderr.write('[scheduler] cleanup_orphan_workers: closed=' + r.closed + ' of ' + r.candidates + ' candidates (leaked=' + (r.leaked || 0) + ')' + _orphanSweepBreakdown(r) + '\n')
+          process.stderr.write('[scheduler] cleanup_orphan_workers: closed=' + r.closed + ' of ' + r.candidates + ' candidates (leaked=' + (r.leaked || 0) + ' gone=' + (r.gone || 0) + ' gone_pending=' + (r.gone_pending || 0) + ')' + _orphanSweepBreakdown(r) + '\n')
         }
       }
     } catch (e) {

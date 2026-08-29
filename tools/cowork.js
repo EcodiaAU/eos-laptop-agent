@@ -1217,6 +1217,8 @@ async function cleanup_orphan_workers(params) {
 
   const results = []
   let closedCount = 0
+  let goneCount = 0
+  let gonePendingCount = 0
 
   for (const { filePath, worker } of orphans) {
     let th = worker.tab_handle
@@ -1281,6 +1283,7 @@ async function cleanup_orphan_workers(params) {
     // So when re-capture fails to produce a replacement, the original id is put
     // back and Pass 0 refuses on it exactly as before. A ghost tab is cheap; a
     // killed running worker is not.
+    const idBeforeRecapture = th.tabId || null
     if (th.tabId && liveIdSet.size && !liveIdSet.has(th.tabId)) {
       let coordMod0 = null
       try { coordMod0 = require('./coord') } catch (e) {}
@@ -1291,6 +1294,114 @@ async function cleanup_orphan_workers(params) {
           if (fresh && fresh.tab_handle) th = fresh.tab_handle
         } catch (e) {}
       }
+    }
+
+    // ── Pass 0-GC: a terminated row whose tab is PROVABLY gone ─────────────
+    //
+    // 2026-08-29 lane W1 registry GC. The `leaked` counter was lying. Measured
+    // on the live agent for hours: "closed=0 of 76 candidates (leaked=76)".
+    // That reads as 76 abandoned tabs burning memory. It is not. Measured in
+    // ~/.ecodiaos/coordination/workers at 2026-08-29T04:00Z: 104 rows, 84
+    // terminated, and ZERO whose stored tabId points at a tab that still
+    // exists, against only 12 live tabs. Every one of those rows is a corpse
+    // whose tab is ALREADY GONE, so no close path can ever succeed on it, and
+    // Pass 0 correctly refuses it on every sweep, forever. Re-scanned every 7
+    // minutes and re-counted as a leak each time.
+    //
+    // A row proven dead is not a leak, it is garbage. Reclassify it and unlink
+    // it. What is NOT changed: a row whose tab might still be open still counts
+    // as leaked, because that one is a real ghost worth reporting.
+    //
+    // PROOF OF DEATH, and why each conjunct is load-bearing:
+    //   liveIdSet.size > 0  - only a SUCCESSFUL, NON-EMPTY listing proves an
+    //     absence. A failed or empty ide.tabs probe proves nothing at all, and
+    //     treating it as death is the fail-OPEN inversion that turns a janitor
+    //     into a shredder. Same precedent the re-capture above is gated on.
+    //   !recaptureReplaced  - _captureStableTabId does its own fresh probe. If
+    //     it produced a DIFFERENT id it found a real tab, and that new id can
+    //     legitimately be absent from liveIdSet, which is a snapshot taken
+    //     BEFORE the re-capture. Without this conjunct a successful re-capture
+    //     would be read as proof of death: precisely inverted.
+    //   the id itself      - a row that never held a stable id is NOT provably
+    //     dead, because absence of a handle is not evidence about the tab. Those
+    //     stay on the 24h retention backstop. tabId_stale_dropped counts,
+    //     because that flag is written only after a probe proved the id dead.
+    //
+    // CONFIRMATIONS. One pass is a single signal, and the skill's rule is that
+    // one signal is never enough inside a destroyer. Each confirmation comes
+    // from a DIFFERENT sweep with its own successful listing, so N=2 means two
+    // independent probes agreed. This also absorbs a transient bridge hiccup.
+    //
+    // KNOWN LIMIT, do not design past it. Once Claude Code retitles a worker
+    // tab to a human summary (measured: "[d1a5 coord tab close lane W1 verify]"
+    // became "Coord close") the sentinel is GONE from the live label, so
+    // sentinel re-capture can no longer find that tab. If the bridge ALSO
+    // re-minted the id, a live-but-retitled tab can read as gone here. The cost
+    // is bounded and deliberate: we unlink an audit row, we never close a tab.
+    // That row's close was already impossible (Pass 0 refuses it every pass and
+    // re-capture can no longer find it), so nothing operational is lost.
+    const recaptureReplaced = !!(th.tabId && th.tabId !== idBeforeRecapture)
+    const provablyGone = liveIdSet.size > 0 && !recaptureReplaced &&
+      (th.tabId ? !liveIdSet.has(th.tabId) : !!th.tabId_stale_dropped)
+    if (provablyGone) {
+      // Re-read from disk. The upstream terminated_at was read before several
+      // awaits, and a worker can bind and heartbeat in that gap.
+      let curRow = null
+      try { curRow = JSON.parse(fs.readFileSync(filePath, 'utf8')) } catch (e) {}
+      if (curRow && curRow.terminated_at) {
+        const confirmations = (Number(curRow.tab_gone_confirmations) || 0) + 1
+        const gcTabId = th.tabId || idBeforeRecapture
+        if (dry_run) {
+          // Enumerate the EXACT set that would be destroyed, not a superset.
+          // The helper carries guards the caller does not (clean-exit vs quiet
+          // period, conductor, terminated re-read), so a dry run that skips it
+          // reports rows the real run would refuse, and the operator reads a
+          // blast radius bigger than the one that exists. Ask the helper.
+          const probe = (() => {
+            try {
+              const cmP = require('./coord')
+              return cmP && cmP._gcWorkerRow ? cmP._gcWorkerRow(worker.tab_id, { dry_run: true }) : null
+            } catch (e) { return null }
+          })()
+          const admitted = !!(probe && probe.ok) && confirmations >= GONE_CONFIRMATIONS_REQUIRED
+          results.push({ tab_id: worker.tab_id,
+                         action: admitted ? 'would_gc' : 'would_gc_pending',
+                         reason: (probe && !probe.ok) ? ('gc_would_refuse:' + probe.reason) : 'tab_gone_confirmed',
+                         confirmations: confirmations, tabId: gcTabId })
+          continue
+        }
+        curRow.tab_gone_confirmations = confirmations
+        curRow.tab_gone_last_seen_at = new Date().toISOString()
+        if (!curRow.tab_gone_first_seen_at) curRow.tab_gone_first_seen_at = curRow.tab_gone_last_seen_at
+        try { fs.writeFileSync(filePath, JSON.stringify(curRow, null, 2)) } catch (e) {}
+        if (confirmations >= GONE_CONFIRMATIONS_REQUIRED) {
+          let gcRes = null
+          try {
+            const cmGc = require('./coord')
+            if (cmGc && cmGc._gcWorkerRow) {
+              gcRes = cmGc._gcWorkerRow(worker.tab_id, { reason: 'tab_gone_confirmed_x' + confirmations })
+            }
+          } catch (e) {}
+          if (gcRes && gcRes.ok) {
+            goneCount++
+            results.push({ tab_id: worker.tab_id, action: 'gone', reason: 'tab_gone_confirmed',
+                           confirmations: confirmations, tabId: gcTabId })
+            continue
+          }
+          // The helper refused (row un-terminated under us, conductor, unlink
+          // failed). Refusing to delete is always the correct outcome here.
+          results.push({ tab_id: worker.tab_id, action: 'leak',
+                         reason: 'gc_refused:' + ((gcRes && gcRes.reason) || 'helper_unavailable'),
+                         confirmations: confirmations, tabId: gcTabId })
+          continue
+        }
+        gonePendingCount++
+        results.push({ tab_id: worker.tab_id, action: 'gone_pending', reason: 'tab_gone_confirmed',
+                       confirmations: confirmations, tabId: gcTabId })
+        continue
+      }
+      // curRow lost its terminated_at or vanished: fall through and let the
+      // normal resolver path handle it. Never GC what we cannot confirm.
     }
 
     // 2026-08-29 lane W1-verify. The gate admits tabId_stale_dropped too, and that
@@ -1521,6 +1632,8 @@ async function cleanup_orphan_workers(params) {
     candidates: orphans.length,
     closed: closedCount,
     leaked: results.filter(r => r.action === 'leak').length,
+    gone: goneCount,
+    gone_pending: gonePendingCount,
     results: results,
   }
 }
@@ -1551,6 +1664,14 @@ async function cleanup_orphan_workers(params) {
 //   - critical_section_active: a worker is mid-write (in_critical_section=true)
 //   - creds_backup_missing: ~/.ecodia-creds/<account>.json does not exist
 //   - file_clobber_check_failed: current creds mtime changed during swap (race)
+
+// 2026-08-29 lane W1 registry GC. How many CONSECUTIVE sweeps must independently
+// prove a terminated row's tab gone before its registry row is unlinked. Each
+// confirmation is a separate pass with its own successful, non-empty ide.tabs
+// listing, so this is a multi-signal gate and not one probe read twice. Raising
+// it costs only latency (one sweep cadence per increment); lowering it to 1
+// removes the independence that makes the gate safe.
+const GONE_CONFIRMATIONS_REQUIRED = 2
 
 const LOCKS_DIR = path.join(COORD_ROOT, 'locks')
 const SWAP_LOCK_FILE = path.join(LOCKS_DIR, 'swap.lock')

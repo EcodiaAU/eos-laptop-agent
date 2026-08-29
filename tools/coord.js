@@ -2870,6 +2870,15 @@ const SWEEP_STALE_THRESHOLD_MS = 60 * 60 * 1000  // 60 min
 // against live ide.tabs(); a tab gone longer than that is unmatchable anyway.
 const WORKER_JSON_RETENTION_MS = 24 * 60 * 60 * 1000  // 24h
 
+// 2026-08-29 lane W1 registry GC. How long a NON-cleanly-terminated row must
+// have been silent before its registry row may be unlinked. Deliberately 2x
+// SWEEP_STALE_THRESHOLD_MS: a row is marked terminated at 60min of silence, and
+// that mark is a false positive whenever the worker is mid Bash-only stretch, so
+// the GC waits a second full threshold for the worker to prove it by
+// heartbeating. Cleanly-terminated rows (signal_done / closed_tab_ok) skip this
+// entirely because their own protocol already settled the question.
+const GC_MIN_QUIET_MS = 2 * 60 * 60 * 1000  // 120 min
+
 function sweepStaleWorkers() {
   const now = Date.now()
   const nowIso = new Date(now).toISOString()
@@ -2934,6 +2943,88 @@ function sweepStaleWorkers() {
     try { process.stderr.write(`[coord-sweep] marked=${marked} unlinked=${unlinked} purged=${purged}\n`) } catch (e) {}
   }
   return { marked, unlinked, purged }
+}
+
+// 2026-08-29 lane W1 registry GC. Unlink ONE terminated registry row whose IDE
+// tab has been proven gone by a successful bridge listing, and drop it from the
+// in-memory map in the same call.
+//
+// Why this is a coord-side helper and not an fs.unlinkSync at the cowork call
+// site: cowork.js reads and writes the registry FILES, while sweepStaleWorkers
+// iterates the in-memory `workers` Map that loadFromDisk populated at boot.
+// Those two views diverge the moment either side writes alone. That divergence
+// is why `closed_tab_ok` never triggers the sweep's immediate-purge branch: the
+// cowork close path stamps it on the file (cowork.js:1337) and coord's sweep
+// reads the boot-loaded object, which never learns. Measured 2026-08-29T04:00Z:
+// 84 terminated rows on disk, ZERO carrying closed_tab_ok. So a GC that only
+// unlinks the file would leave a live Map entry pointing at a deleted path.
+// One entry point mutates both.
+//
+// FAIL-SAFE. The caller proves death; this helper independently re-reads the
+// row from DISK and refuses anything it cannot confirm is a terminated worker.
+// terminated_at is re-read here rather than trusted from the caller's upstream
+// filter because that value was read before an await and a worker can bind,
+// heartbeat and un-terminate in the gap.
+function _gcWorkerRow(tab_id, opts) {
+  opts = opts || {}
+  if (!tab_id) return { ok: false, reason: 'no_tab_id' }
+  const file = path.join(WORKERS_DIR, tab_id + '.json')
+  let row = null
+  try { row = JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) {
+    return { ok: false, reason: 'row_unreadable:' + (e.code || e.message) }
+  }
+  // A row we cannot confirm terminated is NEVER GC'd. This is the single most
+  // load-bearing guard here: an active worker's row is its only registry
+  // identity, and deleting it strands a LIVE tab with no close path at all.
+  if (!row || !row.terminated_at) return { ok: false, reason: 'not_terminated' }
+  // SECOND, INDEPENDENT LIVENESS SIGNAL. The caller proves the TAB is gone. That
+  // is one signal, and the skill's rule is that one is never enough inside a
+  // destroyer. terminated_at alone is not the second signal, because the
+  // stale-heartbeat sweep sets it on a worker that may still be ALIVE: the
+  // auto-heartbeat middleware in index.js only fires on MCP tool calls hitting
+  // the laptop-agent, and Claude Code's built-in Bash/Read/Grep/Edit bypass it
+  // entirely, which is exactly why SWEEP_STALE_THRESHOLD_MS was raised to 60min.
+  // A worker doing a long Bash-only stretch is marked terminated while running.
+  //
+  // Deleting that row is not cosmetic: the row IS the worker's registry
+  // identity, so signal_done and every other coord call would start failing
+  // unknown_worker. Under the old 24h retention such a worker had a full day to
+  // come back and heartbeat; a GC on the sweep cadence would take it in minutes.
+  // Measured 2026-08-29 on the live registry: the freshest heartbeat in the
+  // would-GC set was 63.1 minutes, i.e. 3 minutes past the stale threshold.
+  //
+  // So the union is: tab proven gone AND (terminated by the worker's OWN clean
+  // protocol, where there is no liveness doubt at all, OR silent for long enough
+  // that the stale mark is not a false positive). Any coord tool call from a
+  // live worker bumps last_heartbeat_at and re-protects its row immediately.
+  const cleanExit = row.terminated_reason === 'signal_done' || row.closed_tab_ok === true
+  if (!cleanExit) {
+    // NOT `|| 0`: Date.parse coerces 0 to the string "0", which V8 parses as
+    // the year 2000, so a row carrying NO timestamp at all would read as
+    // maximally quiet and be collected. That is the fail-OPEN inversion, in the
+    // one line that is supposed to be the fail-safe. Caught by the no-heartbeat
+    // case in cowork-orphan-sweep-registry-gc.test.js, which is why that case
+    // exists. Absent timestamp must mean unknown, and unknown must mean refuse.
+    const hbRaw = row.last_heartbeat_at || row.registered_at || null
+    const hbMs = hbRaw ? Date.parse(hbRaw) : NaN
+    const quietMs = Number.isFinite(hbMs) ? (Date.now() - hbMs) : -1
+    if (!(quietMs > GC_MIN_QUIET_MS)) {
+      return { ok: false, reason: 'not_quiet_enough', quiet_ms: quietMs }
+    }
+  }
+  // Defence in depth: the registered conductor tab is never a reapable worker.
+  // Doctrine: coord-sweep-must-exempt-registered-conductor-tab-2026-07-21.
+  try {
+    const c = loadConductorRegistration()
+    if (c && c.tab_id && c.tab_id === tab_id) return { ok: false, reason: 'registered_conductor' }
+  } catch (e) {}
+  if (opts.dry_run) return { ok: true, dry_run: true, would_unlink: file }
+  try { fs.unlinkSync(file) } catch (e) {
+    return { ok: false, reason: 'unlink_failed:' + (e.code || e.message) }
+  }
+  workers.delete(tab_id)
+  try { process.stderr.write('[coord-gc] purged terminated row ' + tab_id + ' (' + (opts.reason || 'tab_gone_confirmed') + ')\n') } catch (e) {}
+  return { ok: true, unlinked: file }
 }
 
 // Start the sweep loop unless explicitly disabled (e.g. for unit tests).
@@ -3365,6 +3456,7 @@ module.exports = {
   _loadConductorRegistration: loadConductorRegistration,
   // Sweep API for tests and for the daemon harness.
   _sweepStaleWorkers: sweepStaleWorkers,
+  _gcWorkerRow: _gcWorkerRow,
   _startSweepLoop: startSweepLoop,
   _stopSweepLoop: stopSweepLoop,
   // Side-channel heartbeat touch for the /api/tool middleware (any tool
