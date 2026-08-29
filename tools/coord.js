@@ -342,8 +342,25 @@ async function wakeConductor(msg) {
       const notification = require('./notification')
       // Don't await - toast can take 6s+ under load; persistMessage must not wait.
       notification.toast({ title: notice.title, body: notice.body, durationMs: policy.toast_duration_ms || 6000 })
-        .then((r) => { tiers.toast = { ok: !(r && r.ok === false), detail: r && r.reason ? r.reason : null }; record({ mode: policy.mode }) })
-        .catch((e) => { tiers.toast = { ok: false, error: e && e.message }; record({ mode: policy.mode }) })
+        // Carry the WHOLE verdict, not a boolean. `detail: r.reason` alone threw
+        // away the two fields that say why a Mac banner never reached a human:
+        // suppressed_by (a live Focus assertion, or a posting bundle with no
+        // notification authorisation) and spawn_error (the binary is absent, which
+        // spawnSync reports on r.error and NEVER on stderr). Both were invisible
+        // for ~81 days precisely because nothing recorded them.
+        .then((r) => {
+          r = r || {}
+          tiers.toast = {
+            ok: !(r.ok === false),
+            mechanism: r.mechanism || null,
+            reason: r.reason || null,
+            suppressed_by: r.suppressed_by || null,
+            spawn_error: r.spawn_error || null,
+            delivered_to_centre: r.delivered_to_centre === true ? true : null,
+          }
+          record({ mode: policy.mode })
+        })
+        .catch((e) => { tiers.toast = { ok: false, reason: 'toast_threw', error: e && e.message }; record({ mode: policy.mode }) })
       tiers.toast = { ok: null, note: 'dispatched, not awaited' }
     } catch (e) { tiers.toast = { ok: false, error: e && e.message } }
 
@@ -357,7 +374,14 @@ async function wakeConductor(msg) {
 
     if (policy.mode === 'flash' || policy.mode === 'auto_type') {
       if (!guiCap.ok) {
-        tiers.flash = { ok: false, reason: guiCap.reason, error: guiCap.error }
+        // Flash has NO honest darwin equivalent and never will from here:
+        // requestUserAttention is per-process (a headless node agent cannot
+        // bounce VS Code's dock icon) and there is no public API to flash
+        // another app's icon. Refuse with the routing instruction rather than
+        // leave a bare unsupported_platform that reads as "not built yet".
+        tiers.flash = process.platform === 'darwin'
+          ? { ok: false, reason: 'no_flashwindowex_equivalent_on_darwin', alternative: 'auto_type via chat-inject', unsupported_on_platform: 'darwin' }
+          : { ok: false, reason: guiCap.reason, error: guiCap.error }
       } else {
         try {
           const notification = require('./notification')
@@ -370,12 +394,34 @@ async function wakeConductor(msg) {
     }
 
     if (policy.mode === 'auto_type' && !guiCap.ok) {
-      // Refuse rather than pretend. The Mac-native equivalent of this tier
-      // already exists as tools/chat-inject.injectTurn (activate / select /
-      // paste / submit over AppleScript), but auto_type focus-steals and is
-      // policy-banned on this host, so porting it is a DECISION, not a
-      // silently-taken fix. Surfaced in the lane B1 report 2026-08-29.
-      tiers.auto_type = { ok: false, reason: guiCap.reason, error: guiCap.error }
+      // DARWIN AUTO_TYPE (wired 2026-08-29, lane W1). The Mac equivalent of the
+      // win32 keystroke chain is tools/chat-inject.injectTurn, and unlike a
+      // banner it does the thing a wake is FOR: it lands a turn in an idle chat.
+      // It is wired here behind three gates, none of which is cosmetic:
+      //   1. policy.mode === 'auto_type'. This tier focus-steals (injectTurn
+      //      activates VS Code and selects the tab). The default policy is
+      //      'toast', so reaching this line already required someone to opt in.
+      //      That opt-in IS the focus-steal consent, exactly as it is on win32.
+      //   2. conductor.in_turn === false, checked inside _wakeByChatInject, so a
+      //      wake never lands mid-turn on top of what Tate is typing.
+      //   3. COORD_CHAT_INJECT=0 kills it instantly, same switch as chat push.
+      // And it is landing-gated: conductor last_seen_at must advance past a
+      // pre-inject baseline before this reports ok. A submit keystroke that
+      // executed is NOT a turn that landed, which is the whole reason this lane
+      // exists. Doctrine: coord-chat-to-chat-push-delivery-2026-08-02.
+      if (_darwinInjectWakeAvailable()) {
+        tiers.auto_type = { ok: null, note: 'chat-inject dispatched, landing not yet observed' }
+        _wakeByChatInject(notice)
+          .then((r) => { tiers.auto_type = r; record({ mode: policy.mode }) })
+          .catch((e) => { tiers.auto_type = { ok: false, reason: 'chat_inject_threw', error: e && e.message }; record({ mode: policy.mode }) })
+      } else {
+        tiers.auto_type = {
+          ok: false,
+          reason: guiCap.reason,
+          error: guiCap.error,
+          darwin_inject: process.platform === 'darwin' ? _darwinInjectWakeReason() : null,
+        }
+      }
       record({ mode: policy.mode })
       return
     }
@@ -425,6 +471,128 @@ function _guiWakeSupported() {
     return { ok: false, reason: 'ps_daemon_unavailable', error: e && e.message }
   }
   return { ok: process.platform === 'win32', reason: process.platform === 'win32' ? null : 'unsupported_platform' }
+}
+
+// ── darwin wake tier: land a real turn, not a banner ─────────────────────
+//
+// On this host the win32 tiers cannot run at all, and the darwin toast is
+// suppressed by a live Focus assertion plus an unregistered posting bundle
+// (both measured 2026-08-29 and both now reported by notification.capability).
+// So a banner is not a wake here even after the port. The only mechanism on
+// this Mac PROVEN to put a turn into an idle chat is the chat-inject position
+// chain, which is the same machinery chat-to-chat push already uses.
+
+function _darwinInjectWakeReason() {
+  if (process.platform !== 'darwin') return 'not_darwin'
+  if (process.env.COORD_CHAT_INJECT === '0') return 'inject_disabled'
+  if (!_chatInject) return 'inject_unavailable'
+  return null
+}
+
+function _darwinInjectWakeAvailable() { return _darwinInjectWakeReason() === null }
+
+// wakeCapabilities() -> what each tier can ACTUALLY do on this host, probed, not
+// asserted. `toast: true` used to be a hardcoded literal here, which is how
+// get_conductor_state reported a healthy toast tier on a host with no PowerShell
+// and (after the port) a Focus-suppressed banner. Every field below now comes
+// from a live check, so a dead wake reads as dead WITHOUT waiting for a wake to
+// fire and fail.
+function wakeCapabilities() {
+  let cap = null
+  try { cap = require('./notification').capability() } catch (e) { cap = null }
+  const gui = _guiWakeSupported()
+  const darwinInject = _darwinInjectWakeReason()
+  const toastOk = cap && cap.toast ? cap.toast.ok === true : null
+  return {
+    platform: process.platform,
+    // toast is the banner tier ONLY. On darwin it is false whenever a Focus
+    // assertion or an unregistered posting bundle suppresses the banner, both
+    // of which leave osascript exiting 0.
+    toast: toastOk,
+    toast_reason: cap && cap.toast ? (cap.toast.reason || null) : 'capability_probe_failed',
+    toast_suppressed_by: cap && cap.toast ? (cap.toast.suppressed_by || null) : null,
+    beep: cap && cap.beep ? cap.beep.ok === true : null,
+    flash: gui.ok,
+    // auto_type is win32-keystroke OR darwin-chat-inject; either lands a turn.
+    auto_type: gui.ok || darwinInject === null,
+    auto_type_via: gui.ok ? 'win32_keystroke' : (darwinInject === null ? 'chat_inject' : null),
+    gui_wake_reason: gui.ok ? null : gui.reason,
+    darwin_inject_reason: darwinInject,
+    // The only delivery path proven to land a turn on this host.
+    chat_inject: !!_chatInject,
+    // A host where NOTHING can interrupt an idle conductor.
+    any_tier_can_wake: (gui.ok || darwinInject === null || toastOk === true),
+    // THE field the canary reads. any_tier_can_wake being true is not safety:
+    // this host has a working auto_type tier AND a configured mode of 'toast',
+    // whose tier is suppressed. A capable tier nobody is configured to use
+    // wakes no one, and that gap is exactly the shape that hid for 81 days.
+    active_mode_can_wake: (function () {
+      let mode = 'toast'
+      try { mode = (loadWakePolicy() || {}).mode || 'toast' } catch (e) {}
+      if (mode === 'silent') return null   // deliberately off, not broken
+      if (mode === 'toast') return toastOk
+      if (mode === 'flash') return gui.ok
+      if (mode === 'auto_type') return gui.ok || darwinInject === null
+      return null
+    })(),
+    active_mode: (function () { try { return (loadWakePolicy() || {}).mode || null } catch (e) { return null } })(),
+  }
+}
+
+// _wakeByChatInject(notice) -> the SAME verdict shape pushInject returns, so a
+// wake and a push are read the same way. Serialised onto _injectChain: one
+// clipboard and one focus exist on this machine, and a wake racing a chat push
+// over them is how a paste lands in the wrong tab.
+async function _wakeByChatInject(notice) {
+  const blocked = _darwinInjectWakeReason()
+  if (blocked) return { ok: false, reason: blocked }
+
+  const run = async () => {
+    const conductor = loadConductorRegistration()
+    if (!conductor) return { ok: false, reason: 'conductor_unregistered' }
+    // Never type over a turn in progress. in_turn carries a TTL escape inside
+    // loadConductorRegistration, so a crashed turn cannot wedge this shut.
+    if (conductor.in_turn) return { ok: false, reason: 'conductor_in_turn' }
+
+    const tgt = await resolveLiveTargetTab(addressForConductor())
+    if (!tgt.ok) return { ok: false, reason: tgt.reason }
+
+    // Sample the landing observable BEFORE the keystroke, so the comparison is
+    // against a value that predates it.
+    const baselineMs = _conductorLastSeenMs()
+    const text = '[wake] ' + notice.title + '\n' + notice.body +
+      '\n\nThis turn exists because a coord message arrived while this chat was idle. Drain it with coord.read_inbox.'
+
+    let r
+    try { r = await _chatInject.injectTurn({ label: tgt.label, viewColumn: tgt.viewColumn, index: tgt.index, text: text }) }
+    catch (e) { return { ok: false, reason: 'inject_threw', error: e.message } }
+    if (!(r && r.ok)) return { ok: false, reason: (r && r.reason) || 'inject_failed', detail: r }
+
+    const land = await _awaitTurnLanded(baselineMs, LANDING_TIMEOUT_MS, LANDING_POLL_MS)
+    if (!land.landed) {
+      // The keystroke fired into nothing. Say so. The message is untouched in
+      // the durable inbox either way: a wake never marks anything seen.
+      return {
+        ok: false,
+        reason: 'submit_did_not_land',
+        inject_reported_ok: true,
+        via: 'chat-inject',
+        resolved_label: r.label,
+        last_seen_at_baseline: baselineMs == null ? null : new Date(baselineMs).toISOString(),
+        landing_timeout_ms: LANDING_TIMEOUT_MS,
+      }
+    }
+    return {
+      ok: true,
+      via: 'chat-inject',
+      landed: true,
+      landed_at: new Date(land.last_seen_ms).toISOString(),
+      resolved_label: r.label,
+      last_seen_at_baseline: baselineMs == null ? null : new Date(baselineMs).toISOString(),
+    }
+  }
+  _injectChain = _injectChain.then(run, run)
+  return _injectChain
 }
 
 // ── core ops (no auth here - that's the route layer's job) ───────────────
@@ -3301,15 +3469,7 @@ async function get_conductor_state(_params) {
     // the verdict.
     last_wake_result: _lastWakeResult || readJsonSafe(WAKE_STATE_FILE) || null,
     // Static capability of THIS host, readable without waiting for a wake.
-    wake_capabilities: {
-      platform: process.platform,
-      toast: true,
-      flash: _guiWakeSupported().ok,
-      auto_type: _guiWakeSupported().ok,
-      gui_wake_reason: _guiWakeSupported().ok ? null : _guiWakeSupported().reason,
-      // The only delivery path proven to land a turn on this host.
-      chat_inject: !!_chatInject,
-    },
+    wake_capabilities: wakeCapabilities(),
   }
 }
 
@@ -3473,6 +3633,13 @@ module.exports = {
   _resolveLiveTargetTab: resolveLiveTargetTab,
   _pushInject: pushInject,
   _setChatInject: _setChatInject,
+  // Test-only seams for the darwin wake tier (lane W1, 2026-08-29). wakeConductor
+  // is fired-and-forgotten from persistMessage, so a test cannot observe it
+  // without a handle; _wakeByChatInject is the darwin auto_type tier itself.
+  _wakeConductor: wakeConductor,
+  _wakeByChatInject: _wakeByChatInject,
+  _wakeCapabilities: wakeCapabilities,
+  _darwinInjectWakeReason: _darwinInjectWakeReason,
   _awaitTurnLanded: _awaitTurnLanded,
   _readSessionTab: _readSessionTab,
   // Worker-row map, for tests that need to age or terminate a row directly.

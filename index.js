@@ -84,7 +84,14 @@ app.get('/api/health', (_req, res) => {
     scheduler_health,
     // 2026-08-13: expose skipped tool files so a canary can see a DEGRADED boot
     // (agent up, but one tool failed to load) rather than only up/down.
-    tool_load_failures: (toolLoadFailures || []).map(f => f.file),
+    // 2026-08-29: the content screen refuses script-shaped files BEFORE require,
+    // and those are by design, not degradation. Keep them OUT of
+    // tool_load_failures so the field still means "something broke" instead of
+    // going permanently amber on a screened one-shot CLI, and surface them
+    // separately so a wrongly-screened tool is still diagnosable from health.
+    tool_load_failures: (toolLoadFailures || []).filter(f => !f.contentSkip).map(f => f.file),
+    tool_content_skips: (toolLoadFailures || []).filter(f => f.contentSkip)
+      .map(f => ({ file: f.file, reason: f.reason })),
   })
 })
 
@@ -239,9 +246,18 @@ function startCaffeinate() {
 function onListening() {
   console.log(`EcodiaOS Laptop Agent running on :${PORT}`)
   console.log(`Tools loaded: ${Object.keys(tools).join(', ')}`)
-  if (toolLoadFailures && toolLoadFailures.length) {
-    console.error(`Tools SKIPPED (${toolLoadFailures.length}, agent still up): ` +
-      toolLoadFailures.map(f => f.file).join(', '))
+  const toolLoadErrors = (toolLoadFailures || []).filter(f => !f.contentSkip)
+  const toolContentSkips = (toolLoadFailures || []).filter(f => f.contentSkip)
+  if (toolLoadErrors.length) {
+    console.error(`Tools SKIPPED (${toolLoadErrors.length}, agent still up): ` +
+      toolLoadErrors.map(f => f.file).join(', '))
+  }
+  if (toolContentSkips.length) {
+    // Deliberate, not a fault: these are script-shaped files the content screen
+    // refused BEFORE require. Logged at info so a boot-log reader hunting a
+    // degraded boot is not sent down a false trail.
+    console.log(`Tools content-screened (${toolContentSkips.length}, by design, not a fault): ` +
+      toolContentSkips.map(f => `${f.file} [${f.reason}]`).join(', '))
   }
   console.log(`Auth: ${TOKEN ? 'enabled' : 'DISABLED (set AGENT_TOKEN)'}`)
 
