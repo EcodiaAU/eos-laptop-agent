@@ -1124,6 +1124,9 @@ async function _resolveWorkerAnchorCloseTarget(workerTabId, idePort) {
       label: ccHits[0].label,
       index: ccHits[0].index,
       active: !!cand.isActive,
+      // Carried so tab-close-guard belt 2 can compare IDENTITIES rather than
+      // labels. A guard conjunct nothing ever supplies is a no-op that typechecks.
+      tabId: ccHits[0].tabId || null,
     }
   } catch (e) { return null }
 }
@@ -1137,7 +1140,7 @@ async function _closeAnchorTarget(anchorTarget, conductor, guardCtx) {
     if (!anchorTarget) return { closed: false, refused: 'no_anchor_target' }
     const decision = require('./tab-close-guard').evaluateClose(
       'session_anchor',
-      { label: anchorTarget.label, index: anchorTarget.index, viewColumn: anchorTarget.viewColumn, active: anchorTarget.active },
+      { label: anchorTarget.label, index: anchorTarget.index, viewColumn: anchorTarget.viewColumn, active: anchorTarget.active, tabId: anchorTarget.tabId || null },
       conductor,
       guardCtx || undefined
     )
@@ -1509,7 +1512,7 @@ async function _closeStableIdTarget(resolved, conductor, guardCtx) {
   try {
     const decision = require('./tab-close-guard').evaluateClose(
       strategy,
-      { label: tab.label, index: tab.index, viewColumn: tab.viewColumn, active: tab.active },
+      { label: tab.label, index: tab.index, viewColumn: tab.viewColumn, active: tab.active, tabId: tab.tabId || null },
       conductor,
       guardCtx || undefined
     )
@@ -3284,6 +3287,73 @@ async function verify_paste(params, ctx) {
 // fingerprint it at register/heartbeat) - this is the same recognition applied at
 // the WRITE, so the poison never lands. Fail-safe: a rejected write keeps the last
 // good label. Doctrine: coord-conductor-title-match-rejects-worker-sentinel-2026-08-18.
+// Resolve the conductor's live chat tab and return its STABLE bridge tab id.
+//
+// Why the conductor needs one at all (2026-08-29 lane W1 item 1). Every close
+// path identifies the protected conductor tab by comparing tab.label to the
+// stored title_match, and a label is not an identity: it is generic for the
+// first ~11s of a chat's life ("Claude Code", shared with every freshly spawned
+// worker), and Claude Code rewrites it without notice thereafter. The bridge
+// hands out a tabId on every tab of every listing; storing the conductor's lets
+// tab-close-guard belt 2 decide on identity instead. See that file's belt 2.
+//
+// Captured from the tab whose LABEL is the one being stored as title_match, not
+// merely from whichever tab is active. Those are usually the same tab, and when
+// they are not the active one is the trap: measured live 2026-08-29 the active
+// CC tab was a dispatched WORKER (label "[f9b1 coord tab close la...") while the
+// conductor sat backgrounded at index 4. Capturing by activeness would have
+// stored a worker's id as the conductor's, and belt 2 would then have refused
+// that worker's own self-close forever. Tying the id to the accepted label makes
+// the two halves of belt 2 name one tab by construction, so the existing
+// worker-shape rejection covers the id for free.
+//
+// Fail-safe direction is REPLACE-ONLY, the same rule _captureStableTabId learned:
+// a probe that cannot decide returns the prior id untouched. A row that HAS an id
+// is never demoted to having none, because belt 2's fallback ladder treats
+// "no id" as permission to decide on the label alone.
+async function _captureConductorStableTabId(titleMatch, idePort, priorId) {
+  const prior = priorId || null
+  try {
+    if (!idePort) return { tabId: prior, reason: 'no_ide_port' }
+    const tm = String(titleMatch == null ? '' : titleMatch).trim()
+    if (!tm) return { tabId: prior, reason: 'no_title_match' }
+    // A worker sentinel must never name the conductor. Same rejection the
+    // title_match write applies, applied to the id so the pair cannot diverge.
+    if (isWorkerShapedLabel(tm)) return { tabId: prior, reason: 'worker_shaped_label' }
+    let tabs
+    try { tabs = await _liveCcTabsWithIds(idePort) }
+    catch (e) { return { tabId: prior, reason: 'bridge_unreachable' } }
+    // An empty or failed listing proves nothing. Only a SUCCESSFUL listing is
+    // evidence, and even then it is only evidence about which tab to pick.
+    if (!tabs || !tabs.length) return { tabId: prior, reason: 'no_live_tabs' }
+    // Truncation-aware: the bridge returns the RENDERED label (24 chars + U+2026),
+    // and title_match may be either the rendered form (the heartbeat hook reads
+    // it from list_channels) or a full caller-supplied string.
+    let hits = tabs.filter((t) => t.tabId && _labelMatchesStored(t.label, tm))
+    if (!hits.length) return { tabId: prior, reason: 'no_label_match' }
+    // A tab some worker row already owns is that worker's, not the conductor's.
+    // Blunts the spawn-steals-focus race and, more importantly, stops a generic
+    // "Claude Code" label from handing a just-spawned worker's tab to the
+    // conductor slot and making that worker permanently unclosable.
+    const claimed = _claimedStableTabIds(null)
+    const unclaimed = hits.filter((t) => !claimed.has(t.tabId))
+    if (!unclaimed.length) return { tabId: prior, reason: 'all_claimed_by_workers' }
+    let via = unclaimed.length === hits.length ? 'label' : 'label_unclaimed'
+    hits = unclaimed
+    if (hits.length > 1) {
+      // Several tabs wear this label. The conductor is the one the human is in,
+      // and register / heartbeat both run on a genuine conductor turn.
+      const act = hits.filter((t) => t.active === true)
+      if (act.length !== 1) return { tabId: prior, reason: 'ambiguous_label', candidates: hits.length }
+      hits = act
+      via = via + '_active'
+    }
+    return { tabId: hits[0].tabId, reason: via, label: hits[0].label }
+  } catch (e) {
+    return { tabId: prior, reason: 'threw' }
+  }
+}
+
 function isWorkerShapedLabel(s) {
   const v = String(s == null ? '' : s)
   if (!v) return false
@@ -3395,11 +3465,25 @@ async function register_conductor(params, ctx) {
     prior_conductor_tab_id = existing.tab_id || null
   }
 
+  // Capture the conductor's stable bridge tab id from the tab whose label we are
+  // about to store. Runs on EVERY register, including the path where the caller
+  // supplied title_match and the bridge probe above was therefore skipped - that
+  // is the heartbeat hook's path and so the common one. Replace-only: a probe
+  // that cannot decide carries the existing row's id forward untouched.
+  let stable_tab_id = (existing && existing.stable_tab_id) || null
+  if (ide_bridge_port) {
+    try {
+      const cap = await _captureConductorStableTabId(title_match, ide_bridge_port, stable_tab_id)
+      stable_tab_id = (cap && cap.tabId) || stable_tab_id
+    } catch (e) {}
+  }
+
   const now = new Date().toISOString()
   const row = {
     tab_id: tab_id,
     ide: ide,
     title_match: title_match || '',
+    stable_tab_id: stable_tab_id,
     title_fingerprint: title_fingerprint || null,
     hwnd: hwnd || null,
     exe: exe || null,
@@ -3527,6 +3611,20 @@ async function conductor_heartbeat(params, _ctx) {
   if (params.ide_pid) conductor.ide_pid = Number(params.ide_pid)
   if (params.ide_bridge_port) conductor.ide_bridge_port = Number(params.ide_bridge_port)
   if (params.workspace_root) conductor.workspace_root = String(params.workspace_root)
+  // Refresh the stable bridge tab id every beat, against whatever title_match is
+  // now settled (freshly supplied or carried over). Two reasons it cannot be a
+  // register-time one-shot: the conductor slot long predates this field so every
+  // row on disk starts without one, and the bridge RE-MINTS an id for a tab that
+  // retitles and reorders between two listings, which a human chat does often.
+  // Replace-only, so a bridge hiccup or an ambiguous label leaves the stored id
+  // exactly as it was rather than blanking the conductor's cover.
+  if (conductor.ide_bridge_port) {
+    try {
+      const cap = await _captureConductorStableTabId(
+        conductor.title_match, conductor.ide_bridge_port, conductor.stable_tab_id || null)
+      if (cap && cap.tabId) conductor.stable_tab_id = cap.tabId
+    } catch (e) {}
+  }
   try {
     atomicWriteJson(path.join(CONDUCTORS_DIR, 'current.json'), conductor)
     atomicWriteJson(path.join(CONDUCTORS_DIR, 'default.json'), conductor)
@@ -3671,6 +3769,7 @@ module.exports = {
   _closeAnchorTarget: _closeAnchorTarget,
   // Stable IDE tab id (2026-08-29): capture at bind, resolve at close.
   _captureStableTabId: _captureStableTabId,
+  _captureConductorStableTabId: _captureConductorStableTabId,
   _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
   _resolveStableIdCloseTargetRecapturing: _resolveStableIdCloseTargetRecapturing,
   // Exported 2026-08-29 for cowork.cleanup_orphan_workers, the recurring sweep

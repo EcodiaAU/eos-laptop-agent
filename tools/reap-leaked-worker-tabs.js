@@ -203,6 +203,9 @@ async function main() {
     }
     const decision = guard.evaluateClose('reaper_anchor_exact_label', {
       label: tab.label, active: tab.active, index: tab.index, viewColumn: tab.viewColumn,
+      // 2026-08-29: belt 2 identifies the conductor by stable tab id first, so
+      // hand it the id we already keyed this whole loop on.
+      tabId: tab.tabId || ttab || null,
     }, conductor)
     if (!decision.allow) { note('close_guard:' + decision.reason); continue }
 

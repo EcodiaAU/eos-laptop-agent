@@ -60,6 +60,15 @@ function isPositiveStrategy(strategy) {
   return !!String(strategy || '').length && !isFuzzyStrategy(strategy)
 }
 
+// The labels EVERY untitled Claude Code chat carries - the conductor, a freshly
+// spawned worker, and Tate's own new chat all read the same. Duplicated from
+// coord.js GENERIC_TAB_LABELS rather than imported: coord.js requires THIS file,
+// so importing back would be a cycle. This module is the leaf; keep the two
+// sets in step (coord.js ~line 834). A generic label is not an identity, which
+// is the whole reason belt 2 below cannot decide on it alone.
+const GENERIC_TAB_LABELS = new Set(['', 'claude code', 'new chat', 'cursor', 'chat', 'untitled'])
+function isGenericLabel(s) { return GENERIC_TAB_LABELS.has(String(s || '').trim().toLowerCase()) }
+
 // Decide whether a resolved close target may actually be closed.
 //   strategy   - how the tab was matched (matchedBy / strategy string)
 //   tab        - the live tab object from the fresh ide.tabs() probe
@@ -74,7 +83,8 @@ function isPositiveStrategy(strategy) {
 //
 // Three belts, in refuse-precedence order:
 //   1. active_tab_protected              - the focused tab is never a dead orphan
-//   2. conductor_label_protected         - the registered conductor tab, by label
+//   2. conductor_stable_id_protected /   - the registered conductor tab, by its
+//      conductor_label_protected           bridge tab id first, label as fallback
 //   3. fuzzy_fingerprint_refused_not_positive_id - a fuzzy match is not a positive
 //      worker identity, so on the SWEEP paths it can never OS-close.
 //
@@ -110,9 +120,56 @@ function evaluateClose(strategy, tab, conductor, opts) {
   // Belt 2: always. A worker must NEVER close the registered conductor tab, even
   // claiming its own self-close (a fuzzy self-close that resolved onto the
   // conductor's chat is exactly what this stops).
+  //
+  // 2026-08-29 lane W1 item 1: IDENTITY BEFORE LABEL. The belt used to be label
+  // string equality alone, and a label is not an identity. Two ways that bites,
+  // in opposite directions:
+  //   - LEAK AMPLIFIER (the reachable one). Every freshly spawned CC chat is
+  //     labelled "Claude Code", the conductor's included for the ~11s before CC
+  //     autotitles it. Register in that window and title_match stores the
+  //     generic string, at which point EVERY worker tab still showing its
+  //     spawn label matches the belt and becomes permanently unclosable. Belt 2
+  //     only ever refuses, so this can only leak tabs, never wrong-close one.
+  //   - LOST PROTECTION. Once CC retitles the conductor's chat, the stored
+  //     title_match no longer equals the live label and the belt silently stops
+  //     protecting the very tab it exists for.
+  // Both are answered by the bridge's stable tab id, captured onto the conductor
+  // row at register / heartbeat (coord.js _captureConductorStableTabId).
+  //
+  // Precedence, and each branch is load-bearing:
+  //   a. both ids known and EQUAL      -> refuse. This IS the conductor, whatever
+  //                                       the label now says.
+  //   b. label matches, no stable id   -> refuse. Legacy rows on disk carry none
+  //                                       (mac-conductor-2026-06-08.json,
+  //                                       current.json), so the label belt stays
+  //                                       exactly as it was for them.
+  //   c. label matches, id known but   -> refuse. The caller cannot speak the id
+  //      the CALLER supplied none         language, so fall back rather than
+  //                                       silently drop the conductor's cover.
+  //   d. label matches, both ids known -> refuse UNLESS the label is generic.
+  //      and they DISAGREE               A non-generic label agreeing with the
+  //                                       conductor's is real evidence, and it is
+  //                                       the belt against a STALE stored id: the
+  //                                       bridge re-mints an id for a tab that
+  //                                       retitles and reorders between two
+  //                                       listings (see _captureStableTabId,
+  //                                       measured 0 of 10 spawn-time ids still
+  //                                       resolving). A GENERIC label is not
+  //                                       evidence of anything, so there the ids
+  //                                       decide alone - and that single line is
+  //                                       the amplifier fix.
+  // Governing preference unchanged: leak a cosmetic ghost tab before closing a
+  // live chat. Doctrine: coord-conductor-identified-by-stable-tab-id-not-label-2026-08-29.
+  const sid = (conductor && conductor.stable_tab_id != null) ? String(conductor.stable_tab_id).trim() : ''
+  const tid = (tab.tabId != null) ? String(tab.tabId).trim() : ''
+  if (sid && tid && sid === tid) {
+    return { allow: false, reason: 'conductor_stable_id_protected' }
+  }
   const tm = (conductor && conductor.title_match != null) ? String(conductor.title_match).trim() : ''
   if (tm && tab.label && String(tab.label) === tm) {
-    return { allow: false, reason: 'conductor_label_protected' }
+    if (!sid || !tid || !isGenericLabel(tm)) {
+      return { allow: false, reason: 'conductor_label_protected' }
+    }
   }
   // Belt 3: sweep-only. Self-close admits the (upstream-decisive) fuzzy winner.
   if (isFuzzyStrategy(strategy) && !selfClose) {
@@ -121,4 +178,4 @@ function evaluateClose(strategy, tab, conductor, opts) {
   return { allow: true, reason: String(strategy || 'positive') }
 }
 
-module.exports = { isFuzzyStrategy, isPositiveStrategy, evaluateClose }
+module.exports = { isFuzzyStrategy, isPositiveStrategy, isGenericLabel, evaluateClose }
