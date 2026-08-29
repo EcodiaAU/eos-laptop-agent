@@ -212,13 +212,92 @@ async function main () {
     ok('non-pattern source not landed', !after.includes('patterns/not-a-pattern.js'))
     ok('reports nothing to harvest', res.ok === true && res.landed.length === 0, JSON.stringify(res))
 
+    // 2026-08-30. The second half above USED to assert the opposite: that an
+    // archived basename blocks the landing. It was reversed after the block was
+    // caught destroying the highest-value rescue there is. Row 102b5849 restored
+    // never-cdp-drive-live-client-editor-with-autosave-2026-07-16 (status active,
+    // severity HIGH, the rule that stops a CDP probe mutating a client's live
+    // editor) out of _archived at 2026-08-29T16:09:47Z. Harvest ran 10 minutes
+    // later, matched the basename against the ARCHIVED copy, and skipped it as
+    // 'basename already in the corpus'. The file reached neither disk nor
+    // origin/main and knowledge.lookup could not return it.
+    //
+    // The block was aimed at a stale branch resurrecting superseded doctrine.
+    // It cannot tell that apart from a deliberate un-archival, and the two
+    // errors are not symmetric: a wrongly-resurrected pattern is VISIBLE in the
+    // corpus and re-archived in one move, while a wrongly-refused un-archival is
+    // INVISIBLE and permanent, because nothing ever retries a harvest. So the
+    // landing goes through and the audit says so loudly, which turns a silent
+    // permanent loss into a reviewable reversible one.
     plantWorkerBranch(shared, root, 'worker/row-ccc2', {
-      'patterns/old-rule-2025-01-01.md': '# a resurrected archived rule\n',
+      'patterns/old-rule-2025-01-01.md': '# a deliberately un-archived rule\n',
     })
     const res2 = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ccc2', rowId: 'row-ccc2' })
-    ok('an ARCHIVED basename is not resurrected into the live corpus',
-      res2.landed.length === 0 && !fs.existsSync(path.join(shared, 'patterns', 'old-rule-2025-01-01.md')),
+    ok('an UN-ARCHIVAL lands in the live corpus',
+      res2.landed.includes('patterns/old-rule-2025-01-01.md') &&
+      fs.existsSync(path.join(shared, 'patterns', 'old-rule-2025-01-01.md')),
       JSON.stringify(res2))
+    ok('the un-archival is announced, not silent',
+      Array.isArray(res2.unarchived) && res2.unarchived.includes('old-rule-2025-01-01.md'),
+      JSON.stringify(res2))
+    ok('the archived copy is left alone (removing it is the conductor\'s call)',
+      fs.existsSync(path.join(shared, 'patterns', '_archived', 'old-rule-2025-01-01.md')))
+    ok('the landed body is the branch version, not the archived one',
+      readDisk(shared, 'patterns/old-rule-2025-01-01.md') === '# a deliberately un-archived rule\n',
+      JSON.stringify(readDisk(shared, 'patterns/old-rule-2025-01-01.md')))
+
+    // CONTROL, the direction that must NOT change: a LIVE top-level basename
+    // still blocks. Without this the fix reads as 'add-only was removed'.
+    plantWorkerBranch(shared, root, 'worker/row-ccc3', {
+      'patterns/existing-rule-2026-01-01.md': '# a divergent second copy\n',
+    })
+    const res3 = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-ccc3', rowId: 'row-ccc3' })
+    ok('a LIVE top-level basename still blocks (add-only holds)',
+      res3.landed.length === 0 && readDisk(shared, 'patterns/existing-rule-2026-01-01.md') === '# an existing rule\n',
+      JSON.stringify(res3))
+    ok('the live-duplicate skip is NOT reported as an un-archival',
+      !(res3.unarchived || []).length, JSON.stringify(res3))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 3b. The origin/main leg of the baseline splits the same way. basenamesOnMain
+  //     used `ls-tree -r` and kept every .md at any depth, so a stale copy
+  //     archived ON ORIGIN/MAIN poisoned the baseline exactly like the disk leg.
+  //     Fixing only the disk leg leaves the bug alive on the other half.
+  {
+    const { root, shared } = setup()
+    // archive it on origin/main only, and remove it from disk entirely, so the
+    // ONLY thing that can block the landing is the origin/main archived copy.
+    fs.rmSync(path.join(shared, 'patterns', '_archived', 'old-rule-2025-01-01.md'))
+    fs.mkdirSync(path.join(shared, 'patterns', '_archived'), { recursive: true })
+    fs.writeFileSync(path.join(shared, 'patterns', '_archived', 'main-archived-2025-02-02.md'), '# archived on main\n')
+    git(shared, ['add', '-A'])
+    git(shared, ['commit', '-q', '-m', 'archive on main'])
+    git(shared, ['push', '-q', 'origin', 'main'])
+    fs.rmSync(path.join(shared, 'patterns', '_archived', 'main-archived-2025-02-02.md'))
+    git(shared, ['fetch', 'origin', '--quiet'])
+
+    plantWorkerBranch(shared, root, 'worker/row-mainarch', {
+      'patterns/main-archived-2025-02-02.md': '# un-archived from the main copy\n',
+    })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-mainarch', rowId: 'row-mainarch' })
+    ok('a basename archived on ORIGIN/MAIN does not block the un-archival',
+      res.landed.includes('patterns/main-archived-2025-02-02.md'), JSON.stringify(res))
+    ok('the origin/main un-archival is announced too',
+      (res.unarchived || []).includes('main-archived-2025-02-02.md'), JSON.stringify(res))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 3c. The build stamp. The fix is inert until the laptop-agent restarts,
+  //     because require() caches the module, and the ONLY way this run could
+  //     prove the previous fix had loaded was a reason-string flip that appears
+  //     only when something lands. A stamp on EVERY audit line lets a successor
+  //     prove the load from any prune at all, including the silent no-ops.
+  {
+    const { root, shared } = setup()
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/does-not-exist', rowId: 'row-stamp' })
+    ok('every result carries the build stamp, even a no-op',
+      res.build === 'toplevel-baseline-2026-08-30', JSON.stringify(res))
     fs.rmSync(root, { recursive: true, force: true })
   }
 

@@ -85,6 +85,14 @@ const GIT_TIMEOUT_MS = 30_000
 // harvest lands the first MAX_FILES and reports the remainder rather than
 // silently taking everything.
 const MAX_FILES = 25
+
+// Stamped on EVERY audit line, no matter how the call ends. require() caches this
+// module, so a fix here is inert until the laptop-agent restarts, and the only way
+// the 2026-08-27 fix could be proven loaded was a reason-string flip that appears
+// only when something lands. A prune that lands nothing is the common case, so
+// that proof was unavailable most of the time. Bump this string with any change
+// whose liveness a later session has to establish from the log alone.
+const BUILD = 'toplevel-baseline-2026-08-30'
 // Escaped, never a literal: this file is itself subject to the character-level ban.
 const EM_DASH = '\u2014'
 
@@ -144,45 +152,77 @@ async function addedPatternPaths (git, sha) {
 // but that gap is doctrine-branch-drift-canary's job to surface, not this one's
 // to paper over by duplicating the file.
 //
-// Recurses, so patterns/_archived/ counts as present: re-landing a basename the
-// conductor deliberately archived would resurrect superseded doctrine.
+// The baseline splits in two, and the split is the whole point.
+//
+// LIVE is patterns/*.md at the TOP LEVEL, which is the only depth knowledge-index
+// actually indexes and the only depth harvest ever writes to. A live basename
+// blocks: landing over it would put a divergent second copy of the same doctrine
+// in front of every reader.
+//
+// ARCHIVED is the same basename sitting under a subdirectory, patterns/_archived/
+// in practice. It used to block too, and that was wrong. 2026-08-30: row 102b5849
+// deliberately restored never-cdp-drive-live-client-editor-with-autosave-2026-07-16
+// (status active, severity HIGH, the rule that stops a CDP probe mutating a
+// client's live editor) out of _archived. Harvest ran ten minutes later, matched
+// the ARCHIVED copy, and skipped it as 'basename already in the corpus'. The file
+// reached neither disk nor origin/main, and knowledge.lookup could not return it.
+//
+// The old block was aimed at a stale branch resurrecting superseded doctrine. It
+// cannot tell that apart from a deliberate un-archival, and the two errors are not
+// symmetric. A wrongly-resurrected pattern is VISIBLE in the corpus and re-archived
+// in one move. A wrongly-refused un-archival is INVISIBLE and permanent, because
+// nothing ever retries a harvest: the branch is pruned seconds later. So an
+// archived basename no longer blocks, and every such landing is announced in
+// result.unarchived so the conductor can reverse it if the judgement was wrong.
 function basenamesOnDisk (sharedTree) {
-  const set = new Set()
+  const live = new Set()
+  const archived = new Set()
   const root = path.join(sharedTree, 'patterns')
-  const walk = (dir) => {
+  const walk = (dir, depth) => {
     let entries = []
     try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_e) { return }
     for (const e of entries) {
       if (e.name === 'node_modules' || e.name === '.git') continue
       const full = path.join(dir, e.name)
-      if (e.isDirectory()) walk(full)
-      else if (e.isFile() && e.name.endsWith('.md')) set.add(e.name)
+      if (e.isDirectory()) walk(full, depth + 1)
+      else if (e.isFile() && e.name.endsWith('.md')) (depth === 0 ? live : archived).add(e.name)
     }
   }
-  walk(root)
-  return set
+  walk(root, 0)
+  return { live, archived }
 }
 
+// Same split on the origin/main leg. This half is easy to forget and fixing only
+// the disk half leaves the bug alive: `ls-tree -r` walks every depth, so a copy
+// archived ON ORIGIN/MAIN poisoned the baseline exactly like the disk copy did.
 async function basenamesOnMain (git) {
   const out = await git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'patterns/'])
-  const set = new Set()
+  const live = new Set()
+  const archived = new Set()
   for (const line of out.split('\n')) {
     const p = line.trim()
-    if (p.endsWith('.md')) set.add(path.posix.basename(p))
+    if (!p.endsWith('.md')) continue
+    const rest = p.startsWith('patterns/') ? p.slice('patterns/'.length) : p
+    ;(rest.includes('/') ? archived : live).add(path.posix.basename(p))
   }
-  return set
+  return { live, archived }
 }
 
-// The union. A failure to read origin/main is NOT fatal (the disk rail plus the
-// 'wx' exclusive create still hold add-only), but it must not silently widen
-// what harvest is willing to write, so it degrades to disk-only and says so.
+// The union, kept split. A failure to read origin/main is NOT fatal (the disk rail
+// plus the 'wx' exclusive create still hold add-only), but it must not silently
+// widen what harvest is willing to write, so it degrades to disk-only and says so.
 async function existingBasenames (git, sharedTree) {
-  const disk = basenamesOnDisk(sharedTree)
+  const { live, archived } = basenamesOnDisk(sharedTree)
   let degraded = false
   try {
-    for (const bn of await basenamesOnMain(git)) disk.add(bn)
+    const m = await basenamesOnMain(git)
+    for (const bn of m.live) live.add(bn)
+    for (const bn of m.archived) archived.add(bn)
   } catch (_e) { degraded = true }
-  return { set: disk, degraded }
+  // A basename that is live SOMEWHERE outranks the same basename archived
+  // elsewhere: live blocks, and being archived on the other leg cannot unblock it.
+  for (const bn of live) archived.delete(bn)
+  return { set: live, archived, degraded }
 }
 
 // ── the harvest ──────────────────────────────────────────────────────────────
@@ -208,7 +248,7 @@ async function _harvest (opts) {
   const branch = opts && opts.branch
   const rowId = (opts && opts.rowId) || 'unknown'
   const dryRun = !!(opts && opts.dryRun)
-  const result = { ok: false, landed: [], skipped: [], refused: [], commit: null, reason: null, rowId, branch }
+  const result = { ok: false, landed: [], skipped: [], refused: [], unarchived: [], commit: null, reason: null, rowId, branch, build: BUILD }
 
   if (!sharedTree || !branch) {
     result.reason = 'missing sharedTree or branch'
@@ -262,6 +302,8 @@ async function _harvest (opts) {
   for (const [p, sha] of candidates) {
     const bn = path.posix.basename(p)
     if (existing.set.has(bn)) { result.skipped.push({ path: p, reason: 'basename already in the corpus' }); continue }
+    // Not a block. Recorded so the landing is reviewable rather than silent.
+    if (existing.archived.has(bn)) result.unarchived.push(bn)
     if (toLand.length >= MAX_FILES) { result.skipped.push({ path: p, reason: 'MAX_FILES cap reached' }); continue }
     let blob
     try {
@@ -342,8 +384,13 @@ async function _harvest (opts) {
 
   result.ok = true
   result.commit = null
+  // The un-archival variant is a DISTINCT reason string on purpose: it is the one
+  // landing a human should look at, and burying it inside the ordinary success
+  // line is how the old refusal stayed invisible for as long as it did.
   result.reason = result.landed.length
-    ? 'written to the conductor corpus on disk'
+    ? (result.unarchived.length
+      ? 'written to the conductor corpus on disk (un-archived ' + result.unarchived.length + ')'
+      : 'written to the conductor corpus on disk')
     : 'nothing new to land'
   return result
 }
@@ -369,8 +416,10 @@ async function harvestDoctrine (opts) {
       landed: [],
       skipped: [],
       refused: [],
+      unarchived: [],
       commit: null,
       reason: 'threw: ' + (e && e.message || String(e)),
+      build: BUILD,
       rowId: (opts && opts.rowId) || 'unknown',
       branch: (opts && opts.branch) || null,
     }
