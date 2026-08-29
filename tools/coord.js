@@ -1645,19 +1645,58 @@ async function _captureStableTabId(tab_id, opts) {
         workers.set(tab_id, w)
         try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
         // fall through and re-capture against the CURRENT labels
+      } else {
+        // 2026-08-29 lane W1-fix-f7. THIS `else` IS THE WHOLE FIX, and it is
+        // load-bearing rather than tidy. The contradiction arm above deletes
+        // th.tabId and then falls through ON PURPOSE, so that the re-capture at
+        // the bottom of this function can find the right tab. Unguarded, that
+        // fall-through walked straight into the block below, where
+        //     const staleId = th.tabId   // just deleted -> undefined
+        //     th.tabId_stale_dropped = staleId
+        // overwrote the marker the contradiction arm had just earned. And
+        // JSON.stringify OMITS an undefined value, so the durable row came back
+        // with tabId_stale_dropped ABSENT while its two timestamp siblings
+        // survived and made the row look correctly marked. Measured on a
+        // daemon-written row, not theorised.
+        //
+        // Three consumers gate on that one marker and all three failed open:
+        //   _resolveStableIdCloseTarget answered {none} rather than
+        //     {refused: stable_id_dropped_not_recaptured}, so close_my_tab left
+        //     stableSettled false and reached the label/tabIndex ladder;
+        //   kill_worker makes the identical call, with the weaker belt (it
+        //     passes {} not GUARD_SELF_CLOSE, so only a FOCUSED tab is spared);
+        //   cowork.js runOrphanSweep gates its resolver on
+        //     `if (th.tabId || th.tabId_stale_dropped)`, both false, so the row
+        //     fell PAST the resolver into Pass 1 tabIndex+sentinel. That gate
+        //     admits the marker for exactly this reason.
+        // On a recurring cron every handle comes from a byte-identical brief, so
+        // the ladder resolves a dead fire's sentinel onto a SIBLING FIRE'S LIVE
+        // TAB. Reproduced in coord-contradiction-drop-marker.test.js: before this
+        // else, close_my_tab closed the live sentinel-wearing sibling by
+        // 'sentinel_trunc'. A cleanup killing a running worker.
+        //
+        // The recapturing wrapper does not save it either: its
+        // `if (after && after.none) return st` restores a PRIOR refusal, so it
+        // covers only the call that did the dropping. The SECOND call resolves
+        // {none} first, is not repairable, and is handed back untouched.
+        //
+        // The contradiction arm keeps its fall-through, which was always right.
+        // Only this marker write must not run on that path. It also drops a
+        // redundant second atomicWriteJson of a row written one line above.
+        //
+        // Proven dead. Drop it so a re-capture that cannot resolve unambiguously
+        // leaves the row marked as having HAD an id, which keeps the close
+        // terminal, rather than leaving a value we have just proven wrong.
+        const staleId = th.tabId
+        delete th.tabId
+        th.tabId_stale_dropped = staleId
+        th.tabId_stale_dropped_at = new Date().toISOString()
+        th.tabId_stale_dropped_from_via = th.tabId_captured_via || null
+        w.tab_handle = th
+        workers.set(tab_id, w)
+        try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+        // fall through and re-capture against the CURRENT labels
       }
-      // Proven dead. Drop it so a re-capture that cannot resolve unambiguously
-      // leaves the row with NO id ({none}) and the legacy ladder runs, rather
-      // than leaving a value we have just proven wrong to hard-refuse the close.
-      const staleId = th.tabId
-      delete th.tabId
-      th.tabId_stale_dropped = staleId
-      th.tabId_stale_dropped_at = new Date().toISOString()
-      th.tabId_stale_dropped_from_via = th.tabId_captured_via || null
-      w.tab_handle = th
-      workers.set(tab_id, w)
-      try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
-      // fall through and re-capture against the CURRENT labels
     }
     let tabs
     try { tabs = await _liveCcTabsWithIds(conductor.ide_bridge_port) }
