@@ -1240,6 +1240,49 @@ function _claimedStableTabIds(exceptTabId) {
   return claimed
 }
 
+// A worker's tab EXISTS for a measured 3.79-8.33s (median 5.55s, n=29 rows
+// carrying both registered_at and tab_handle_set_at) before dispatch_worker
+// captures its tab_handle. For that whole window the row claims NOTHING in
+// _claimedStableTabIds, the tab is wearing the generic spawn label every fresh
+// Claude Code chat wears, and it is the FOCUSED tab, because a newly opened tab
+// steals focus. Under a GENERIC title_match the label is evidence of nothing, so
+// the conductor capture cannot tell that tab from the conductor's own and takes
+// the worker's id, through either of two doors: the same-label tiebreak picks
+// the focused worker, and a single-hit set (the conductor has already autotitled
+// so only the worker still wears the generic label) returns it with no tiebreak
+// at all. Belt 2 then reads a stored id that disagrees with the live conductor
+// tab under a generic label and ALLOWS the close of the live conductor chat.
+// That is the same wrong-close 300885f closed on the takeover path, re-entering
+// through capture instead of inheritance.
+//
+// So: while any worker is inside that pre-handle window, a generic-label probe
+// is undecidable and must return the prior id. Bounded by age rather than left
+// open-ended because nothing in the production path stamps terminated_at on a
+// row whose worker died before signal_done, and an unbounded predicate would let
+// one such row wedge conductor capture permanently. 120s is ~14x the measured
+// worst case. Doctrine: a-capture-keyed-on-a-generic-label-is-a-guess-2026-08-29.
+const SPAWN_HANDLE_GRACE_MS = 120000
+function _hasSpawningUnclaimedWorker(nowMs) {
+  const now = nowMs || Date.now()
+  const pending = (row) => {
+    if (!row || row.terminated_at) return false
+    if (row.tab_handle && row.tab_handle.tabId) return false
+    const t = Date.parse(row.registered_at || '')
+    if (!isFinite(t)) return false
+    return (now - t) >= 0 && (now - t) <= SPAWN_HANDLE_GRACE_MS
+  }
+  for (const [, w] of workers.entries()) { if (pending(w)) return true }
+  try {
+    for (const f of fs.readdirSync(WORKERS_DIR)) {
+      if (!f.endsWith('.json')) continue
+      const id = f.slice(0, -5)
+      if (workers.has(id)) continue
+      try { if (pending(JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, f), 'utf8')))) return true } catch (e) {}
+    }
+  } catch (e) {}
+  return false
+}
+
 // Stamp the captured id onto this worker's session anchor too, so the anchor
 // record carries the same stable handle the registry row does. Best-effort.
 function _stampAnchorTabId(workerTabId, tabId) {
@@ -3320,6 +3363,18 @@ async function _captureConductorStableTabId(titleMatch, idePort, priorId) {
     // A worker sentinel must never name the conductor. Same rejection the
     // title_match write applies, applied to the id so the pair cannot diverge.
     if (isWorkerShapedLabel(tm)) return { tabId: prior, reason: 'worker_shaped_label' }
+    // A generic label is not an identity (belt 2's own rule), and a worker whose
+    // tab_handle has not landed yet is invisible to the claimed-id filter, so a
+    // generic probe taken while one is spawning can capture the WORKER's tab.
+    // See _hasSpawningUnclaimedWorker. Replace-only: the row keeps what it had,
+    // belt 2 falls back to the label ladder, which refuses. Leak, never
+    // wrong-close. NOT a blanket genericness gate: outside the spawn window the
+    // capture still runs for a generic label, because that is the window belt 2
+    // needs an id in most and declining there would strand the conductor with
+    // neither an id nor a matching label once Claude Code autotitles it.
+    if (isGenericLabelStr(tm) && _hasSpawningUnclaimedWorker()) {
+      return { tabId: prior, reason: 'generic_label_worker_spawning' }
+    }
     let tabs
     try { tabs = await _liveCcTabsWithIds(idePort) }
     catch (e) { return { tabId: prior, reason: 'bridge_unreachable' } }
@@ -3794,6 +3849,7 @@ module.exports = {
   // Stable IDE tab id (2026-08-29): capture at bind, resolve at close.
   _captureStableTabId: _captureStableTabId,
   _captureConductorStableTabId: _captureConductorStableTabId,
+  _hasSpawningUnclaimedWorker: _hasSpawningUnclaimedWorker,
   _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
   _resolveStableIdCloseTargetRecapturing: _resolveStableIdCloseTargetRecapturing,
   // Exported 2026-08-29 for cowork.cleanup_orphan_workers, the recurring sweep

@@ -281,6 +281,103 @@ const coord = require('./coord.js')
   assert(st.conductor.stable_tab_id === 'ttab_reminted_1_1',
     'a tab CLAIMED by a worker row is never captured as the conductor (got ' + st.conductor.stable_tab_id + ')')
 
+  // (r) THE HOLE IN (q). A worker's row claims nothing until dispatch_worker
+  // captures its tab_handle, measured 3.79-8.33s after registration (median
+  // 5.55s, n=29). For that whole window the worker's tab wears the generic spawn
+  // label AND is the focused tab, because a new tab steals focus. So the (q)
+  // filter, which is the ONLY thing standing between a generic probe and a
+  // worker's id, is blind for exactly as long as the tab is most confusable.
+  // Two doors, and the tiebreak one is only the first.
+  const pendingWorker = (regAtMs) => fs.writeFileSync(
+    path.join(tmpRoot, 'workers', 'tab_pending.json'), JSON.stringify({
+      tab_id: 'tab_pending', terminated_at: null, tab_handle: null,
+      registered_at: new Date(regAtMs).toISOString(),
+    }))
+  const dropPendingWorker = () => { try { fs.unlinkSync(path.join(tmpRoot, 'workers', 'tab_pending.json')) } catch (e) {} }
+
+  // DOOR 1: the same-label tiebreak hands the conductor slot to the FOCUSED
+  // worker. Pre-fix this captured ttab_spawn_1_1 and belt 2 then ALLOWED the
+  // close of the live conductor tab.
+  pendingWorker(Date.now() - 4000)
+  LIVE = [ tab('ttab_cond_r_1_1', 'Claude Code', false, 0), tab('ttab_spawn_1_1', 'Claude Code', true, 1) ]
+  await coord.conductor_heartbeat({ title_match: 'Claude Code' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_reminted_1_1',
+    'DOOR 1: a generic probe taken while a worker is pre-tab_handle keeps the PRIOR id (got ' + st.conductor.stable_tab_id + ')')
+
+  // DOOR 2: no tiebreak is involved at all. The conductor has already autotitled
+  // so it no longer wears the stale-generic title_match, leaving the spawning
+  // worker as the SINGLE hit, returned directly.
+  LIVE = [ tab('ttab_cond_r_1_1', 'Studio', false, 0), tab('ttab_spawn_1_1', 'Claude Code', true, 1) ]
+  await coord.conductor_heartbeat({ title_match: 'Claude Code' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_reminted_1_1',
+    'DOOR 2: a SINGLE generic hit that is a spawning worker is not captured either (got ' + st.conductor.stable_tab_id + ')')
+
+  // The helper's own contract, so the reason is pinned and not inferred.
+  ;(() => {
+    const r = coord._hasSpawningUnclaimedWorker()
+    assert(r === true, 'the spawn-window predicate SEES a row that has no tab_handle yet')
+  })()
+
+  // The predicate reads TWO populations and a test that drives only one leaves
+  // the other undefended (measured: disabling the in-memory branch left all 11
+  // suites green). A live worker sits in the in-memory map AND is skipped by the
+  // on-disk loop precisely because it is in the map, so the map branch is the
+  // only thing covering a worker that registered this process.
+  ;(() => {
+    dropPendingWorker()
+    assert(coord._hasSpawningUnclaimedWorker() === false, 'premise: no pending worker before the in-memory register')
+    coord._registerWorkerInternal({ tab_id: 'tab_inmem', task_id: 'tm1', tab_credential: 'cred-inmem' })
+    assert(coord._hasSpawningUnclaimedWorker() === true,
+      'the predicate sees a worker held in the IN-MEMORY map, not just one on disk')
+  })()
+  LIVE = [ tab('ttab_cond_r_1_1', 'Claude Code', false, 0), tab('ttab_spawn_1_1', 'Claude Code', true, 1) ]
+  await coord.conductor_heartbeat({ title_match: 'Claude Code' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_reminted_1_1',
+    'DOOR 1 via the IN-MEMORY registry: prior id kept (got ' + st.conductor.stable_tab_id + ')')
+  coord._workersMap().delete('tab_inmem')
+  try { fs.unlinkSync(path.join(tmpRoot, 'workers', 'tab_inmem.json')) } catch (e) {}
+  assert(coord._hasSpawningUnclaimedWorker() === false, 'cleanup: the in-memory worker is gone')
+
+  // (s) ANTI-OVERREACH A: this must not become a blanket genericness gate.
+  // Outside the spawn window a generic label still captures, which is the
+  // author's line-238 point and it stands: that window is where belt 2 needs an
+  // id most, and declining there would strand the conductor with neither an id
+  // nor a matching label the moment Claude Code autotitles it.
+  pendingWorker(Date.now() - 10 * 60 * 1000)   // aged past SPAWN_HANDLE_GRACE_MS
+  assert(coord._hasSpawningUnclaimedWorker() === false,
+    'a row aged past the grace window no longer blocks capture (nothing stamps terminated_at on a died-at-spawn row)')
+  LIVE = [ tab('ttab_aged_1_1', 'Claude Code', true, 0) ]
+  await coord.conductor_heartbeat({ title_match: 'Claude Code' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_aged_1_1',
+    'ANTI-OVERREACH: capture still runs for a GENERIC label outside the spawn window (got ' + st.conductor.stable_tab_id + ')')
+
+  // A TERMINATED row does not block either.
+  fs.writeFileSync(path.join(tmpRoot, 'workers', 'tab_pending.json'), JSON.stringify({
+    tab_id: 'tab_pending', terminated_at: new Date().toISOString(), tab_handle: null,
+    registered_at: new Date().toISOString(),
+  }))
+  assert(coord._hasSpawningUnclaimedWorker() === false, 'a TERMINATED pre-handle row does not block capture')
+
+  // (t) ANTI-OVERREACH B: a NON-generic title_match is unaffected by the spawn
+  // window. A spawning worker wears the generic label, so it cannot be the hit.
+  pendingWorker(Date.now() - 3000)
+  LIVE = [ tab('ttab_ng_cap_1_1', 'Ecodia Site', true, 0), tab('ttab_spawn_1_1', 'Claude Code', false, 1) ]
+  await coord.conductor_heartbeat({ title_match: 'Ecodia Site' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_ng_cap_1_1',
+    'ANTI-OVERREACH: a NON-generic label captures normally while a worker spawns (got ' + st.conductor.stable_tab_id + ')')
+  dropPendingWorker()
+
+  // Restore the id the rest of this script expects.
+  LIVE = [ tab('ttab_reminted_1_1', 'Claude Code', true, 0) ]
+  await coord.conductor_heartbeat({ title_match: 'Claude Code' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_reminted_1_1', 'capture restored for the remainder of the script')
+
   // ── Part 2b: the helper's OWN contract ────────────────────────────────────
   // Parts 2's assertions go through register_conductor / conductor_heartbeat,
   // and BOTH callers already sanitise a worker-shaped title_match upstream and
