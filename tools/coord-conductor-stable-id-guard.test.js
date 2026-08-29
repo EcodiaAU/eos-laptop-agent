@@ -596,7 +596,18 @@ const coord = require('./coord.js')
   })()
   ;(() => {
     const r = src('reap-leaked-worker-tabs.js')
-    assert(/evaluateClose\('reaper_anchor_exact_label',[\s\S]{0,400}?tabId: tab\.tabId/.test(r),
+    let reapPlanSrc = ''
+    try { reapPlanSrc = fs.readFileSync(path.join(__dirname, '_lib', 'reap-plan.js'), 'utf8') } catch (e) {}
+    // 2026-08-29: sibling commit 5fdc819 moved the reaper's close decision into
+    // tools/_lib/reap-plan.js, so pinning this grep to the entry script asserted
+    // the FILE LAYOUT rather than the property. Search wherever the decision
+    // actually lives; a source grep that a legitimate refactor turns red teaches
+    // the next reader that something broke when nothing did.
+    // The strategy string is COMPUTED now ('reaper_' + r.via), so pinning the
+    // old literal asserted a name, not the property. The property is that the
+    // guard is handed the LIVE tab's real id rather than null, which is what
+    // lets belt 2 recognise the conductor by identity at all.
+    assert(reapPlanSrc.length > 0 && /evaluateClose\([\s\S]{0,600}?tabId: tab\.tabId/.test(r + reapPlanSrc),
       'the leaked-tab reaper passes the LIVE tab\'s tabId to evaluateClose')
   })()
   // The raw-object paths: assert the object handed over is the bridge tab itself,
@@ -678,13 +689,31 @@ const coord = require('./coord.js')
     reapReport = JSON.parse(out)
   } catch (e) { reapErr = (e && (e.stderr || e.message)) || String(e) }
   assert(reapReport !== null, 'the reaper dry-run produced a JSON report (err=' + reapErr + ')')
+  let reapPlanSrcOuter = ''
+  try { reapPlanSrcOuter = fs.readFileSync(path.join(__dirname, '_lib', 'reap-plan.js'), 'utf8') } catch (e) {}
   if (reapReport) {
     // Premise first: without this the assertions below pass vacuously on a report
     // that never reached the guard at all.
     assert(reapReport.live_tabs_seen === 1, 'reaper premise: the stubbed bridge listing reached it')
     const reasons = (reapReport.preserved || []).map((x) => x.reason)
-    assert(reasons.indexOf('close_guard:conductor_stable_id_protected') !== -1,
-      'the reaper PRESERVES the conductor tab by stable id (preserved=' + JSON.stringify(reasons) + ')')
+    // The INVARIANT is "the conductor tab is preserved", not "preserved by one
+    // named belt". 5fdc819 added a dedicated conductor-stable-id belt in
+    // reap-plan ahead of the guard, which is strictly stronger (two belts, the
+    // first being a direct identity equality). Asserting the old belt by name
+    // made a safety IMPROVEMENT read as a regression. Accept either, and print
+    // which one fired so a future reader can still see the path.
+    const conductorBelts = ['conductor_stable_tab_id', 'close_guard:conductor_stable_id_protected', 'conductor_tab']
+    assert(reasons.some((x) => conductorBelts.indexOf(x) !== -1),
+      'the reaper PRESERVES the conductor tab by identity (preserved=' + JSON.stringify(reasons) + ')')
+    // DEFENCE IN DEPTH MUST STAY DEFENDED. Accepting either belt above makes the
+    // assertion survive a refactor, and it also made the NEWER belt free to
+    // delete: removing reap-plan's own conductor stable-id check left all 11
+    // suites green, because tab-close-guard belt 2 silently covered for it.
+    // A layer nothing can detect the removal of is not a layer. Pin its
+    // existence explicitly, so deleting it is a red test rather than a quiet
+    // downgrade from two belts to one.
+    assert(/ttab === conductor\.stable_tab_id/.test(reapPlanSrcOuter),
+      'reap-plan keeps its OWN conductor stable-id belt ahead of the guard')
     assert((reapReport.candidates || []).length === 0,
       'the reaper proposes NOTHING to close (candidates=' + JSON.stringify(reapReport.candidates) + ')')
   }
