@@ -164,4 +164,79 @@ ok('a tab with no anchor and no registry row is reported, not silently invisible
   assert.strictEqual(reasonFor(rep, 'ttab_orphan_1_1'), 'no_anchor_no_registry_row')
 })
 
+// ── THE 2026-08-29 LANE C5 ANCHOR-KEY COLLISION. ────────────────────────────
+// The label was the tier-1 join key and a label is not unique across fires of
+// one cron: the dispatch sentinel comes from the row's task_id, Claude Code
+// truncates the title at 24 chars, so every fire renders a BYTE-IDENTICAL label.
+// Measured live at 16:41Z: the handle ttab_mtelxb62_1_1 resolved
+// via=anchor_exact_label to tab_1788006622530_7f429531, which is not the calling
+// tab and is in no registry row, out of an anchor written 4h11m earlier by the
+// PREVIOUS fire of that cron. The fixtures below are that exact shape.
+const STALE_TTAB = 'ttab_mtecz9vl_1_1'   // the dead fire's stable id
+const LIVE_TTAB = 'ttab_mtelxb62_1_1'    // the live fire's stable id
+const CRON_LABEL = '[ea2e ecodiaos lane C3 r…'
+
+ok('a stale same-label anchor from a dead cron fire loses to the live tab', () => {
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TTAB, label: CRON_LABEL })],
+    // The ONLY anchor on disk bearing this label belongs to the dead fire and
+    // names the dead fire's tab. This is the measured case: the current fire
+    // wrote no anchor at all.
+    anchors: [{ label: CRON_LABEL, tab_id: 'tab_deadfire', tabId: STALE_TTAB, role: 'worker', session_id: 'sdead' }],
+    rows: {
+      // The dead fire's row is stranded un-terminated, so winning the join with
+      // it does REAL harm: the battery reads worker_row_is_not_terminated off
+      // the wrong row and preserves a tab that is genuinely collectable.
+      tab_deadfire: row({ terminated_at: null, tab_handle: { tabId: STALE_TTAB } }),
+      tab_livefire: row({ tab_handle: { tabId: LIVE_TTAB, sentinel_prefix: '[ea2e ecodiaos lane C3 reap leaked worker tabs]' } }),
+    },
+  })
+  assert.strictEqual(rep.candidates.length, 1,
+    'the stale anchor won the label join and cost a collection')
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_livefire',
+    'resolved to the DEAD fire\'s tab_id: this is the 16:41Z measurement')
+  assert.strictEqual(rep.candidates[0].via, 'stable_tab_id')
+})
+
+ok('CONTROL: an anchor whose stable id NAMES this tab still resolves by label', () => {
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TTAB, label: CRON_LABEL })],
+    anchors: [{ label: CRON_LABEL, tab_id: 'tab_livefire', tabId: LIVE_TTAB, role: 'worker', session_id: 'slive' }],
+    rows: { tab_livefire: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 1)
+  assert.strictEqual(rep.candidates[0].via, 'anchor_exact_label',
+    'narrowing the join must not break the case it was meant to keep')
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_livefire')
+})
+
+ok('stale AND fresh anchors on one label: the fresh one wins outright', () => {
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TTAB, label: CRON_LABEL })],
+    anchors: [
+      { label: CRON_LABEL, tab_id: 'tab_deadfire', tabId: STALE_TTAB, role: 'worker', session_id: 'sdead' },
+      { label: CRON_LABEL, tab_id: 'tab_livefire', tabId: LIVE_TTAB, role: 'worker', session_id: 'slive' },
+    ],
+    rows: { tab_livefire: row({}), tab_deadfire: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 1,
+    'two same-label anchors used to collapse to multiple_anchors_claim_this_tab')
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_livefire')
+  assert.strictEqual(rep.candidates[0].via, 'anchor_exact_label')
+})
+
+ok('GUARD INTACT: two anchors with NO stable id on one label still refuse', () => {
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TTAB, label: CRON_LABEL })],
+    anchors: [
+      { label: CRON_LABEL, tab_id: 'tab_fireA', role: 'worker', session_id: 'sa' },
+      { label: CRON_LABEL, tab_id: 'tab_fireB', role: 'worker', session_id: 'sb' },
+    ],
+    rows: { tab_fireA: row({}), tab_fireB: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 0,
+    'an anchor carrying no stable id must keep the label-only behaviour, ambiguity included')
+  assert.strictEqual(reasonFor(rep, LIVE_TTAB), 'multiple_anchors_claim_this_tab')
+})
+
 console.log('\n' + passed + ' passed (' + path.basename(__filename) + ')')

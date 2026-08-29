@@ -1351,7 +1351,31 @@ async function _resolveWorkerAnchorCloseTarget(workerTabId, idePort) {
     let liveTabs
     try { liveTabs = await _chatInject.listChatTabs() } catch (e) { return null }
     if (!liveTabs || !liveTabs.length) return null
-    const cand = _resolveAnchorToTab(rec, liveTabs)  // exact-label unique / position on collision
+    // THE ANCHOR'S STABLE ID BREAKS THE CRON TIE (2026-08-29 lane C5).
+    //
+    // _resolveAnchorToTab is exact-label-unique, then viewColumn+index on a
+    // collision. Both halves fail on a recurring cron for the same reason: every
+    // fire of one cron renders a byte-identical truncated label, so while a
+    // sibling fire's tab is open the label matches two tabs, and the position
+    // tiebreak reads a viewColumn+index captured turns ago that has since
+    // shifted as other tabs opened and closed around it. The result is null and
+    // a guaranteed leak, on exactly the population that leaks most.
+    //
+    // The anchor already carries the answer: coord's _stampAnchorTabId writes
+    // the bridge's stable id onto it at signal_bound. Use it, and REQUIRE THE
+    // LABEL TO CORROBORATE. Corroboration is not ceremony here: assignStableTabIds
+    // pass 2 rehomes a freed id onto whatever tab inherits its (viewColumn,index)
+    // slot, so a stored id can outlive the tab it was minted for, and id-alone
+    // would hand a stranger's tab to a close. Id plus label defeats that, which
+    // is the same bar reap-plan's tier 2 sets for the same reason. So this can
+    // only ever pick from the set the label path was already willing to accept;
+    // it decides WHICH of them, where the label path had to give up.
+    let cand = null
+    if (rec.tabId) {
+      const byId = liveTabs.filter((t) => t.tabId && t.tabId === rec.tabId && t.label === rec.label)
+      if (byId.length === 1) cand = byId[0]
+    }
+    if (!cand) cand = _resolveAnchorToTab(rec, liveTabs)  // exact-label unique / position on collision
     if (!cand) return null
     // Ownership-conflict guard: if ANY OTHER anchor resolves to this same live tab,
     // one is a mis-capture - refuse (safe leak), same guard the session-inject path uses.
@@ -1360,6 +1384,16 @@ async function _resolveWorkerAnchorCloseTarget(workerTabId, idePort) {
     // that spurious refusal, over 1000+ accreted anchors, was a silent-failure class.
     const conflict = _freshAnchors().some((a) => {
       if (!a || a.session_id === rec.session_id) return false
+      // 2026-08-29 lane C5. An anchor that NAMES A DIFFERENT LIVE TAB is not a
+      // rival claim on this one, it is a positive statement about somewhere
+      // else, and letting it veto here is what the cron collision does to this
+      // guard: the previous fire's anchor is still inside the 30-minute freshness
+      // window, wears the byte-identical label, and so resolves onto the current
+      // fire's tab by label and refuses every close. The guard exists to catch a
+      // focus-race MIS-CAPTURE, where two anchors genuinely believe they own one
+      // tab; an anchor holding a different stable id believes no such thing.
+      // A conflicting anchor with no stable id still vetoes, exactly as before.
+      if (a.tabId && cand.tabId && a.tabId !== cand.tabId) return false
       const t = _resolveAnchorToTab(a, liveTabs)
       return t && t.viewColumn === cand.viewColumn && t.index === cand.index
     })
@@ -1478,10 +1512,16 @@ async function _liveCcTabsWithIds(idePort) {
 // A terminated row still owns its id: its corpse tab is exactly what a later
 // fire of the same cron must not claim. Reads the in-memory map and the disk
 // rows, because a row written across the HTTP boundary is only on disk.
-function _claimedStableTabIds(exceptTabId) {
+// opts.liveOnly skips rows that are already TERMINATED. reap-plan's equivalent
+// (liveClaimedTtab) has always made that exclusion; this function never did, and
+// the asymmetry is load-bearing rather than cosmetic. See the fossil-claim note
+// in _captureStableTabId for the guaranteed leak it produces.
+function _claimedStableTabIds(exceptTabId, opts) {
+  const liveOnly = !!(opts && opts.liveOnly)
   const claimed = new Set()
   const take = (id, row) => {
     if (!row || id === exceptTabId) return
+    if (liveOnly && row.terminated_at) return
     const t = row.tab_handle && row.tab_handle.tabId
     if (t) claimed.add(t)
   }
@@ -1604,7 +1644,17 @@ function _storedIdContradicted(th, tabs, tab_id, want) {
   if (!th || !tabs || !tabs.length || !want) return false
   const held = tabs.find((t) => t.tabId === want)
   if (!held) return false                       // not live: the not_live path owns this
-  try { if (_claimedStableTabIds(tab_id).has(want)) return true } catch (e) {}
+  // liveOnly (2026-08-29 lane C5). This is the SECOND place the fossil claim
+  // blocks, and it blocks after the first one has been repaired: recapture
+  // correctly takes a recycled id, the wrapper re-resolves, and this conjunct
+  // then reads the dead fire's corpse row still naming that id and answers
+  // stable_id_not_mine. Found by the lane C5 test, not reasoned about.
+  // A TERMINATED row is not another live worker, so its claim cannot be the
+  // evidence this conjunct is looking for. The identity arm below (some OTHER
+  // live tab wears my sentinel while the held tab does not) is untouched, and it
+  // is the arm that caught the real 2026-08-29 wrong-close of the "Crons" chat,
+  // which had no registry row at all and so was never seen by this conjunct.
+  try { if (_claimedStableTabIds(tab_id, { liveOnly: true }).has(want)) return true } catch (e) {}
   const spawnLabel = th.label || th.label_at_spawn
   const haveSentinel = !!th.sentinel_prefix
   const haveSpawn = !!(spawnLabel && !isGenericLabelStr(spawnLabel))
@@ -1798,7 +1848,45 @@ async function _captureStableTabId(tab_id, opts) {
     // mine, whether one tab matched or five.
     {
       const claimed = _claimedStableTabIds(tab_id)
-      const unclaimed = hits.filter((t) => !claimed.has(t.tabId))
+      let unclaimed = hits.filter((t) => !claimed.has(t.tabId))
+      // A FOSSIL CLAIM IS NOT A CLAIM (2026-08-29 lane C5).
+      //
+      // The claimed-set exists to stop this worker taking an id that belongs to
+      // ANOTHER LIVE WORKER. It was built over every row on disk, terminated
+      // ones included, and a terminated row's stored id is not a live worker's
+      // property, it is a fossil. That matters because the bridge RECYCLES ids:
+      // assignStableTabIds pass 2 matches on (viewColumn, index), so when a tab
+      // closes, the tab that shifts into its slot INHERITS its id. Every worker
+      // tab lives at the end of viewColumn 1, so this is routine, not exotic.
+      //
+      // The resulting shape is a guaranteed leak and it is the one the field log
+      // shows. Fire N terminates and its row keeps id X. Fire N+1's tab inherits
+      // X. At N+1's close its own bind-time id is dead, so the recapturing
+      // wrapper drops it and re-matches by sentinel; the sole live tab wearing
+      // that sentinel is N+1's own, holding X; X is "claimed" by N's corpse row;
+      // every hit is filtered; sentinel_all_claimed; the row is left with no id
+      // and marked as having HAD one, which _resolveStableIdCloseTarget answers
+      // as the TERMINAL stable_id_dropped_not_recaptured. Nothing below it runs.
+      // Measured in the agent log across three consecutive orphan sweeps:
+      // stable_id_dropped_not_recaptured 26, then 34, then 41, and 0 or 1 closes
+      // out of 76 to 93 candidates.
+      //
+      // ONLY THE SINGLE-HIT CASE IS RELAXED, and that is what keeps it safe. One
+      // live tab wearing my non-generic sentinel IS mine: a sibling fire's corpse
+      // would be a SECOND tab wearing it, and the multi-hit path below is
+      // untouched, so the corpse-still-open case still filters against the full
+      // claimed set and still refuses when two survive. The relaxed case
+      // therefore cannot pick a stranger's tab, because a stranger's tab does
+      // not wear my sentinel. And a claim from a row that is NOT terminated
+      // still blocks unconditionally, which is the property the set was built
+      // for. Fail-safe direction is unchanged: worst case here is a leak.
+      if (!unclaimed.length && hits.length === 1) {
+        const liveClaimed = _claimedStableTabIds(tab_id, { liveOnly: true })
+        if (!liveClaimed.has(hits[0].tabId)) {
+          unclaimed = hits
+          via = via + '_fossil_claim_ignored'
+        }
+      }
       if (!unclaimed.length) {
         return { ok: false, reason: 'sentinel_all_claimed', candidates: hits.length }
       }
@@ -2899,6 +2987,23 @@ async function list_channels(params, ctx) {
       // caller ended up sending to something the directory had already flagged.
       addressable: !!address,
       task_id: workerMatch ? workerMatch.task_id : null,
+      // 2026-08-29 lane C5. THE WORKER'S OWN tab_id, emitted so a caller can tie
+      // a directory row to a worker by IDENTITY rather than by parsing the
+      // address string. It is additive and nothing that reads `address` changes.
+      //
+      // WHY IT HAD TO BE ADDED. conductor_heartbeat.py writes a worker's session
+      // anchor only after it POSITIVELY ties the live tab to this worker, and
+      // its tie was `address === 'chat.' + worker_tab_id + '.inbox'`. When the
+      // mailbox became lane-keyed (f2be49b) `address` above started resolving to
+      // chat.lane.<lane>.inbox for every lane-bearing worker, so that string is
+      // never emitted any more and the tie silently found zero rows. The anchor
+      // write is best-effort and returns quietly, so nothing reported it.
+      // MEASURED: 1542 worker anchors on disk, the newest written 14:17Z, and
+      // ZERO written in the 1h50m and 7 dispatches after f2be49b landed at
+      // 15:06Z. That is the whole T2 close tier dark for the entire fleet.
+      // An address is a ROUTE and it is allowed to change; a tab_id is an
+      // IDENTITY and it is not. Ties belong on the identity.
+      tab_id: workerMatch ? workerMatch.tab_id : null,
       worker_status: workerMatch ? (workerMatch.status || null) : null,
     })
   }

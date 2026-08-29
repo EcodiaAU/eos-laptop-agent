@@ -586,6 +586,65 @@ function setTabId(tab_id, ttab) {
   ok('a tab another registry row already claims is never closed as mine',
     thief.tabId !== 'ttab_owned_by_claimant', JSON.stringify(thief))
 
+  // ── A FOSSIL CLAIM IS NOT A CLAIM (2026-08-29 lane C5). ───────────────────
+  //
+  // The claimed-set was built over EVERY row on disk, terminated ones included,
+  // and the bridge recycles ids: assignStableTabIds pass 2 matches on
+  // (viewColumn, index), so a tab that shifts into a closed tab's slot INHERITS
+  // its id. Every worker tab lives at the end of viewColumn 1, so this is the
+  // normal case for a cron. Fire N terminates holding id X, fire N+1's live tab
+  // inherits X, and at N+1's close the recapture found its own tab, saw X
+  // "claimed" by N's corpse row, filtered every hit and returned
+  // sentinel_all_claimed. The row was then left with no id AND marked as having
+  // had one, which resolves as the TERMINAL stable_id_dropped_not_recaptured, so
+  // the anchor and label tiers below it never ran. Guaranteed leak, every fire.
+  // Field evidence: three consecutive orphan sweeps reporting
+  // stable_id_dropped_not_recaptured 26, then 34, then 41, closing 0 or 1 of
+  // 76 to 93 candidates.
+  const terminate = (tab_id) => {
+    const w = coord.loadWorkerRegistry(tab_id)
+    w.terminated_at = new Date().toISOString()
+  }
+
+  mkCronWorker('w-fossil-corpse', 0)
+  setTabId('w-fossil-corpse', 'ttab_recycled_id')
+  terminate('w-fossil-corpse')
+  mkCronWorker('w-fossil-live', 1)
+  setTabId('w-fossil-live', 'ttab_now_dead')     // its bind-time id, since re-minted
+  LIVE_TABS = [{ tabId: 'ttab_recycled_id', label: SENTINEL, viewColumn: 1, index: 0 }]
+  const fossil = await coord._resolveStableIdCloseTargetRecapturing('w-fossil-live', 7457)
+  ok('a recycled id claimed only by a TERMINATED row is recaptured, not refused',
+    fossil.tabId === 'ttab_recycled_id', JSON.stringify(fossil))
+
+  // THE CONTROL, and it is the whole safety argument. Identical fixture, one
+  // variable changed: the claiming row is still RUNNING. A live worker's claim
+  // must still block unconditionally, because taking it would close a running
+  // worker, which is the worst thing this subsystem can do.
+  mkCronWorker('w-livecorpse-claimant', 0)
+  setTabId('w-livecorpse-claimant', 'ttab_recycled_id2')
+  mkCronWorker('w-livecorpse-taker', 1)
+  setTabId('w-livecorpse-taker', 'ttab_now_dead2')
+  LIVE_TABS = [{ tabId: 'ttab_recycled_id2', label: SENTINEL, viewColumn: 1, index: 0 }]
+  const livecl = await coord._resolveStableIdCloseTargetRecapturing('w-livecorpse-taker', 7457)
+  ok('CONTROL: the same id claimed by a RUNNING row is still refused',
+    livecl.tabId !== 'ttab_recycled_id2', JSON.stringify(livecl))
+
+  // And the relaxation is single-hit only. Two live tabs wearing the sentinel
+  // means the sibling fire's corpse is still open and there is a real choice to
+  // get wrong, so the full claimed set still applies and ambiguity still refuses.
+  mkCronWorker('w-twohit-corpse', 0)
+  setTabId('w-twohit-corpse', 'ttab_twohit_a')
+  terminate('w-twohit-corpse')
+  mkCronWorker('w-twohit-live', 1)
+  setTabId('w-twohit-live', 'ttab_twohit_gone')
+  LIVE_TABS = [
+    { tabId: 'ttab_twohit_a', label: SENTINEL, viewColumn: 1, index: 0 },
+    { tabId: 'ttab_twohit_b', label: SENTINEL, viewColumn: 1, index: 1 },
+  ]
+  const twohit = await coord._resolveStableIdCloseTargetRecapturing('w-twohit-live', 7457)
+  ok('CONTROL: two live tabs wear the sentinel, so the corpse claim still filters and one survives',
+    twohit.tabId === 'ttab_twohit_b', JSON.stringify(twohit))
+
   ide.tabs = realTabs
   ide.tabs_close = realClose
   console.log('\n' + (fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'))

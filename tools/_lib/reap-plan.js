@@ -13,7 +13,12 @@
 //
 // planReap(input) -> { candidates, preserved }
 //   input.liveTabsIde  [{ tabId, label, index, viewColumn, active }]
-//   input.anchors      chat-tabs records having BOTH label and tab_id
+//   input.anchors      chat-tabs records having BOTH label and tab_id, and
+//                      OPTIONALLY tabId (the bridge's stable id, stamped by
+//                      coord's _stampAnchorTabId). When present it is the join
+//                      key and the label is only corroboration; see the tier 1
+//                      note below for the cron collision that makes that
+//                      necessary.
 //   input.rows         Map<worker tab_id, registry row>
 //   input.liveWriters  Map<worker tab_id, newest transcript turn ms>
 //   input.conductor    the conductor registration
@@ -56,11 +61,41 @@ function planReap(input) {
   // Resolve each anchor to a live tab by EXACT label. Signal 1 and 4 both fall
   // out of this map: an anchor with several exact-label hits is not resolved,
   // and a live tab claimed by more than one anchor is dropped entirely.
+  // THE ANCHOR'S OWN STABLE ID OUTRANKS ITS LABEL (2026-08-29 lane C5).
+  //
+  // The label was doing the whole job of the join, and a label is not unique
+  // across fires of one cron. The dispatch sentinel is derived from the row's
+  // task_id, Claude Code truncates the title at 24 chars, and every fire of one
+  // cron therefore wears a BYTE-IDENTICAL label. So a dead fire's anchor matched
+  // the live tab of the current fire and handed back the DEAD fire's tab_id.
+  //
+  // MEASURED 2026-08-29T16:41Z, and this is the probe that named the defect:
+  // the live handle ttab_mtelxb62_1_1 resolved via=anchor_exact_label to
+  // tab_1788006622530_7f429531, a tab_id that is not the calling tab and appears
+  // nowhere in the 54-row worker registry. It came from
+  // chat-tabs/455634df-....json, written 12:30:22Z by the PREVIOUS fire of that
+  // same cron, carrying its own tabId ttab_mtecz9vl_1_1.
+  //
+  // THE FIX IS A FILTER, NOT A NEW MATCHER. An anchor that carries a tabId is
+  // making a positive claim about WHICH tab it is, so it may only claim the tab
+  // whose id it names. An anchor with no tabId keeps the label-only behaviour
+  // unchanged, which is what the legacy corpus needs. Against the measured case:
+  // the stale anchor names ttab_mtecz9vl_1_1, the live tab is ttab_mtelxb62_1_1,
+  // no claim, tier 1 yields nothing, and tier 2 resolves the tab correctly off
+  // the registry row's own stable id.
+  //
+  // ON RECOGNITION VS PERMISSION. This mostly REMOVES claims, and where it adds
+  // one it is the stale-plus-fresh case: two anchors wear the label, only the
+  // fresh one names this tab, so a pair that used to collapse to
+  // 'multiple_anchors_claim_this_tab' now resolves to the LIVE fire's tab_id.
+  // That is the intended outcome and it buys no permission: signals 2, 3, 5, 6
+  // and 7 run afterwards from the one shared battery, unweakened.
   const byTtab = new Map()   // ttab id -> [{anchor, tab}]
   for (const a of anchors) {
     const exact = liveTabsIde.filter((t) => t.label === a.label && t.tabId)
     if (exact.length !== 1) continue
     const tab = exact[0]
+    if (a.tabId && a.tabId !== tab.tabId) continue
     if (!byTtab.has(tab.tabId)) byTtab.set(tab.tabId, [])
     byTtab.get(tab.tabId).push({ anchor: a, tab: tab })
   }
