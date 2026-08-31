@@ -132,6 +132,15 @@ const BA_ACCOUNT_MAP = {
 // number (12566110) appeared as an element value, while the VISIBLE pageContext listed three numbers
 // (ambiguous). Match an element whose text is EXACTLY a known BA account number (whole-value match,
 // so a transaction description containing digits cannot false-positive); require exactly one distinct.
+// public.vault_approvals.id is a uuid, so only a uuid-shaped requestId can name an approval.
+// Every other requestId is a caller's trace tag (the bank-feed cron's 'ba-cron-YYYYMMDD'),
+// which names the recon file and nothing else. Whole-string match: a tag that merely CONTAINS
+// a uuid is still a tag.
+const APPROVAL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+function isApprovalRequestId(requestId) {
+  return typeof requestId === 'string' && APPROVAL_ID_RE.test(requestId.trim())
+}
+
 function accountFromNavDom(navDom) {
   if (!navDom) return null
   let parsed
@@ -604,11 +613,24 @@ async function pull(db) {
     // If this verified result answers a pending approval, mark it approved (arms the WAKE
     // that re-opens the conductor with the task continuation - so an approval that lands
     // hours later resumes the task instead of it dying while I was asleep).
+    //
+    // requestId carries TWO unrelated meanings and only one of them is an approval id.
+    // bank-feed-refresh-prompt.cjs sets it to a human trace tag ('ba-cron-20260831') purely
+    // so a landed capture is traceable to that cron in these logs and in the recon filename.
+    // vault_approvals.id is a uuid column, so passing a tag makes the lookup throw
+    // '22P02 invalid input syntax for type uuid' on EVERY result of every bank-feed run
+    // (measured 2026-08-31: 8 of 8 results on the ba-cron-20260831 pull). Harmless to the
+    // import, but it buried a real error class under a permanent one. Only ids that could
+    // BE an approval reach approve(); a trace tag records why it was skipped instead.
     if (ok && msg.requestId) {
-      try {
-        const { approve } = require('./vault-approval.js')
-        result.approval = await approve(db, msg.requestId, msg.approvedBy || 'tate')
-      } catch (e) { result.approvalError = e.message }
+      if (!isApprovalRequestId(msg.requestId)) {
+        result.approvalSkipped = 'requestId is a trace tag, not a uuid approval id'
+      } else {
+        try {
+          const { approve } = require('./vault-approval.js')
+          result.approval = await approve(db, msg.requestId, msg.approvedBy || 'tate')
+        } catch (e) { result.approvalError = e.message }
+      }
     }
     await db`UPDATE public.vault_inbox SET consumed_at = now(), sig_verified = ${ok}, note = ${result.action} WHERE id = ${row.id}`
     out.push(result)
@@ -623,7 +645,7 @@ module.exports = {
   // Phase 2 phone-delivered CSV import
   stageGroupedBaRows, parseCsv, parseBaCsvRows, importBankCsv, BA_CSV_ACCOUNTS, resolveBankCsvAccount,
   // Build 29 post-Search DOM recon merge (no-clobber, richest-per-URL) + navDom hidden-field attribution
-  mergeReconPages, accountFromNavDom,
+  mergeReconPages, accountFromNavDom, isApprovalRequestId,
 }
 
 if (require.main === module) {
