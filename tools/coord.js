@@ -386,6 +386,61 @@ function shouldWake(msg, policy) {
   return false
 }
 
+// Is this message a WORKER LIFECYCLE BROADCAST into the singleton conductor slot?
+// (2026-08-31, the half the 2026-08-28 per-tab-identity work did not reach.)
+//
+// `chat.conductor.inbox` is a SLOT, not an identity: every non-worker chat's
+// turn-start heartbeat overwrites the registration with its own handle, so the
+// slot means "whichever chat Tate typed in most recently". message_chat already
+// refuses to guess: a worker addressing `conductor` is rewritten to its recorded
+// parent session, and with no parent the message QUEUES rather than being
+// injected into a stranger (coord.js parent_rewrite, ~line 2884).
+//
+// That rule was enforced on the ADDRESSING path and nowhere else. signal_done
+// does not go through message_chat: it calls send_message directly with a
+// hardcoded `to: chat.conductor.inbox` (see the (a)/(b) split comment), so its
+// worker_report lands on the slot without ever meeting the guard, and then
+// wakeConductor's auto_type tier types it into whatever resolveLiveTargetTab
+// hands back. The refusal to guess was one layer too high.
+//
+// MEASURED 2026-08-31: 14,894 of 16,230 messages on disk are addressed to this
+// one slot, 13,422 of them worker lifecycle chatter (bound 6,737 / done 6,280 /
+// worker_report 405), against ~25 live workers. Four cron worker_reports in
+// three minutes were auto-typed into a chat that had dispatched none of them.
+//
+// scheduler.js:2011 already states the intended contract in the other direction:
+// "standing crons stay inbox-only (no wake), delayed/one_shot rows default to
+// REPORT-BACK". That gate is applied when composing the BRIEF, so a cron worker
+// is correctly given no report-back step, and then wakes a chat anyway on its way
+// out through signal_done. A cron has no dispatching chat by construction, so
+// there is no correct tab to wake and every injection is a guess.
+//
+// So: a message that reached the SLOT from a WORKER is a broadcast. It may toast
+// (a banner steals no focus and lands on no one's turn), it may never auto_type.
+// Non-worker senders are untouched: inbound_sms, error escalations and a peer
+// chat's deliberate push still wake exactly as before. This is deliberately
+// keyed on sender-is-a-worker rather than on a body.type allowlist, because the
+// type vocabulary drifts (worker_report was `done` until 2026-08-28) while the
+// structural fact does not.
+// Doctrine: [[conductor-is-a-slot-not-an-identity-2026-08-28]],
+//           [[a-slot-broadcast-plus-auto-type-is-a-misroute-generator-2026-08-31]].
+function slotBroadcastFromWorker(msg) {
+  try {
+    if (!msg || msg.to !== addressForConductor()) return { is: false }
+    const from = msg.from
+    if (!from || !workers.has(from)) return { is: false }
+    const w = workers.get(from) || {}
+    return {
+      is: true,
+      from: from,
+      task_id: w.task_id || null,
+      lane_name: w.lane_name || null,
+      parent_session: w.parent_session || null,
+      body_type: (msg.body && typeof msg.body === 'object') ? (msg.body.type || null) : null,
+    }
+  } catch (e) { return { is: false } }
+}
+
 function buildWakeNotice(msg) {
   const body = (msg.body && typeof msg.body === 'object') ? msg.body : {}
   const t = body.type || 'message'
@@ -499,6 +554,25 @@ async function wakeConductor(msg) {
           tiers.flash = { ok: null, note: 'dispatched, not awaited' }
         } catch (e) { tiers.flash = { ok: false, error: e && e.message } }
       }
+    }
+
+    // The refusal to guess, enforced where every path converges. Placed AFTER
+    // the toast tier (a broadcast still deserves a banner) and BEFORE both
+    // auto_type tiers (a broadcast never deserves someone else's turn).
+    const _cast = slotBroadcastFromWorker(msg)
+    if (policy.mode === 'auto_type' && _cast.is) {
+      tiers.auto_type = {
+        ok: false,
+        reason: 'slot_broadcast_not_injected',
+        detail: 'worker ' + _cast.from + ' addressed the conductor SLOT, which is not an identity. Toast only; the report is durable in chat.conductor.inbox and is read by the next coord.peek_inbox.',
+        from_worker: _cast.from,
+        task_id: _cast.task_id,
+        lane_name: _cast.lane_name,
+        parent_session: _cast.parent_session,
+        body_type: _cast.body_type,
+      }
+      record({ mode: policy.mode })
+      return
     }
 
     if (policy.mode === 'auto_type' && !guiCap.ok) {
