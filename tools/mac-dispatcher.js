@@ -188,9 +188,39 @@ function composeBrief(opts) {
     'Ignore it and the conductor will close this tab under you (coord.kill_worker),\n' +
     'and then nobody learns what you had done.\n'
 
-  const taskBlock = brief_storage === 'file'
+  // SEND ORIGIN (lane E2, 2026-09-01). The outbound ledger records who
+  // initiated a message, and it defaults to "unknown" unless the caller passes
+  // it. That default decides real behaviour: a cron- or worker-originated cold
+  // message to a client is STAGED AS A DRAFT rather than sent, so the person
+  // gets one coherent message from the daily comms pass instead of several
+  // fragments, and "unknown" opts out of that batching.
+  //
+  // The obvious fix, setting ECODIAOS_SEND_ORIGIN in the env this dispatcher
+  // hands the worker, DOES NOT EXIST TO BE SET. This dispatcher never spawns a
+  // child process. It drives the IDE bridge to open a Claude Code tab and then
+  // sends a Return keystroke, so the tab inherits the IDE's environment and
+  // nothing here can reach it. resolveOrigin reads process.env in whichever
+  // process evaluates it, which is the stdio MCP server (inheriting the IDE env
+  // on this Mac, shared with the conductor's own tabs, where a hardcoded "cron"
+  // would be a lie) or ecodia-api on the VPS.
+  //
+  // So the attribution has to travel in the brief, which is the one channel
+  // that reaches a dispatched tab. Lane C1 rewrote 18 cron prompts by hand to
+  // say this; putting it here makes it true of EVERY dispatch by construction,
+  // including the ones nobody remembers to edit.
+  const originBlock =
+    'SEND ORIGIN (applies to every outbound message you send this run):\n' +
+    'You are a DISPATCHED WORKER, not a person at a keyboard. Pass origin:"cron"\n' +
+    'on every gmail_send / gmail_reply call. It is not decoration: it is what\n' +
+    'routes a cold message to a client into the daily comms pass as a draft\n' +
+    'instead of firing a fragment at them now, and it is what the outbound\n' +
+    'ledger records. Omit it and it records "unknown" and the batching is off.\n' +
+    'If a human decision is genuinely behind the send, pass batch:false and say\n' +
+    'why in your result_summary.\n\n'
+
+  const taskBlock = originBlock + (brief_storage === 'file'
     ? 'YOUR TASK (full brief at: ' + brief_file_path + ' - read in full, then execute):\n'
-    : 'YOUR TASK:\n' + brief_body + '\n'
+    : 'YOUR TASK:\n' + brief_body + '\n')
 
   // Plumbing-only closing actions. Agency, scope, scheduling permissions all
   // come from the cron's AGENCY block above. The dispatcher wrapper imposes
