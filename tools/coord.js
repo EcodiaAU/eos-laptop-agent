@@ -3340,6 +3340,65 @@ async function signal_done(params, ctx) {
   // human learning that from the toast is strictly better than silence while the
   // row waits for the orphan sweep. The refusal is returned to the caller and
   // named in the notice so it is visible rather than swallowed.
+  // 2026-09-01. THE CLOSE IS NOT GUARANTEED BY THE MODEL, SO DO NOT PRICE IT AS
+  // IF IT WERE. Measured over 14 days of transcripts on this host: 1,584 sessions
+  // called signal_done and 176 of them (11.1 pct) never called close_my_tab at
+  // all, and 144 of those 176 kept working for six or more entries after the
+  // done call. An instruction in a brief read at the top of a long arc is the
+  // weakest position in the system to enforce a final action from, and 11 pct is
+  // simply the compliance floor.
+  //
+  // The backstop for that population already exists: cowork.cleanup_orphan_workers
+  // sweeps every 7 minutes over rows carrying terminated_at, and its Pass 0 closes
+  // on the stable tab id. It is effective ONLY there. Aggregated over this host's
+  // whole agent log, that sweep closed 90 tabs by stable_tab_id and 5 by
+  // sentinel_prefix, while refusing 365 times with no_match and 276 times with
+  // fuzzy_fingerprint_refused_not_positive_id. Both refusals are the same
+  // condition: the row reached the sweep with NO usable stable id, so the fuzzy
+  // ladder ran and correctly declined to guess. A row in that state leaks
+  // forever, because nothing later in its life ever captures an id again.
+  //
+  // signal_bound captures one, but bind time is the WORST moment in the arc to
+  // capture: the tab is still wearing its provisional "Claude Code" label and
+  // autotitles seconds later, and the bridge mints a fresh ttab id for a tab that
+  // both retitles and reorders between two listings. close_my_tab recaptures, but
+  // only for the workers that call it, which is exactly the population that does
+  // not need the repair.
+  //
+  // So capture here. Done time is the STRONGEST moment: the tab is provably alive
+  // (it is mid-tool-call), its label is final, and the worker's own turn is what
+  // put it in front of the bridge. _captureStableTabId is idempotent (an
+  // uncontradicted stored id returns already_set), self-correcting (a stale or
+  // contradicted id is dropped and re-resolved against CURRENT labels), and
+  // fail-safe (an ambiguous resolve stores nothing rather than a guess). It is
+  // advisory: a miss degrades to exactly today's behaviour, never worse.
+  //
+  // This deliberately does NOT close the tab. 144 of those 176 sessions were
+  // still writing after signal_done, and a close wired to this call would
+  // truncate their durability writes. The sweep owns the close, behind its own
+  // active-tab and conductor belts; this call only makes sure the sweep can tell
+  // WHICH tab to close. Doctrine: [[a-guard-can-be-right-and-the-resolution-under-
+  // it-wrong-2026-09-01]], [[signal-done-terminate-must-be-the-arcs-last-write]].
+  let closeHandoff = { captured: false, reason: null, stable_tab_id: null }
+  if (ctx.tab_id) {
+    try {
+      let timer = null
+      const capped = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, reason: 'capture_timeout' }), _STABLE_ID_CAPTURE_TIMEOUT_MS)
+        if (timer && typeof timer.unref === 'function') timer.unref()
+      })
+      const cap = await Promise.race([_captureStableTabId(ctx.tab_id), capped])
+      if (timer) clearTimeout(timer)
+      closeHandoff = {
+        captured: !!(cap && cap.ok),
+        reason: (cap && (cap.reason || cap.via)) || null,
+        stable_tab_id: (cap && cap.ok) ? cap.tabId : null,
+      }
+    } catch (e) {
+      closeHandoff = { captured: false, reason: 'capture_threw:' + ((e && e.message) || String(e)), stable_tab_id: null }
+    }
+  }
+
   const taskSignals = require('./task-signals')
   const signalRes = await taskSignals.recordDone({
     task_id: params.task_id,
@@ -3367,6 +3426,15 @@ async function signal_done(params, ctx) {
     const w = workers.get(ctx.tab_id)
     w.terminated_at = new Date().toISOString()
     w.terminated_reason = w.terminated_reason || 'signal_done'
+    // The sweep already keys on terminated_at && !closed_tab_ok, so these three
+    // fields add no new selection rule. They exist so the leak is COUNTABLE: a
+    // row still carrying close_owed_at with no closed_tab_at is a worker whose
+    // tab outlived it, and close_handoff_reason names which of the capture
+    // outcomes it was. Without them the only instrument is a stderr line that
+    // aggregates every row in the sweep into one count.
+    w.close_owed_at = w.close_owed_at || new Date().toISOString()
+    w.close_handoff_reason = closeHandoff.reason
+    w.close_handoff_stable_tab_id = closeHandoff.stable_tab_id
     try { atomicWriteJson(path.join(WORKERS_DIR, ctx.tab_id + '.json'), w) } catch (e) {}
     // 2026-05-18 worker-registry-truth pattern: signal_done MUST unlink the
     // .spawned marker so any consumer reading mtime as a liveness proxy
@@ -3376,9 +3444,16 @@ async function signal_done(params, ctx) {
   // ok reflects whether the SCHEDULER-VISIBLE completion landed, not whether the
   // toast was written. A worker that reads ok:true and stops has a right to
   // expect its row will complete; tying ok to the notice would make that a lie.
+  // The nudge, and it is the cheap half of the fix. A brief read at the top of a
+  // long arc loses to a field in the response of the call the worker just made.
+  // next_action is stated even when the capture succeeded, because a self-close
+  // is still strictly better than a close seven minutes later by the sweep.
   return Object.assign({}, r, {
     ok: !!(signalRes && signalRes.ok),
     signal: signalRes,
+    close_owed: !!ctx.tab_id,
+    next_action: ctx.tab_id ? 'coord.close_my_tab' : null,
+    close_handoff: closeHandoff,
   })
 }
 
