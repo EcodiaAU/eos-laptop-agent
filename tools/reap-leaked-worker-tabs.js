@@ -92,6 +92,7 @@ const path = require('path')
 const COORD_ROOT = process.env.COORD_ROOT || path.join(os.homedir(), '.ecodiaos', 'coordination')
 const WORKERS_DIR = path.join(COORD_ROOT, 'workers')
 const CHAT_TABS_DIR = path.join(COORD_ROOT, 'chat-tabs')
+const EMIT_PATH = path.join(COORD_ROOT, 'state', 'reap-leaked-worker-tabs.jsonl')
 const CC = 'mainThreadWebview-claudeVSCodePanel'
 
 const argv = process.argv.slice(2)
@@ -129,6 +130,69 @@ const labelMatches = (live, full) => {
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { return null } }
 const GENERIC = new Set(['', 'claude code', 'new chat', 'cursor', 'chat', 'untitled'])
 const isGeneric = (s) => GENERIC.has(String(s || '').trim().toLowerCase())
+
+// THE DURABLE RECORD (2026-09-03, lane C5).
+//
+// WHY. This cron is the standing P1 guard against Claude Code webviews (50 to
+// 200 MB each) accreting until they OOM the Mac, which crashes the tabs and
+// kills the scheduler. It printed its numbers to stdout and nowhere else, and
+// the worker tab that read that stdout is then closed, so about a third of
+// fires left no record anywhere: unless that worker survived long enough to
+// write a status_board row, the fire's numbers died with it. The record is now
+// mechanical rather than contingent on a worker surviving.
+//
+// SIX EXIT PATHS, NOT ONE, AND THAT IS THE WHOLE TRAP. main() exits at the
+// dry-run early return, at the apply tail, and at FOUR fail-safe refusals (no
+// conductor port, bridge unreachable, no live tabs, liveness probe threw). An
+// append written at the tail alone would record apply runs only. Each C3 fire
+// makes three passes (dry, apply, dry), so two of every three would be lost,
+// and every refusal would be lost outright. A refusal is the fire whose record
+// you most want: it is the one where the reaper did nothing, and without a line
+// here nobody can later tell a silent healthy no-op from a bridge that has been
+// down for a day. So emit() is called from all six.
+//
+// STDOUT IS UNCHANGED BY CONSTRUCTION. `out` is printed exactly as the previous
+// bare console.log printed it, at every path; the summary written to disk is a
+// separate derived object. Nothing parsing this tool's stdout can see this.
+//
+// THE APPEND CANNOT BREAK THE REAP. The reaper outranks its own logging. Every
+// filesystem call sits inside one try/catch that swallows, so an unwritable
+// sink, a full disk or a missing directory costs a log line and nothing else.
+// The write also happens BEFORE the console.log deliberately: the dry-run path
+// calls process.exit(0) immediately after printing, which can truncate a piped
+// stdout, and appendFileSync has already returned by then.
+function summarise(report, extra) {
+  const reasons = {}
+  for (const p of report.preserved || []) {
+    const k = String((p && p.reason) || 'unknown')
+    reasons[k] = (reasons[k] || 0) + 1
+  }
+  // Counts and the preserved-reasons histogram, never the per-tab arrays. This
+  // file is appended to every four hours forever, so it carries what a later
+  // question needs (how many, why preserved, did it refuse) and not the payload
+  // that would make it grow without bound. `refused` is always present so every
+  // line has one key set.
+  return Object.assign({
+    at: report.at,
+    mode: report.mode,
+    window_minutes: report.window_minutes,
+    refused: null,
+    live_tabs_seen: report.live_tabs_seen || 0,
+    candidate_count: (report.candidates || []).length,
+    preserved_count: (report.preserved || []).length,
+    closed_count: (report.closed || []).length,
+    failed_count: (report.failed || []).length,
+    preserved_reasons: reasons,
+  }, extra || {})
+}
+
+function emit(out, summary) {
+  try {
+    fs.mkdirSync(path.dirname(EMIT_PATH), { recursive: true })
+    fs.appendFileSync(EMIT_PATH, JSON.stringify(summary) + '\n')
+  } catch (e) {}
+  console.log(JSON.stringify(out, null, 2))
+}
 
 function allWorkerRows() {
   const out = new Map()
@@ -185,30 +249,26 @@ async function main() {
     failed: [],
   }
 
-  const conductor = coord._loadConductorRegistration()
-  if (!conductor || !conductor.ide_bridge_port) {
-    console.log(JSON.stringify({ ok: false, refused: 'no_conductor_ide_port, reaping nothing (fail-safe)' }, null, 2))
+  // The fail-safe exit. Records the refusal, prints the same object the bare
+  // console.log printed, exits 1 as before. A closure so it can read `report`,
+  // which carries live_tabs_seen by the time the later refusals can fire.
+  const refuse = (reason) => {
+    emit({ ok: false, refused: reason }, summarise(report, { refused: reason }))
     process.exit(1)
   }
 
+  const conductor = coord._loadConductorRegistration()
+  if (!conductor || !conductor.ide_bridge_port) refuse('no_conductor_ide_port, reaping nothing (fail-safe)')
+
   let liveTabsIde
   try { liveTabsIde = await coord._liveCcTabsWithIds(conductor.ide_bridge_port) }
-  catch (e) {
-    console.log(JSON.stringify({ ok: false, refused: 'bridge_unreachable, reaping nothing (fail-safe): ' + (e.message || e) }, null, 2))
-    process.exit(1)
-  }
-  if (!liveTabsIde || !liveTabsIde.length) {
-    console.log(JSON.stringify({ ok: false, refused: 'no_live_tabs, reaping nothing (fail-safe)' }, null, 2))
-    process.exit(1)
-  }
+  catch (e) { refuse('bridge_unreachable, reaping nothing (fail-safe): ' + (e.message || e)) }
+  if (!liveTabsIde || !liveTabsIde.length) refuse('no_live_tabs, reaping nothing (fail-safe)')
   report.live_tabs_seen = liveTabsIde.length
 
   let liveWriters
   try { liveWriters = liveness.liveTabs(WINDOW_MIN) }
-  catch (e) {
-    console.log(JSON.stringify({ ok: false, refused: 'liveness_probe_threw, reaping nothing (fail-safe): ' + (e.message || e) }, null, 2))
-    process.exit(1)
-  }
+  catch (e) { refuse('liveness_probe_threw, reaping nothing (fail-safe): ' + (e.message || e)) }
 
   const rows = allWorkerRows()
   const anchors = allWorkerAnchors()
@@ -230,7 +290,7 @@ async function main() {
   report.preserved_count = report.preserved.length
 
   if (!APPLY) {
-    console.log(JSON.stringify(report, null, 2))
+    emit(report, summarise(report))
     process.exit(0)
   }
 
@@ -266,7 +326,7 @@ async function main() {
   }
   report.closed_count = report.closed.length
   report.failed_count = report.failed.length
-  console.log(JSON.stringify(report, null, 2))
+  emit(report, summarise(report))
 }
 
 // Kept identical to the prior tail: a throw still reports and exits non-zero,
