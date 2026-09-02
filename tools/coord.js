@@ -3476,14 +3476,263 @@ async function signal_done(params, ctx) {
 // The guard still requires a POSITIVE identity strategy before honouring it.
 const GUARD_SELF_CLOSE = Object.freeze({ selfClose: true })
 
+// ── plain-chat self-close via session address (2026-09-03) ───────────────────
+//
+// THE GAP THIS CLOSES. Every tier above resolves a close target from a WORKER
+// registry row, so `close_my_tab` was structurally unreachable for a plain human
+// chat: no dispatch, no registry row, nothing for ctx.tab_id to carry, and the
+// call returned `tab_id required`. Measured 2026-08-29 when Tate told every open
+// chat to resume and close its tab and one chat could not comply: list_channels
+// returned your_tab_id:null, and list_workers include_dead=true returned 39 rows,
+// every one a dispatched tab_* and none matching that chat's session id.
+//
+// WHY THE OBVIOUS WORKAROUND IS BANNED. Passing any tab_id to force the worker
+// path is the wrong-close bug of board row 14b69425, where a stored id checked
+// for LIFE rather than OWNERSHIP closed the live human chat labelled "Crons"
+// while reporting closed:true. At the moment that was hit the only live worker
+// was 54 seconds into an audit, so a guess would have killed real work mid-run.
+//
+// WHAT A PLAIN CHAT ACTUALLY HAS. It has a session anchor, written by
+// conductor_heartbeat.py only on a GENUINE USER TURN (which is the proof that
+// this chat was the focused tab at that moment), carrying label + viewColumn +
+// index and role "conductor"; and it has the `_recent_active` pointer, rewritten
+// by that same turn. So the identity exists - it is just keyed on session, not
+// on a worker tab id.
+//
+// ROLE IS NOT THE CONDUCTOR TEST. Every plain chat anchor carries role
+// "conductor" (measured 2026-09-03: 418 of 2,247 anchors, 0 of them the
+// registered conductor by that field alone), so excluding on role === 'conductor'
+// would refuse every close forever and read as a clean no-op. The registered
+// conductor is excluded where it is actually identified: tab-close-guard belt 2,
+// on the conductor row's stable_tab_id, with title_match as the legacy fallback.
+//
+// NO STABLE ID ON THIS POPULATION. The worker tiers corroborate a label with the
+// bridge's stable tab id stamped at signal_bound. A plain chat is never bound, so
+// its anchor has none - measured 0 of 418, including 0 of the 122 written since
+// 2026-08-28. The corroboration therefore has to come from somewhere else, and it
+// comes from two independent signals that a worker path does not have:
+//
+//   1. THE ANCHOR IS THE RECENT-ACTIVE ONE. `_recent_active` names the chat the
+//      human most recently typed into. A chat asked "close your tab" is that
+//      chat. A caller may also PASS its session_id, and then the two must AGREE:
+//      a mismatch REFUSES rather than falling back, which is the same
+//      contradiction-not-confirmation rule the stable-id tier already encodes.
+//   2. THE RESOLVED TAB IS FOCUSED. On the worker sweeps `active` is evidence a
+//      tab is a live human chat and so a reason to REFUSE (belt 1). Here the
+//      target IS a live human chat by construction, and focus is the positive
+//      half of the same fact: the chat the user just typed into is the focused
+//      one. A background chat calling this resolves to a tab it does not own and
+//      is refused.
+//
+// Both signals are cheap to satisfy honestly and hard to satisfy by accident, and
+// every failure below REFUSES rather than falling through to a looser tier. The
+// residual, stated plainly rather than hidden: a chat that deliberately passes a
+// DIFFERENT chat's session id, while that other chat is both recent-active and
+// focused, can close it. Freshness bounds that window to minutes and there is no
+// silent path into it. Better leak than wrong-close remains the governing rule.
+//
+// Doctrine: coord-conductor-addressing-per-tab-identity-2026-08-13,
+// coord-conductor-identified-by-stable-tab-id-not-label-2026-08-29,
+// coord-sweep-must-exempt-registered-conductor-tab-2026-07-21.
+
+// How stale the `_recent_active` pointer may be before an UNCONFIRMED self-close
+// (no session_id supplied) refuses. The caller is answering a user turn, so this
+// is generous already; a stale pointer means the chat that typed is not the chat
+// calling. An explicitly-supplied session_id still has to equal the pointer, so
+// this window bounds the guess, never the assertion.
+const CHAT_SELF_CLOSE_RECENT_MAX_MS = Number(process.env.COORD_CHAT_SELF_CLOSE_RECENT_MAX_MS || 15 * 60 * 1000)
+
+// Read the `_recent_active` pointer WITH its timestamp. _recentActiveSession()
+// deliberately returns only the id (its callers do not care how old it is); this
+// path does, because the age IS one of the two identity signals.
+function _recentActiveRecord() {
+  try {
+    const p = path.join(COORD_ROOT, 'chat-tabs', '_recent_active.json')
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'))
+    return rec && rec.session_id ? rec : null
+  } catch (e) { return null }
+}
+
+// Accept either a bare session id or the `chat.session:<id>.inbox` address
+// list_channels hands out, so a caller can paste back exactly what it was given.
+function _sessionIdFromInput(v) {
+  const s = String(v == null ? '' : v).trim()
+  if (!s) return null
+  const m = /^chat\.session:([^.]+)\.inbox$/.exec(s)
+  if (m) return m[1]
+  if (/^session:/.test(s)) return s.slice('session:'.length)
+  return s
+}
+
+// Resolve the CALLING chat's own live tab, or a refusal reason. Never returns a
+// target it is not certain of; every branch below is fail-safe.
+// Returns { target } | { refused } | { refused, detail }.
+async function _resolveOwnChatCloseTarget(params, conductor) {
+  if (!_chatInject) return { refused: 'chat_bridge_unavailable' }
+  const claimed = _sessionIdFromInput(params && (params.session_id || params.session_address))
+  const recent = _recentActiveRecord()
+  if (!recent) return { refused: 'no_recent_active_chat' }
+
+  // Signal 1a: the caller's claim, when it makes one, must AGREE with the
+  // substrate. Disagreement is a contradiction and refuses; it never downgrades
+  // to "well, use the recent one instead", because that downgrade is the guess.
+  if (claimed && claimed !== recent.session_id) {
+    return { refused: 'not_recent_active_session', detail: 'claimed=' + claimed }
+  }
+  // Signal 1b: an UNCONFIRMED close (no session_id) additionally needs the
+  // pointer to be fresh, so a chat calling long after some other chat's turn
+  // cannot inherit that chat's identity.
+  if (!claimed) {
+    const ageMs = Date.now() - ((recent.updated_at || 0) * 1000)
+    if (!(ageMs >= 0 && ageMs <= CHAT_SELF_CLOSE_RECENT_MAX_MS)) {
+      return { refused: 'recent_active_stale', detail: 'age_ms=' + ageMs }
+    }
+  }
+
+  const sessionId = recent.session_id
+  const safe = String(sessionId).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120)
+  let rec
+  try { rec = JSON.parse(fs.readFileSync(path.join(COORD_ROOT, 'chat-tabs', safe + '.json'), 'utf8')) }
+  catch (e) { return { refused: 'no_session_anchor' } }
+  if (!rec || !rec.label) return { refused: 'anchor_has_no_label' }
+  // A worker is addressed by tab_id and takes the path above. If the recent-active
+  // pointer somehow names one, that is a mis-capture, not a close target.
+  if (rec.role === 'worker') return { refused: 'anchor_is_worker_role' }
+  const anchorAgeMs = Date.now() - ((rec.updated_at || 0) * 1000)
+  if (!(anchorAgeMs >= 0 && anchorAgeMs <= ANCHOR_FRESH_MS)) {
+    return { refused: 'anchor_stale', detail: 'age_ms=' + anchorAgeMs }
+  }
+
+  let liveTabs
+  try { liveTabs = await _chatInject.listChatTabs() } catch (e) { return { refused: 'bridge_list_failed' } }
+  if (!liveTabs || !liveTabs.length) return { refused: 'no_live_tabs' }
+  // Resolve inside the NON-WORKER pool, the same space list_channels uses to hand
+  // out session addresses. A worker tab is never a candidate for this path.
+  const liveWorkers = _liveWorkerRows()
+  const nonWorker = liveTabs.filter((t) => !_looksLikeWorkerTab(t, liveWorkers))
+  if (!nonWorker.length) return { refused: 'no_non_worker_tabs' }
+
+  const cand = _resolveAnchorToTab(rec, nonWorker)
+  if (!cand) return { refused: 'anchor_not_uniquely_resolvable' }
+
+  // Ownership conflict: another FRESH non-worker anchor claiming this same live
+  // position means two sessions believe they own one tab (a focus-race
+  // mis-capture). Refuse rather than pick. Same guard, same reason, as the worker
+  // anchor tier.
+  const contested = _freshAnchors().some((a) => {
+    if (!a || a.role === 'worker' || a.session_id === rec.session_id) return false
+    const t = _resolveAnchorToTab(a, nonWorker)
+    return t && t.viewColumn === cand.viewColumn && t.index === cand.index
+  })
+  if (contested) return { refused: 'position_contested' }
+
+  // Signal 2: the resolved tab must be the FOCUSED one. See the header - on this
+  // path focus is positive ownership evidence, not the sweep paths' reason to
+  // refuse.
+  if (cand.isActive !== true) return { refused: 'resolved_tab_not_focused' }
+
+  // Remap into the ide.tabs coordinate space for the bridge's deterministic
+  // single-target close, exactly as the worker anchor tier does.
+  let ide
+  try { ide = require('./ide') } catch (e) { return { refused: 'ide_module_unavailable' } }
+  let tabsResult
+  try { tabsResult = await ide.tabs({ ide_port: conductor.ide_bridge_port }) }
+  catch (e) { return { refused: 'ide_tabs_failed' } }
+  const groups = (tabsResult && (tabsResult.groups || (tabsResult.result && tabsResult.result.groups))) || []
+  let group = null
+  for (const g of groups) { if (g.viewColumn === cand.viewColumn) { group = g; break } }
+  if (!group) return { refused: 'viewcolumn_not_found' }
+  const ccHits = (group.tabs || []).filter((t) => t.viewType === _CC_CHAT_VIEW_TYPE && t.label === cand.label)
+  if (ccHits.length !== 1) return { refused: 'label_not_unique_in_viewcolumn', detail: 'hits=' + ccHits.length }
+
+  return {
+    target: {
+      session_id: sessionId,
+      viewColumn: cand.viewColumn,
+      label: ccHits[0].label,
+      index: ccHits[0].index,
+      active: true,
+      tabId: ccHits[0].tabId || null,
+      confirmed: !!claimed,
+    },
+  }
+}
+
+// Execute the guarded close of a resolved own-chat target. The guard call is not
+// ceremony: belt 2 is what keeps this path off the REGISTERED conductor tab, by
+// stable id first and title_match second, which is the exclusion the scope note
+// on board row 86b287cf requires.
+async function _closeOwnChatTab(params, conductor) {
+  const res = await _resolveOwnChatCloseTarget(params, conductor)
+  if (!res.target) {
+    return {
+      ok: true, closed: false, tab_id: null,
+      strategy: 'refused:' + res.refused,
+      refused: res.refused + (res.detail ? (':' + res.detail) : ''),
+      session_id: null,
+    }
+  }
+  const t = res.target
+  const decision = require('./tab-close-guard').evaluateClose(
+    'chat_session_anchor',
+    { label: t.label, index: t.index, viewColumn: t.viewColumn, active: t.active, tabId: t.tabId },
+    conductor,
+    GUARD_SELF_CLOSE
+  )
+  if (!decision.allow) {
+    return {
+      ok: true, closed: false, tab_id: null,
+      strategy: 'refused:' + decision.reason,
+      refused: 'chat_self_close_guard_refused:' + decision.reason,
+      session_id: t.session_id,
+    }
+  }
+  let closed = false
+  let refused = null
+  let error = null
+  try {
+    const ide = require('./ide')
+    const closeResult = await ide.tabs_close({
+      viewColumn: t.viewColumn,
+      viewType: _CC_CHAT_VIEW_TYPE,
+      exactLabel: t.label,
+      tabIndex: t.index,
+      ide_port: conductor.ide_bridge_port,
+    })
+    const inner = (closeResult && closeResult.result) || closeResult || {}
+    closed = (typeof inner.closed === 'number' ? inner.closed > 0 : !!inner.ok)
+    if (!closed) refused = 'chat_self_close_no_close:' + (inner.refused || 'closed=0')
+  } catch (e) { error = e.message || String(e) }
+  try {
+    process.stderr.write('[coord] close_my_tab chat_session_anchor ' + (closed ? 'CLOSED' : 'not-closed')
+      + ' session=' + t.session_id + ' label=' + JSON.stringify(String(t.label)) + '\n')
+  } catch (e) {}
+  return {
+    ok: true,
+    closed: closed,
+    tab_id: null,
+    session_id: t.session_id,
+    strategy: closed ? (t.confirmed ? 'chat_session_anchor_confirmed' : 'chat_session_anchor_recent_active') : null,
+    refused: refused,
+    error: error,
+  }
+}
+
+
 async function close_my_tab(params, ctx) {
   ctx = ctx || {}
-  if (!ctx.tab_id) {
-    return { ok: false, error: 'tab_id required (set X-Tab-Id header or pass tab_id param)' }
-  }
+  params = params || {}
   const conductor = loadConductorRegistration()
   if (!conductor || !conductor.ide_bridge_port) {
-    return { ok: false, error: 'no_conductor_ide_port', tab_id: ctx.tab_id }
+    return { ok: false, error: 'no_conductor_ide_port', tab_id: ctx.tab_id || null }
+  }
+  // A caller with NO worker tab_id is a plain chat (never dispatched, so no
+  // registry row exists to resolve). It closes itself through the session-anchor
+  // path above rather than being told to supply an id it structurally cannot
+  // have. See the _resolveOwnChatCloseTarget header for why forcing a tab_id
+  // here is the banned workaround.
+  if (!ctx.tab_id) {
+    return await _closeOwnChatTab(params, conductor)
   }
   // Lazy-require ide to avoid circular deps.
   let ide
@@ -4733,6 +4982,10 @@ module.exports = {
   signal_done: signal_done,
   signal_bound: signal_bound,
   close_my_tab: close_my_tab,
+  // Test seams for the plain-chat self-close path (2026-09-03).
+  _resolveOwnChatCloseTarget: _resolveOwnChatCloseTarget,
+  _closeOwnChatTab: _closeOwnChatTab,
+  _sessionIdFromInput: _sessionIdFromInput,
   kill_worker: kill_worker,
   setWorkerTabHandle: setWorkerTabHandle,
   loadWorkerRegistry: loadWorkerRegistry,

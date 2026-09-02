@@ -206,10 +206,19 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.close_my_tab',
-    description: 'Close your own IDE chat tab. Call this as the FINAL action right after coord.signal_done({terminate:true}). Targets the editor focused at the moment of call (which is your chat panel because you just made a tool call). Best-effort; failures do not crash the worker arc. Returns {ok, tab_id, closed, error}. READ `closed`, NOT `ok`: ok:true with closed:false is a REFUSED close and a leaked tab, and the refusal names what it resolved to. WHY: without this, every dispatched worker tab accumulates in the IDE and burns memory (each Claude Code chat is a webview ~50-200MB). Measured over 14 days on this host: of 1,432 calls, 1,303 closed and 118 refused, while a further 176 sessions ended without ever calling it.',
+    description: 'Close your own IDE chat tab. A DISPATCHED WORKER calls this as the FINAL action right after coord.signal_done({terminate:true}); it resolves the worker\'s own tab from its registry row, so pass nothing. A PLAIN CHAT (never dispatched, so it has no tab_id and coord.list_channels reports your_tab_id:null) can ALSO close itself now: call it with no tab_id and it resolves the chat the user most recently typed into, which is you when you are answering the turn that asked you to close. Pass session_id (or the session_address coord.list_channels gives you) to assert WHICH chat you are, and the call refuses on any disagreement rather than closing a stranger; without it the call additionally requires that turn to be recent. Best-effort; failures do not crash the arc. Returns {ok, tab_id, session_id, closed, strategy, refused, error}. READ `closed`, NOT `ok`: ok:true with closed:false is a REFUSED close and a leaked tab, and `refused` names exactly what stopped it (a stale or contested identity, a tab that is not focused, an anchor Claude Code has retitled, or the registered conductor tab, which can never be closed this way). NEVER pass a tab_id you were not issued to force a close: a stored id checked for life rather than ownership is what closed a live human chat labelled "Crons" while reporting closed:true. WHY THIS EXISTS: every unclosed tab accumulates in the IDE and burns memory (each Claude Code chat is a webview ~50-200MB). Measured over 14 days: of 1,432 calls, 1,303 closed and 118 refused, while a further 176 sessions ended without ever calling it.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        session_id: {
+          type: 'string',
+          description: 'PLAIN CHATS ONLY (a worker leaves this out and is resolved by its tab_id). Your own Claude Code session id, asserting which chat is calling. It must match the chat that most recently took a user turn, or the call REFUSES with not_recent_active_session rather than closing anything. Supplying it also lifts the recency requirement that an unasserted close carries.',
+        },
+        session_address: {
+          type: 'string',
+          description: 'Alternative spelling of session_id: the `chat.session:<id>.inbox` address coord.list_channels hands out, accepted verbatim so you can paste back exactly what you were given.',
+        },
+      },
       additionalProperties: true,
     },
   },
