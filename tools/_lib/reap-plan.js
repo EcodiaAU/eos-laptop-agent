@@ -193,16 +193,39 @@ function planReap(input) {
       // not a new threshold: a strict match already implied
       // full.length >= visible.length >= _MIN_TRUNC_PREFIX, and the wears
       // direction is the ONLY path on which full can be the shorter side.
+      //
+      // THE TWO ARMS ARE EVALUATED SEPARATELY SO THE FIX CAN BE OBSERVED
+      // (2026-09-03, lane C6 second verify pass). The truth table is unchanged:
+      // OR-over-names of (strict || gatedWears) is exactly (OR-over-names
+      // strict) || (OR-over-names gatedWears). Splitting them costs at most
+      // three extra predicate calls per tier-2 tab and buys the one fact this
+      // fix's production gate needs and could not otherwise get: whether the
+      // WEARS branch is what rescued this tab. Two consecutive reaper fires
+      // (07:15Z and 11:20Z) resolved every tab at tier 1, so the fixed branch
+      // was never exercised and the gate stayed open on coincidence. The
+      // measured forward exposure is thin (34 of 1656 worker anchors wear a
+      // whole short sentinel the strict matcher rejects, 2.1 pct), so waiting
+      // for a lucky fire is a worse instrument than recording the answer.
+      // wears_rescued rides to the per-tab report and is counted in the durable
+      // JSONL summary, so the FIRST time this branch ever fires in production
+      // the record says so, forever, without anyone watching.
       const MIN_STORED_IDENTITY = 6   // mirrors coord.js _MIN_TRUNC_PREFIX
-      const corroboratedBy = (full) => labelMatches(tab.label, full) || (
+      const storedNames = [th.sentinel_prefix, th.label, th.label_at_spawn]
+      const gatedWears = (full) => (
         !!full && !isGeneric(full) && String(full).length >= MIN_STORED_IDENTITY &&
         labelWears(tab.label, full)
       )
-      const corroborated = corroboratedBy(th.sentinel_prefix) ||
-                           corroboratedBy(th.label) ||
-                           corroboratedBy(th.label_at_spawn)
+      const strictAny = storedNames.some((full) => labelMatches(tab.label, full))
+      // Short-circuits exactly as the single-expression form did: the wears
+      // arm is only asked where strict refused all three names.
+      const corroborated = strictAny || storedNames.some(gatedWears)
       if (corroborated) {
-        resolved.set(tab.tabId, { tab: tab, tab_id: byId[0].id, via: 'stable_tab_id', anchor: null })
+        resolved.set(tab.tabId, {
+          tab: tab, tab_id: byId[0].id, via: 'stable_tab_id', anchor: null,
+          // True only where the strict direction refused every stored name and
+          // the gated wears direction accepted one: the b826db9 branch, taken.
+          wears_rescued: !strictAny,
+        })
       } else {
         // The recycling case: a stored id that outlived the tab it was minted
         // for and was re-homed onto whatever inherited the slot. Refuse.
@@ -259,8 +282,15 @@ function planReap(input) {
   for (const [ttab, r] of resolved.entries()) {
     const tab = r.tab
     const tabId = r.tab_id
+    // wears_rescued is carried ONLY where it is true, so every other entry is
+    // key-for-key what this tool printed before. A reader that does not know
+    // the key sees no change; a reader looking for the b826db9 branch finds it
+    // on the one entry that took it. Spread LAST so the existing key order is
+    // untouched and the flag lands at the tail.
+    const rescued = r.wears_rescued ? { wears_rescued: true } : null
     const note = (reason, extra) => report.preserved.push(Object.assign(
-      { ttab: ttab, label: tab.label, tab_id: tabId, via: r.via, reason: reason }, extra || {}))
+      { ttab: ttab, label: tab.label, tab_id: tabId, via: r.via, reason: reason },
+      extra || {}, rescued || {}))
 
     if (conductorTabIds.has(tabId)) { note('conductor_tab'); continue }
     // Belt on top of tab-close-guard: the conductor's own registered stable id,
@@ -301,15 +331,61 @@ function planReap(input) {
     }, conductor)
     if (!decision.allow) { note('close_guard:' + decision.reason); continue }
 
-    report.candidates.push({
+    report.candidates.push(Object.assign({
       ttab: ttab, tab_id: tabId, label: tab.label, via: r.via,
       viewColumn: tab.viewColumn, index: tab.index,
       session_id: r.anchor ? r.anchor.session_id : null,
       terminated_at: row.terminated_at,
       closed_tab_refused_reason: row.closed_tab_refused_reason || null,
-    })
+    }, rescued || {}))
   }
   return report
 }
 
-module.exports = { planReap: planReap, isGeneric: isGeneric, wearsDispatchSentinel: wearsDispatchSentinel }
+// THE RESOLUTION TIER IS THE FACT THE REASONS HISTOGRAM CANNOT CARRY
+// (2026-09-03, lane C6 second verify pass). The durable JSONL sink keeps
+// preserved_reasons, which answers "why was this tab kept", and
+// stable_id_claimed_by_a_live_worker fits tier 1, tier 2 and tier 3 equally.
+// So two separate verification passes could not tell from the durable record
+// whether the b826db9 tier-2 fix had ever run, and both fell back to digging a
+// worker transcript out of ~/.claude/projects for the per-tab `via`. That data
+// is already on every entry and was being thrown away at summarise time.
+//
+// wears_rescued_count is the sharper half and is the actual production gate for
+// b826db9: set only where the strict matcher refused every stored name and the
+// gated wears direction accepted one, which is the fixed branch and nothing
+// else. One nonzero at any fire, forever, closes that gate from the durable
+// record with nobody watching.
+//
+// IT LIVES HERE, NOT IN THE CLI, ON PURPOSE. tools/reap-leaked-worker-tabs.js
+// exports nothing, which is exactly what makes the autoload content screen skip
+// it (lib/tool-autoload.js rule A, after that file crash-looped the host on
+// 2026-08-28). Adding a module.exports there to make this testable would hand
+// it back an export signature and put a one-shot CLI back into the autoload
+// registry. _lib/reap-plan.js already exports and is already required directly
+// by the suite, so the seam belongs here.
+//
+// preserved + candidates is the WHOLE tab population and each tab is in exactly
+// one of them. report.closed is deliberately NOT a third source: the apply path
+// pushes the SAME candidate object into closed, so counting it would
+// double-count every tab the tool actually collected.
+function summariseResolution(report) {
+  const vias = {}
+  let wearsRescued = 0
+  for (const arr of [(report || {}).preserved, (report || {}).candidates]) {
+    for (const p of arr || []) {
+      if (!p) continue
+      const k = String(p.via || 'unknown')
+      vias[k] = (vias[k] || 0) + 1
+      if (p.wears_rescued) wearsRescued += 1
+    }
+  }
+  return { resolved_via: vias, wears_rescued_count: wearsRescued }
+}
+
+module.exports = {
+  planReap: planReap,
+  isGeneric: isGeneric,
+  wearsDispatchSentinel: wearsDispatchSentinel,
+  summariseResolution: summariseResolution,
+}

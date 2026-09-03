@@ -304,4 +304,113 @@ ok('GUARD INTACT: two anchors with NO stable id on one label still refuse', () =
   assert.strictEqual(reasonFor(rep, LIVE_TTAB), 'multiple_anchors_claim_this_tab')
 })
 
+// ── PART 5. THE INSTRUMENT. Making the fix OBSERVABLE from the durable record.
+//
+// WHY (2026-09-03, lane C6 second verify pass). b826db9 is correct and its unit
+// cases pass, but two consecutive production fires of
+// cowork.ecodiaos-lane-C3-reap-leaked-worker-tabs (07:15:17Z and 11:20:58Z)
+// resolved EVERY tab at tier 1 (anchor_exact_label), so the fixed tier-2 branch
+// was never exercised and its production gate stayed open. Both passes had to
+// recover the per-tab `via` from a worker transcript in ~/.claude/projects,
+// because the JSONL sink keeps counts and preserved_reasons only and
+// stable_id_claimed_by_a_live_worker fits every tier equally. Forward exposure
+// is thin (34 of 1656 worker anchors wear a whole short sentinel the strict
+// matcher rejects, 2.1 pct), so a third wait is a worse instrument than
+// recording the answer. wears_rescued marks the tab the NEW branch rescued;
+// summariseResolution folds it and the tier histogram into the durable line.
+const { summariseResolution } = require('./_lib/reap-plan')
+
+ok('PART 5a: a tab the WEARS branch rescued is flagged wears_rescued', () => {
+  const STORED = '[bbbb short cron]'          // 17 chars, inside the 24-char window
+  const LIVE = '[bbbb short cron]\n…'     // shown whole, then spillover
+  const rep = run({
+    tabs: [tab({ tabId: 'ttab_short_1_1', label: LIVE })],
+    rows: { tab_short: row({ tab_handle: { tabId: 'ttab_short_1_1', sentinel_prefix: STORED } }) },
+  })
+  assert.strictEqual(rep.candidates.length, 1)
+  assert.strictEqual(rep.candidates[0].via, 'stable_tab_id')
+  assert.strictEqual(rep.candidates[0].wears_rescued, true,
+    'the strict matcher refused this shape, so the flag must say the wears branch carried it')
+  assert.strictEqual(summariseResolution(rep).wears_rescued_count, 1)
+  assert.strictEqual(summariseResolution(rep).resolved_via.stable_tab_id, 1)
+})
+
+ok('PART 5b: a tab STRICT already corroborated is NOT flagged', () => {
+  // Sentinel longer than the 24-char window, so the live label is a strict
+  // prefix of the stored name and labelMatches answers on its own. The flag has
+  // to stay off here or it counts the old path as the new one and the gate it
+  // exists to close becomes unreadable.
+  const STORED = '[cccc a long enough sentinel to be truncated]'
+  const rep = run({
+    tabs: [tab({ tabId: 'ttab_long_1_1', label: '[cccc a long enough sent…' })],
+    rows: { tab_long: row({ tab_handle: { tabId: 'ttab_long_1_1', sentinel_prefix: STORED } }) },
+  })
+  assert.strictEqual(rep.candidates.length, 1)
+  assert.strictEqual(rep.candidates[0].via, 'stable_tab_id')
+  assert.strictEqual(rep.candidates[0].wears_rescued, undefined,
+    'a strict-corroborated tab must carry no flag at all, not a false one')
+  assert.strictEqual(summariseResolution(rep).wears_rescued_count, 0)
+})
+
+ok('PART 5c: a tier-1 resolution counts under its own via and rescues nobody', () => {
+  const L = '[dddd tier one anchor label]'
+  const rep = run({
+    tabs: [tab({ tabId: 'ttab_t1_1_1', label: L })],
+    anchors: [{ label: L, tab_id: 'tab_t1', role: 'worker', session_id: 's1' }],
+    rows: { tab_t1: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 1)
+  assert.strictEqual(rep.candidates[0].via, 'anchor_exact_label')
+  const sum = summariseResolution(rep)
+  assert.strictEqual(sum.resolved_via.anchor_exact_label, 1)
+  assert.strictEqual(sum.resolved_via.stable_tab_id, undefined)
+  assert.strictEqual(sum.wears_rescued_count, 0,
+    'THIS IS THE 07:15Z AND 11:20Z SHAPE: all tier 1, so the gate is vacuous, and ' +
+    'the record must now say so rather than reading as a clean pass')
+})
+
+ok('PART 5d: an unresolved tab is counted, not dropped', () => {
+  const rep = run({ tabs: [tab({ tabId: 'ttab_hum_1_1', label: 'COherence' })] })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(summariseResolution(rep).resolved_via.unresolved, 1)
+})
+
+ok('PART 5e: report.closed is NOT double-counted against candidates', () => {
+  // The apply path pushes the SAME candidate object into report.closed. A
+  // three-array sum would count every tab this tool actually collected twice,
+  // which is exactly the population a later reader most cares about.
+  const c = { via: 'stable_tab_id', wears_rescued: true }
+  const sum = summariseResolution({ preserved: [], candidates: [c], closed: [c] })
+  assert.strictEqual(sum.resolved_via.stable_tab_id, 1)
+  assert.strictEqual(sum.wears_rescued_count, 1)
+})
+
+ok('PART 5f: a fail-safe refusal summarises without throwing', () => {
+  // Four of the six exit paths call summarise on a report that never reached
+  // planReap, so both arrays are empty or absent. The instrument outranks
+  // nothing: if it throws here it takes out the refusal line, which is the one
+  // record a silent healthy no-op cannot be told from a dead bridge without.
+  for (const thin of [{}, { preserved: [], candidates: [] }, { preserved: null }]) {
+    const sum = summariseResolution(thin)
+    assert.deepStrictEqual(sum.resolved_via, {})
+    assert.strictEqual(sum.wears_rescued_count, 0)
+  }
+})
+
+ok('PART 5g: MUTATION GATE, the flag tracks the branch and not the outcome', () => {
+  // Injecting the STRICT matcher as labelWears reproduces the pre-fix code, so
+  // the short-sentinel tab must go back to being refused entirely. If it still
+  // resolves, this whole Part is measuring nothing.
+  const STORED = '[bbbb short cron]'
+  const before = run({
+    labelWears: labelMatches,
+    tabs: [tab({ tabId: 'ttab_short_1_1', label: '[bbbb short cron]\n…' })],
+    rows: { tab_short: row({ tab_handle: { tabId: 'ttab_short_1_1', sentinel_prefix: STORED } }) },
+  })
+  assert.strictEqual(before.candidates.length, 0)
+  assert.strictEqual(reasonFor(before, 'ttab_short_1_1'), 'stable_id_label_does_not_corroborate')
+  assert.strictEqual(summariseResolution(before).wears_rescued_count, 0)
+  assert.strictEqual(summariseResolution(before).resolved_via.unresolved, 1)
+})
+
 console.log('\n' + passed + ' passed (' + path.basename(__filename) + ')')

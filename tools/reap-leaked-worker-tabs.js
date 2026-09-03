@@ -168,17 +168,27 @@ const isGeneric = (s) => GENERIC.has(String(s || '').trim().toLowerCase())
 // The write also happens BEFORE the console.log deliberately: the dry-run path
 // calls process.exit(0) immediately after printing, which can truncate a piped
 // stdout, and appendFileSync has already returned by then.
+//
+// THE RESOLUTION TIER IS THE SECOND HALF, and it lives in _lib/reap-plan.js
+// beside the tiers it counts. preserved_reasons answers "why was this tab
+// kept" and cannot answer "which tier resolved it", because
+// stable_id_claimed_by_a_live_worker fits tier 1, tier 2 and tier 3 equally.
+// Two verification passes over this sink had to dig the per-tab `via` out of a
+// worker transcript instead. summariseResolution folds it back in, plus
+// wears_rescued_count, which is the production gate for the b826db9 tier-2 fix.
+// Both keys are ALWAYS present, so a later reader can tell a genuine zero from
+// a fire that predates the instrument.
+//
+// THE LOGGING STILL CANNOT BREAK THE REAP. summariseResolution reads two arrays
+// off an object this function already owns and calls nothing, so it has no new
+// failure mode; the surrounding try/catch in emit() is unchanged either way.
 function summarise(report, extra) {
+  const { summariseResolution } = require('./_lib/reap-plan')
   const reasons = {}
   for (const p of report.preserved || []) {
     const k = String((p && p.reason) || 'unknown')
     reasons[k] = (reasons[k] || 0) + 1
   }
-  // Counts and the preserved-reasons histogram, never the per-tab arrays. This
-  // file is appended to every four hours forever, so it carries what a later
-  // question needs (how many, why preserved, did it refuse) and not the payload
-  // that would make it grow without bound. `refused` is always present so every
-  // line has one key set.
   return Object.assign({
     at: report.at,
     mode: report.mode,
@@ -190,7 +200,7 @@ function summarise(report, extra) {
     closed_count: (report.closed || []).length,
     failed_count: (report.failed || []).length,
     preserved_reasons: reasons,
-  }, extra || {})
+  }, summariseResolution(report), extra || {})
 }
 
 function emit(out, summary) {
