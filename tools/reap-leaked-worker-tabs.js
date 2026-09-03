@@ -126,6 +126,13 @@ const wearsDispatchSentinel = (s) => DISPATCH_SENTINEL.test(String(s || ''))
 const labelMatches = (live, full) => {
   try { return !!(full && coord._labelMatchesStored(live, full)) } catch (e) { return false }
 }
+// The IDENTITY-strength variant, for the ONE tier that already knows which
+// single row it is asking about. See the tier 2 note in _lib/reap-plan.js for
+// why the strict matcher above cannot answer that question, and for the gate
+// that keeps the extra direction from becoming a wrong-close path.
+const labelWears = (live, full) => {
+  try { return !!(full && coord._labelWearsStored(live, full)) } catch (e) { return false }
+}
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { return null } }
 const GENERIC = new Set(['', 'claude code', 'new chat', 'cursor', 'chat', 'untitled'])
@@ -282,6 +289,7 @@ async function main() {
     guard: guard,
     ttm: ttm,
     labelMatches: labelMatches,
+    labelWears: labelWears,
   })
   report.candidates = plan.candidates
   report.preserved = plan.preserved

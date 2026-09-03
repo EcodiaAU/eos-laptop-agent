@@ -22,6 +22,7 @@ const guard = require('./tab-close-guard')
 const ttm = require('./tab-title-match')
 const coord = require('./coord')
 const labelMatches = (live, full) => { try { return !!(full && coord._labelMatchesStored(live, full)) } catch (e) { return false } }
+const labelWears = (live, full) => { try { return !!(full && coord._labelWearsStored(live, full)) } catch (e) { return false } }
 
 const TERMINATED = '2026-08-29T04:00:00.000Z'
 const CONDUCTOR = { tab_id: 'conductor', stable_tab_id: 'ttab_cond_1_1', title_match: 'CE Teams', ide_bridge_port: 1 }
@@ -32,6 +33,11 @@ const run = (o) => planReap({
   liveTabsIde: o.tabs, anchors: o.anchors || [], rows: new Map(Object.entries(o.rows || {})),
   liveWriters: new Map(Object.entries(o.writers || {})), conductor: o.conductor || CONDUCTOR,
   guard: guard, ttm: ttm, labelMatches: labelMatches,
+  // The harness must inject BOTH matchers. reap-plan defaults labelWears to
+  // labelMatches, so a harness that passes only the strict one exercises the
+  // pre-2026-09-03 behaviour while looking like it tests the current code, and
+  // every short-sentinel fixture below would fail for the wrong reason.
+  labelWears: o.labelWears || labelWears,
 })
 const reasonFor = (rep, ttab) => (rep.preserved.find((p) => p.ttab === ttab) || {}).reason
 let passed = 0
@@ -90,6 +96,65 @@ ok('tier 2 refuses a stable id whose label does not corroborate (id recycling)',
   })
   assert.strictEqual(rep.candidates.length, 0)
   assert.strictEqual(reasonFor(rep, 'ttab_w3_1_1'), 'stable_id_label_does_not_corroborate')
+})
+
+// -- 4b. THE SHORT-SENTINEL SHAPE. The population tier 2 was built for. -------
+// Claude Code renders a chat title into a 24-char window. A sentinel LONGER
+// than that is truncated mid-word and the live label is a strict prefix of the
+// stored name, which case 3 above covers and which the strict matcher handles.
+// A sentinel SHORTER than 24 chars is shown WHOLE, followed by a newline and
+// whatever spills in from the brief, so the live string is LONGER than the
+// stored one and full.startsWith(visible) is false. Tier 2 refused every one of
+// them, pushed the tab to unresolved and CONTINUED, so tier 3 never ran for it
+// either: a short-named recurring cron tab was uncollectable forever. Measured
+// 2026-09-03T03:03Z on ttab_mtkxtb18_1_1, live "[aea4 gmail inbox poll]\n<U+2026>"
+// against stored "[aea4 gmail inbox poll]" (23 chars). coord.js:2207-2219
+// carries the corpus figure: 278 of 309 such labels rejected over 1587 anchors.
+ok('tier 2 resolves a SHORT sentinel the tab wears whole (the recurring-cron leak)', () => {
+  const STORED = '[bbbb short cron]'            // 17 chars, inside the 24-char window
+  const LIVE = '[bbbb short cron]\n\u2026'       // shown whole, then spillover
+  const fixture = {
+    tabs: [tab({ tabId: 'ttab_short_1_1', label: LIVE })],
+    rows: { tab_short: row({ tab_handle: { tabId: 'ttab_short_1_1', sentinel_prefix: STORED } }) },
+  }
+  // A fixture that passes both before and after the change pins nothing. Injecting
+  // the STRICT matcher as labelWears reproduces the pre-fix code exactly, and it
+  // must still refuse, or this case is not testing what its name says.
+  const before = run(Object.assign({ labelWears: labelMatches }, fixture))
+  assert.strictEqual(before.candidates.length, 0,
+    'FIXTURE BROKEN: the strict matcher no longer refuses this shape, so this case ' +
+    'no longer reproduces the 2026-09-03 leak')
+  assert.strictEqual(reasonFor(before, 'ttab_short_1_1'), 'stable_id_label_does_not_corroborate')
+
+  const rep = run(fixture)
+  assert.strictEqual(rep.candidates.length, 1,
+    'tier 2 must resolve a tab wearing its stored sentinel whole')
+  assert.strictEqual(rep.candidates[0].via, 'stable_tab_id')
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_short')
+})
+
+// -- 4c. THE GATE ON THE NEW DIRECTION. A generic stored name proves nothing. -
+// visible.startsWith(full) is only an identity claim when `full` IS an identity.
+// label_at_spawn is the literal string "Claude Code" on 8 of 8 live worker rows
+// (~/.ecodiaos/coordination/workers/*.json, 2026-09-03), so an ungated wears
+// swap would corroborate ANY truncated tab titled "Claude Code<U+2026>" onto a
+// re-homed stable id. That is the recycling wrong-close of case 4, re-opened by
+// the fix for case 4b. This is the case that keeps the gate honest: delete the
+// isGeneric check in reap-plan and this fails.
+ok('tier 2 refuses a recycled id corroborated only by a GENERIC label_at_spawn', () => {
+  const rep = run({
+    tabs: [tab({ tabId: 'ttab_gen_1_1', label: 'Claude Code somethi\u2026' })],
+    rows: {
+      tab_gen: row({ tab_handle: {
+        tabId: 'ttab_gen_1_1',
+        sentinel_prefix: '[dddd a completely different worker]',
+        label_at_spawn: 'Claude Code',
+      } }),
+    },
+  })
+  assert.strictEqual(rep.candidates.length, 0,
+    'a generic spawn label must never corroborate a stable id')
+  assert.strictEqual(reasonFor(rep, 'ttab_gen_1_1'), 'stable_id_label_does_not_corroborate')
 })
 
 // ── 5. Tier 3 sentinel: reaps once, refuses when two rows claim the label. ───

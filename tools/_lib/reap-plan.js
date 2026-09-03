@@ -23,7 +23,16 @@
 //   input.liveWriters  Map<worker tab_id, newest transcript turn ms>
 //   input.conductor    the conductor registration
 //   input.guard        tab-close-guard (injected so a test can see its refusals)
-//   input.labelMatches (live, full) -> bool, truncation-aware
+//   input.labelMatches (live, full) -> bool, truncation-aware. A UNIQUENESS
+//                      test: full.startsWith(visible) only. Several call sites
+//                      filter a whole tab list with it and refuse on more than
+//                      one hit, so it stays strict and one-directional.
+//   input.labelWears   (live, full) -> bool, the IDENTITY-strength variant
+//                      (coord._labelWearsStored), which additionally accepts
+//                      visible.startsWith(full). Used by tier 2 ONLY, where the
+//                      subject is already a single known row. Defaults to
+//                      labelMatches so an un-updated caller degrades to the old
+//                      behaviour rather than to always-false.
 //   input.ttm          tab-title-match, or null
 //
 // The tier design, the measured "ECodia site" wrong-close that shaped it, and
@@ -45,6 +54,12 @@ function planReap(input) {
   const guard = input.guard
   const ttm = input.ttm || null
   const labelMatches = input.labelMatches || (() => false)
+  // NEVER `|| (() => false)` here. An always-false default silently disables a
+  // whole tier, and the tier this one feeds is the only path a short-named
+  // recurring cron tab has. Falling back to labelMatches costs the caller
+  // today's behaviour, which is a miss; falling back to false costs it every
+  // tier-2 collection, which is a regression.
+  const labelWears = input.labelWears || labelMatches
 
   const report = { candidates: [], preserved: [] }
 
@@ -144,9 +159,48 @@ function planReap(input) {
     }
     if (byId.length === 1) {
       const th = byId[0].row.tab_handle || {}
-      const corroborated = labelMatches(tab.label, th.sentinel_prefix) ||
-                           labelMatches(tab.label, th.label) ||
-                           labelMatches(tab.label, th.label_at_spawn)
+      // A UNIQUENESS TEST WAS ANSWERING AN IDENTITY QUESTION (2026-09-03, lane C6).
+      //
+      // labelMatches is one-directional, full.startsWith(visible), and that is
+      // correct where it is used to FILTER a whole tab list and refuse on more
+      // than one hit. Tier 2 is not that question. It has already found exactly
+      // ONE row by the tab's stable id and is only asking "is this one tab
+      // wearing my name", which is identity-strength. The strict direction
+      // answers that wrongly on the whole short-name population: Claude Code's
+      // title window is 24 chars, so a sentinel SHORTER than 24 renders as the
+      // whole sentinel plus a newline and spillover, the visible string is
+      // LONGER than the stored one, and full.startsWith(visible) is false.
+      // Measured 2026-09-03T03:03Z on the live pair, tab ttab_mtkxtb18_1_1
+      // label "[aea4 gmail inbox poll]\n<U+2026>" against stored sentinel
+      // "[aea4 gmail inbox poll]" (23 chars): strict false, wears true.
+      // coord.js:2207-2219 records the corpus figure, 278 of 309 such labels
+      // rejected over 1587 worker-role anchors, and names them "the short-named
+      // recurring crons, the exact population the stable-id work exists to stop
+      // leaking". The failure is fail-safe (line below preserves and CONTINUES,
+      // so tier 3 never runs for it either) which is why it read as clean for
+      // as long as it did: not a wrong close, a permanent leak.
+      //
+      // THE WEARS DIRECTION IS GATED, AND THE GATE IS THE LOAD-BEARING HALF.
+      // Accepting visible.startsWith(full) unconditionally opens a wrong-close
+      // path this tier exists to refuse. label_at_spawn is the literal string
+      // "Claude Code" on 8 of 8 live worker rows (measured 2026-09-03T03:2xZ
+      // over ~/.ecodiaos/coordination/workers/*.json), so an ungated swap would
+      // corroborate ANY truncated tab titled "Claude Code<U+2026>" onto a
+      // re-homed stable id, which is exactly the recycling case below. So the
+      // wears direction is additive only, and only for a stored name that is a
+      // real identity: non-generic, and at least as long as the shortest
+      // visible prefix the strict path already trusts. That floor is symmetry,
+      // not a new threshold: a strict match already implied
+      // full.length >= visible.length >= _MIN_TRUNC_PREFIX, and the wears
+      // direction is the ONLY path on which full can be the shorter side.
+      const MIN_STORED_IDENTITY = 6   // mirrors coord.js _MIN_TRUNC_PREFIX
+      const corroboratedBy = (full) => labelMatches(tab.label, full) || (
+        !!full && !isGeneric(full) && String(full).length >= MIN_STORED_IDENTITY &&
+        labelWears(tab.label, full)
+      )
+      const corroborated = corroboratedBy(th.sentinel_prefix) ||
+                           corroboratedBy(th.label) ||
+                           corroboratedBy(th.label_at_spawn)
       if (corroborated) {
         resolved.set(tab.tabId, { tab: tab, tab_id: byId[0].id, via: 'stable_tab_id', anchor: null })
       } else {
