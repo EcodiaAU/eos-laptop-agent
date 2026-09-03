@@ -750,6 +750,72 @@ function setTabId(tab_id, ttab) {
   ok('(e) CONTROL: a LIVE row claiming the held tab still contradicts even when the label reads as mine',
     coord._storedIdContradicted(th('f-e-caller'), tabsE, 'f-e-caller', 'ttab_fe') === true)
 
+  // ── Part 11: ARM (b), the identity arm, on the SHORT-sentinel population ──
+  //
+  // Cases (a) to (e) above all exercise the FOSSIL arm, and every one of their
+  // fixtures has exactly ONE live tab. Arm (b) is the other one:
+  //     tabs.some((t) => t.tabId !== want && wearsMyIdentity(t))
+  // "some OTHER live tab wears my sentinel while the held tab does not". It
+  // needs a SECOND live tab to instantiate at all, so no fixture in this file
+  // reached it, and it is the arm the header credits with catching the real
+  // 2026-08-29 wrong-close of the "Crons" chat.
+  //
+  // It read as covered because the fossil arm beside it is covered thoroughly.
+  // Same shape as the reaper suite's own gap: case 3 there used a 29-char
+  // sentinel and case 4 the recycling refusal, and neither instantiated the
+  // short shape that breaks the matcher.
+  //
+  // DIRECTION MATTERS HERE, which is why this is the case worth having. On the
+  // fossil arm a false negative costs an extra refusal, so the defect leaks a
+  // webview. On THIS arm a false negative returns "not contradicted" and hands
+  // the stranger's tab to the close. Measured against the deployed function
+  // before this commit: 41 and 30 char sentinels contradict, 23 and 19 do not.
+  //
+  // (f) is (d) with ONE variable changed: a second live tab wearing my whole
+  // short sentinel plus spillover. (d) correctly reads false with nothing
+  // wearing my name; (f) must read true.
+  mkNamed('f-f-caller', SHORT, 0)
+  th('f-f-caller').tabId = 'ttab_ff_stranger'
+  LIVE_TABS = [{ tabId: 'ttab_ff_stranger', label: STRANGER, viewColumn: 1, index: 0 },
+               { tabId: 'ttab_ff_mine', label: SPILL, viewColumn: 1, index: 1 }]
+  const tabsF = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(f) arm (b): a SHORT sentinel worn whole by another live tab CONTRADICTS the recycled id',
+    coord._storedIdContradicted(th('f-f-caller'), tabsF, 'f-f-caller', 'ttab_ff_stranger') === true)
+  ok('(f) and the one-directional matcher is what got this wrong',
+    coord._labelMatchesStored(SPILL, SHORT) === false && coord._labelIsMyIdentity(SPILL, SHORT) === true)
+
+  // (g) POSITIVE CONTROL on the same fixture shape with a LONG sentinel. This
+  // one contradicted BEFORE the change too, which is what proves the fixture is
+  // sound and that the defect was confined to the short population.
+  mkNamed('f-g-caller', SENTINEL, 0)
+  th('f-g-caller').tabId = 'ttab_fg_stranger'
+  LIVE_TABS = [{ tabId: 'ttab_fg_stranger', label: STRANGER, viewColumn: 1, index: 0 },
+               { tabId: 'ttab_fg_mine', label: SENTINEL.slice(0, 24) + '\u2026', viewColumn: 1, index: 1 }]
+  const tabsG = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(g) CONTROL: a LONG sentinel on the same two-tab shape contradicted before and still does',
+    coord._storedIdContradicted(th('f-g-caller'), tabsG, 'f-g-caller', 'ttab_fg_stranger') === true)
+
+  // (h) THE OVER-REFUSAL CONTROL. Widening this predicate must not start
+  // refusing a close nobody else is claiming. Same short-sentinel caller, same
+  // stranger-titled held tab, and the second live tab wears an unrelated title.
+  mkNamed('f-h-caller', SHORT, 0)
+  th('f-h-caller').tabId = 'ttab_fh_stranger'
+  LIVE_TABS = [{ tabId: 'ttab_fh_stranger', label: STRANGER, viewColumn: 1, index: 0 },
+               { tabId: 'ttab_fh_other', label: 'Some other chat entir\u2026', viewColumn: 1, index: 1 }]
+  const tabsH = LIVE_TABS.map((t, i) => Object.assign({ viewType: CC, index: i }, t))
+  ok('(h) CONTROL: with nothing wearing my name the widened arm still does NOT contradict',
+    coord._storedIdContradicted(th('f-h-caller'), tabsH, 'f-h-caller', 'ttab_fh_stranger') === false)
+
+  // (i) THE GATE. label_at_spawn is "Claude Code" on 8 of 8 live worker rows, so
+  // an ungated identity test would let any truncated tab titled "Claude Code"
+  // corroborate every worker at once. haveSpawn already vets it upstream; this
+  // pins the helper itself so a later caller cannot inherit the hole.
+  ok('(i) GATE: a generic stored name is never an identity, in either direction',
+    coord._labelIsMyIdentity('Claude Code\u2026', 'Claude Code') === false &&
+    coord._labelIsMyIdentity('Claude Code', 'Claude Code') === false)
+  ok('(i) GATE: a stored name shorter than the minimum visible prefix is refused',
+    coord._labelIsMyIdentity('abcxyz\u2026', 'abc') === false)
+
   ide.tabs = realTabs
   ide.tabs_close = realClose
   console.log('\n' + (fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'))

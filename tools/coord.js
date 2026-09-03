@@ -1733,9 +1733,25 @@ function _storedIdContradicted(th, tabs, tab_id, want) {
   const haveSentinel = !!th.sentinel_prefix
   const haveSpawn = !!(spawnLabel && !isGenericLabelStr(spawnLabel))
   if (!haveSentinel && !haveSpawn) return false // nothing to judge with
+  // A UNIQUENESS TEST WAS ANSWERING THE IDENTITY QUESTION (2026-09-03 lane C6
+  // verify). This predicate's own name is "wears my identity" and it asks it of
+  // ONE tab at a time, but it asked with the strict one-directional matcher,
+  // which false-negatives on every sentinel SHORTER than the 24-char title
+  // window because such a tab shows the sentinel WHOLE plus spillover. Both
+  // uses below are affected and they pull in opposite directions, which is why
+  // this is worth stating here:
+  //   line below, `wearsMyIdentity(held)` -> returns false (not contradicted),
+  //     so a false negative costs an extra refusal. Fail-safe.
+  //   arm (b), `tabs.some(... wearsMyIdentity(t))` -> returns true (contradicted),
+  //     so a false negative ALLOWS THE CLOSE. That is the wrong-close direction,
+  //     and arm (b) is the arm that caught the real 2026-08-29 "Crons" close.
+  // Measured against this deployed function before the change: sentinels of 41
+  // and 30 chars contradict correctly, 23 and 19 return false and hand the
+  // stranger's tab to the close. Same defect class as the reaper's tier 2, same
+  // population, opposite and worse consequence.
   const wearsMyIdentity = (t) =>
-    (haveSentinel && _labelMatchesStored(t.label, th.sentinel_prefix)) ||
-    (haveSpawn && _labelMatchesStored(t.label, spawnLabel))
+    (haveSentinel && _labelIsMyIdentity(t.label, th.sentinel_prefix)) ||
+    (haveSpawn && _labelIsMyIdentity(t.label, spawnLabel))
   // Arm (a2), restored 2026-08-29 lane C5 gen 3. The liveOnly relaxation above
   // rests on "a TERMINATED row is not another live worker", which is true and is
   // about the CLAIMANT. It says nothing about the HELD TAB, and that is the only
@@ -2224,6 +2240,38 @@ function _labelWearsStored(live, full) {
   const vis = _visiblePrefix(live)
   if (vis.length < _MIN_TRUNC_PREFIX) return false
   return full.startsWith(vis) || vis.startsWith(full)
+}
+
+// THE GATED IDENTITY TEST. Ask "is this ONE tab wearing MY name" with the
+// bidirectional matcher, but only when the stored name IS an identity, and say
+// so in one place so the three call sites cannot drift apart.
+//
+// The wears direction is what recognises the short-named crons, and it is also
+// the only direction on which `full` can be the SHORTER side, so it is the only
+// one that needs the stored name vetted. label_at_spawn is the literal string
+// "Claude Code" on 8 of 8 live worker rows, and ungated, any truncated tab
+// titled "Claude Code<U+2026>" would read as an identity match for every worker
+// at once. Non-generic, and at least as long as the shortest visible prefix the
+// strict path already trusts. That floor is symmetry rather than a new
+// threshold: a strict match already implied
+// full.length >= visible.length >= _MIN_TRUNC_PREFIX.
+//
+// The shared _labelMatchesStored is NOT loosened. Its other call sites filter a
+// whole tab list and refuse on more than one hit, so widening it there would let
+// one tab match several rows. Two questions, two functions.
+// Doctrine: patterns/a-uniqueness-test-and-an-identity-test-are-different-questions-2026-09-03.md
+function _labelIsMyIdentity(live, full) {
+  // The vetting gates the WHOLE predicate, not just the wears arm. The strict
+  // matcher answers TRUE for the pair ("Claude Code<U+2026>", "Claude Code"),
+  // since the visible prefix is the entire stored string, so gating only the
+  // wears arm would leave this function claiming a generic name is an identity.
+  // On the live call path _storedIdContradicted already excludes that upstream
+  // (haveSpawn vets the spawn label and a sentinel_prefix is never generic), so
+  // this costs nothing there and keeps the exported helper honest for the next
+  // caller, which is the whole reason it is one function and not three.
+  if (!full || isGenericLabelStr(full)) return false
+  if (String(full).length < _MIN_TRUNC_PREFIX) return false
+  return _labelMatchesStored(live, full) || _labelWearsStored(live, full)
 }
 
 function _liveWorkerRows() {
@@ -5025,6 +5073,7 @@ module.exports = {
   _isChatDeliver: isChatDeliver,
   _labelMatchesStored: _labelMatchesStored,
   _labelWearsStored: _labelWearsStored,
+  _labelIsMyIdentity: _labelIsMyIdentity,
   _isTruncatedLabel: _isTruncatedLabel,
   _matchWorkerRow: _matchWorkerRow,
   _chatTopicMid: chatTopicMid,
