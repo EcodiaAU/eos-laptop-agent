@@ -290,14 +290,17 @@ function parseBaBody(value) {
 // guard on (account_code, as_of_date, phone-vault provenance) means re-running the same read
 // adds zero rows. Available + uncleared are carried in the note for the current-vs-available
 // gap (e.g. an inbound transfer sitting as a pending hold).
-async function recordBalances(db, balances, asOfDate) {
+async function recordBalances(db, balances, asOfDate, opts = {}) {
   const out = {}
   for (const [account, b] of Object.entries(balances)) {
     if (b.curr_cents == null) continue
     const avail = b.avail_cents == null ? null : b.avail_cents
     const uncleared = avail == null ? null : b.curr_cents - avail
+    // The 'phone-vault-feed' PREFIX is load-bearing: the NOT-EXISTS guard below keys on
+    // `notes LIKE 'phone-vault-feed%'`, so a carry-forward marker is APPENDED, never prefixed.
     const note = `phone-vault-feed ${asOfDate} via vault-pull.js normaliser: current ${(b.curr_cents / 100).toFixed(2)}`
       + (avail == null ? '' : `, available ${(avail / 100).toFixed(2)}${uncleared ? `, uncleared ${(uncleared / 100).toFixed(2)}` : ''}`)
+      + (opts.carriedForwardFrom ? ` (CARRIED FORWARD: empty statement, dormant account, balance unchanged since ${opts.carriedForwardFrom})` : '')
     const res = await db`INSERT INTO public.bank_reconciliation
       (id, account_code, as_of_date, bank_balance, ledger_balance, difference, status, notes)
       SELECT gen_random_uuid(), ${account}, ${asOfDate}, ${b.curr_cents}, 0, 0, 'reconciled', ${note}
@@ -456,11 +459,45 @@ async function importBankCsv(db, csvText, sourceAccount, asOfDate) {
   }
   const stats = await stageGroupedBaRows(db, rows, { idPrefix: 'bacsv_', refPrefix: 'ba-phonecsv-' })
   let balances = {}
+  let carriedForwardFrom = null
   if (liveBalance != null) {
     const asOf = liveBalanceDate || asOfDate || new Date().toISOString().slice(0, 10)
     balances = await recordBalances(db, { [sourceAccount]: { curr_cents: liveBalance } }, asOf)
+  } else if (rows.length === 0) {
+    // DORMANT-ACCOUNT CARRY-FORWARD.
+    //
+    // liveBalance is only ever read off a TRANSACTION row's Balance column, so an account with
+    // no transactions in the export window yields a header-only CSV, liveBalance stays null, and
+    // the branch above never runs. No bank_reconciliation row is written at all, so the account's
+    // as_of_date freezes at its last day of activity while every staleness surface keeps counting
+    // up. An account measured on transaction date can therefore NEVER satisfy a freshness window
+    // once it goes dormant: the alarm is permanent, and the only thing that would clear it is a
+    // transaction, which by definition a dormant account does not have.
+    //
+    // Measured on ba_personal_savings: emptied to $0.00 on 2026-08-14, and the 2026-08-31 one-tap
+    // export DID cover it (vault_inbox dbb9804d, sig_verified true, navDom url .../accounts/history/
+    // with elCount 199, so the account is reachable and OPEN, merely dormant). Its payload decodes
+    // to exactly "Effective Date,Entered Date,Transaction Description,Amount,Balance\r\n" and
+    // nothing else. It stamped nothing and sat 21d stale inside a 35d window.
+    //
+    // Carrying the last known balance forward states a TRUE fact: no transactions means no
+    // movement, so the balance has not changed. It is stamped at asOfDate, the export's own
+    // SIGNED ts, so it never claims freshness the export did not actually have. It is also
+    // harmless if the account turns out to be closed rather than dormant, since a closed account
+    // holds $0.00 and that is exactly what the carried balance says.
+    //
+    // Genuine feed breakage is still detected: this only fires when an export ACTUALLY COVERED the
+    // account and came back empty. If the export stops covering it, importBankCsv never runs for
+    // that account, no row is written, and it goes stale correctly.
+    const prior = await db`SELECT bank_balance, as_of_date FROM public.bank_reconciliation
+      WHERE account_code = ${sourceAccount} ORDER BY as_of_date DESC LIMIT 1`
+    if (prior.length) {
+      const asOf = asOfDate || new Date().toISOString().slice(0, 10)
+      carriedForwardFrom = String(prior[0].as_of_date).slice(0, 10)
+      balances = await recordBalances(db, { [sourceAccount]: { curr_cents: Number(prior[0].bank_balance) } }, asOf, { carriedForwardFrom })
+    }
   }
-  return { account: sourceAccount, stats, declineEvents, liveBalance, liveBalanceDate, balances, totalStaged: rows.length, supersededScrapeRows }
+  return { account: sourceAccount, stats, declineEvents, liveBalance, liveBalanceDate, balances, totalStaged: rows.length, supersededScrapeRows, carriedForwardFrom }
 }
 
 // The read's own date (signed `ts`, Brisbane-agnostic - a date is a date) is the as-of for the
