@@ -2612,8 +2612,46 @@ exports.completionPass = async function completionPass() {
   // by the worker itself, so this reads a report that was already there.
   const result = await pool.query(
     `SELECT * FROM os_scheduled_tasks
-      WHERE status IN ('running', 'orphaned') AND done_at IS NOT NULL LIMIT 50`
+      WHERE status = 'running' AND done_at IS NOT NULL LIMIT 50`
   )
+
+  // The orphaned arm is DELIBERATELY SEPARATE and deliberately does not go
+  // through markComplete. Shipping it through markComplete first, at 07:10Z on
+  // 2026-09-05, produced a hot loop within seconds: row 9ddd9320
+  // (cowork.coexist-lane-B1-emergency-contact-book-block) had reported
+  // done_status='failed' on 2026-08-29 and been orphaned, so markComplete routed
+  // it to markFailed, which re-arms status='active' for a retry, which fired the
+  // migration 153 lane-revive arm, which correctly REFUSED because a live sibling
+  // held lane coexist-lane-b1. The row stayed orphaned and the next tick tried
+  // again, forever, nine times before it was caught.
+  //
+  // The lesson is the distinction the first version missed. Honouring a report the
+  // scheduler threw away means RECORDING what the worker said. It does not mean
+  // re-running a week-old job, and a terminal row is terminal: it has no lease to
+  // complete, no next fire to schedule, and it may sit on a lane something live
+  // now owns. So this arm writes the terminal status the report implies and
+  // nothing else. One statement, no re-arm, no lane transition, and it can never
+  // select the same row twice because the write moves it out of 'orphaned'.
+  try {
+    const late = await pool.query(
+      `UPDATE os_scheduled_tasks
+          SET status = CASE WHEN done_status IS NULL OR done_status IN ('success', 'stood_down')
+                            THEN 'completed' ELSE 'failed' END,
+              last_status = CASE WHEN done_status IS NULL OR done_status IN ('success', 'stood_down')
+                            THEN 'completed' ELSE 'failed' END,
+              last_result = COALESCE(done_summary, last_result),
+              last_error = COALESCE(last_error, 'worker reported after the row was orphaned'),
+              updated_at = NOW()
+        WHERE status = 'orphaned' AND done_at IS NOT NULL AND archived_at IS NULL
+        RETURNING id, name, done_status`)
+    for (const r of late.rows) {
+      process.stderr.write('[scheduler] completionPass: honoured a late worker report on orphaned row ' +
+        r.id + ' (' + (r.name || '?') + ') done_status=' + (r.done_status || 'success') + '\n')
+    }
+  } catch (e) {
+    process.stderr.write('[scheduler] completionPass late-report arm error: ' + e.message + '\n')
+  }
+
   if (!result.rows.length) return
 
   for (const row of result.rows) {
