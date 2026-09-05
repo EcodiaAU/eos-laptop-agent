@@ -33,6 +33,94 @@ function _extractTargetId(page) {
   catch (_e) { return null }
 }
 
+// === ambiguity guard: resolving a shared resource by a NON-UNIQUE key ======
+//
+// The canonical Chrome (~/chrome-canonical :9222) is shared by the whole worker
+// fleet, so several tabs on the same host is the NORMAL state, not the edge
+// case. Measured 2026-08-29: 14 live pages, FIVE of them studio.ecodia.au, so
+// titleContains 'Studio' matched 5 and urlContains 'studio.ecodia.au' matched 5.
+//
+// Until now both branches were shaped `for (const p of pages) { if (match) return p }`
+// - they returned the FIRST match and never looked for a second. An ambiguous
+// needle was therefore a SILENT coin-flip onto whichever tab puppeteer happened
+// to list first, with no warning to the caller. It bit twice on Advanced-DNS
+// (2026-08-18: a ReturnUrl query param echoed the needle and cdp-shot grabbed a
+// stale logged-out tab) and it bit a SeedTree verify worker, which screenshotted
+// another worker's stale tab while its own tab was fine and reported the wrong
+// screen as proof. The standing workaround - every caller invents a unique URL
+// query param - is a discipline, not a guard, and disciplines do not survive a
+// fleet.
+//
+// RULE: resolving a shared resource by a non-unique key is not resolution, and
+// the correct failure mode is to REFUSE, not to pick. A loud throw is strictly
+// better than a silent wrong tab, because a caller that was getting a coin-flip
+// was already broken and simply could not tell.
+//
+// Two narrow tiebreaks run before refusing, because they are unambiguous by
+// construction rather than by luck:
+//   1. EXACT - the needle IS the whole url (or the whole title).
+//   2. PATH-CANONICAL (url only) - the needle equals the tab url with its query
+//      string and fragment stripped. This is what makes `.../sites/abc` pick the
+//      real page over `.../sites/abc/settings`, and it deliberately does NOT
+//      canonicalise the NEEDLE, so the unique-`?eos-...=` param convention keeps
+//      working as the sanctioned disambiguator.
+// A tier only wins if it narrows to exactly ONE candidate. Two tabs on the same
+// canonical path are genuinely indistinguishable by url and must refuse.
+//
+// The throw carries err.code = 'AMBIGUOUS_TARGET' and err.candidates =
+// [{targetId, url, title}] so a caller that genuinely does not care WHICH tab it
+// gets (vault-session sets cookies, which are browser-context-global) can catch
+// the error and re-call with an explicit targetId. That structured two-step is
+// the sanctioned escape hatch; there is deliberately NO `allowAmbiguous: true`
+// flag, because a bypass flag gets cargo-culted onto exactly the call sites that
+// most need to refuse.
+//
+// Doctrine: patterns/resolution-by-non-unique-key-must-refuse-not-pick-2026-08-29.md
+
+function _canonicalUrl(u) {
+  const s = String(u || '')
+  const cut = Math.min(
+    s.indexOf('?') === -1 ? s.length : s.indexOf('?'),
+    s.indexOf('#') === -1 ? s.length : s.indexOf('#')
+  )
+  return s.slice(0, cut).toLowerCase()
+}
+
+function _ambiguityError(matches, kind, rawNeedle) {
+  const lines = matches.map((m, i) =>
+    '  [' + i + '] targetId=' + (m.targetId || '?') +
+    ' url=' + (m.url || '?') +
+    (m.title != null ? ' title=' + JSON.stringify(m.title) : ''))
+  const err = new Error(
+    'AMBIGUOUS ' + kind + 'Contains: ' + matches.length + ' tabs match ' + JSON.stringify(rawNeedle) +
+    ' and none is an exact or path-canonical match, so there is no correct tab to pick.\n' +
+    lines.join('\n') +
+    '\nRefusing rather than coin-flipping onto one. Disambiguate with an explicit ' +
+    '{targetId}, a registered {alias} (cdp.attach_tab), or a more specific needle ' +
+    '(a unique ?eos-<job>= query param is the fleet convention).')
+  err.code = 'AMBIGUOUS_TARGET'
+  err.candidates = matches.map(m => ({ targetId: m.targetId || null, url: m.url || null, title: m.title != null ? m.title : null }))
+  return err
+}
+
+// Exported for tests. `matches` is [{targetId, url, title?, page?}] - the pages
+// that already matched the substring. `needle` is lowercased; `rawNeedle` is the
+// caller's original string, used only in the error message.
+// Returns the single winning match, or THROWS an AMBIGUOUS_TARGET error.
+function pickUnique(matches, needle, kind, rawNeedle) {
+  if (matches.length === 1) return matches[0]
+  if (kind === 'url') {
+    const exact = matches.filter(m => String(m.url || '').toLowerCase() === needle)
+    if (exact.length === 1) return exact[0]
+    const canon = matches.filter(m => _canonicalUrl(m.url) === needle)
+    if (canon.length === 1) return canon[0]
+  } else {
+    const exact = matches.filter(m => String(m.title || '').toLowerCase() === needle)
+    if (exact.length === 1) return exact[0]
+  }
+  throw _ambiguityError(matches, kind, rawNeedle === undefined ? needle : rawNeedle)
+}
+
 // Per-call page resolver. Picks the lookup strategy from EITHER:
 //   - flat opts (canonical):  {alias} / {targetId} / {urlContains} / {titleContains} / {index}
 //   - nested opts.target (legacy): {target: {alias|targetId|...}}
@@ -83,27 +171,35 @@ async function resolveTarget(opts) {
   }
   if (spec.urlContains) {
     const needle = String(spec.urlContains).toLowerCase()
+    const matches = []
     for (const p of pages) {
       try {
-        if (String(await p.url()).toLowerCase().indexOf(needle) !== -1) {
-          lastTouchedTargetId = _extractTargetId(p)
-          return p
-        }
+        const u = String(await p.url())
+        if (u.toLowerCase().indexOf(needle) !== -1) matches.push({ page: p, url: u, targetId: _extractTargetId(p) })
       } catch (_e) {}
     }
-    throw new Error('no tab url contains: ' + spec.urlContains)
+    if (matches.length === 0) throw new Error('no tab url contains: ' + spec.urlContains)
+    const chosen = await pickUnique(matches, needle, 'url', spec.urlContains)
+    lastTouchedTargetId = chosen.targetId
+    return chosen.page
   }
   if (spec.titleContains) {
     const needle = String(spec.titleContains).toLowerCase()
+    const matches = []
     for (const p of pages) {
       try {
-        if (String(await p.title()).toLowerCase().indexOf(needle) !== -1) {
-          lastTouchedTargetId = _extractTargetId(p)
-          return p
+        const t = String(await p.title())
+        if (t.toLowerCase().indexOf(needle) !== -1) {
+          let u = ''
+          try { u = String(await p.url()) } catch (_e) {}
+          matches.push({ page: p, url: u, title: t, targetId: _extractTargetId(p) })
         }
       } catch (_e) {}
     }
-    throw new Error('no tab title contains: ' + spec.titleContains)
+    if (matches.length === 0) throw new Error('no tab title contains: ' + spec.titleContains)
+    const chosen = await pickUnique(matches, needle, 'title', spec.titleContains)
+    lastTouchedTargetId = chosen.targetId
+    return chosen.page
   }
   if (typeof spec.index === 'number') {
     if (spec.index < 0 || spec.index >= pages.length) throw new Error('index out of range')
@@ -1091,6 +1187,9 @@ module.exports = {
   findVisible: findVisible,
   clickByTag: clickByTag,
   helpers: helpers,
+  // exported for tools/cdp.test.js - the ambiguity guard's pure core.
+  _pickUnique: pickUnique,
+  _canonicalUrl: _canonicalUrl,
 }
 
 // CLI selftest for the credKey indirection. Proves the resolver returns a
