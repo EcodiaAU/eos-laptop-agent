@@ -2603,9 +2603,16 @@ exports.completionPass = async function completionPass() {
   // finished this tick) costs one indexless-but-tiny scan and zero further work,
   // where the old path read every running row and then walked the entire
   // in-memory inbox index for each of them, every 5 seconds, forever.
+  // 2026-09-05 lane C1. Widened from status = 'running' to include 'orphaned'.
+  // Measured over 14 days: 3 one-shot rows carry BOTH status='orphaned' and a
+  // worker-written done_at. Those are real completions the scheduler threw away,
+  // because the reap or the six-hour timer fired between the worker's row write
+  // and the next completion tick, and after that no pass would ever look at them
+  // again. Honouring them fabricates nothing: done_at can only have been written
+  // by the worker itself, so this reads a report that was already there.
   const result = await pool.query(
     `SELECT * FROM os_scheduled_tasks
-      WHERE status = 'running' AND done_at IS NOT NULL LIMIT 50`
+      WHERE status IN ('running', 'orphaned') AND done_at IS NOT NULL LIMIT 50`
   )
   if (!result.rows.length) return
 
@@ -3298,7 +3305,8 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
   const liveness = opts.liveness || require('./worker-liveness')
   const dispatcher = opts.dispatcher || getDispatcher()
   const res = await pool.query(
-    `SELECT id, name, type, cron_expression, status, leased_at, dispatched_tab_id
+    `SELECT id, name, type, cron_expression, status, leased_at, dispatched_tab_id,
+            bound_at, launch_retry_count
        FROM os_scheduled_tasks WHERE status = 'running' AND archived_at IS NULL`
   )
   if (!res.rows.length) return { scanned: 0, reaped: 0, live: 0, unknown: 0, verdicts: [] }
@@ -3344,6 +3352,85 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
         [nextRunAt, row.id, why.slice(0, 900)]
       )
+    } else if (!row.bound_at) {
+      // C-i, 2026-09-05 lane C1. A one-shot that leased and never bound never
+      // STARTED. Measured over 14 days: 89 of 194 leased rows died here, every one
+      // of them carrying this same reap reason at retry_count = 0, and every one
+      // of them terminal, because 0 orphaned rows carry a future next_run_at. The
+      // Mac failing to open a tab (usage cap, memory pressure, the IDE tab
+      // ceiling) was being recorded as the job failing, and the job was then
+      // silently lost. It is the largest single class in the whole funnel.
+      //
+      // So relaunch it, under a ceiling, and refuse the relaunch in the three
+      // cases where retrying is worse than stopping. The decision is in
+      // dispatch-settle.launchFailureDecision so it is testable without a tick.
+      const settleMod = opts.settle || require('./dispatch-settle')
+      let laneHeld = false, laneKey = null
+      try {
+        const lh = await pool.query(
+          `SELECT os_sched_lane_key($2) AS lane,
+                  EXISTS (SELECT 1 FROM os_scheduled_tasks h
+                           WHERE h.id <> $1 AND h.archived_at IS NULL
+                             AND h.status IN ('active', 'paused', 'running', 'dispatching')
+                             AND os_sched_lane_key(h.name) IS NOT NULL
+                             AND os_sched_lane_key(h.name) = os_sched_lane_key($2)) AS held`,
+          [row.id, row.name]
+        )
+        laneKey = lh.rows[0] && lh.rows[0].lane
+        laneHeld = !!(laneKey && lh.rows[0].held)
+      } catch (e) {
+        // Unresolvable lane state fails CLOSED: treat it as held, which defers.
+        laneHeld = true
+        process.stderr.write('[scheduler] launch-failure lane probe failed for ' + row.id + ': ' + e.message + '\n')
+      }
+      const capped = exports._getCappedOutageState().firstDeferAt !== null
+      const d = settleMod.launchFailureDecision(row, { capped, laneHeld, laneKey })
+
+      if (d.action === 'relaunch') {
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', next_run_at = $2,
+               launch_retry_count = COALESCE(launch_retry_count, 0) + 1,
+               leased_by = NULL, leased_at = NULL, last_run_at = NOW(),
+               last_error = $3, ${tabFrag} updated_at = NOW()
+           WHERE id = $1 AND status = 'running' AND archived_at IS NULL
+             AND bound_at IS NULL AND done_at IS NULL
+             AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+          [row.id, d.next_run_at, ('launch-failure relaunch: ' + d.reason).slice(0, 900)]
+        )
+        process.stderr.write('[scheduler] launch-failure RELAUNCH ' + row.id + ' (' + (row.name || '?') +
+          ') attempt ' + d.attempts + '/' + settleMod.MAX_LAUNCH_RETRIES + ' at ' + d.next_run_at + '\n')
+      } else if (d.action === 'escalate') {
+        // Loudly. Repeated launch failure is not this row's problem, it is the
+        // whole fleet degraded, and a quiet retry ceiling would hide exactly that.
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'settled-no-trace', settled_at = NOW(),
+               settle_verdict = 'launch-failure',
+               settle_evidence = $2::jsonb,
+               last_run_at = NOW(), last_error = $3, ${tabFrag} updated_at = NOW()
+           WHERE id = $1 AND status = 'running' AND archived_at IS NULL AND done_at IS NULL`,
+          [row.id,
+           JSON.stringify({ launch_failure: true, attempts: d.attempts, ceiling: settleMod.MAX_LAUNCH_RETRIES,
+                            liveness_reason: v.reason, transcript: v.evidence,
+                            settled_by: 'livenessReapPass.launch-failure-ceiling',
+                            note: 'the Mac could not open a tab for this row after ' + d.attempts +
+                                  ' attempts; the fleet is out of launch capacity' }),
+           ('launch-failure ceiling: ' + d.reason).slice(0, 900)]
+        )
+        process.stderr.write('[scheduler] LAUNCH-FAILURE CEILING ' + row.id + ' (' + (row.name || '?') +
+          '): ' + d.reason + ' -- the Mac is out of launch capacity\n')
+      } else {
+        // Deferred (capped, or the lane is held). Leave the row exactly where the
+        // pre-existing behaviour left it so nothing regresses, and say why.
+        await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'orphaned', last_run_at = NOW(), last_error = $2, ${tabFrag} updated_at = NOW()
+           WHERE id = $1 AND status = 'running' AND archived_at IS NULL`,
+          [row.id, ('launch-failure not relaunched: ' + d.reason + ' | ' + why).slice(0, 900)]
+        )
+        process.stderr.write('[scheduler] launch-failure DEFER ' + row.id + ': ' + d.reason + '\n')
+      }
     } else {
       await pool.query(
         `UPDATE os_scheduled_tasks
@@ -4448,6 +4535,25 @@ exports.start = function start() {
       }
     } catch (e) {
       process.stderr.write('[scheduler] livenessReapPass error: ' + e.message + '\n')
+    }
+    // 2026-09-05 lane C1. The evidence-settle reconciler, THIRD and last in the
+    // same serial tick, so a reclaim, a reap and a settle can never touch one row
+    // in one pass.
+    //
+    // Deliberately in-process and NOT a scheduled cron row. A cron row costs a
+    // dispatched tab and a model turn, which means the mechanism that fixes
+    // orphaned dispatches would itself be orphanable at the fleet's measured 84
+    // pct, and it would sit in the austerity band that currently has 37 cron rows
+    // paused. A reconciler you cannot count on running is not a reconciler.
+    try {
+      const settle = require('./dispatch-settle')
+      const r = await settle.settleReconcilerPass({ scheduler: exports })
+      if (r.settled || r.skipped_live) {
+        process.stderr.write('[scheduler] settleReconcilerPass: scanned=' + r.scanned +
+          ' settled=' + r.settled + ' refused_live=' + r.skipped_live + '\n')
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] settleReconcilerPass error: ' + e.message + '\n')
     }
   }, STALE_LEASE_INTERVAL_MS)
 
