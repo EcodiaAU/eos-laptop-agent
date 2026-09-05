@@ -62,7 +62,17 @@ ok('constructed command targets text-tate.js with --from watchdog label', () => 
   assert.ok(/imessage-agent\/text-tate\.js$/.test(rec.scriptPath), 'script path is text-tate.js: ' + rec.scriptPath)
   assert.strictEqual(rec.args[0], '--from')
   assert.strictEqual(rec.args[1], 'scheduler watchdog')
-  const msg = rec.args[2]
+  // TIER IS THE REGRESSION THIS PINS. text-tate defaults to fyi, which the send
+  // gate lints for operator vocabulary, and this page's own first word is
+  // "DISPATCH". Measured 2026-09-05: 62 refusals over four days, zero delivered,
+  // while the unlatch-and-retry loop above tried faithfully into a wall. Only
+  // critical is exempt (the gate warns rather than blocks on a page). This
+  // assertion existed as a positional read of args[2] and could not see the tier,
+  // which is why the defect shipped.
+  const u = rec.args.indexOf('--urgency')
+  assert.ok(u !== -1, 'page must carry an explicit --urgency, not inherit the fyi default')
+  assert.strictEqual(rec.args[u + 1], 'critical', 'a last-resort page is critical tier')
+  const msg = rec.args[rec.args.length - 1]
   assert.ok(/DISPATCH OUTAGE/.test(msg), 'message names the outage')
   assert.ok(/STALLED/.test(msg), 'message says work is stalled')
   // The whole constructed command must be em-dash (U+2014) free.

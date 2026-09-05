@@ -107,8 +107,16 @@ ok('aggregate: page targets text-tate.js with the runaway-breaker label, no em-d
   assert.ok(/text-tate\.js$/.test(s.scriptPath), 'targets text-tate.js: ' + s.scriptPath)
   assert.strictEqual(s.args[0], '--from')
   assert.strictEqual(s.args[1], 'runaway breaker')
-  assert.ok(/RUNAWAY DISPATCH BREAKER TRIPPED/.test(s.args[2]), 'message names the breaker')
-  assert.strictEqual(s.args[2].indexOf('\u2014'), -1, 'no em-dash in the page body')
+  // A last-resort page must be critical tier, not the fyi default: the send gate
+  // lints fyi for operator vocabulary and this body names fleet machinery. Read
+  // the message off the END rather than args[2], so adding a flag cannot make this
+  // assertion silently measure the wrong string.
+  const bu = s.args.indexOf('--urgency')
+  assert.ok(bu !== -1, 'breaker page must carry an explicit --urgency')
+  assert.strictEqual(s.args[bu + 1], 'critical', 'a breaker page is critical tier')
+  const bmsg = s.args[s.args.length - 1]
+  assert.ok(/RUNAWAY DISPATCH BREAKER TRIPPED/.test(bmsg), 'message names the breaker')
+  assert.strictEqual(bmsg.indexOf('\u2014'), -1, 'no em-dash in the page body')
   assert.ok(trip.page.command.indexOf('\u2014') === -1, 'no em-dash in constructed command')
 })
 
@@ -184,9 +192,11 @@ ok('same-name: a runaway loop (>5 in 2min) is quarantined with exactly one page'
   }
   assert.strictEqual(quarantinedAt, 5, 'quarantined on the 6th fire (index 5), i.e. more than 5 in 2min')
   assert.strictEqual(sent.length, 1, 'exactly one quarantine page')
-  assert.ok(/RUNAWAY TASK QUARANTINED/.test(sent[0].args[2]))
-  assert.ok(/"loopy"/.test(sent[0].args[2]), 'page names the offending task')
-  assert.strictEqual(sent[0].args[2].indexOf('\u2014'), -1, 'no em-dash in quarantine page')
+  const qmsg = sent[0].args[sent[0].args.length - 1]
+  assert.strictEqual(sent[0].args[sent[0].args.indexOf('--urgency') + 1], 'critical', 'a quarantine page is critical tier')
+  assert.ok(/RUNAWAY TASK QUARANTINED/.test(qmsg))
+  assert.ok(/"loopy"/.test(qmsg), 'page names the offending task')
+  assert.strictEqual(qmsg.indexOf('\u2014'), -1, 'no em-dash in quarantine page')
 
   // Idempotent: a second quarantine note for the same name does not re-page.
   const again = scheduler.breakerNoteQuarantine('loopy', 9)

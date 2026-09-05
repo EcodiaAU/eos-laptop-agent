@@ -591,7 +591,18 @@ exports.noteTransientDefer = function noteTransientDefer(errMsg) {
       'min). All scheduled work is STALLED (transient IDE-bridge, deferring 5min). ' +
       'Last error: ' + String(errMsg || '').slice(0, 120) +
       '. Reopen VSCode / the conductor to resume dispatch.'
-    const args = ['--from', 'scheduler watchdog', msg]
+  // --urgency critical is LOAD-BEARING. These pagers are the last-resort channel
+    // (see the TEXT_TATE_SCRIPT comment above: the one path that still reaches Tate
+    // when the IDE is gone), and every one of them named fleet machinery in its own
+    // alarm text. text-tate defaults to fyi, which the send gate lints for
+    // operator vocabulary, caps at 450 chars and makes compete for the daily chatter
+    // budget. Measured 2026-09-05: the DISPATCH OUTAGE page was refused 62 times over
+    // four days and landed ZERO, every one on the word "DISPATCH" in its first line,
+    // while the retry loop below faithfully unlatched and tried again into a wall.
+    // The gate already holds the right belief - it warns rather than blocks on a
+    // critical alarm ("never mute a page over word choice") and never refuses one for
+    // length - so the defect was the tier, not the gate and not the words.
+    const args = ['--from', 'scheduler watchdog', '--urgency', 'critical', msg]
     _pagerSender(TEXT_TATE_SCRIPT, args, function (err, code) {
       if (err || code !== 0) {
         // Send did not confirm delivery: unlatch so the next defer retries. Guard
@@ -845,7 +856,8 @@ exports.noteAllAccountsCapped = function noteAllAccountsCapped(err, nowMs) {
     'min and ALL scheduled work is stalled. Earliest reset: ' + resetTxt +
     '. This does not clear itself: switch or re-auth an account ' +
     '(bash ~/.code/eos-laptop-agent/scripts/account-switch.sh <tate|code|money>).'
-  const args = ['--from', 'scheduler capped-outage', msg]
+  // --urgency critical: see noteTransientDefer. Same last-resort class.
+  const args = ['--from', 'scheduler capped-outage', '--urgency', 'critical', msg]
   _pagerSender(TEXT_TATE_SCRIPT, args, function (err2, code) {
     if (err2 || code !== 0) {
       _cappedPageSent = false
@@ -967,7 +979,8 @@ function _consumeBreakerResetFile() {
 // the quarantine itself is the real protection and one attempt is enough. Returns the
 // constructed command so tests assert on it without spawning text-tate.js.
 function _fireBreakerPage(msg, latched) {
-  const args = ['--from', 'runaway breaker', msg]
+  // --urgency critical: see noteTransientDefer. Same last-resort class.
+  const args = ['--from', 'runaway breaker', '--urgency', 'critical', msg]
   _pagerSender(TEXT_TATE_SCRIPT, args, function (err, code) {
     if (err || code !== 0) {
       if (latched) _breakerPageSent = false
