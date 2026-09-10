@@ -648,7 +648,19 @@ const coord = require('./coord.js')
   console.log('Part 5: the leaked-tab reaper preserves the conductor by identity')
   const { execFileSync } = require('child_process')
   const reapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'reap-fix-'))
-  const REAP_TTAB = 'ttab_cond_reap_1_1'
+  // MINTED THE WAY THE BRIDGE MINTS ONE, AND THE ANCHOR DATED AFTER IT
+  // (2026-09-11, lane C7). reap-plan now refuses a label-only anchor claim whose
+  // anchor predates the tab's own stable id, because a cron's label is
+  // byte-identical on every fire and a 13-day-old anchor was handing a live tab
+  // the dead fire's tab_id. A synthetic id that decodes to nothing, or an anchor
+  // with no updated_at, is refused at THAT tier, the battery never runs, and
+  // this Part stops exercising the conductor belt it exists to exercise: it
+  // would still report the tab preserved, for a reason that proves nothing about
+  // the conductor. So the fixture states a real identity and a real clock, and
+  // the anchor postdates the tab exactly as the scenario in the header requires.
+  const REAP_BORN = Date.parse('2026-09-10T12:00:00.000Z')
+  const REAP_TTAB = 'ttab_' + REAP_BORN.toString(36) + '_reap_1_1'
+  const REAP_ANCHOR_AT = Math.floor((REAP_BORN + 30000) / 1000)
   const REAP_LABEL = 'Reaper Live Label'
   fs.mkdirSync(path.join(reapRoot, 'conductors'), { recursive: true })
   fs.mkdirSync(path.join(reapRoot, 'workers'), { recursive: true })
@@ -664,6 +676,7 @@ const coord = require('./coord.js')
   }))
   fs.writeFileSync(path.join(reapRoot, 'chat-tabs', 'tab_reapw.json'), JSON.stringify({
     tab_id: 'tab_reapw', role: 'worker', label: REAP_LABEL, session_id: 'sess_reapw',
+    updated_at: REAP_ANCHOR_AT,
   }))
   const preload = path.join(reapRoot, 'stub-bridge.js')
   fs.writeFileSync(preload, [
@@ -696,6 +709,14 @@ const coord = require('./coord.js')
     // that never reached the guard at all.
     assert(reapReport.live_tabs_seen === 1, 'reaper premise: the stubbed bridge listing reached it')
     const reasons = (reapReport.preserved || []).map((x) => x.reason)
+    // SECOND PREMISE (2026-09-11). The conductor belt only fires if the anchor
+    // tier resolved this tab at all. If the 2026-09-11 causality test refuses
+    // the claim, the tab is preserved for a reason that says nothing about the
+    // conductor and the assertion below would pass on a vacuous report.
+    assert(reasons.indexOf('anchor_predates_this_tab_identity') === -1 &&
+           reasons.indexOf('anchor_has_no_stable_id_and_no_usable_clock') === -1,
+      'reaper premise: the anchor tier must ADMIT this claim so the conductor belt ' +
+      'is what preserves the tab (preserved=' + JSON.stringify(reasons) + ')')
     // The INVARIANT is "the conductor tab is preserved", not "preserved by one
     // named belt". 5fdc819 added a dedicated conductor-stable-id belt in
     // reap-plan ahead of the guard, which is strictly stronger (two belts, the

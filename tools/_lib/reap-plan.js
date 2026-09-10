@@ -45,6 +45,44 @@ const isGeneric = (s) => GENERIC.has(String(s || '').trim().toLowerCase())
 const DISPATCH_SENTINEL = /^\[[0-9a-f]{4}\s/
 const wearsDispatchSentinel = (s) => DISPATCH_SENTINEL.test(String(s || ''))
 
+// A LABEL THAT IS STABLE ACROSS FIRES IS NOT AN IDENTITY, AND THE CLOCK IS
+// (2026-09-11, lane C7). See the tier-1 note below for the measured wrong-close
+// these two decoders exist to refuse.
+//
+// The bridge mints a stable id as 'ttab_' + Date.now().toString(36) + ... in
+// cursor-preview-extension/ide-bridge.js assignStableTabIds, so the id itself
+// carries the millisecond at which THIS tab's identity was minted. That is a
+// causal fact, not an age heuristic: nothing written before a tab had an
+// identity can be a statement about that tab.
+//
+// FAIL-SAFE ON EVERY UNKNOWN. An id that does not decode to a plausible epoch
+// and an anchor with no usable clock both return null, and the caller REFUSES
+// the label-only claim rather than admitting it. Refusing costs a collection
+// (one leaked webview); admitting costs a live worker.
+const TTAB_EPOCH = /^ttab_([0-9a-z]+)_/
+const PLAUSIBLE_MIN_MS = 1000000000000   // 2001-09-09, below any real fleet id
+const PLAUSIBLE_MAX_MS = 4000000000000   // 2096, above any id this tool will see
+const plausible = (ms) => Number.isFinite(ms) && ms >= PLAUSIBLE_MIN_MS && ms <= PLAUSIBLE_MAX_MS
+function ttabMintedAtMs(ttab) {
+  const m = TTAB_EPOCH.exec(String(ttab || ''))
+  if (!m) return null
+  const ms = parseInt(m[1], 36)
+  return plausible(ms) ? ms : null
+}
+// Anchors store updated_at in WHOLE SECONDS. Measured 2026-09-11 over the 2,103
+// stamped anchors on disk, 138 of them read up to 0.9s BEFORE their own ttab
+// mint purely from that truncation, which is why the caller carries slop.
+function anchorWrittenAtMs(a) {
+  const u = a && a.updated_at
+  if (typeof u !== 'number' || !Number.isFinite(u) || u <= 0) return null
+  const ms = u < PLAUSIBLE_MIN_MS ? u * 1000 : u
+  return plausible(ms) ? ms : null
+}
+// 2 minutes. Two orders of magnitude above the worst measured truncation lead
+// (0.9s) and two orders BELOW the tightest live cron interval (4h), so it
+// absorbs clock granularity without ever admitting a previous fire.
+const ANCHOR_CLOCK_SLOP_MS = 120000
+
 function planReap(input) {
   const liveTabsIde = input.liveTabsIde || []
   const anchors = input.anchors || []
@@ -105,12 +143,83 @@ function planReap(input) {
   // 'multiple_anchors_claim_this_tab' now resolves to the LIVE fire's tab_id.
   // That is the intended outcome and it buys no permission: signals 2, 3, 5, 6
   // and 7 run afterwards from the one shared battery, unweakened.
+  //
+  // THE OTHER HALF OF THAT FILTER WAS VACUOUS, AND THE HOLE WAS LIVE
+  // (2026-09-11, lane C7). `a.tabId && a.tabId !== tab.tabId` refuses a stale
+  // anchor only when the stale anchor CARRIES a stable id. An anchor with no
+  // id skipped the test entirely and kept an unqualified label-only claim, so
+  // the whole defect above simply moved to the unstamped population. Measured
+  // that day over the live corpus: 508 of 2,611 anchors carry no stable id, and
+  // 65 of the 91 labels worn by more than one anchor have at least one of them.
+  //
+  // MEASURED 2026-09-10T17:30Z, C3 fire 29, and the pair is still on disk. One
+  // live handle resolved to TWO tab_ids twenty seconds apart in a single fire:
+  // ttab_mtvsz8rr_1_1 (minted 17:30:22.887Z) took tab_1787938228880_a97dce1d
+  // from anchor 44bf616f-....json, written 2026-08-28T17:30:46Z by the fire
+  // THIRTEEN DAYS earlier and carrying no tabId, then took its own
+  // tab_1789061417567_626d74ae once anchor 6d7fc10f-....json landed at
+  // 17:30:30Z. A cron's task_id is its os_scheduled_tasks row id (probed:
+  // ledger-safety-sweep is 8dc1983a-557f-4e03-977c-ea1a2ddfb82e, and 8dc1 is
+  // the sentinel), so every fire wears a byte-identical label forever.
+  //
+  // AND EVERY BELT DOWNSTREAM INHERITS THE WRONG ANSWER, INCLUDING THE ONE
+  // BUILT FOR THIS. liveClaimedTabIds and rows.get() are keyed on the STALE
+  // tab_id, so a terminated 13-day-old row reads as a collectable worker.
+  // liveWriters is keyed on the same stale id, so the transcript belt cannot
+  // see the live tab writing turns under its OWN id. The strategy name is
+  // reaper_anchor_exact_label, which is not fuzzy, so tab-close-guard belt 3
+  // does not refuse. A background tab is not active, so belts 1 and 2 pass. The
+  // 17:30Z fire survived on luck alone: the 13-day-old registry row had already
+  // aged off disk (retention ~22h, 35 files), so rows.get missed and
+  // no_registry_row preserved. Six live crons fire more often than daily, which
+  // puts a TERMINATED previous-fire row inside that retention window.
+  //
+  // THE FIX IS A CAUSALITY TEST, NOT AN AGE THRESHOLD. An epoch threshold on
+  // the resolved tab_id cannot separate "the previous fire" from "a worker that
+  // has legitimately run for hours". This asks a question that has one answer:
+  // was this anchor written before the tab it wants to claim even had an
+  // identity? The bridge mints the stable id from Date.now(), so the id itself
+  // dates the identity. A previous fire's anchor always predates the current
+  // fire's tab; a long-running worker's anchor NEVER predates its own tab, no
+  // matter how long it runs, so this refuses the one and cannot touch the other.
+  //
+  // ON RECOGNITION VS PERMISSION. It only ever REMOVES claims. A refused
+  // label-only claim falls through to tier 2 (the row's own stable id) and tier
+  // 3 (fingerprint), both of which are id-grounded, and the shared battery runs
+  // unweakened afterwards. The cost is bounded and one-directional: a leaked
+  // webview, never a wrong close.
   const byTtab = new Map()   // ttab id -> [{anchor, tab}]
+  // Refused label-only claims, kept so a tab this narrowing dropped reports the
+  // reason it was dropped for instead of a vaguer downstream one. Seen and
+  // refused on policy is a more useful fact than invisible.
+  const labelOnlyRefused = new Map()   // ttab id -> { reason, claimants }
+  const refuse = (ttabId, reason) => {
+    const cur = labelOnlyRefused.get(ttabId)
+    if (!cur) { labelOnlyRefused.set(ttabId, { reason: reason, claimants: 1 }); return }
+    cur.claimants += 1
+    // 'predates' is the sharper fact and names the measured defect, so it wins
+    // over a bare clock failure when one tab collects both.
+    if (reason === 'anchor_predates_this_tab_identity') cur.reason = reason
+  }
   for (const a of anchors) {
     const exact = liveTabsIde.filter((t) => t.label === a.label && t.tabId)
     if (exact.length !== 1) continue
     const tab = exact[0]
-    if (a.tabId && a.tabId !== tab.tabId) continue
+    if (a.tabId) {
+      // Positive claim about WHICH tab this is. Unchanged since 2026-08-29.
+      if (a.tabId !== tab.tabId) continue
+    } else {
+      const mintedAt = ttabMintedAtMs(tab.tabId)
+      const writtenAt = anchorWrittenAtMs(a)
+      if (mintedAt === null || writtenAt === null) {
+        refuse(tab.tabId, 'anchor_has_no_stable_id_and_no_usable_clock')
+        continue
+      }
+      if (writtenAt + ANCHOR_CLOCK_SLOP_MS < mintedAt) {
+        refuse(tab.tabId, 'anchor_predates_this_tab_identity')
+        continue
+      }
+    }
     if (!byTtab.has(tab.tabId)) byTtab.set(tab.tabId, [])
     byTtab.get(tab.tabId).push({ anchor: a, tab: tab })
   }
@@ -147,9 +256,15 @@ function planReap(input) {
     }
     // Carried so a tab that also fails tiers 2 and 3 still reports the reason
     // the anchor tier had for it, rather than a vaguer one.
+    const refused = labelOnlyRefused.get(tab.tabId) || null
     const tier1 = claims.length > 1
       ? { reason: 'multiple_anchors_claim_this_tab', extra: { claimants: claims.length } }
-      : null
+      // A tab whose only would-be anchors were refused by the causality test
+      // reports THAT, so the 2026-09-11 narrowing is legible in the durable
+      // record instead of hiding behind no_anchor_no_registry_row.
+      : (claims.length === 0 && refused
+        ? { reason: refused.reason, extra: { label_only_refused: refused.claimants } }
+        : null)
 
     // TIER 2 - the stable ttab id stored on the row, corroborated by the label.
     const byId = rowsByTtab.get(tab.tabId) || []

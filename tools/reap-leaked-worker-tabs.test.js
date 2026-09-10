@@ -27,6 +27,23 @@ const labelWears = (live, full) => { try { return !!(full && coord._labelWearsSt
 const TERMINATED = '2026-08-29T04:00:00.000Z'
 const CONDUCTOR = { tab_id: 'conductor', stable_tab_id: 'ttab_cond_1_1', title_match: 'CE Teams', ide_bridge_port: 1 }
 
+// A PRODUCTION STABLE ID DATES ITS TAB, AND A FIXTURE THAT IGNORES THAT CANNOT
+// EXERCISE THE 2026-09-11 CAUSALITY RULE.
+//
+// The bridge mints 'ttab_' + Date.now().toString(36) + '_' + seq + '_' + column
+// (cursor-preview-extension/ide-bridge.js assignStableTabIds), so every live id
+// decodes to the millisecond that tab's identity was minted, and every anchor on
+// disk carries updated_at in WHOLE SECONDS (measured 2026-09-11: 0 of 2,611
+// missing). reap-plan refuses a label-only claim whose clock it cannot read, so
+// a fixture wanting the legacy label-only path has to mint its id and state its
+// clock the way production does. Any fixture below that never reaches that path
+// keeps its synthetic id, because changing it would prove nothing.
+const mintTtab = (ms, tag) => 'ttab_' + ms.toString(36) + '_' + tag
+const secs = (ms) => Math.floor(ms / 1000)
+// The tab from C3 fire 29, 2026-09-10T17:30:22.887Z, decoded from the real
+// ttab_mtvsz8rr_1_1 that took a 13-day-old anchor's tab_id.
+const BORN = Date.parse('2026-09-10T17:30:22.887Z')
+
 const tab = (o) => Object.assign({ tabId: 'ttab_x_1_1', label: 'x', index: 3, viewColumn: 1, active: false }, o)
 const row = (o) => Object.assign({ terminated_at: TERMINATED, tab_handle: {} }, o)
 const run = (o) => planReap({
@@ -66,8 +83,10 @@ ok('a human chat scoring 2/2 cov=1.00 on a terminated worker brief is NEVER a ca
 // ── 2. Tier 1 unchanged: one exact-label anchor still reaps. ─────────────────
 ok('tier 1 (one exact-label anchor) reaps a terminated quiet worker', () => {
   const rep = run({
-    tabs: [tab({ tabId: 'ttab_w1_1_1', label: '[aaaa a leaked worker t…' })],
-    anchors: [{ label: '[aaaa a leaked worker t…', tab_id: 'tab_w1', role: 'worker', session_id: 's1' }],
+    // Minted id + a clock the anchor postdates: the legacy label-only path, on
+    // the only shape production actually produces.
+    tabs: [tab({ tabId: mintTtab(BORN, 'w1_1'), label: '[aaaa a leaked worker t…' })],
+    anchors: [{ label: '[aaaa a leaked worker t…', tab_id: 'tab_w1', role: 'worker', session_id: 's1', updated_at: secs(BORN + 8000) }],
     rows: { tab_w1: row({}) },
   })
   assert.strictEqual(rep.candidates.length, 1)
@@ -78,11 +97,13 @@ ok('tier 1 (one exact-label anchor) reaps a terminated quiet worker', () => {
 ok('tier 2 (stable id + label corroboration) reaps where the anchor tier is ambiguous', () => {
   const L = '[bbbb a recurring cron b…'
   const rep = run({
-    tabs: [tab({ tabId: 'ttab_w2_1_1', label: L })],
+    tabs: [tab({ tabId: mintTtab(BORN, 'w2_1'), label: L })],
     // Seven anchors wearing ONE label - the measured recurring-cron shape that
-    // makes signal 4 drop the tab.
-    anchors: Array.from({ length: 7 }, (_, i) => ({ label: L, tab_id: 'tab_fire' + i, role: 'worker' })),
-    rows: { tab_w2: row({ tab_handle: { tabId: 'ttab_w2_1_1', sentinel_prefix: '[bbbb a recurring cron brief]' } }) },
+    // makes signal 4 drop the tab. All seven postdate the tab, so all seven are
+    // admitted and the ambiguity this tier exists to survive is the real one
+    // rather than an artefact of the 2026-09-11 clock refusal.
+    anchors: Array.from({ length: 7 }, (_, i) => ({ label: L, tab_id: 'tab_fire' + i, role: 'worker', updated_at: secs(BORN + 1000 * i) })),
+    rows: { tab_w2: row({ tab_handle: { tabId: mintTtab(BORN, 'w2_1'), sentinel_prefix: '[bbbb a recurring cron brief]' } }) },
   })
   assert.strictEqual(rep.candidates.length, 1, 'tier 2 must resolve a tier-1-ambiguous tab')
   assert.strictEqual(rep.candidates[0].via, 'stable_tab_id')
@@ -239,6 +260,9 @@ ok('a tab with no anchor and no registry row is reported, not silently invisible
 // PREVIOUS fire of that cron. The fixtures below are that exact shape.
 const STALE_TTAB = 'ttab_mtecz9vl_1_1'   // the dead fire's stable id
 const LIVE_TTAB = 'ttab_mtelxb62_1_1'    // the live fire's stable id
+// Both decode, because the bridge minted them: 2026-08-29T12:30:25.473Z and
+// 16:40:50.378Z, 4h10m apart, which is the previous-fire gap the header names.
+const LIVE_BORN = parseInt(LIVE_TTAB.split('_')[1], 36)
 const CRON_LABEL = '[ea2e ecodiaos lane C3 r…'
 
 ok('a stale same-label anchor from a dead cron fire loses to the live tab', () => {
@@ -294,8 +318,11 @@ ok('GUARD INTACT: two anchors with NO stable id on one label still refuse', () =
   const rep = run({
     tabs: [tab({ tabId: LIVE_TTAB, label: CRON_LABEL })],
     anchors: [
-      { label: CRON_LABEL, tab_id: 'tab_fireA', role: 'worker', session_id: 'sa' },
-      { label: CRON_LABEL, tab_id: 'tab_fireB', role: 'worker', session_id: 'sb' },
+      // Both postdate the live tab's mint, so both are ADMITTED and collide.
+      // Dating them earlier would refuse them on the clock and this guard would
+      // read as intact while testing nothing.
+      { label: CRON_LABEL, tab_id: 'tab_fireA', role: 'worker', session_id: 'sa', updated_at: secs(LIVE_BORN + 3000) },
+      { label: CRON_LABEL, tab_id: 'tab_fireB', role: 'worker', session_id: 'sb', updated_at: secs(LIVE_BORN + 9000) },
     ],
     rows: { tab_fireA: row({}), tab_fireB: row({}) },
   })
@@ -355,8 +382,8 @@ ok('PART 5b: a tab STRICT already corroborated is NOT flagged', () => {
 ok('PART 5c: a tier-1 resolution counts under its own via and rescues nobody', () => {
   const L = '[dddd tier one anchor label]'
   const rep = run({
-    tabs: [tab({ tabId: 'ttab_t1_1_1', label: L })],
-    anchors: [{ label: L, tab_id: 'tab_t1', role: 'worker', session_id: 's1' }],
+    tabs: [tab({ tabId: mintTtab(BORN, 't1_1'), label: L })],
+    anchors: [{ label: L, tab_id: 'tab_t1', role: 'worker', session_id: 's1', updated_at: secs(BORN + 5000) }],
     rows: { tab_t1: row({}) },
   })
   assert.strictEqual(rep.candidates.length, 1)
@@ -411,6 +438,201 @@ ok('PART 5g: MUTATION GATE, the flag tracks the branch and not the outcome', () 
   assert.strictEqual(reasonFor(before, 'ttab_short_1_1'), 'stable_id_label_does_not_corroborate')
   assert.strictEqual(summariseResolution(before).wears_rescued_count, 0)
   assert.strictEqual(summariseResolution(before).resolved_via.unresolved, 1)
+})
+
+
+// -- PART 6. THE UNSTAMPED HALF OF THE STALE-ANCHOR DEFECT. -------------------
+//
+// WHY (2026-09-11, lane C7). Part 4's filter refuses a stale anchor only when
+// that anchor CARRIES a stable id. An anchor with no id skipped the test and
+// kept an unqualified label-only claim, so the defect simply moved to the
+// unstamped population: 508 of the 2,611 anchors on disk carry no stable id,
+// and 65 of the 91 labels worn by more than one anchor have at least one.
+//
+// MEASURED 2026-09-10T17:30Z, C3 fire 29. The live handle ttab_mtvsz8rr_1_1
+// (minted 17:30:22.887Z) resolved via anchor_exact_label to
+// tab_1787938228880_a97dce1d, out of an anchor written 2026-08-28T17:30:46Z by
+// the same cron THIRTEEN days earlier and carrying no tabId. It survived on
+// luck: the 13-day-old registry row had already aged off disk (retention ~22h)
+// so rows.get missed and no_registry_row preserved. Six live crons fire more
+// often than daily, which puts a TERMINATED previous-fire row inside that
+// window, and then every remaining belt reads the WRONG id, including the
+// transcript belt that exists to catch exactly this.
+//
+// The fix is a causality test, not an age threshold: an anchor written before
+// a tab's identity was minted cannot be a statement about that tab. Cases 6c
+// and 6d are the half that makes it a rule rather than a blanket refusal.
+const STALE_ANCHOR_AT = Date.parse('2026-08-28T17:30:46.000Z')   // 13 days back
+const LIVE_TAB = mintTtab(BORN, 'mtvsz_1')                        // 17:30:22.887Z
+const SWEEP_LABEL = '[8dc1 ledger safety swee…'
+const SWEEP_SENTINEL = '[8dc1 ledger safety sweep]'
+const staleAnchor = { label: SWEEP_LABEL, tab_id: 'tab_deadfire_8dc1', role: 'worker', session_id: 's_2026_08_28', updated_at: secs(STALE_ANCHOR_AT) }
+
+ok('PART 6a: a 13-day-old UNSTAMPED anchor never claims this fire’s live tab', () => {
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    // The only anchor on disk for this label. The live fire has not written its
+    // own yet: that ~20s gap IS the window.
+    anchors: [staleAnchor],
+    rows: {
+      // The dead fire's row, TERMINATED and still on disk. This is the half the
+      // 17:30Z fire got lucky on, and it is what turns the defect into a close.
+      tab_deadfire_8dc1: row({ tab_handle: { tabId: 'ttab_deadfire_1_1' } }),
+      // The live fire, running right now under its own id.
+      tab_livefire_8dc1: row({ terminated_at: null, tab_handle: { tabId: LIVE_TAB, sentinel_prefix: SWEEP_SENTINEL } }),
+    },
+    // AND THE LIVE TAB IS WRITING. Keyed on its OWN tab_id, which the stale
+    // resolution never reaches, so this belt is blind pre-fix by construction.
+    writers: { tab_livefire_8dc1: Date.now() },
+  })
+  assert.strictEqual(rep.candidates.length, 0,
+    'WRONG CLOSE: a live worker tab became a reap candidate on a dead fire’s identity')
+  assert.strictEqual(reasonFor(rep, LIVE_TAB), 'stable_id_claimed_by_a_live_worker',
+    'and it must be preserved BECAUSE a live worker holds this stable id, not by luck downstream')
+})
+
+ok('PART 6b: the refusal is the ANCHOR TIER’s, and it says so in the report', () => {
+  // Same stale anchor, but nothing downstream can resolve the tab either, so
+  // the reported reason is the tier-1 refusal itself rather than a rescue.
+  // Without this case 6a alone cannot tell the narrowing from a lucky tier 2.
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    anchors: [staleAnchor],
+    rows: {},
+  })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, LIVE_TAB), 'anchor_predates_this_tab_identity')
+  const entry = rep.preserved.find((x) => x.ttab === LIVE_TAB)
+  assert.strictEqual(entry.label_only_refused, 1,
+    'the refused claimant count rides to the durable record so the narrowing is legible')
+})
+
+ok('PART 6c: CONTROL, an unstamped anchor that POSTDATES the tab still reaps it', () => {
+  // The rule must refuse a previous fire and nothing else. This is the genuine
+  // leak the tool exists to collect: same shape, same label, same absence of a
+  // stable id, and the only difference is that the anchor was written after
+  // this tab had an identity. A fix that fails this is a blanket refusal
+  // wearing a causality argument, and cases 6a and 6b would not notice.
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    anchors: [Object.assign({}, staleAnchor, { tab_id: 'tab_thisfire_8dc1', updated_at: secs(BORN + 7000) })],
+    rows: { tab_thisfire_8dc1: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 1, 'the narrowing must not cost a real collection')
+  assert.strictEqual(rep.candidates[0].via, 'anchor_exact_label')
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_thisfire_8dc1')
+})
+
+ok('PART 6d: CONTROL, a worker running for six hours is never refused on its age', () => {
+  // The failure mode a naive epoch threshold on the RESOLVED tab_id would
+  // introduce. Measured over the live corpus, an anchor trails its own tab's
+  // mint by up to 22,259s (6.2h) because the anchor is refreshed across the
+  // tab's life. A long-running worker's anchor can never predate its own tab,
+  // so the causality test cannot reach it no matter how long it runs.
+  const SIX_HOURS = 6 * 3600 * 1000
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    anchors: [Object.assign({}, staleAnchor, { tab_id: 'tab_longrunner', updated_at: secs(BORN + SIX_HOURS) })],
+    rows: { tab_longrunner: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 1)
+  assert.strictEqual(rep.candidates[0].via, 'anchor_exact_label')
+})
+
+ok('PART 6e: CONTROL, second-granularity truncation does not refuse a live anchor', () => {
+  // updated_at is stored in WHOLE SECONDS while the ttab carries milliseconds,
+  // so a legitimate anchor reads up to 1s EARLY. Measured 2026-09-11: 138 of
+  // the 2,103 stamped anchors sit up to 0.9s before their own mint from that
+  // alone. A zero-slop comparison would refuse them and this tool would quietly
+  // stop collecting.
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    anchors: [Object.assign({}, staleAnchor, { tab_id: 'tab_truncated', updated_at: secs(BORN) - 1 })],
+    rows: { tab_truncated: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 1, 'a 1s truncation lead is not a previous fire')
+  assert.strictEqual(rep.candidates[0].via, 'anchor_exact_label')
+})
+
+ok('PART 6f: an anchor with no stable id and no usable clock is refused, not admitted', () => {
+  // Fail-safe on the unknown. Every one of the 2,611 anchors on disk carries
+  // updated_at, so this is the shape that appears only if the writer changes or
+  // a record is truncated. It reports its own reason rather than resolving on
+  // a label, because a label is what started all of this.
+  const noClock = { label: SWEEP_LABEL, tab_id: 'tab_noclock', role: 'worker', session_id: 's_noclock' }
+  for (const bad of [{}, { updated_at: 0 }, { updated_at: 'yesterday' }, { updated_at: null }, { updated_at: NaN }]) {
+    const rep = run({
+      tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+      // Built WITHOUT a clock rather than by overriding one, so the bare {} case
+      // is genuinely absent instead of inheriting a valid stale timestamp.
+      anchors: [Object.assign({}, noClock, bad)],
+      rows: {},
+    })
+    assert.strictEqual(rep.candidates.length, 0, 'an unreadable clock must never admit a claim')
+    assert.strictEqual(reasonFor(rep, LIVE_TAB), 'anchor_has_no_stable_id_and_no_usable_clock')
+  }
+})
+
+ok('PART 6g: an unparseable stable id refuses the claim rather than trusting the label', () => {
+  // If the bridge ever changes its id format, every label-only claim must fail
+  // CLOSED and say so, not fall back to the join that produced the defect.
+  const rep = run({
+    tabs: [tab({ tabId: 'ttab_notanepoch_1_1', label: SWEEP_LABEL })],
+    anchors: [Object.assign({}, staleAnchor, { tab_id: 'tab_x', updated_at: secs(BORN) })],
+    rows: {},
+  })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, 'ttab_notanepoch_1_1'), 'anchor_has_no_stable_id_and_no_usable_clock')
+})
+
+ok('PART 6i: STATE THE FLOOR, a fire five minutes ago is still a previous fire', () => {
+  // 6a through 6h all pin the MEASURED case, which is 13 days stale, and a
+  // suite that only pins that passes happily with the slop widened to a week.
+  // Caught by mutation M4 on 2026-09-11: ANCHOR_CLOCK_SLOP_MS = 7 days left all
+  // eight green, because 13 days still clears a 7-day tolerance. The tolerance
+  // exists to absorb the SECOND-granularity of updated_at and nothing else, so
+  // the floor belongs in the suite as its own assertion rather than in a
+  // constant nobody re-reads.
+  //
+  // Five minutes is deliberately far below today's tightest live cadence
+  // (measured 2026-09-11: 180min, gmail-inbox-poll) because that number moves
+  // the moment someone adds a cron and a test pinned to it would rot into a
+  // false pass. Any slop wide enough to admit a five-minute-old fire is wrong
+  // on any fleet.
+  const FIVE_MIN = 5 * 60 * 1000
+  const rep = run({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    anchors: [Object.assign({}, staleAnchor, { updated_at: secs(BORN - FIVE_MIN) })],
+    rows: { tab_deadfire_8dc1: row({}) },
+  })
+  assert.strictEqual(rep.candidates.length, 0,
+    'ANCHOR_CLOCK_SLOP_MS is wide enough to admit a previous fire: it absorbs ' +
+    'clock granularity, measured at under one second, not a dispatch interval')
+  assert.strictEqual(reasonFor(rep, LIVE_TAB), 'anchor_predates_this_tab_identity')
+})
+
+ok('PART 6h: MUTATION GATE, the stale anchor is refused by the CLOCK and nothing else', () => {
+  // 6a asserts a preserved tab and 6b asserts a reason, and a suite can pass
+  // both while the guard does nothing, because a tab with no resolution is
+  // preserved anyway. This case pins the DISCRIMINATION: one fixture, one field
+  // changed, opposite outcomes. Move the stale anchor's clock forward past the
+  // tab's mint and the SAME anchor must win the join and hand back the SAME
+  // dead tab_id that 6a refuses. If both halves agree, the rule is not reading
+  // the clock and every case in Part 6 is measuring nothing.
+  const fixture = (updated_at) => ({
+    tabs: [tab({ tabId: LIVE_TAB, label: SWEEP_LABEL })],
+    anchors: [Object.assign({}, staleAnchor, { updated_at: updated_at })],
+    rows: { tab_deadfire_8dc1: row({}) },
+  })
+  const refused = run(fixture(secs(STALE_ANCHOR_AT)))
+  const admitted = run(fixture(secs(BORN + 1000)))
+  assert.strictEqual(refused.candidates.length, 0,
+    'PRE-FIX BEHAVIOUR IS BACK: the 13-day-old anchor claimed a live tab')
+  assert.strictEqual(reasonFor(refused, LIVE_TAB), 'anchor_predates_this_tab_identity')
+  assert.strictEqual(admitted.candidates.length, 1,
+    'FIXTURE BROKEN: this anchor cannot win the join even when its clock is valid, ' +
+    'so the refusal above proves nothing about the clock')
+  assert.strictEqual(admitted.candidates[0].tab_id, 'tab_deadfire_8dc1')
 })
 
 console.log('\n' + passed + ' passed (' + path.basename(__filename) + ')')
