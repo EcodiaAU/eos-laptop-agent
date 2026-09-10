@@ -82,6 +82,21 @@ function anchorWrittenAtMs(a) {
 // (0.9s) and two orders BELOW the tightest live cron interval (4h), so it
 // absorbs clock granularity without ever admitting a previous fire.
 const ANCHOR_CLOCK_SLOP_MS = 120000
+// A WORKER ROW CARRIES ITS OWN CLOCK, IN A DIFFERENT TYPE (2026-09-11, lane C7
+// verify). Anchors store updated_at as a NUMBER of seconds; rows store
+// registered_at as an ISO STRING written once by the dispatcher. Two decoders,
+// because one function that guessed between them would have to guess.
+// Measured that day over the 45 rows on disk: 45 of 45 carry registered_at.
+function rowRegisteredAtMs(r) {
+  const v = r && r.registered_at
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
+    const ms = v < PLAUSIBLE_MIN_MS ? v * 1000 : v
+    return plausible(ms) ? ms : null
+  }
+  if (typeof v !== 'string' || !v) return null
+  const ms = Date.parse(v)
+  return plausible(ms) ? ms : null
+}
 
 function planReap(input) {
   const liveTabsIde = input.liveTabsIde || []
@@ -357,11 +372,68 @@ function planReap(input) {
       continue
     }
     const fpHits = []
+    // THE SAME VACUOUS CONJUNCT WAS LIVE ONE TIER DOWN (2026-09-11, lane C7
+    // verify pass). `th.tabId && th.tabId !== tab.tabId` refuses a stale row
+    // only when that row CARRIES a stable id. A row with none skipped the test
+    // and kept an unqualified sentinel claim, which is the identical shape the
+    // tier-1 narrowing above was written to close, on the identical population:
+    // a cron's sentinel_prefix is derived from its task_id and is byte-identical
+    // across every fire forever, so a PREVIOUS fire's terminated row claims THIS
+    // fire's live tab and hands back the dead fire's tab_id. Every belt below
+    // then reads the wrong id, including the transcript belt built for this.
+    //
+    // MEASURED 2026-09-11 on the live corpus: 12 of 45 rows carry no stable id,
+    // 7 of them terminated, and 5 share the one sentinel [aea4 gmail inbox
+    // poll]. Today that is preserved only by the reverse-uniqueness check below
+    // (5 hits, not 1), which is retention arithmetic and not a design property.
+    // Reproduced through this planner with the real tab-close-guard: one stale
+    // unstamped terminated row makes the live tab a CANDIDATE via
+    // fingerprint:sentinel_prefix, and belt 3 does not refuse it because that
+    // strategy is not fuzzy. The control that names the cause: the same row
+    // carrying a DIFFERENT tabId yields 0 candidates.
+    //
+    // THE RULE IS THE TIER-1 RULE, READ OFF THE ROW'S OWN CLOCK. A row
+    // registered before this tab's identity was minted cannot be a statement
+    // about this tab. It does NOT transplant without the slop: measured over
+    // the 32 stamped rows on disk, a row is registered 1.3s to 4.9s BEFORE its
+    // own tab's identity is minted (the dispatcher writes the row, then the tab
+    // opens), so a strict comparison would refuse every legitimate row.
+    // ANCHOR_CLOCK_SLOP_MS is 120000, two orders above the worst of those, and
+    // two orders below the tightest live cron interval, so it absorbs the
+    // dispatch lag without ever admitting a previous fire.
+    //
+    // registered_at, NOT terminated_at. terminated_at has two provenances: the
+    // real signal_done, and the stale-heartbeat sweep, which stamps it at SWEEP
+    // time rather than death time. A sweep firing after a later fire's tab was
+    // minted would make a stale row read as terminated-after-mint and admit it
+    // again. registered_at is written once, at a fixed lifecycle point, and is
+    // never manufactured. It also refuses the never-bound orphan (terminated_at
+    // null, unstamped, sentinel-wearing) that terminated_at would admit.
+    //
+    // FAIL CLOSED, and only ever SUBTRACTIVE, exactly as tier 1. An unreadable
+    // clock on either side refuses the claim with its own reason rather than
+    // trusting the sentinel. The cost of a refusal is a leaked webview; the cost
+    // of an admission is a live worker. Postdating rows are deliberately left
+    // admitted, the same asymmetry PART 6c fixes at tier 1.
+    const tabMintedAt = ttabMintedAtMs(tab.tabId)
+    let fpRefusedCount = 0
+    let fpRefusedReason = null
+    const refuseFp = (reason) => {
+      fpRefusedCount += 1
+      // 'predates' names the measured defect and is the sharper fact, so it
+      // wins where one tab collects both, mirroring the tier-1 refuse().
+      if (fpRefusedReason === null || reason === 'row_predates_this_tab_identity') fpRefusedReason = reason
+    }
     for (const [id, row] of rows.entries()) {
       const th = row.tab_handle || {}
       // A row that already names a DIFFERENT stable id is positively another
       // tab; it can never be this one.
       if (th.tabId && th.tabId !== tab.tabId) continue
+      if (!th.tabId) {
+        const regAt = rowRegisteredAtMs(row)
+        if (regAt === null || tabMintedAt === null) { refuseFp('row_has_no_stable_id_and_no_usable_clock'); continue }
+        if (regAt + ANCHOR_CLOCK_SLOP_MS < tabMintedAt) { refuseFp('row_predates_this_tab_identity'); continue }
+      }
       if (labelMatches(tab.label, th.sentinel_prefix)) { fpHits.push({ id: id, via: 'sentinel_prefix' }); continue }
       if (ttm && th.autotitle_fingerprint) {
         const r = ttm.pickByFingerprint([tab], th.autotitle_fingerprint, th.sentinel_prefix || null)
@@ -377,9 +449,16 @@ function planReap(input) {
     } else if (fpHits.length > 1) {
       unresolved.push({ tab: tab, reason: 'multiple_rows_claim_this_label', extra: { claimants: fpHits.length } })
     } else {
+      // A tab whose only would-be rows were refused by the causality test above
+      // reports THAT, so the 2026-09-11 tier-3 narrowing is legible in the
+      // durable JSONL instead of hiding behind no_anchor_no_registry_row. The
+      // anchor tier's own refusal still outranks it: it fired first and is the
+      // same class of fact one tier up.
       unresolved.push(tier1
         ? { tab: tab, reason: tier1.reason, extra: tier1.extra }
-        : { tab: tab, reason: 'no_anchor_no_registry_row' })
+        : (fpRefusedCount
+          ? { tab: tab, reason: fpRefusedReason, extra: { fingerprint_rows_refused: fpRefusedCount } }
+          : { tab: tab, reason: 'no_anchor_no_registry_row' }))
     }
   }
 

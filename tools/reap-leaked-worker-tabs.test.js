@@ -44,6 +44,16 @@ const secs = (ms) => Math.floor(ms / 1000)
 // ttab_mtvsz8rr_1_1 that took a 13-day-old anchor's tab_id.
 const BORN = Date.parse('2026-09-10T17:30:22.887Z')
 
+// TIER 3 READS THE ROW'S OWN CLOCK (2026-09-11, lane C7 verify). An UNSTAMPED
+// row may only claim a tab whose identity was minted after that row was
+// registered, so a fixture reaching tier 3 on an unstamped row has to state
+// both the way production does, exactly as the anchor note above demands.
+// Measured 2026-09-11 over the 32 stamped rows on disk, a row is registered
+// 1.3s to 4.9s BEFORE its own tab's identity is minted: the dispatcher writes
+// the row, then the tab opens. 4s is that shape.
+const T3_BORN = Date.parse('2026-09-10T22:00:00.000Z')
+const OWN_ROW_AT = new Date(T3_BORN - 4000).toISOString()
+
 const tab = (o) => Object.assign({ tabId: 'ttab_x_1_1', label: 'x', index: 3, viewColumn: 1, active: false }, o)
 const row = (o) => Object.assign({ terminated_at: TERMINATED, tab_handle: {} }, o)
 const run = (o) => planReap({
@@ -181,20 +191,27 @@ ok('tier 2 refuses a recycled id corroborated only by a GENERIC label_at_spawn',
 // ── 5. Tier 3 sentinel: reaps once, refuses when two rows claim the label. ───
 ok('tier 3 (sentinel prefix, no stored id) reaps a single claimant', () => {
   const rep = run({
-    tabs: [tab({ tabId: 'ttab_w4_1_1', label: '[eeee a worker with no …' })],
-    rows: { tab_w4: row({ tab_handle: { sentinel_prefix: '[eeee a worker with no stored id]' } }) },
+    tabs: [tab({ tabId: mintTtab(T3_BORN, 'w4_1'), label: '[eeee a worker with no …' })],
+    rows: { tab_w4: row({ registered_at: OWN_ROW_AT, tab_handle: { sentinel_prefix: '[eeee a worker with no stored id]' } }) },
   })
   assert.strictEqual(rep.candidates.length, 1)
   assert.strictEqual(rep.candidates[0].via, 'fingerprint:sentinel_prefix')
 })
 ok('tier 3 refuses when TWO rows claim one live tab (reverse ambiguity)', () => {
   const th = { sentinel_prefix: '[ffff one brief fired twice by a cron]' }
+  const W5 = mintTtab(T3_BORN, 'w5_1')
   const rep = run({
-    tabs: [tab({ tabId: 'ttab_w5_1_1', label: '[ffff one brief fired t…' })],
-    rows: { tab_a: row({ tab_handle: th }), tab_b: row({ tab_handle: Object.assign({}, th) }) },
+    tabs: [tab({ tabId: W5, label: '[ffff one brief fired t…' })],
+    // BOTH rows are contemporaneous with the tab, so the 2026-09-11 causality
+    // gate admits both and this stays a test of reverse uniqueness rather than
+    // quietly becoming a second test of that gate.
+    rows: {
+      tab_a: row({ registered_at: OWN_ROW_AT, tab_handle: th }),
+      tab_b: row({ registered_at: OWN_ROW_AT, tab_handle: Object.assign({}, th) }),
+    },
   })
   assert.strictEqual(rep.candidates.length, 0)
-  assert.strictEqual(reasonFor(rep, 'ttab_w5_1_1'), 'multiple_rows_claim_this_label')
+  assert.strictEqual(reasonFor(rep, W5), 'multiple_rows_claim_this_label')
 })
 
 // ── 6. The fuzzy tier resolves but belt 3 still refuses it. ─────────────────
@@ -203,11 +220,11 @@ ok('a fingerprint-only resolution is SEEN but refused by tab-close-guard belt 3'
   const rep = run({
     // Wears the dispatch sentinel (so the gate lets it through) but its label no
     // longer matches the stored sentinel, so only the fingerprint can claim it.
-    tabs: [tab({ tabId: 'ttab_w6_1_1', label: '[9999 murbpook dietary d…' })],
-    rows: { tab_w6: row({ tab_handle: { sentinel_prefix: '[9999 an entirely different spawn name]', autotitle_fingerprint: ttm.computeFingerprint(brief) } }) },
+    tabs: [tab({ tabId: mintTtab(T3_BORN, 'w6_1'), label: '[9999 murbpook dietary d…' })],
+    rows: { tab_w6: row({ registered_at: OWN_ROW_AT, tab_handle: { sentinel_prefix: '[9999 an entirely different spawn name]', autotitle_fingerprint: ttm.computeFingerprint(brief) } }) },
   })
   assert.strictEqual(rep.candidates.length, 0, 'belt 3 must still refuse a fuzzy sweep close')
-  assert.strictEqual(reasonFor(rep, 'ttab_w6_1_1'), 'close_guard:fuzzy_fingerprint_refused_not_positive_id')
+  assert.strictEqual(reasonFor(rep, mintTtab(T3_BORN, 'w6_1')), 'close_guard:fuzzy_fingerprint_refused_not_positive_id')
 })
 
 // ── 7. Signals 2, 3, 5 and the conductor belts survive the new tiers. ───────
@@ -633,6 +650,163 @@ ok('PART 6h: MUTATION GATE, the stale anchor is refused by the CLOCK and nothing
     'FIXTURE BROKEN: this anchor cannot win the join even when its clock is valid, ' +
     'so the refusal above proves nothing about the clock')
   assert.strictEqual(admitted.candidates[0].tab_id, 'tab_deadfire_8dc1')
+})
+
+
+// -- PART 7. THE SAME VACUOUS CONJUNCT, ONE TIER DOWN. -----------------------
+//
+// WHY (2026-09-11, lane C7 verify pass). Part 6 closed the anchor tier. The
+// fingerprint tier carried the identical shape, `th.tabId && th.tabId !==
+// tab.tabId`, which is vacuous for a row with no stable id, so a PREVIOUS
+// fire's terminated row could still claim THIS fire's live tab by a sentinel
+// that is byte-identical across every fire of one cron forever.
+//
+// MEASURED 2026-09-11 on the live corpus: 12 of 45 worker rows carry no stable
+// id, 7 of them terminated, and 5 share the single sentinel [aea4 gmail inbox
+// poll]. Five is what preserves them today, via the reverse-uniqueness check,
+// and five is retention arithmetic rather than a design property: as the older
+// four age past retention the count walks to one, and one is a close.
+//
+// Reproduced through this planner with the real tab-close-guard before the fix:
+// candidates=[{via:'fingerprint:sentinel_prefix', tab_id:'tab_deadfire_aea4'}].
+// Belt 3 does not refuse it, because 'reaper_fingerprint:sentinel_prefix' is
+// not a fuzzy strategy name.
+//
+// The rule is Part 6's rule read off the ROW's clock, and 7c is the half that
+// makes it a rule rather than a blanket refusal: a row is registered 1.3s to
+// 4.9s BEFORE its own tab's identity is minted, measured over the 32 stamped
+// rows on disk, so without the slop this would refuse every legitimate row.
+const AEA4_SENT = '[aea4 gmail inbox poll]'
+const AEA4_LABEL = '[aea4 gmail inbox poll…'
+const AEA4_TAB = mintTtab(T3_BORN, 'aea4_1')
+// The previous fire: registered a day before this tab's identity existed.
+const staleRow = (o) => row(Object.assign({
+  registered_at: '2026-09-09T04:00:00.000Z',
+  tab_handle: { sentinel_prefix: AEA4_SENT, label_at_spawn: 'Claude Code' },
+}, o || {}))
+
+ok('PART 7a: a previous fire UNSTAMPED row never claims this fire\'s live tab', () => {
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_deadfire_aea4: staleRow() },
+  })
+  assert.strictEqual(rep.candidates.length, 0,
+    'WRONG CLOSE: a live tab became a candidate on a previous fire\'s identity')
+  assert.strictEqual(reasonFor(rep, AEA4_TAB), 'row_predates_this_tab_identity')
+  const entry = rep.preserved.find((x) => x.ttab === AEA4_TAB)
+  assert.strictEqual(entry.fingerprint_rows_refused, 1,
+    'the refused row count rides to the durable record so the narrowing is legible')
+})
+
+ok('PART 7b: MUTATION GATE, that refusal is the CLOCK and nothing else', () => {
+  // The same row, registered 4s before this tab's identity instead of a day.
+  // If this does NOT reap, 7a is refusing for some other reason and proves
+  // nothing about the causality gate.
+  const admitted = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_deadfire_aea4: staleRow({ registered_at: OWN_ROW_AT }) },
+  })
+  assert.strictEqual(admitted.candidates.length, 1,
+    'FIXTURE BROKEN: this row cannot win the join even with a contemporaneous ' +
+    'clock, so 7a proves nothing about the clock')
+  assert.strictEqual(admitted.candidates[0].via, 'fingerprint:sentinel_prefix')
+  assert.strictEqual(admitted.candidates[0].tab_id, 'tab_deadfire_aea4')
+})
+
+ok('PART 7c: CONTROL, the dispatch lag is absorbed and the tab is still collectable', () => {
+  // The genuine quarry: a terminated worker whose tab leaked. Its own row is
+  // registered BEFORE its tab's identity, which is what every real row looks
+  // like. Refusing this would trade a wrong close for a permanent leak on the
+  // whole population, which is not a fix.
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_own_aea4: staleRow({ registered_at: OWN_ROW_AT }) },
+  })
+  assert.strictEqual(rep.candidates.length, 1, 'a real leaked worker tab must still be collectable')
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_own_aea4')
+})
+
+ok('PART 7d: CONTROL, a row registered a full minute early is still inside the slop', () => {
+  // ANCHOR_CLOCK_SLOP_MS is 120000. The measured worst dispatch lag is 4.9s, so
+  // a minute is far outside anything real and must still be admitted: the gate
+  // is aimed at a previous FIRE, never at a slow dispatch.
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_slow: staleRow({ registered_at: new Date(T3_BORN - 60000).toISOString() }) },
+  })
+  assert.strictEqual(rep.candidates.length, 1)
+  assert.strictEqual(rep.candidates[0].tab_id, 'tab_slow')
+})
+
+ok('PART 7e: STATE THE FLOOR, a fire ten minutes ago is still a previous fire', () => {
+  // The mutation that widening the slop must not survive. Ten minutes is inside
+  // every live cron interval, so a slop that admits it admits a sibling fire.
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_prev: staleRow({ registered_at: new Date(T3_BORN - 600000).toISOString() }) },
+  })
+  assert.strictEqual(rep.candidates.length, 0,
+    'ANCHOR_CLOCK_SLOP_MS is wide enough to admit a previous fire: it absorbs ' +
+    'dispatch lag, measured at under five seconds, not a dispatch interval')
+  assert.strictEqual(reasonFor(rep, AEA4_TAB), 'row_predates_this_tab_identity')
+})
+
+ok('PART 7f: a row with no stable id and no usable clock is refused, not admitted', () => {
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_noclock: staleRow({ registered_at: null }) },
+  })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, AEA4_TAB), 'row_has_no_stable_id_and_no_usable_clock')
+})
+
+ok('PART 7g: an UNPARSEABLE tab id refuses the sentinel claim rather than trusting it', () => {
+  // If the bridge ever changes its id format this tier goes dark rather than
+  // wrong. That is the designed direction and it is the one that must be
+  // visible in the durable record, because tier 3 has nothing below it.
+  const rep = run({
+    tabs: [tab({ tabId: 'ttab_notanepoch_1_1', label: AEA4_LABEL })],
+    rows: { tab_deadfire_aea4: staleRow({ registered_at: OWN_ROW_AT }) },
+  })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, 'ttab_notanepoch_1_1'), 'row_has_no_stable_id_and_no_usable_clock')
+})
+
+ok('PART 7h: CONTROL, a row carrying a DIFFERENT stable id is refused as it always was', () => {
+  // The half of the conjunct that was never vacuous. Unchanged since 2026-08-29,
+  // and asserted here so a future edit cannot delete it and still read green.
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    rows: { tab_deadfire_aea4: staleRow({ registered_at: OWN_ROW_AT, tab_handle: { tabId: 'ttab_deadfire_1_1', sentinel_prefix: AEA4_SENT } }) },
+  })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, AEA4_TAB), 'no_anchor_no_registry_row')
+})
+
+ok('PART 7i: CONTROL, the live corpus shape, five stale rows, stays preserved', () => {
+  // The five [aea4 gmail inbox poll] rows measured on disk. Before this fix
+  // they were preserved by reverse uniqueness alone; now they are refused at
+  // the gate. Either way the answer must be 0 candidates, and the reason must
+  // say which mechanism did it.
+  const rows = {}
+  for (const k of ['a', 'b', 'c', 'd', 'e']) rows['tab_' + k] = staleRow()
+  const rep = run({ tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })], rows: rows })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, AEA4_TAB), 'row_predates_this_tab_identity')
+  const entry = rep.preserved.find((x) => x.ttab === AEA4_TAB)
+  assert.strictEqual(entry.fingerprint_rows_refused, 5)
+})
+
+ok('PART 7j: the ANCHOR tier\'s refusal still outranks the row tier\'s', () => {
+  // Both tiers refuse the same tab. The anchor refusal fired first and is the
+  // same class of fact one tier up, so it is what the durable record reports.
+  const rep = run({
+    tabs: [tab({ tabId: AEA4_TAB, label: AEA4_LABEL })],
+    anchors: [{ label: AEA4_LABEL, tab_id: 'tab_anchor_deadfire', role: 'worker', session_id: 's_old', updated_at: secs(T3_BORN - 86400000) }],
+    rows: { tab_deadfire_aea4: staleRow() },
+  })
+  assert.strictEqual(rep.candidates.length, 0)
+  assert.strictEqual(reasonFor(rep, AEA4_TAB), 'anchor_predates_this_tab_identity')
 })
 
 console.log('\n' + passed + ' passed (' + path.basename(__filename) + ')')
