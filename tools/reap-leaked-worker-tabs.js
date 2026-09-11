@@ -182,6 +182,20 @@ const isGeneric = (s) => GENERIC.has(String(s || '').trim().toLowerCase())
 // THE LOGGING STILL CANNOT BREAK THE REAP. summariseResolution reads two arrays
 // off an object this function already owns and calls nothing, so it has no new
 // failure mode; the surrounding try/catch in emit() is unchanged either way.
+//
+// CARDINALITY IS NOT MEMBERSHIP, and until 2026-09-11 this sink recorded only
+// cardinality. Every field above is a COUNT. The ttab and tab_id of each tab
+// lived only on stdout, which nothing stores, so a later fire could see that
+// six tabs vanished between two fires and could never say WHICH six. The C3
+// prompt prescribes exactly that diff ("report MEMBERSHIP differences BY TAB
+// ID in both directions, never a count") as the correct use of a second
+// surface, and the 11:06Z fire tried it and got empty sets from both ends.
+// preserved_ids / candidate_ids / closed_ids close that: one small record per
+// tab, always present so a genuine empty fire is distinguishable from a fire
+// predating the instrument. Bounded by the live tab count (single digits in
+// practice, 12 at the largest fire on record), so it does not grow the line
+// materially. Same failure posture as everything else here: it reads arrays
+// this function already owns, calls nothing, and rides inside emit()'s catch.
 function summarise(report, extra) {
   const { summariseResolution } = require('./_lib/reap-plan')
   const reasons = {}
@@ -200,7 +214,20 @@ function summarise(report, extra) {
     closed_count: (report.closed || []).length,
     failed_count: (report.failed || []).length,
     preserved_reasons: reasons,
+    preserved_ids: idsOf(report.preserved),
+    candidate_ids: idsOf(report.candidates),
+    closed_ids: idsOf(report.closed),
   }, summariseResolution(report), extra || {})
+}
+
+function idsOf(list) {
+  return (list || []).map((p) => ({
+    ttab: (p && p.ttab) || null,
+    tab_id: (p && p.tab_id) || null,
+    label: (p && p.label) || null,
+    reason: (p && p.reason) || null,
+    via: (p && p.via) || null,
+  }))
 }
 
 function emit(out, summary) {
