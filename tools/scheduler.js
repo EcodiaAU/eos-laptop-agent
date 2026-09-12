@@ -422,7 +422,55 @@ async function runGit(args) {
 let _allocateWorktreeForRow = defaultAllocateWorktreeForRow
 let _pruneWorktreeForRow = defaultPruneWorktreeForRow
 
-exports.allocateWorktreeForRow = function (row) { return _allocateWorktreeForRow(row) }
+// 2026-09-13 lane W1: A WORKTREE WITH NO .git ORPHANS EVERYTHING THE WORKER WRITES.
+//
+// Measured that day over _worktrees/dispatched: 2 of 28 directories carry no .git
+// entry, both allocated in June 2026 (births 06-13 and 06-14), and BOTH hold real
+// worker output that could never leave. cad94dad holds a novel Supabase RLS
+// migration plus the helper that wrote it; fd4c1fc6 holds a 272-file src/ tree.
+// Nothing errored at the time. A worker handed a repo-less directory writes its
+// files, commits nothing (there is no repository to commit to), pushes nothing,
+// and the output sits unreachable until a census finds it three months later.
+// The prune-path doctrine-harvest cannot rescue it either: harvest reads the
+// worker BRANCH, and a directory with no .git never had one. The sweeper below
+// deliberately PRESERVES unregistered directories, so nothing ever reclaims them.
+//
+// That silent shape is worse than a loud death, which is why the invariant is
+// asserted at the one point every dispatch crosses.
+//
+// It lives in the EXPORTED WRAPPER rather than inside defaultAllocateWorktreeForRow
+// on purpose: _setWorktreeFns lets any caller inject an allocator, and a check
+// buried in the default implementation is not on the path an injected one takes.
+//
+// A throw here is NOT a new failure mode. dispatchOne already wraps this call and
+// converts a throw into the established "dispatch without an isolated worktree,
+// the shared tree's reference-transaction hook is the backstop" fallback. That
+// path is loud, names the row, and leaves the worker inside a real repository.
+// Silent orphaning is the outcome being traded away.
+//
+// `.git` in a LINKED worktree is a regular FILE holding a gitdir: pointer, NOT a
+// directory (verified 2026-09-13 against three live dispatched worktrees:
+// ef98e866, f0c904df, e68afb72, all "Regular File"). So this must test existence
+// only. An isDirectory() check here would reject every healthy worktree the
+// allocator produces, which is the inverted-guard shape that reads as working.
+//
+// The offending directory is deliberately NOT deleted here: it is evidence, and
+// defaultAllocateWorktreeForRow force-clears the path on the next allocation anyway.
+exports.allocateWorktreeForRow = async function (row) {
+  const wtPath = await _allocateWorktreeForRow(row)
+  // No path allocated: the pre-existing no-worktree dispatch, unchanged.
+  if (!wtPath) return wtPath
+  if (!fs.existsSync(path.join(String(wtPath), '.git'))) {
+    throw new Error(
+      'worktree allocated without a .git entry: ' + wtPath +
+      ' - refusing to hand a worker a directory with no repository under it, ' +
+      'because anything it writes there is unreachable by construction ' +
+      '(no commit, no push, no doctrine-harvest). Dispatching without an ' +
+      'isolated worktree instead; the reference-transaction hook is the backstop.'
+    )
+  }
+  return wtPath
+}
 exports.pruneWorktreeForRow = function (row) { return _pruneWorktreeForRow(row) }
 
 // Injection seam: tests pass {allocate, prune} stubs to skip subprocess git.

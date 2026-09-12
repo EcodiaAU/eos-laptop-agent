@@ -515,16 +515,33 @@ test('dispatchOne: SKIPs a marker-less cron suppressed by posture - no dispatch,
 
 // ── 2026-06-10 branch-thrash guard: dispatchOne worktree wiring + cleanup ───
 
+const _wtFs = require('fs')
+const _wtPath = require('path')
+const _wtOs = require('os')
+
 test('dispatchOne: allocates worktree, passes path into brief, dispatches with worker_acknowledgment_timeout_ms=0', async () => {
   const pool = makeStubPool([])
   scheduler._setPool(pool)
 
   let allocateCalledWith = null
   let pruneCalledWith = null
+  // 2026-09-13 lane W1: the stub must return a path that REALLY EXISTS and really
+  // carries a .git entry, because the exported allocateWorktreeForRow now asserts
+  // exactly that before handing the path to a worker. The old stub returned a bare
+  // string '/tmp/test/wt-<id>' pointing at nothing, which is precisely the orphaning
+  // state the guard exists to refuse: a worker given a directory with no repository
+  // under it writes files that can never be committed, pushed or harvested. Modelling
+  // a real allocation keeps this test about the WIRING (does the path reach the brief)
+  // instead of accidentally asserting that an invalid allocation is dispatchable.
+  // .git is written as a FILE because that is the shape git gives a LINKED worktree.
+  const _wtStubRoot = _wtFs.mkdtempSync(_wtPath.join(_wtOs.tmpdir(), 'sched-wt-stub-'))
+  const _wtStubDir = _wtPath.join(_wtStubRoot, 'wt-wt-alloc-test')
+  _wtFs.mkdirSync(_wtStubDir, { recursive: true })
+  _wtFs.writeFileSync(_wtPath.join(_wtStubDir, '.git'), 'gitdir: /elsewhere/.git/worktrees/wt-alloc-test\n')
   scheduler._setWorktreeFns({
     allocate: async (row) => {
       allocateCalledWith = row
-      return '/tmp/test/wt-' + row.id
+      return _wtStubDir
     },
     prune: async (row) => { pruneCalledWith = row },
   })
@@ -555,7 +572,7 @@ test('dispatchOne: allocates worktree, passes path into brief, dispatches with w
 
   assert(allocateCalledWith && allocateCalledWith.id === 'wt-alloc-test',
     'dispatchOne: allocateWorktreeForRow called with the row')
-  assert(dispatched && dispatched.brief && dispatched.brief.includes('WORKTREE: /tmp/test/wt-wt-alloc-test'),
+  assert(dispatched && dispatched.brief && dispatched.brief.includes('WORKTREE: ' + _wtStubDir),
     'dispatchOne: brief contains the allocated WORKTREE path')
   // markComplete owns prune, not dispatchOne happy-path - so prune should NOT have fired yet.
   assert(pruneCalledWith === null, 'dispatchOne happy path: prune NOT called (markComplete owns it)')
