@@ -311,11 +311,31 @@ async function runTests() {
     coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'worker_report' } }, staleDonePolicy),
     'a policy listing "done" is honoured for worker_report (the live on-disk shape)'
   )
-  // NEGATIVE CONTROL. Without it, a compat that returned true for everything
-  // would pass the leg above and silence nothing while waking on all noise.
+  // NEGATIVE CONTROL, REWRITTEN 2026-09-15 (fire df1649cb) FOR THE DENYLIST.
+  // Its PURPOSE is unchanged and still load-bearing: without a control here, a
+  // compat that returned true for everything would pass the leg above while
+  // silencing nothing. Its EXAMPLE was stale. This used to assert that
+  // `some_other_type` does NOT wake, which encoded the pre-inversion ALLOWLIST.
+  // shouldWake was deliberately inverted to a denylist on 2026-09-11 (e420c31,
+  // SHOULD_WAKE_SHAPE = 'denylist') precisely so an invented escalation type DOES
+  // wake: 87 escalations across 44 invented type names were dying silent. So the
+  // old assertion had become an assertion OF THE BUG, and it sat red for 4 days
+  // because this repo has no CI to say so.
+  // Under a denylist the discriminating control is a MACHINE_CHATTER type, which
+  // still proves shouldWake is not constant-true. `progress` is chosen because it
+  // is in MACHINE_CHATTER and NOT in this policy's notify_types; `done` would be
+  // wrong here, since it is explicitly subscribed on the leg above.
   assertFalse(
+    coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'progress' } }, staleDonePolicy),
+    'NEGATIVE CONTROL: routine machine chatter still does NOT wake'
+  )
+  // THE OTHER HALF, which the allowlist-era test could not express: an
+  // unrecognised type is somebody's invented escalation vocabulary and MUST wake.
+  // That is the behaviour the inversion was bought for, so it gets an assertion
+  // rather than living only in a comment where the next edit cannot see it.
+  assertTrue(
     coord._shouldWake({ to: 'chat.conductor.inbox', body: { type: 'some_other_type' } }, staleDonePolicy),
-    'NEGATIVE CONTROL: an unlisted type still does NOT wake'
+    'an unlisted, unrecognised type WAKES under the denylist (the inversion contract)'
   )
   // The compat is deliberately ONE-WAY. The ~2,568 historical `done` messages
   // must not start waking a policy that never subscribed to them.
