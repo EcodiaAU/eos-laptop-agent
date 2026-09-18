@@ -141,15 +141,58 @@ const TEXT_TATE_PATH = process.env.TEXT_TATE_PATH ||
 // account, which is how code@ reached 484 consecutive failures.
 const _deadSnapshots = new Map()   // account -> mtimeMs at the moment it was marked dead
 
+// ── transient failures must not take the permanent latch (2026-09-18, ISO lane E6) ──
+//
+// The mtime latch above is correct for the condition it was built for. A non-live
+// snapshot holds a spent single-use refresh token, 400s invalid_grant forever, and
+// only a switch can re-seed it, so waiting for an mtime bump is exactly right.
+//
+// It was wrong for everything else. On 2026-09-17 three consecutive
+// `getaddrinfo ENOTFOUND platform.claude.com` latched code@ at 13:15Z and money@ at
+// 15:15Z. DNS recovered. The latch did not, because nothing writes a non-live
+// account file, and the skip at the top of refresh_account emits no log line. Both
+// accounts sat unreadable for over ten hours with valid tokens on disk, the
+// account-failover-depth canary read 0 targets for the whole fleet, and a single
+// daemon restart refreshed both inside one pass. A network fault measured in
+// minutes had become fleet-wide blindness measured in hours.
+//
+// So a transient reason still stops the 30-minute hammering, and it self-releases.
+const TRANSIENT_RETRY_MS = Number(process.env.TRANSIENT_RETRY_MS) || 60 * 60 * 1000
+const _deadSnapshotRetryAt = new Map()   // account -> epoch ms after which a transient mark self-clears
+
+const TRANSIENT_REASON_RE = /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EPIPE|socket hang up|network|timed? ?out|HTTP 5\d\d/i
+const PERMANENT_REASON_RE = /invalid_grant|invalid_client|unauthorized_client|invalid_request|HTTP 40[0-3]/i
+
+// An auth rejection is permanent on this machine by design, so it keeps the mtime
+// latch even when its message happens to carry a transient-looking substring. That
+// ordering is load-bearing: `HTTP 400 from OAuth endpoint: {"error":"invalid_grant"}`
+// matches nothing transient today, and a vendor wording change should not be able to
+// hand a spent refresh token an hourly retry.
+function isTransientReason(reason) {
+  const s = String(reason || '')
+  if (PERMANENT_REASON_RE.test(s)) return false
+  return TRANSIENT_REASON_RE.test(s)
+}
+
+function clearDeadMark(acct) {
+  _deadSnapshots.delete(acct)
+  _deadSnapshotRetryAt.delete(acct)
+}
+
 function markSnapshotDead(account, reason) {
   let mtimeMs = 0
   try { mtimeMs = fs.statSync(path.join(CREDS_DIR, account + '.json')).mtimeMs } catch (e) {}
   _deadSnapshots.set(account, mtimeMs)
+  const transient = isTransientReason(reason)
+  if (transient) _deadSnapshotRetryAt.set(account, Date.now() + TRANSIENT_RETRY_MS)
+  else _deadSnapshotRetryAt.delete(account)
   try {
     accountsRegistry.markSnapshot(account, 'dead', String(reason || '').slice(0, 160), { by: 'cred-refresher' })
   } catch (e) {}
-  console.error('[cred-refresher] ' + account + ' snapshot marked DEAD (' + String(reason || '').slice(0, 80) +
-    '). Not retrying until the file changes. Switching does NOT need it: account-switch.sh re-logs in.')
+  const tail = transient
+    ? '). Looks transient, so retrying in ' + Math.round(TRANSIENT_RETRY_MS / 60000) + 'min even if the file never changes.'
+    : '). Not retrying until the file changes. Switching does NOT need it: account-switch.sh re-logs in.'
+  console.error('[cred-refresher] ' + account + ' snapshot marked DEAD (' + String(reason || '').slice(0, 80) + tail)
 }
 
 function snapshotIsDeadAndUnchanged(account) {
@@ -157,12 +200,33 @@ function snapshotIsDeadAndUnchanged(account) {
   let mtimeMs = 0
   try { mtimeMs = fs.statSync(path.join(CREDS_DIR, account + '.json')).mtimeMs } catch (e) { return true }
   if (mtimeMs > _deadSnapshots.get(account)) {
-    _deadSnapshots.delete(account)
+    clearDeadMark(account)
     try { accountsRegistry.markSnapshot(account, 'stale', 're-seeded, awaiting refresh', { by: 'cred-refresher' }) } catch (e) {}
     return false
   }
+  const retryAt = _deadSnapshotRetryAt.get(account)
+  if (retryAt && Date.now() >= retryAt) {
+    clearDeadMark(account)
+    // A fresh 3-strike budget, or the first failure after release lands as #4 and
+    // re-latches immediately, which would make the retry a single shot.
+    failureCount[account] = 0
+    try { accountsRegistry.markSnapshot(account, 'stale', 'transient dead-mark expired, retrying', { by: 'cred-refresher' }) } catch (e) {}
+    console.error('[cred-refresher] ' + account + ' transient dead-mark expired, retrying this pass')
+    return false
+  }
+  // The skip used to be silent, which is how ten hours of blindness read as a healthy
+  // daemon to anyone tailing stdout. Say it once an hour per account.
+  const lastSaid = _deadSkipLoggedAt.get(account) || 0
+  if (Date.now() - lastSaid > DEAD_SKIP_LOG_EVERY_MS) {
+    _deadSkipLoggedAt.set(account, Date.now())
+    console.error('[cred-refresher] ' + account + ' still skipped: snapshot marked dead and its file has not changed' +
+      (retryAt ? ' (transient, retry at ' + new Date(retryAt).toISOString() + ')' : ' (permanent until a switch re-seeds it)'))
+  }
   return true
 }
+
+const DEAD_SKIP_LOG_EVERY_MS = Number(process.env.DEAD_SKIP_LOG_EVERY_MS) || 60 * 60 * 1000
+const _deadSkipLoggedAt = new Map()
 
 // ── failure counter (per-account, resets on success) ─────────────────────────
 
@@ -453,7 +517,7 @@ async function refresh_account(account, live) {
     }
     failureCount[account] = 0
     // The live account's snapshot is by definition the freshest one on the machine.
-    _deadSnapshots.delete(account)
+    clearDeadMark(account)
     try { accountsRegistry.markSnapshot(account, 'fresh', 'synced from live keychain', { by: 'cred-refresher' }) } catch (e) {}
     return
   }
@@ -513,7 +577,7 @@ async function refresh_account(account, live) {
         if (!liveMatchesOther) {
           writeAccountFileAtomic(account, withIdentity(account, { claudeAiOauth: liveNow.raw.claudeAiOauth }, fileData))
           failureCount[account] = 0
-          _deadSnapshots.delete(account)
+          clearDeadMark(account)
           try { accountsRegistry.markSnapshot(account, 'fresh', 'self-healed from live after 401', { by: 'cred-refresher' }) } catch (e) {}
           console.log('[cred-refresher] self-healed ' + account + ' backup from live credentials after 401 (live session had rotated the token)')
           return
@@ -550,7 +614,7 @@ async function refresh_account(account, live) {
 
   // Reset failure counter on success
   failureCount[account] = 0
-  _deadSnapshots.delete(account)
+  clearDeadMark(account)
   try { accountsRegistry.markSnapshot(account, 'fresh', 'oauth refresh ok', { by: 'cred-refresher' }) } catch (e) {}
 
   console.log('[cred-refresher] refreshed ' + account + ' (expires in ' + Math.round(parsed.expires_in / 60) + 'min)')
@@ -661,6 +725,10 @@ module.exports = {
   _markSnapshotDead: markSnapshotDead,
   _snapshotIsDeadAndUnchanged: snapshotIsDeadAndUnchanged,
   _deadSnapshots,
+  _deadSnapshotRetryAt,
+  _isTransientReason: isTransientReason,
+  _TRANSIENT_RETRY_MS: TRANSIENT_RETRY_MS,
+  _failureCount: failureCount,
   _withIdentity: withIdentity,
   // Expose config values used by tests
   _REFRESH_THRESHOLD_MS: REFRESH_THRESHOLD_MS,

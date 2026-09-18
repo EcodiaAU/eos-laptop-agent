@@ -561,13 +561,86 @@ function readBody(req) {
     if (r._switchInFlight()) throw new Error('no lock file means no switch in flight')
   })
 
+  // ── TEST 13: a transient network fault must not take the permanent latch ───
+  //
+  // 2026-09-17: three consecutive `getaddrinfo ENOTFOUND platform.claude.com` latched
+  // code@ at 13:15Z and money@ at 15:15Z. DNS recovered within the hour. The latch did
+  // not, because only an mtime bump clears it and nothing writes a non-live account
+  // file. Both accounts held valid tokens and read as unreachable for over ten hours,
+  // account-failover-depth reported 0 targets for the entire fleet, and one daemon
+  // restart refreshed both inside a single pass.
+
+  await test('a transient reason self-releases the dead mark; a permanent one does not', async () => {
+    const refresher = freshRequire()
+
+    // Classification is the load-bearing half.
+    const transient = [
+      'getaddrinfo ENOTFOUND platform.claude.com',
+      'getaddrinfo EAI_AGAIN platform.claude.com',
+      'read ECONNRESET',
+      'connect ETIMEDOUT 160.79.104.10:443',
+      'socket hang up',
+      'HTTP 503 from OAuth endpoint',
+    ]
+    for (const r of transient) {
+      if (!refresher._isTransientReason(r)) throw new Error('should read as transient: ' + r)
+    }
+    const permanent = [
+      'HTTP 400 from OAuth endpoint: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}',
+      'HTTP 401 from OAuth endpoint: {"error":"invalid_grant"}',
+      'HTTP 403 from OAuth endpoint',
+    ]
+    for (const r of permanent) {
+      if (refresher._isTransientReason(r)) throw new Error('must stay permanent: ' + r)
+    }
+
+    // A permanent mark holds with no retry clock at all.
+    writeAccountFile('code', { claudeAiOauth: { accessToken: 'AT-x', refreshToken: 'RT-spent', expiresAt: Date.now() + 60 * 1000 } })
+    refresher._markSnapshotDead('code', 'HTTP 400 from OAuth endpoint: {"error":"invalid_grant"}')
+    if (!refresher._snapshotIsDeadAndUnchanged('code')) throw new Error('a permanent mark must hold')
+    if (refresher._deadSnapshotRetryAt.has('code')) throw new Error('a permanent mark must carry no retry clock')
+
+    // A transient mark holds while its window is open.
+    writeAccountFile('money', { claudeAiOauth: { accessToken: 'AT-y', refreshToken: 'RT-ok', expiresAt: Date.now() + 60 * 1000 } })
+    refresher._markSnapshotDead('money', 'getaddrinfo ENOTFOUND platform.claude.com')
+    if (!refresher._snapshotIsDeadAndUnchanged('money')) throw new Error('a transient mark must still stop the hammering inside its window')
+    if (!refresher._deadSnapshotRetryAt.has('money')) throw new Error('a transient mark must carry a retry clock')
+
+    // Wind the clock back past the window. The mark releases with the file untouched,
+    // which is the whole point: nothing writes a non-live account file.
+    const mtimeBefore = fs.statSync(path.join(CREDS_DIR, 'money.json')).mtimeMs
+    refresher._deadSnapshotRetryAt.set('money', Date.now() - 1000)
+    if (refresher._snapshotIsDeadAndUnchanged('money')) throw new Error('an expired transient mark must release')
+    const mtimeAfter = fs.statSync(path.join(CREDS_DIR, 'money.json')).mtimeMs
+    if (mtimeAfter !== mtimeBefore) throw new Error('release must not depend on the file changing')
+
+    // And the permanent one is untouched by any of that.
+    if (!refresher._snapshotIsDeadAndUnchanged('code')) throw new Error('the permanent mark must be unaffected')
+  })
+
+  // ── TEST 14: release restores a full 3-strike budget ──────────────────────
+  //
+  // Without this the first failure after release lands as #4, re-latches at once, and
+  // the hourly retry degrades to a single shot per daemon lifetime.
+
+  await test('a released transient mark restores a full failure budget', async () => {
+    const refresher = freshRequire()
+    writeAccountFile('money', { claudeAiOauth: { accessToken: 'AT-y', refreshToken: 'RT-ok', expiresAt: Date.now() + 60 * 1000 } })
+
+    refresher._failureCount.money = 3
+    refresher._markSnapshotDead('money', 'getaddrinfo ENOTFOUND platform.claude.com')
+    refresher._deadSnapshotRetryAt.set('money', Date.now() - 1000)
+    if (refresher._snapshotIsDeadAndUnchanged('money')) throw new Error('expired transient mark must release')
+    if (refresher._failureCount.money !== 0) throw new Error('failure budget was not reset on release: ' + refresher._failureCount.money)
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
     console.error('\n' + failures + ' test(s) FAILED')
     process.exit(1)
   } else {
-    console.log('\nALL TESTS PASSED (' + 12 + ' tests)')
+    console.log('\nALL TESTS PASSED (' + 14 + ' tests)')
     process.exit(0)
   }
 
