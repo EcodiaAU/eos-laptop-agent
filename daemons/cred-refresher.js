@@ -60,7 +60,8 @@
 //   REFRESH_INTERVAL_MS   loop interval, default 30 * 60 * 1000 (30 min)
 //   REFRESH_THRESHOLD_MS  how far in advance to refresh, default 45 * 60 * 1000 (45 min);
 //                         must exceed REFRESH_INTERVAL_MS + PROBE_MARGIN_MS (see header)
-//   SUPABASE_URL          Supabase REST endpoint (for kv_store escalation)
+//   OAUTH_REQUEST_TIMEOUT_MS  idle limit on one OAuth request, default 30 * 1000 (30 s)
+//   SUPABASE_URL         Supabase REST endpoint (for kv_store escalation)
 //   SUPABASE_SERVICE_KEY  Supabase service role key (for kv_store escalation)
 //
 // Run under PM2 (see ecosystem.config.js).
@@ -121,6 +122,12 @@ const REFRESH_THRESHOLD_MS  = Number(process.env.REFRESH_THRESHOLD_MS)  || 45 * 
 // tools/usage-real.js returns no_token for a snapshot this close to expiry, so a
 // refresh must always land earlier than this or the account reads unprobeable.
 const PROBE_MARGIN_MS = 2 * 60 * 1000
+// A pass walks the accounts one after another, so a request that never returns
+// stalls every account after it and records no failure (ISO lane E6 gap G13,
+// reproduced 2026-09-18 against a server that accepts and never replies). One
+// silent endpoint at the pass 25 minutes before expiry would leave the next account
+// unrefreshed until after its token expired, which undoes the threshold rule above.
+const OAUTH_REQUEST_TIMEOUT_MS = Number(process.env.OAUTH_REQUEST_TIMEOUT_MS) || 30 * 1000
 const FAILURE_ESCALATION_COUNT = 3
 
 // ── dead-snapshot handling (was: SMS Tate every 6h, forever) ─────────────────
@@ -334,6 +341,16 @@ function postJson(urlStr, headers, bodyObj) {
       let data = ''
       res.on('data', c => { data += c })
       res.on('end', () => resolve({ status: res.statusCode, body: data }))
+      // Defensive only. A body that stalls after the headers is still ended by the
+      // idle limit below, whose error reaches req on node 22 (test 20); this keeps a
+      // response-side error from ever going unhandled.
+      res.on('error', reject)
+    })
+    // Idle limit, so a silent peer ends as a counted TRANSIENT failure: the message
+    // says "timed out" and the code is ETIMEDOUT, both of which the shared
+    // classifier reads as transient.
+    req.setTimeout(OAUTH_REQUEST_TIMEOUT_MS, () => {
+      req.destroy(Object.assign(new Error('OAuth request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
     })
     req.on('error', reject)
     req.write(body)

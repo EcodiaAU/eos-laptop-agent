@@ -14,6 +14,7 @@ const fs   = require('fs')
 const path = require('path')
 const os   = require('os')
 const http = require('http')
+const net  = require('net')
 
 // ── sandbox setup (before requiring the daemon) ───────────────────────────────
 
@@ -742,6 +743,74 @@ function readBody(req) {
     refresher._deadSnapshotRetryAt.set('money', Date.now() - 1000)
     if (refresher._snapshotIsDeadAndUnchanged('money')) throw new Error('expired transient mark must release')
     if (refresher._deadSkipLoggedAt.has('money')) throw new Error('release kept the skip-log stamp, so a retaken mark stays silent for up to an hour')
+  })
+
+  // ── TEST 19: a silent endpoint cannot stall the pass (E6 gap G13) ────────
+  //
+  // postJson had no timeout and a pass walks the accounts in order, so a peer that
+  // accepts and never replies left the pass pending forever: no failure counted and
+  // every later account never attempted. The server below accepts and says nothing.
+  // The race bound keeps a regression from hanging the suite.
+
+  await test('a silent OAuth endpoint times out as a transient failure and the pass moves on', async () => {
+    const sockets = []
+    const srv = net.createServer(s => { sockets.push(s) })
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + srv.address().port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = '300'
+    process.env.CLAUDE_CREDENTIALS_PATH = path.join(TMP, 'no-live-credentials.json')
+    process.env.SWITCH_LOCK_FILE = path.join(TMP, 'no-switch.lock')
+    try {
+      writeAccountFile('tate')   // default TTL is 1h, above the threshold, so tate is skipped
+      writeAccountFile('code', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+      const settled = await Promise.race([
+        refresher._runOnce().then(() => 'settled'),
+        new Promise(r => setTimeout(() => r('STILL PENDING'), 5000)),
+      ])
+      if (settled !== 'settled') throw new Error('the pass is ' + settled + ' 5s after a silent peer; an OAuth request has no timeout')
+      if (sockets.length !== 2) throw new Error('expected code and money both attempted, saw ' + sockets.length + ' request(s)')
+      if (refresher._failureCount.code !== 1 || refresher._failureCount.money !== 1) {
+        throw new Error('a timeout must count as a failure: ' + JSON.stringify(refresher._failureCount))
+      }
+      for (let i = 0; i < 2; i++) {
+        try { await refresher.refresh_account('money') } catch (e) { /* counted by handleFailure */ }
+      }
+      if (!refresher._deadSnapshots.has('money')) throw new Error('three timeouts must mark the snapshot dead')
+      if (!refresher._deadSnapshotRetryAt.has('money')) throw new Error('a timeout took the PERMANENT latch; it must read transient')
+    } finally {
+      sockets.forEach(s => s.destroy())
+      await new Promise(r => srv.close(r))
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+      delete process.env.CLAUDE_CREDENTIALS_PATH
+    }
+  })
+
+  // ── TEST 20: the idle limit also covers a body that stalls (E6 gap G13) ──
+
+  await test('a response that sends headers and then stalls also times out', async () => {
+    const { srv, port } = await startStubServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.write('{"access_token":')   // then silence
+    })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = '300'
+    try {
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+      const out = await Promise.race([
+        refresher.refresh_account('money').then(() => 'resolved', e => 'rejected: ' + e.message),
+        new Promise(r => setTimeout(() => r('STILL PENDING'), 5000)),
+      ])
+      if (!/^rejected: .*timed out/.test(out)) throw new Error('a stalled body must end as a timeout, got ' + out)
+      if (refresher._failureCount.money !== 1) throw new Error('the stalled body was not counted: ' + JSON.stringify(refresher._failureCount))
+      if (readAccountFile('money').claudeAiOauth.refreshToken !== 'RT-money-old') throw new Error('a stalled response must not touch the snapshot')
+    } finally {
+      srv.closeAllConnections()
+      await stopStubServer(srv)
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+    }
   })
 
   // ── summary ───────────────────────────────────────────────────────────────
