@@ -72,7 +72,9 @@ function readAccountFile(account) {
 // ── test harness ──────────────────────────────────────────────────────────────
 
 let failures = 0
+let testCount = 0
 async function test(name, fn) {
+  testCount++
   try {
     await fn()
     console.log('ok', name)
@@ -116,7 +118,7 @@ function readBody(req) {
 
   await test('refresh_account refreshes a stale token and writes rotated tokens atomically', async () => {
     const account = 'tate'
-    const staleExpiresAt = Date.now() + 5 * 60 * 1000  // 5 min - under 20 min threshold
+    const staleExpiresAt = Date.now() + 5 * 60 * 1000  // 5 min - under the 45 min threshold
     writeAccountFile(account, { claudeAiOauth: { expiresAt: staleExpiresAt } })
 
     const newAccessToken  = 'AT-tate-new-' + Date.now()
@@ -179,7 +181,7 @@ function readBody(req) {
 
   // ── TEST 2: skip when TTL is ample ───────────────────────────────────────
 
-  await test('refresh_account skips refresh when token TTL is ample (>20 min)', async () => {
+  await test('refresh_account skips refresh when token TTL is ample (>45 min)', async () => {
     const account = 'code'
     const ampleExpiresAt = Date.now() + 2 * 60 * 60 * 1000  // 2h from now
     writeAccountFile(account, { claudeAiOauth: { expiresAt: ampleExpiresAt } })
@@ -634,13 +636,121 @@ function readBody(req) {
     if (refresher._failureCount.money !== 0) throw new Error('failure budget was not reset on release: ' + refresher._failureCount.money)
   })
 
+  // ── TEST 15: the threshold outruns the interval (ISO lane E6 gap G8) ─────
+  //
+  // At 20 minutes against a 30-minute interval the margin never engaged: the pass
+  // fifteen intervals after a refresh saw 30 minutes left and skipped, the next saw
+  // none, and usage-real.js refused the snapshot for its last 2 minutes. Pinned on
+  // the MODULE DEFAULTS, because no plist sets either variable.
+
+  await test('default threshold exceeds interval plus the probe margin, and a 40-min token is refreshed', async () => {
+    delete process.env.REFRESH_THRESHOLD_MS
+    delete process.env.REFRESH_INTERVAL_MS
+    const probe = freshRequire()
+    const margin = 2 * 60 * 1000
+    if (probe._PROBE_MARGIN_MS !== margin) throw new Error('probe margin drifted from usage-real.js 2min: ' + probe._PROBE_MARGIN_MS)
+    if (!(probe._REFRESH_THRESHOLD_MS > probe._REFRESH_INTERVAL_MS + margin)) {
+      throw new Error('threshold ' + probe._REFRESH_THRESHOLD_MS / 60000 + 'min must exceed interval ' +
+        probe._REFRESH_INTERVAL_MS / 60000 + 'min + 2min, or non-live tokens are refreshed at expiry')
+    }
+
+    // Behaviour, not just a constant: 40 minutes left is inside one interval of
+    // expiry, so this pass is the last one that can refresh it in time.
+    let hits = 0
+    const { srv, port } = await startStubServer(async (req, res) => {
+      hits++
+      await readBody(req)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ access_token: 'AT-g8-new', refresh_token: 'RT-g8-new', expires_in: 28800 }))
+    })
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + port + '/v1/oauth/token'
+    const refresher = freshRequire()
+    writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 40 * 60 * 1000 } })
+    try {
+      await refresher.refresh_account('money')
+    } finally {
+      await stopStubServer(srv)
+    }
+    if (hits !== 1) throw new Error('a token 40min from expiry must be refreshed this pass, stub saw ' + hits + ' request(s)')
+    if (readAccountFile('money').claudeAiOauth.accessToken !== 'AT-g8-new') throw new Error('rotated token was not written')
+  })
+
+  // ── TEST 16: a rate limit is transient (ISO lane E6 gap G9) ──────────────
+
+  await test('HTTP 429 and Too Many Requests classify transient; unknown reasons stay permanent', async () => {
+    const refresher = freshRequire()
+    const transient = [
+      'HTTP 429 from OAuth endpoint: {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}',
+      'HTTP 429 from OAuth endpoint: Too Many Requests',
+      'Too Many Requests',
+    ]
+    for (const r of transient) {
+      if (!refresher._isTransientReason(r)) throw new Error('should read as transient: ' + r)
+    }
+    // The permanent default is deliberate and must survive the widening.
+    const permanent = [
+      'HTTP 404 from OAuth endpoint: not found',
+      'Non-JSON response from OAuth endpoint: <html>',
+      "Hostname/IP does not match certificate's altnames: Host: platform.claude.com",
+      'unable to get local issuer certificate',
+      '',
+      // Permanent-first: an auth rejection mentioning a rate limit is still an auth rejection.
+      'HTTP 400 from OAuth endpoint: {"error":"invalid_grant","error_description":"Too Many Requests on a spent token"}',
+    ]
+    for (const r of permanent) {
+      if (refresher._isTransientReason(r)) throw new Error('must stay permanent: ' + JSON.stringify(r))
+    }
+  })
+
+  // ── TEST 17: an empty-message connect failure is not an unknown failure ──
+  //
+  // Node 22 connects dual-stack, and when every address fails it throws an
+  // AggregateError whose message is "". The daemon handed err.message to the
+  // classifier, so a refused connection read as an empty reason and took the
+  // PERMANENT latch on its third strike. Driven end to end against a port nothing
+  // listens on, which on this machine produces exactly that AggregateError.
+
+  await test('a refused dual-stack connection latches transient, not permanent', async () => {
+    const r = require('../tools/oauth-refresh-reason')
+    const agg = Object.assign(new Error(''), { name: 'AggregateError', code: 'ECONNREFUSED',
+      errors: [{ code: 'ECONNREFUSED', message: 'connect ECONNREFUSED ::1:1' }, { code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:1' }] })
+    const reason = r.describeRequestError(agg)
+    if (!/ECONNREFUSED/.test(reason)) throw new Error('reason lost the code: ' + JSON.stringify(reason))
+    if (!r.isTransientReason(reason)) throw new Error('AggregateError reason must classify transient: ' + reason)
+    if (r.describeRequestError(new Error('socket hang up')) !== 'socket hang up') throw new Error('a plain message must pass through unchanged')
+
+    process.env.OAUTH_REFRESH_URL = 'http://localhost:1/v1/oauth/token'
+    const refresher = freshRequire()
+    writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 60 * 1000 } })
+    for (let i = 0; i < 3; i++) {
+      try { await refresher.refresh_account('money') } catch (e) { /* counted by handleFailure */ }
+    }
+    if (!refresher._deadSnapshots.has('money')) throw new Error('three refused connections must mark the snapshot dead')
+    if (!refresher._deadSnapshotRetryAt.has('money')) {
+      throw new Error('a refused connection took the PERMANENT latch; its reason reached the classifier without its code')
+    }
+  })
+
+  // ── TEST 18: a released mark announces its next skip (E6 gap G11) ────────
+
+  await test('clearDeadMark forgets the hourly skip-log stamp', async () => {
+    const refresher = freshRequire()
+    writeAccountFile('money', { claudeAiOauth: { accessToken: 'AT-y', refreshToken: 'RT-ok', expiresAt: Date.now() + 60 * 1000 } })
+    refresher._markSnapshotDead('money', 'getaddrinfo ENOTFOUND platform.claude.com')
+    if (!refresher._snapshotIsDeadAndUnchanged('money')) throw new Error('mark must hold inside its window')
+    if (!refresher._deadSkipLoggedAt.has('money')) throw new Error('the first skip must stamp the hourly log clock')
+    refresher._deadSnapshotRetryAt.set('money', Date.now() - 1000)
+    if (refresher._snapshotIsDeadAndUnchanged('money')) throw new Error('expired transient mark must release')
+    if (refresher._deadSkipLoggedAt.has('money')) throw new Error('release kept the skip-log stamp, so a retaken mark stays silent for up to an hour')
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
     console.error('\n' + failures + ' test(s) FAILED')
     process.exit(1)
   } else {
-    console.log('\nALL TESTS PASSED (' + 14 + ' tests)')
+    console.log('\nALL TESTS PASSED (' + testCount + ' tests)')
     process.exit(0)
   }
 

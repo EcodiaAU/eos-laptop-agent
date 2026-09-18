@@ -1,8 +1,18 @@
 // daemons/cred-refresher.js
 //
-// Proactively refreshes per-account Claude OAuth tokens every 30 minutes so
-// they never expire while the scheduler is mid-dispatch. Access tokens last
-// 8 hours; refreshing every 30 min is conservative and safe.
+// Proactively refreshes per-account Claude OAuth tokens so they never expire while
+// the scheduler is mid-dispatch. A pass runs every 30 minutes and refreshes any
+// token with 45 minutes or less to live. Access tokens last 8 hours.
+//
+// THE THRESHOLD MUST EXCEED THE INTERVAL PLUS THE PROBE MARGIN (2026-09-18, ISO lane
+// E6 gap G8). It was 20 against a 30-minute interval. A 480-minute token is exactly
+// 16 intervals, so the pass 15 intervals after a refresh saw 30 minutes left and
+// skipped, and the next saw none: every non-live token was refreshed AT expiry.
+// tools/usage-real.js refuses a snapshot within 2 minutes of expiry (no_token), so
+// code@ and money@ went unreadable for about 2 minutes every 8 hours, and for up to
+// 11 minutes on the first cycle after a restart shifted the pass phase. At 45 every
+// refresh lands 15 to 45 minutes before expiry. The start line warns if an env
+// override breaks the rule.
 //
 // ============================================================
 // INVARIANT - DO NOT REMOVE THIS COMMENT:
@@ -48,7 +58,8 @@
 //   OAUTH_USER_AGENT   User-Agent header sent with every refresh request
 //                      default: claude-cli-refresher/1.0 (eos-laptop-agent)
 //   REFRESH_INTERVAL_MS   loop interval, default 30 * 60 * 1000 (30 min)
-//   REFRESH_THRESHOLD_MS  how far in advance to refresh, default 20 * 60 * 1000 (20 min)
+//   REFRESH_THRESHOLD_MS  how far in advance to refresh, default 45 * 60 * 1000 (45 min);
+//                         must exceed REFRESH_INTERVAL_MS + PROBE_MARGIN_MS (see header)
 //   SUPABASE_URL          Supabase REST endpoint (for kv_store escalation)
 //   SUPABASE_SERVICE_KEY  Supabase service role key (for kv_store escalation)
 //
@@ -106,7 +117,10 @@ const OAUTH_REFRESH_URL  = process.env.OAUTH_REFRESH_URL  || 'https://platform.c
 const OAUTH_CLIENT_ID    = process.env.OAUTH_CLIENT_ID    || '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const OAUTH_USER_AGENT   = process.env.OAUTH_USER_AGENT   || 'claude-cli-refresher/1.0 (eos-laptop-agent)'
 const REFRESH_INTERVAL_MS   = Number(process.env.REFRESH_INTERVAL_MS)   || 30 * 60 * 1000
-const REFRESH_THRESHOLD_MS  = Number(process.env.REFRESH_THRESHOLD_MS)  || 20 * 60 * 1000
+const REFRESH_THRESHOLD_MS  = Number(process.env.REFRESH_THRESHOLD_MS)  || 45 * 60 * 1000
+// tools/usage-real.js returns no_token for a snapshot this close to expiry, so a
+// refresh must always land earlier than this or the account reads unprobeable.
+const PROBE_MARGIN_MS = 2 * 60 * 1000
 const FAILURE_ESCALATION_COUNT = 3
 
 // ── dead-snapshot handling (was: SMS Tate every 6h, forever) ─────────────────
@@ -160,23 +174,25 @@ const _deadSnapshots = new Map()   // account -> mtimeMs at the moment it was ma
 const TRANSIENT_RETRY_MS = Number(process.env.TRANSIENT_RETRY_MS) || 60 * 60 * 1000
 const _deadSnapshotRetryAt = new Map()   // account -> epoch ms after which a transient mark self-clears
 
-const TRANSIENT_REASON_RE = /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EPIPE|socket hang up|network|timed? ?out|HTTP 5\d\d/i
-const PERMANENT_REASON_RE = /invalid_grant|invalid_client|unauthorized_client|invalid_request|HTTP 40[0-3]/i
+// The hourly "still skipped" line. Declared here, above every function that reads it,
+// so no future refactor can call one of them inside the temporal dead zone.
+const DEAD_SKIP_LOG_EVERY_MS = Number(process.env.DEAD_SKIP_LOG_EVERY_MS) || 60 * 60 * 1000
+const _deadSkipLoggedAt = new Map()
 
-// An auth rejection is permanent on this machine by design, so it keeps the mtime
-// latch even when its message happens to carry a transient-looking substring. That
-// ordering is load-bearing: `HTTP 400 from OAuth endpoint: {"error":"invalid_grant"}`
-// matches nothing transient today, and a vendor wording change should not be able to
-// hand a spent refresh token an hourly retry.
-function isTransientReason(reason) {
-  const s = String(reason || '')
-  if (PERMANENT_REASON_RE.test(s)) return false
-  return TRANSIENT_REASON_RE.test(s)
-}
+// Transient versus permanent is decided in ONE place, tools/oauth-refresh-reason.js,
+// shared with the backend account-failover-depth canary so the daemon and the human
+// reading the canary can never disagree about whether a dead mark heals itself
+// (ISO lane E6 gap G10). Order and default are unchanged: an auth rejection is tested
+// first and wins, and a reason matching neither pattern is permanent.
+const reasonClass = require('../tools/oauth-refresh-reason')
+const isTransientReason = reasonClass.isTransientReason
 
 function clearDeadMark(acct) {
   _deadSnapshots.delete(acct)
   _deadSnapshotRetryAt.delete(acct)
+  // A mark released and retaken inside the hour must announce its first skip, not
+  // inherit the silence of the mark before it (E6 gap G11).
+  _deadSkipLoggedAt.delete(acct)
 }
 
 function markSnapshotDead(account, reason) {
@@ -224,9 +240,6 @@ function snapshotIsDeadAndUnchanged(account) {
   }
   return true
 }
-
-const DEAD_SKIP_LOG_EVERY_MS = Number(process.env.DEAD_SKIP_LOG_EVERY_MS) || 60 * 60 * 1000
-const _deadSkipLoggedAt = new Map()
 
 // ── failure counter (per-account, resets on success) ─────────────────────────
 
@@ -548,7 +561,9 @@ async function refresh_account(account, live) {
       }
     )
   } catch (err) {
-    await handleFailure(account, err.message)
+    // Not err.message: a dual-stack connect failure is an AggregateError whose message
+    // is empty, and an empty reason classifies permanent by default.
+    await handleFailure(account, reasonClass.describeRequestError(err))
     throw err
   }
 
@@ -707,6 +722,10 @@ async function _runOnce() {
 function start_loop() {
   const intervalStr = Math.round(REFRESH_INTERVAL_MS / 60000) + ' min'
   console.log('[cred-refresher] starting, interval=' + intervalStr + ', threshold=' + Math.round(REFRESH_THRESHOLD_MS / 60000) + 'min')
+  if (REFRESH_THRESHOLD_MS <= REFRESH_INTERVAL_MS + PROBE_MARGIN_MS) {
+    console.error('[cred-refresher] WARNING threshold ' + Math.round(REFRESH_THRESHOLD_MS / 60000) + 'min does not exceed interval ' +
+      intervalStr + ' plus the ' + Math.round(PROBE_MARGIN_MS / 60000) + 'min probe margin, so non-live tokens will be refreshed at expiry and read unprobeable')
+  }
   _runOnce()
   setInterval(_runOnce, REFRESH_INTERVAL_MS)
 }
@@ -727,11 +746,15 @@ module.exports = {
   _deadSnapshots,
   _deadSnapshotRetryAt,
   _isTransientReason: isTransientReason,
+  _describeRequestError: reasonClass.describeRequestError,
+  _deadSkipLoggedAt,
   _TRANSIENT_RETRY_MS: TRANSIENT_RETRY_MS,
   _failureCount: failureCount,
   _withIdentity: withIdentity,
   // Expose config values used by tests
   _REFRESH_THRESHOLD_MS: REFRESH_THRESHOLD_MS,
+  _REFRESH_INTERVAL_MS: REFRESH_INTERVAL_MS,
+  _PROBE_MARGIN_MS: PROBE_MARGIN_MS,
 }
 
 // ── entrypoint ────────────────────────────────────────────────────────────────
