@@ -946,6 +946,55 @@ function setWorkerTabHandle(tab_id, tab_handle) {
   return { ok: true, tab_id: tab_id, tab_handle: tab_handle }
 }
 
+// abandonWorkerRow - stamp a registered worker DEAD because its dispatch never
+// produced a running session.
+//
+// WHY THIS EXISTS. register-worker runs BEFORE the tab is spawned, so a dispatch
+// that fails at the spawn or never submits leaves a fully-formed registry row
+// behind with registered_at === last_heartbeat_at and no terminated_at. Nothing
+// in the production path cleaned those up: measured 2026-09-17 over 48h, 500
+// rows, 466 of them carrying a null tab_handle (the spawn never captured a tab)
+// and 481 whose heartbeat never advanced. They are indistinguishable by query
+// from a worker that is booting, so the orphan sweep counted them as candidates
+// forever ("closed=0 of 70 candidates (leaked=70)") and every consumer that
+// reads the registry to answer "is this lane held" read them as live.
+//
+// This is deliberately NOT signal_done: no completion is claimed, no scheduler
+// row is touched, no worker_report is posted. It records that the arc died
+// before it began, with the reason, so the row stops impersonating a live
+// worker. Doctrine: a-registration-that-outlives-its-failed-spawn-is-a-live-worker-to-every-reader.
+function abandonWorkerRow(tab_id, reason) {
+  if (!tab_id) return { ok: false, error: 'tab_id required' }
+  const nowIso = new Date().toISOString()
+  let w = workers.get(tab_id)
+  if (!w) {
+    // Cross-process caller (the dispatcher can run outside coord's process).
+    try {
+      const fp = path.join(WORKERS_DIR, tab_id + '.json')
+      if (!fs.existsSync(fp)) return { ok: false, error: 'unknown_tab_id' }
+      w = JSON.parse(fs.readFileSync(fp, 'utf8'))
+    } catch (e) {
+      return { ok: false, error: 'unreadable_row: ' + e.message }
+    }
+  }
+  // Never re-stamp a row that already reached a real terminal state: a worker
+  // that signalled done and THEN had its tab identified late is finished, not
+  // abandoned, and overwriting its reason would erase the only record of which.
+  if (w.terminated_at) {
+    return { ok: true, tab_id, already_terminated: true, terminated_reason: w.terminated_reason || null }
+  }
+  w.terminated_at = nowIso
+  w.terminated_reason = 'dispatch_abandoned'
+  w.abandoned_reason = String(reason || 'unspecified').slice(0, 400)
+  w.abandoned_at = nowIso
+  workers.set(tab_id, w)
+  try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}
+  // Same contract as signal_done: a .spawned marker left behind makes mtime read
+  // as a running session to every liveness consumer.
+  try { fs.unlinkSync(path.join(STATE_DIR, tab_id + '.spawned')) } catch (e) {}
+  return { ok: true, tab_id, terminated_at: nowIso, abandoned_reason: w.abandoned_reason }
+}
+
 // loadWorkerRegistry - read a worker row from disk by tab_id.
 //
 // 2026-05-29 ultracode audit C1 fix. cowork.kill_worker runs in the same
@@ -5234,6 +5283,7 @@ module.exports = {
   _sessionIdFromInput: _sessionIdFromInput,
   kill_worker: kill_worker,
   setWorkerTabHandle: setWorkerTabHandle,
+  abandonWorkerRow: abandonWorkerRow,
   loadWorkerRegistry: loadWorkerRegistry,
   verify_paste: verify_paste,
   register_conductor: register_conductor,
