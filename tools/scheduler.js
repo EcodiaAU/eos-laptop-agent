@@ -2807,7 +2807,7 @@ exports.markComplete = async function markComplete(row, signal) {
       `UPDATE os_scheduled_tasks
        SET status = 'active', last_run_at = NOW(), next_run_at = $1,
            run_count = run_count + 1, last_result = $2,
-           retry_count = 0, leased_by = NULL, leased_at = NULL,
+           retry_count = 0, launch_retry_count = 0, leased_by = NULL, leased_at = NULL,
            ${taskSignals.CLEAR_SQL_FRAGMENT},
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $3
@@ -3503,7 +3503,9 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
   // The suspended slice of this population is already owned by branch 0 above,
   // which pass 5 watched settle a REAL running row at 11:09:44Z.
   const orphans = await pool.query(
-    `SELECT id, dispatched_tab_id, type, cron_expression, tz FROM os_scheduled_tasks
+    `SELECT id, name, dispatched_tab_id, type, cron_expression, tz,
+            bound_at, launch_retry_count
+       FROM os_scheduled_tasks
      WHERE status = 'running'
        AND (
          (type = 'cron' AND cron_expression IS NOT NULL
@@ -3553,6 +3555,39 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     }
     const tabFrag = closeOk ? 'dispatched_tab_id = NULL,' : ''
     if (row.type === 'cron' && row.cron_expression) {
+      // A never-bound cron did not overrun, it never started. Retry it on a short
+      // backoff rather than losing the whole interval. See cronLaunchRetry.
+      const lf = cronLaunchRetry(row)
+      if (lf && !lf.ceiling) {
+        const r = await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', retry_count = 0, last_run_at = NOW(),
+               next_run_at = $1,
+               launch_retry_count = COALESCE(launch_retry_count, 0) + 1,
+               last_error = $3,
+               leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
+           WHERE id = $2
+             AND status = 'running'
+             AND bound_at IS NULL
+             AND done_at IS NULL
+             AND archived_at IS NULL
+             AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+          [lf.next_run_at, row.id, ('running orphan-timeout | ' + lf.reason).slice(0, 900)]
+        )
+        if (r.rowCount) {
+          process.stderr.write('[scheduler] CRON LAUNCH-FAILURE RELAUNCH ' + row.id + ' (' +
+            (row.name || '?') + ') attempt ' + lf.attempts + ' at ' + lf.next_run_at + '\n')
+          try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
+          continue
+        }
+        // Lost the race (it bound, completed or was suspended between the probe and
+        // the write). Fall through to the ordinary interval defer, which is guarded.
+      }
+      if (lf && lf.ceiling) {
+        process.stderr.write('[scheduler] CRON LAUNCH-FAILURE CEILING ' + row.id + ' (' +
+          (row.name || '?') + '): ' + lf.attempts + ' launches never bound, deferring to the ' +
+          'next interval instead of retrying -- the Mac is out of launch capacity\n')
+      }
       let nextRunAt = null
       try {
         nextRunAt = exports.computeNextRunAt(row)
@@ -3588,6 +3623,72 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
     try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
   }
 }
+
+// ── cronLaunchRetry ──────────────────────────────────────────────────────────
+//
+// A CRON WHOSE TAB NEVER OPENED LOSES A WHOLE INTERVAL, AND NOTHING RETRIES IT.
+//
+// Both reclaim paths below (the status='running' orphan-timeout sweep and
+// livenessReapPass) branch on `row.type === 'cron'` FIRST and defer the row to its
+// next natural slot. That defer is right for an OVERRUN, which is what the doctrine
+// line it prints was written about: the fire started, ran long, and the next slot is
+// soon enough. It is wrong for a LAUNCH FAILURE, where the Mac minted a tab id,
+// never opened a tab, no transcript was ever born, and the job never started. For a
+// daily cron that is a 24-hour hole in the deliverable with no retry and no alarm.
+//
+// The one-shot half of this was fixed on 2026-09-05 (lane C1, launchFailureDecision)
+// after measuring that 89 of 194 leased one-shot rows died exactly here. The cron
+// half was never covered, because the `type === 'cron'` branch wins before the
+// `!row.bound_at` branch is ever reached. Measured 2026-09-12: orphan-next-action-audit
+// leased at 00:10:31Z, hit `dispatchOne: signal_bound timeout`, wrote NO transcript
+// anywhere on disk, was reclaimed at 01:11:26Z with run_count frozen at 29, and its
+// own deliverable (kv_store cowork.orphan_next_action.last_audit) still carried the
+// PREVIOUS day's heartbeat. The whole 2026-09-12 audit window went unswept.
+//
+// THREE REFUSALS, each a real failure mode rather than a theoretical one:
+//   bound      the fire STARTED. This is an overrun, not a launch failure, and the
+//              next-interval defer is the correct and doctrinal answer. Never retry
+//              it: that is the 2026-06-18 double-fire path.
+//   capped     relaunching into an all-accounts cap burns the quota the next job needs.
+//   ceiling    past MAX_LAUNCH_RETRIES the Mac is out of launch capacity, not having a
+//              blip. A CRON IS NEVER SETTLED TERMINAL HERE, unlike a one-shot: it falls
+//              back to the ordinary next-interval defer and says so loudly. A recurring
+//              row removed from the fleet by a retry ceiling is a far worse outcome than
+//              a skipped interval.
+//
+// The retry time is the SOONER of the launch backoff and the row's own next slot, so a
+// five-minute cron is never delayed by the retry that exists to help it.
+//
+// The streak is measured by launch_retry_count, which markComplete's cron arm now
+// clears alongside retry_count. Without that clear the counter is a LIFETIME tally and
+// a healthy daily cron would silently reach the ceiling after three unrelated launch
+// blips spread over months.
+function cronLaunchRetry(row, opts) {
+  opts = opts || {}
+  if (row.bound_at) return null
+  const settleMod = opts.settle || require('./dispatch-settle')
+  const attempts = Number(row.launch_retry_count || 0)
+  if (attempts >= settleMod.MAX_LAUNCH_RETRIES) {
+    return { ceiling: true, attempts }
+  }
+  const capped = (opts.capped !== undefined)
+    ? opts.capped
+    : exports._getCappedOutageState().firstDeferAt !== null
+  if (capped) return null
+  const nowMs = opts.now_ms || Date.now()
+  const backoffAt = nowMs + settleMod.launchBackoffMs(attempts)
+  let naturalAt = null
+  try { naturalAt = Date.parse(exports.computeNextRunAt(row)) } catch (_e) { naturalAt = null }
+  const at = (naturalAt && naturalAt < backoffAt) ? naturalAt : backoffAt
+  return {
+    ceiling: false,
+    attempts: attempts + 1,
+    next_run_at: new Date(at).toISOString(),
+    reason: 'cron leased but never bound: launch failure, relaunch ' +
+            (attempts + 1) + ' of ' + settleMod.MAX_LAUNCH_RETRIES,
+  }
+}
+exports.cronLaunchRetry = cronLaunchRetry
 
 // ── livenessReapPass ─────────────────────────────────────────────────────────
 //
@@ -3656,6 +3757,32 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
     const why = 'liveness-reap: ' + v.reason + ' (' + JSON.stringify(v.evidence) + ')'
 
     if (row.type === 'cron' && row.cron_expression) {
+      // Same asymmetry as the orphan-timeout sweep: the `else if (!row.bound_at)`
+      // relaunch below is unreachable for a cron because this branch wins first.
+      const lf = cronLaunchRetry(row, { settle: opts.settle })
+      if (lf && !lf.ceiling) {
+        const r = await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', retry_count = 0, last_run_at = NOW(), next_run_at = $1,
+               launch_retry_count = COALESCE(launch_retry_count, 0) + 1,
+               last_error = $3, leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
+           WHERE id = $2 AND status = 'running' AND archived_at IS NULL
+             AND bound_at IS NULL AND done_at IS NULL
+             AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
+          [lf.next_run_at, row.id, (lf.reason + ' | ' + why).slice(0, 900)]
+        )
+        if (r.rowCount) {
+          process.stderr.write('[scheduler] CRON LAUNCH-FAILURE RELAUNCH ' + row.id + ' (' +
+            (row.name || '?') + ') attempt ' + lf.attempts + ' at ' + lf.next_run_at + '\n')
+          reaped++
+          continue
+        }
+      }
+      if (lf && lf.ceiling) {
+        process.stderr.write('[scheduler] CRON LAUNCH-FAILURE CEILING ' + row.id + ' (' +
+          (row.name || '?') + '): ' + lf.attempts + ' launches never bound, deferring to the ' +
+          'next interval instead of retrying -- the Mac is out of launch capacity\n')
+      }
       let nextRunAt = null
       try { nextRunAt = exports.computeNextRunAt(row) }
       catch (_e) { nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() }
