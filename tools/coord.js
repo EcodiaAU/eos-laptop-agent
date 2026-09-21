@@ -4777,8 +4777,46 @@ async function verify_paste(params, ctx) {
 // a probe that cannot decide returns the prior id untouched. A row that HAS an id
 // is never demoted to having none, because belt 2's fallback ladder treats
 // "no id" as permission to decide on the label alone.
+// A PRIOR ID A LIVE WORKER OWNS IS EVICTED, and that is the one place
+// replace-only yields (2026-09-21, board ce638fbf).
+//
+// Replace-only exists so an undecidable probe never blanks a GOOD id. It was
+// never meant to preserve a WRONG one, and it did, permanently: once a capture
+// landed on a worker's tab, every later beat found that tab claimed, returned
+// all_claimed_by_workers, and handed the worker's id straight back as "prior".
+// Measured that day: a headless email session (no IDE tab, so "the focused tab"
+// was whatever VS Code showed) beat inside worker b3415465's spawn window, 11s
+// before its tab_handle landed, and stored ttab_muaihq00_1_1. The worker's own
+// close_my_tab was refused conductor_stable_id_protected and its tab leaked.
+// With this rule the very next beat, while the worker was still live, would
+// have dropped it.
+//
+// LIVE claims only, on purpose. A TERMINATED row's id can be a fossil: the
+// bridge recycles ids by (viewColumn, index), so a corpse's id may now name a
+// human chat, and that same corpse row's stored id is what the orphan sweep
+// closes by. The slot holding that id is then the backstop that stops the sweep
+// closing the human chat, so evicting on a dead claim would trade a leak for a
+// wrong-close. Evicting on a live claim cannot: a live worker's tab is open and
+// is that worker's. The dead-worker case heals on the next IDE beat, which
+// captures the real chat's id and replaces this one.
+//
+// Fail-safe direction: a null id sends belt 2 to its label ladder, which
+// refuses on a label match. Leak, never wrong-close. Doctrine:
+// a-headless-session-has-no-tab-so-the-focused-tab-is-a-strangers-2026-09-21.
 async function _captureConductorStableTabId(titleMatch, idePort, priorId) {
-  const prior = priorId || null
+  let prior = priorId || null
+  let evicted = null
+  if (prior) {
+    try {
+      if (_claimedStableTabIds(null, { liveOnly: true }).has(prior)) { evicted = prior; prior = null }
+    } catch (e) {}
+  }
+  const r = await _captureConductorStableTabIdFrom(titleMatch, idePort, prior)
+  if (evicted && r) r.prior_evicted = evicted
+  return r
+}
+
+async function _captureConductorStableTabIdFrom(titleMatch, idePort, prior) {
   try {
     if (!idePort) return { tabId: prior, reason: 'no_ide_port' }
     const tm = String(titleMatch == null ? '' : titleMatch).trim()
@@ -4815,7 +4853,18 @@ async function _captureConductorStableTabId(titleMatch, idePort, priorId) {
     // conductor slot and making that worker permanently unclosable.
     const claimed = _claimedStableTabIds(null)
     const unclaimed = hits.filter((t) => !claimed.has(t.tabId))
-    if (!unclaimed.length) return { tabId: prior, reason: 'all_claimed_by_workers' }
+    if (!unclaimed.length) {
+      // Every tab wearing this label is a worker's. When every one of them is a
+      // LIVE worker's, the LABEL is a worker's too, and the callers refuse to
+      // store it as title_match (same reasoning as the id eviction above: a
+      // non-generic title_match equal to a worker's label makes belt 2 refuse
+      // that worker's own close by label). A dead claim does not count, for the
+      // recycled-id reason given above.
+      let live = null
+      try { live = _claimedStableTabIds(null, { liveOnly: true }) } catch (e) {}
+      const names = !!live && hits.every((t) => live.has(t.tabId))
+      return { tabId: prior, reason: 'all_claimed_by_workers', title_names_live_worker: names }
+    }
     let via = unclaimed.length === hits.length ? 'label' : 'label_unclaimed'
     hits = unclaimed
     if (hits.length > 1) {
@@ -4829,6 +4878,41 @@ async function _captureConductorStableTabId(titleMatch, idePort, priorId) {
     return { tabId: hits[0].tabId, reason: via, label: hits[0].label }
   } catch (e) {
     return { tabId: prior, reason: 'threw' }
+  }
+}
+
+// Settle title_match and stable_tab_id TOGETHER. Candidates are tried in
+// preference order (the incoming label, then the one already stored) and the
+// first that does not name only live workers' tabs wins. When every candidate
+// does, NO label is kept: a slot whose only evidence is a worker's tab has no
+// human chat to protect, and keeping the label would make belt 2 refuse that
+// worker's close by label. An id evicted by one candidate stays evicted for
+// the next, because it is the same prior id. Board ce638fbf, 2026-09-21.
+async function _settleConductorLabelAndId(candidates, idePort, priorId) {
+  let prior = priorId || null
+  let evicted = null
+  let last = null
+  for (const c of candidates) {
+    if (!c || !c.title_match || !String(c.title_match).trim()) continue
+    const cap = await _captureConductorStableTabId(c.title_match, idePort, prior)
+    if (cap && cap.prior_evicted) { evicted = cap.prior_evicted; prior = null }
+    last = cap
+    if (cap && cap.title_names_live_worker) continue
+    return { title: c, tabId: (cap && cap.tabId) || null, evicted: evicted, cap: cap, rejected_all: false }
+  }
+  // No candidate survived. Still apply a pending eviction: the prior id is a
+  // live worker's whether or not any label was usable.
+  if (!last && prior) {
+    try {
+      if (_claimedStableTabIds(null, { liveOnly: true }).has(prior)) { evicted = prior; prior = null }
+    } catch (e) {}
+  }
+  return {
+    title: null,
+    tabId: last ? ((last.tabId) || null) : prior,
+    evicted: evicted,
+    cap: last,
+    rejected_all: !!(last && last.title_names_live_worker),
   }
 }
 
@@ -4975,8 +5059,25 @@ async function register_conductor(params, ctx) {
   let stable_tab_id = (!took_over && existing && existing.stable_tab_id) || null
   if (ide_bridge_port) {
     try {
-      const cap = await _captureConductorStableTabId(title_match, ide_bridge_port, stable_tab_id)
-      stable_tab_id = (cap && cap.tabId) || stable_tab_id
+      // A label naming only live workers' tabs is refused here exactly as a
+      // worker-SHAPED one is refused above, falling back to the last good label
+      // (never across a takeover: that row belonged to a different chat). And a
+      // prior id a live worker owns is evicted rather than carried. See
+      // _captureConductorStableTabId and _settleConductorLabelAndId.
+      const cands = [{ title_match: title_match, title_fingerprint: title_fingerprint }]
+      if (!took_over && existing && existing.title_match && existing.title_match !== title_match &&
+          !isWorkerShapedLabel(existing.title_match)) {
+        cands.push({ title_match: String(existing.title_match), title_fingerprint: existing.title_fingerprint || null })
+      }
+      const s = await _settleConductorLabelAndId(cands, ide_bridge_port, stable_tab_id)
+      stable_tab_id = s.tabId || (s.evicted ? null : stable_tab_id)
+      if (s.title) {
+        title_match = s.title.title_match
+        title_fingerprint = s.title.title_fingerprint || null
+      } else if (s.rejected_all) {
+        title_match = ''
+        title_fingerprint = null
+      }
     } catch (e) {}
   }
 
@@ -5100,6 +5201,8 @@ async function conductor_heartbeat(params, _ctx) {
   // 2026-05-19: heartbeat may refresh moving fields. Title/hwnd can shift when
   // Tate resizes; ide_pid stable but workspace_root may change if he re-opens
   // a different folder. Accept refresh of any of these.
+  const prevTitle = conductor.title_match ? String(conductor.title_match) : ''
+  const prevFingerprint = conductor.title_fingerprint || null
   if (params.title_match && !isWorkerShapedLabel(params.title_match)) {
     conductor.title_match = String(params.title_match)
     // 2026-08-13 conductor addressing v2: refresh the fingerprint from the fresh
@@ -5127,11 +5230,27 @@ async function conductor_heartbeat(params, _ctx) {
   // retitles and reorders between two listings, which a human chat does often.
   // Replace-only, so a bridge hiccup or an ambiguous label leaves the stored id
   // exactly as it was rather than blanking the conductor's cover.
+  //
+  // Two exceptions to replace-only, both 2026-09-21 (board ce638fbf): a stored id
+  // a LIVE worker owns is evicted, and a label naming only live workers' tabs is
+  // refused (the incoming one falls back to the stored one; a stored one that
+  // itself names a live worker is dropped). See _settleConductorLabelAndId.
   if (conductor.ide_bridge_port) {
     try {
-      const cap = await _captureConductorStableTabId(
-        conductor.title_match, conductor.ide_bridge_port, conductor.stable_tab_id || null)
-      if (cap && cap.tabId) conductor.stable_tab_id = cap.tabId
+      const cands = [{ title_match: conductor.title_match, title_fingerprint: conductor.title_fingerprint }]
+      if (prevTitle && prevTitle !== conductor.title_match) {
+        cands.push({ title_match: prevTitle, title_fingerprint: prevFingerprint })
+      }
+      const s = await _settleConductorLabelAndId(cands, conductor.ide_bridge_port, conductor.stable_tab_id || null)
+      if (s.tabId) conductor.stable_tab_id = s.tabId
+      else if (s.evicted) conductor.stable_tab_id = null
+      if (s.title) {
+        conductor.title_match = s.title.title_match
+        conductor.title_fingerprint = s.title.title_fingerprint || null
+      } else if (s.rejected_all) {
+        conductor.title_match = ''
+        conductor.title_fingerprint = null
+      }
     } catch (e) {}
   }
   try {
@@ -5299,6 +5418,7 @@ module.exports = {
   _captureStableTabId: _captureStableTabId,
   _storedIdContradicted: _storedIdContradicted,
   _captureConductorStableTabId: _captureConductorStableTabId,
+  _settleConductorLabelAndId: _settleConductorLabelAndId,
   _hasSpawningUnclaimedWorker: _hasSpawningUnclaimedWorker,
   _resolveStableIdCloseTarget: _resolveStableIdCloseTarget,
   _resolveStableIdCloseTargetRecapturing: _resolveStableIdCloseTargetRecapturing,
