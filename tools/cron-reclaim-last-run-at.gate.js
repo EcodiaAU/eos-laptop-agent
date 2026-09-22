@@ -94,7 +94,13 @@ async function main() {
     const bound = await mkCron('bound', '0 3 * * *', 0)
     await pool.query(`UPDATE os_scheduled_tasks SET bound_at = $2 WHERE id = $1`, [bound, old])
 
-    const target = new Set(ids.map(String))
+    // 4. THE ARM THAT ACTUALLY FIRED ON 23fddbac. staleLeaseRecovery branch 3 reclaims
+    //    a cron whose lease is older than RUNNING_CRON_ORPHAN_MS (30m). It is deliberately
+    //    left OUT of `target`, so the liveness stub reports it live and livenessReapPass
+    //    cannot touch it; staleLeaseRecovery is then driven against it separately below.
+    const sweepFixture = await mkCron('stalelease', '0 3 * * *', 0)
+
+    const target = new Set(ids.filter(id => String(id) !== String(sweepFixture)).map(String))
     const liveness = {
       probeRows(rows) {
         return rows.map(r => target.has(String(r.id))
@@ -169,7 +175,39 @@ async function main() {
       r.reaped === target.size && r.live === Math.max(0, before - target.size),
       'reaped=' + r.reaped + ' live=' + r.live + ' targeted=' + target.size)
 
-    // ---- 6. SOURCE BELT for staleLeaseRecovery, the arm that cannot be driven safely ----
+    // ---- 6. THE ARM THAT FIRED, driven live ----
+    // Safe to drive here and only here: staleLeaseRecovery already runs on a 60s timer
+    // inside the daemon, so calling it once more is not a novel action. Its branch-3
+    // orphan query selects cron rows leased more than 30m ago and non-cron rows leased
+    // more than 6h ago. Every real running row was probed immediately before this gate
+    // was written and none qualified. It takes no opts, so it uses the real coord oracle
+    // and the real dispatcher; the fixture carries dispatched_tab_id NULL so kill_worker
+    // is skipped entirely and it can never reach for an IDE tab.
+    await scheduler.staleLeaseRecovery()
+    const sw = (await pool.query(
+      // `type` is load-bearing and was omitted in the first draft of this gate.
+      // cronAlreadyRanThisPeriod returns false on `row.type !== 'cron'` BEFORE it ever
+      // looks at last_run_at, so a row read back without it made the PAYOFF check pass
+      // for a reason that had nothing to do with the fix. The paired control below is
+      // what caught that, which is the whole argument for pairing a refusal with its
+      // reason: [[a-negative-control-that-only-asserts-a-refusal-happened]].
+      `SELECT id, name, type, cron_expression, tz, status, last_run_at, next_run_at, run_count,
+              launch_retry_count, bound_at, last_error
+         FROM os_scheduled_tasks WHERE id = $1`, [sweepFixture])).rows[0]
+    check('STALELEASE arm: the 23fddbac path relaunches a never-bound cron',
+      sw && sw.status === 'active' && sw.launch_retry_count === 1,
+      sw && sw.status + ' launch_retry_count=' + sw.launch_retry_count)
+    check('STALELEASE arm: last_run_at did NOT advance on the arm that lost the 09-21 sweep',
+      sw && new Date(sw.last_run_at).getTime() === new Date(PRIOR_RUN).getTime(),
+      sw && 'last_run_at=' + sw.last_run_at)
+    check('STALELEASE arm: PAYOFF, the re-entry guard now lets its own relaunch through',
+      sw && scheduler.cronAlreadyRanThisPeriod(sw, new Date()) === false,
+      sw && 'next_run_at=' + sw.next_run_at)
+    check('  pair: with last_run_at forced to now the guard refuses it, which is the 09-21 outcome',
+      sw && scheduler.cronAlreadyRanThisPeriod(
+        Object.assign({}, sw, { last_run_at: new Date().toISOString() }), new Date()) === true)
+
+    // ---- 7. SOURCE BELT for staleLeaseRecovery ----
     // staleLeaseRecovery takes no opts, so driving it would consult the real coord
     // oracle against real running rows. Its two cron arms are asserted on the file
     // the daemon executes instead. This is the arm that actually fired on 23fddbac.
@@ -188,7 +226,7 @@ async function main() {
       /SET status = 'orphaned', last_run_at = NOW\(\)/.test(body),
       'one-shot rows go terminal, which is not a green read')
 
-    // ---- 7. markComplete must clear last_error, or the reclaim marker is untrustworthy ----
+    // ---- 8. markComplete must clear last_error, or the reclaim marker is untrustworthy ----
     const mc = src.slice(src.indexOf('run_count = run_count + 1, last_result = $2'))
     check('markComplete clears last_error on a real completion',
       /run_count = run_count \+ 1, last_result = \$2, last_error = NULL/.test(src),
