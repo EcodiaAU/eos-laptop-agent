@@ -2806,7 +2806,7 @@ exports.markComplete = async function markComplete(row, signal) {
     const cronRes = await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = 'active', last_run_at = NOW(), next_run_at = $1,
-           run_count = run_count + 1, last_result = $2,
+           run_count = run_count + 1, last_result = $2, last_error = NULL,
            retry_count = 0, launch_retry_count = 0, leased_by = NULL, leased_at = NULL,
            ${taskSignals.CLEAR_SQL_FRAGMENT},
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
@@ -2828,7 +2828,7 @@ exports.markComplete = async function markComplete(row, signal) {
     await pool.query(
       `UPDATE os_scheduled_tasks
        SET status = '${oneShotStatusSqlLiteral}', last_run_at = NOW(), last_result = $1,
-           run_count = run_count + 1, leased_by = NULL, leased_at = NULL,
+           run_count = run_count + 1, last_error = NULL, leased_by = NULL, leased_at = NULL,
            ${taskSignals.CLEAR_SQL_FRAGMENT},
            ${dispatchedTabIdSqlFrag} updated_at = NOW()
        WHERE id = $2`,
@@ -3559,9 +3559,36 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
       // backoff rather than losing the whole interval. See cronLaunchRetry.
       const lf = cronLaunchRetry(row)
       if (lf && !lf.ceiling) {
+      // 2026-09-23 lane S6. A RECLAIM IS NOT A RUN, AND STAMPING last_run_at HERE
+      // BOTH LIES TO EVERY READER AND DEFEATS THE RELAUNCH THIS BRANCH JUST ARMED.
+      // last_run_at has exactly one honest meaning, the last time this row actually
+      // fired, and run_count (written only by markComplete) is its only companion.
+      // A cron whose tab never opened produced nothing, so advancing the timestamp
+      // makes the row read green off a fire that never started.
+      //
+      // The second half is worse and is the measured one. cronAlreadyRanThisPeriod
+      // reads last_run_at against the current cron boundary and has NO
+      // launch_retry_count carve-out. The relaunch below sets next_run_at to a short
+      // backoff INSIDE the same period, so the same UPDATE that arms the retry also
+      // writes the value that makes the re-entry guard refuse it on the very next
+      // lease. Measured on secrets-daily-audit (23fddbac) 2026-09-21: worker
+      // tab_1790017295261_87ec82e4 registered 19:01:35.296Z and never bound, this
+      // branch relaunched it for 20:06:47.741Z at 20:01:47.757981Z, and leaseDueRows
+      // then logged 're-entry guard skipped ... already ran this period; next_run_at
+      // -> 2026-09-22T19:00:00.000Z'. run_count stayed at 49,
+      // kv_store.health.secrets_audit stayed stamped 2026-09-20T19:07:14Z, and no
+      // /tmp sweep artefact exists for 09-21. A day of security coverage was lost and
+      // every surface read green. c7d441e's relaunch fix was dead on arrival for this
+      // reason, on the first cron that exercised it.
+      //
+      // No reader regresses. startupCleanup's 24h last_run_at filter is scoped to
+      // status IN ('completed','failed','orphaned') and these cron paths set 'active',
+      // so they never matched it; the one-shot 'orphaned' branches keep their stamp
+      // untouched. last_error still records that this touch was a reclaim, and
+      // markComplete now clears it so that marker stays trustworthy.
         const r = await pool.query(
           `UPDATE os_scheduled_tasks
-           SET status = 'active', retry_count = 0, last_run_at = NOW(),
+           SET status = 'active', retry_count = 0,
                next_run_at = $1,
                launch_retry_count = COALESCE(launch_retry_count, 0) + 1,
                last_error = $3,
@@ -3596,7 +3623,8 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
       }
       await pool.query(
         `UPDATE os_scheduled_tasks
-         SET status = 'active', retry_count = 0, last_run_at = NOW(),
+         SET status = 'active', retry_count = 0,
+             last_run_at = CASE WHEN bound_at IS NULL THEN last_run_at ELSE NOW() END,
              next_run_at = $1,
              last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
              leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
@@ -3761,9 +3789,36 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
       // relaunch below is unreachable for a cron because this branch wins first.
       const lf = cronLaunchRetry(row, { settle: opts.settle })
       if (lf && !lf.ceiling) {
+      // 2026-09-23 lane S6. A RECLAIM IS NOT A RUN, AND STAMPING last_run_at HERE
+      // BOTH LIES TO EVERY READER AND DEFEATS THE RELAUNCH THIS BRANCH JUST ARMED.
+      // last_run_at has exactly one honest meaning, the last time this row actually
+      // fired, and run_count (written only by markComplete) is its only companion.
+      // A cron whose tab never opened produced nothing, so advancing the timestamp
+      // makes the row read green off a fire that never started.
+      //
+      // The second half is worse and is the measured one. cronAlreadyRanThisPeriod
+      // reads last_run_at against the current cron boundary and has NO
+      // launch_retry_count carve-out. The relaunch below sets next_run_at to a short
+      // backoff INSIDE the same period, so the same UPDATE that arms the retry also
+      // writes the value that makes the re-entry guard refuse it on the very next
+      // lease. Measured on secrets-daily-audit (23fddbac) 2026-09-21: worker
+      // tab_1790017295261_87ec82e4 registered 19:01:35.296Z and never bound, this
+      // branch relaunched it for 20:06:47.741Z at 20:01:47.757981Z, and leaseDueRows
+      // then logged 're-entry guard skipped ... already ran this period; next_run_at
+      // -> 2026-09-22T19:00:00.000Z'. run_count stayed at 49,
+      // kv_store.health.secrets_audit stayed stamped 2026-09-20T19:07:14Z, and no
+      // /tmp sweep artefact exists for 09-21. A day of security coverage was lost and
+      // every surface read green. c7d441e's relaunch fix was dead on arrival for this
+      // reason, on the first cron that exercised it.
+      //
+      // No reader regresses. startupCleanup's 24h last_run_at filter is scoped to
+      // status IN ('completed','failed','orphaned') and these cron paths set 'active',
+      // so they never matched it; the one-shot 'orphaned' branches keep their stamp
+      // untouched. last_error still records that this touch was a reclaim, and
+      // markComplete now clears it so that marker stays trustworthy.
         const r = await pool.query(
           `UPDATE os_scheduled_tasks
-           SET status = 'active', retry_count = 0, last_run_at = NOW(), next_run_at = $1,
+           SET status = 'active', retry_count = 0, next_run_at = $1,
                launch_retry_count = COALESCE(launch_retry_count, 0) + 1,
                last_error = $3, leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
            WHERE id = $2 AND status = 'running' AND archived_at IS NULL
@@ -3788,7 +3843,8 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
       catch (_e) { nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() }
       await pool.query(
         `UPDATE os_scheduled_tasks
-         SET status = 'active', retry_count = 0, last_run_at = NOW(), next_run_at = $1,
+         SET status = 'active', retry_count = 0, next_run_at = $1,
+             last_run_at = CASE WHEN bound_at IS NULL THEN last_run_at ELSE NOW() END,
              last_error = $3, leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
          WHERE id = $2 AND status = 'running' AND archived_at IS NULL
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
