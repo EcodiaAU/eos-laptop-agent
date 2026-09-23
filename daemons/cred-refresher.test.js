@@ -813,6 +813,161 @@ function readBody(req) {
     }
   })
 
+
+  // ── TEST 21: the connect phase is inside the named limit (E6 gap G16) ────
+  //
+  // req.setTimeout arms the socket idle timer only once the socket CONNECTS, so a peer
+  // that drops the SYN never met OAUTH_REQUEST_TIMEOUT_MS. Measured against 192.0.2.1
+  // on node v22.22.3 with the limit at 300ms, 2026-09-23: the `timeout` request option
+  // fired at 303/304/305/308 ms over four runs, the same code without it fired at 5023
+  // and 5003 ms (http.globalAgent.options.timeout is 5000 by default and the daemon
+  // never sets it), and under a plain https.Agent, whose options carry no timeout key
+  // at all, it did not fire through a 20-second ceiling on two of three rounds.
+  //
+  // THAT MEASUREMENT IS NOT THIS TEST, on purpose. 192.0.2.1 answered with an RST on
+  // 4 of 12 attempts from this network that day, so a suite case against it would be
+  // flaky by construction and would read green for the wrong reason. The fake below
+  // models node's two halves exactly: req.setTimeout(ms, cb) registers cb on 'timeout'
+  // EAGERLY and arms the socket timer only on 'connect', while options.timeout reaches
+  // net.Socket.connect and arms it before connect. A socket that never connects is
+  // therefore bounded by the option and by nothing else.
+
+  await test('postJson bounds a connect that never completes, and names the limit that fired', async () => {
+    const realRequest = http.request
+    let seen = null
+    http.request = function fakeRequest(options, cb) {
+      seen = options
+      const req = new (require('events').EventEmitter)()
+      req.write = () => {}
+      req.end   = () => {}
+      req.destroy = (err) => { req.emit('error', err) }
+      // node registers the callback eagerly and defers only the socket timer.
+      req.setTimeout = (ms, fn) => { if (fn) req.once('timeout', fn); return req }
+      // ...and 'connect' never happens here, so the deferred half never arms.
+      if (options.timeout) {
+        const t = setTimeout(() => req.emit('timeout'), options.timeout)
+        t.unref?.()
+      }
+      return req
+    }
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = '120'
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:9/v1/oauth/token'
+    try {
+      const refresher = freshRequire()
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const t0 = Date.now()
+      const outcome = await Promise.race([
+        refresher.refresh_account('money').then(() => 'resolved', e => e),
+        new Promise(r => setTimeout(() => r('STILL PENDING'), 3000)),
+      ])
+      const elapsed = Date.now() - t0
+      if (outcome === 'STILL PENDING') {
+        throw new Error('a connect that never completes is unbounded: nothing armed a timer before connect')
+      }
+      if (outcome === 'resolved') throw new Error('a connect that never completes must not resolve')
+      // Assert WHY it ended, not merely that it ended. A refusal for any other reason
+      // would pass a bare "it rejected" check while the connect phase stayed unbounded.
+      if (outcome.code !== 'ETIMEDOUT') {
+        throw new Error('ended with ' + outcome.code + ', not the ETIMEDOUT the classifier reads as transient')
+      }
+      if (!/timed out after 120ms/.test(outcome.message)) {
+        throw new Error('the message must name the limit that actually fired, got: ' + outcome.message)
+      }
+      if (elapsed > 1500) throw new Error('bounded at ' + elapsed + 'ms, far past the 120ms named limit')
+      // The mechanism itself, so removing the option line fails here even if the fake changes.
+      if (seen.timeout !== 120) {
+        throw new Error('postJson did not pass timeout in the request options (saw ' + seen.timeout + '), so the timer cannot arm before connect')
+      }
+    } finally {
+      http.request = realRequest
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+    }
+  })
+
+  // ── TEST 22: a pass cannot overlap itself (E6 gap G15a) ──────────────────
+  //
+  // start_loop arms setInterval(_runOnce) and setInterval does not await an async
+  // callback, so a pass outrunning REFRESH_INTERVAL_MS overlaps the next tick. An
+  // overlap is credential-damaging rather than merely wasteful: both passes read the
+  // same snapshot and POST the same refresh_token, Anthropic refresh tokens are
+  // single-use, so the first spends it and the second reads invalid_grant against a
+  // snapshot that was healthy a second earlier.
+
+  await test('a second pass entering while one is in flight is refused, and attempts nothing', async () => {
+    const sockets = []
+    const srv = net.createServer(s => { sockets.push(s) })   // accepts, never replies
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + srv.address().port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = '400'
+    process.env.CLAUDE_CREDENTIALS_PATH = path.join(TMP, 'no-live-credentials.json')
+    process.env.SWITCH_LOCK_FILE = path.join(TMP, 'no-switch.lock')
+    try {
+      writeAccountFile('tate')   // 1h TTL, above threshold, skipped without a request
+      writeAccountFile('code',  { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+
+      const first = refresher._runOnce()
+      // The first pass is now inside its first 400ms request. Assert that, rather than
+      // inferring it from timing: a guard that refused because the pass had already
+      // FINISHED would be a lucky refusal, not a designed one.
+      if (!refresher._isPassInFlight()) throw new Error('the first pass did not set the in-flight flag, so the second was never actually re-entrant')
+      const second = await refresher._runOnce().then(() => 'returned')
+      if (second !== 'returned') throw new Error('the re-entrant call did not return')
+      if (refresher._failureCount.code || refresher._failureCount.money) {
+        throw new Error('the refused pass counted a failure, so it did real work: ' + JSON.stringify(refresher._failureCount))
+      }
+      await first
+      if (refresher._isPassInFlight()) throw new Error('the flag stayed true after the pass finished, so every later pass is wedged')
+      // code and money each attempted ONCE. Two of each means the second pass ran and
+      // spent the same single-use refresh_token twice.
+      if (sockets.length !== 2) {
+        throw new Error('expected 2 OAuth attempts from one pass, saw ' + sockets.length + '; a second pass ran concurrently')
+      }
+    } finally {
+      sockets.forEach(s => s.destroy())
+      await new Promise(r => srv.close(r))
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+      delete process.env.CLAUDE_CREDENTIALS_PATH
+    }
+  })
+
+  // ── TEST 23: the switch recheck is ONE chain, not one per entry (G15b) ───
+  //
+  // The switch-in-flight branch used to arm a fresh 2-minute chain on every entry, and
+  // each link re-armed its own successor, so a switch held across N interval ticks left
+  // N independent chains alive and all of them fell through into a real pass in the same
+  // tick once the lock cleared. That branch RETURNS before the G15a flag is ever set,
+  // which is why one flag does not cover it and it needs its own handle.
+
+  await test('a held switch lock arms exactly one recheck chain however many passes enter', async () => {
+    const lockDir = path.join(CREDS_DIR, '_reentry', 'usage')
+    fs.mkdirSync(lockDir, { recursive: true })
+    const lockFile = path.join(lockDir, 'switch.lock')
+    process.env.SWITCH_LOCK_FILE = lockFile
+    process.env.SWITCH_RECHECK_MS = '50'
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, stage: 'LOGIN_CLI', heartbeat_at: new Date().toISOString() }))
+    const realLog = console.log
+    const armLines = []
+    console.log = (...a) => { const s = a.join(' '); if (/rechecking in/.test(s)) armLines.push(s) }
+    try {
+      const refresher = freshRequire()
+      if (!refresher._switchInFlight()) throw new Error('fixture lock does not read as in-flight, so this test proves nothing')
+      // Five interval ticks landing inside one held switch.
+      for (let i = 0; i < 5; i++) await refresher._runOnce()
+      if (armLines.length !== 1) {
+        throw new Error('five entries armed ' + armLines.length + ' recheck chains; each one falls through into its own pass when the lock clears')
+      }
+      if (!refresher._hasRecheckTimer()) throw new Error('no recheck chain is armed at all, so a held switch is never revisited')
+      refresher._clearRecheckTimer()
+      if (refresher._hasRecheckTimer()) throw new Error('the handle did not clear')
+    } finally {
+      console.log = realLog
+      delete process.env.SWITCH_RECHECK_MS
+      try { fs.unlinkSync(lockFile) } catch (e) {}
+    }
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
