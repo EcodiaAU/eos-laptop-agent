@@ -299,19 +299,68 @@ async function defaultKvWriter(key, value) {
         'Authorization':  'Bearer ' + serviceKey,
         'Prefer':         'resolution=merge-duplicates',
       },
+      // G18 (ISO lane E6, 2026-09-23). THE SECOND REQUEST SITE, now bounded the same way
+      // postJson is. This site had NO timeout option and NO req.setTimeout, so a peer that
+      // accepted and never answered held it open with no limit at all. It reuses
+      // OAUTH_REQUEST_TIMEOUT_MS rather than naming a kv-specific constant: one knob for
+      // every outbound request this daemon makes is the property worth having, and a
+      // second constant is a second thing to forget. The option reaches net.Socket.connect
+      // and so bounds the CONNECT phase, which req.setTimeout alone cannot, for the reason
+      // G16 records at the matching line in postJson.
+      timeout: OAUTH_REQUEST_TIMEOUT_MS,
     }
+    // G18 DEADLINE, part 1 of 2: the settle paths. Same shape as postJson's, and the
+    // helper names are deliberately the same so the two sites read as one pattern. The
+    // callbacks differ because this site resolves a fixed true and classifies a non-2xx
+    // as a failure, where postJson hands the status back to its caller.
+    let deadline = null
+    const clearDeadline = () => { if (deadline) { clearTimeout(deadline); deadline = null } }
+    const settleOk   = () => { clearDeadline(); resolve(true) }
+    const settleFail = (e) => { clearDeadline(); reject(e) }
+
     const req = transport.request(options, (res) => {
       let data = ''
       res.on('data', c => { data += c })
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(true)
+          settleOk()
         } else {
-          reject(new Error('kv_store upsert failed: HTTP ' + res.statusCode + ' ' + data))
+          settleFail(new Error('kv_store upsert failed: HTTP ' + res.statusCode + ' ' + data))
         }
       })
+      res.on('error', settleFail)
     })
-    req.on('error', reject)
+
+    // G18 DEADLINE, part 2 of 2. THE WHOLE-REQUEST BUDGET, for the reason G17 gives in
+    // postJson: the connect bound and the idle bound cover two PHASES and compose
+    // ADDITIVELY, so without this one request can take connect_time plus the limit. Armed
+    // ONCE and never reset, so DNS, connect, TLS, headers and body share one budget.
+    //
+    // ARMED AFTER const req, NEVER BEFORE. A timer created above that declaration
+    // references req in its temporal dead zone, so a synchronous throw from
+    // transport.request leaves a timer nothing can clear which then raises a
+    // ReferenceError from inside itself. This daemon installs no uncaughtException
+    // handler and its job carries KeepAlive with ThrottleInterval 30, so that second
+    // throw is a 30-second relaunch loop rather than one counted failure. E6 section 15.4
+    // proved the pair: the shipped ordering exits 0, timer-before-req exits 1.
+    //
+    // WHY THIS SITE MATTERS EVEN THOUGH IT IS UNREACHABLE TODAY. _kvWriter is AWAITED
+    // from handleFailure once FAILURE_ESCALATION_COUNT is reached, so an unbounded stall
+    // here stalls the failure path of a pass that is ALREADY failing, while _passInFlight
+    // is held for the whole stall. Reachability rests on the CONTENTS of the supabase env
+    // file this module dotenv-loads at startup, which any unrelated task can append a
+    // SUPABASE_URL to, rather than on anything in this daemon. See E6 section 15.5.
+    deadline = setTimeout(() => {
+      deadline = null
+      req.destroy(Object.assign(new Error('kv_store request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
+    }, OAUTH_REQUEST_TIMEOUT_MS)
+    // The ACTION on the idle timeout. node emits 'timeout' and destroys nothing by
+    // itself, so the option above without this handler would fire and leave the request
+    // hanging anyway.
+    req.setTimeout(OAUTH_REQUEST_TIMEOUT_MS, () => {
+      req.destroy(Object.assign(new Error('kv_store request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
+    })
+    req.on('error', settleFail)
     req.write(body)
     req.end()
   })
@@ -810,6 +859,32 @@ async function _runOnce() {
     console.log('[cred-refresher] a pass is already running - skipping this entry')
     return
   }
+  // G19 (ISO lane E6, 2026-09-23). THE PASS-START MARKER, and the whole point of it is
+  // that an observer OUTSIDE this process can tell an idle daemon from one eight minutes
+  // into a silent pass. Before this line it could not. Every other stdout write in this
+  // file is a per-account OUTCOME or a process-lifecycle event, an account whose TTL is
+  // ample returns with no log at all, and handleFailure writes to STDERR, so a pass whose
+  // three refreshes all time out wrote NOTHING to out.log for up to 90 seconds. A restart
+  // gate statting out.log therefore read a live pass and a quiet daemon identically, which
+  // is the blind gate E6 section 15.8 measured at 506 seconds of quiet against a healthy
+  // running pid.
+  //
+  // PLACED AFTER BOTH GUARDS ON PURPOSE. The marker has to mean "accounts are about to be
+  // touched" for a restart gate to act on it, and an entry that returns at the switch
+  // branch or at the re-entry flag touches nothing. Those two branches already log their
+  // own skip immediately above, so nothing is lost by not logging here, and putting the
+  // marker first would have emitted a pass-start for a pass that never ran.
+  //
+  // IT CARRIES ITS OWN TIMESTAMP because launchd's stdout redirect stamps nothing, so
+  // without one the age of this line is knowable only from the file mtime, which is the
+  // exact signal 15.8 showed blind.
+  //
+  // THE g17-deadline TOKEN IS A BUILD MARKER. 15.9 recorded that no line in this daemon's
+  // output distinguishes a G17 process from a pre-G17 one, so the bytes a running pid
+  // loaded were not re-derivable from the log. This token is that discriminator: a process
+  // printing it carries the whole-request deadline, and one that does not, does not.
+  console.log('[cred-refresher] pass start (g17-deadline, ' + OAUTH_REQUEST_TIMEOUT_MS +
+    'ms whole-request budget) accounts=' + ACCOUNTS.length + ' at ' + new Date().toISOString())
   _passInFlight = true
   try {
     const live = readLiveCredentials()
@@ -852,6 +927,11 @@ module.exports = {
   refresh_account,
   _runOnce,
   _setKvWriter,
+  // G18 seam (2026-09-23). _setKvWriter replaces the writer, so it cannot be used to
+  // TEST the default one. Case 29 drives defaultKvWriter itself, which needs a handle on
+  // it, and the alternative was reaching it through three counted failures in
+  // handleFailure, which would have measured the escalation path rather than the bound.
+  _defaultKvWriter: defaultKvWriter,
   // 2026-08-02 seams: the darwin Keychain always won over file fixtures, so the suite
   // could not pin which account was live (five structural failures). Injecting the
   // keychain reader plus CLAUDE_JSON_PATH makes identity testable.

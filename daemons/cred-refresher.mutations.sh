@@ -47,21 +47,32 @@ run() {
 echo "### BASELINE (unmutated) ###"
 report
 
+# M1 AND M2 ARE SITE-AWARE SINCE G18 (2026-09-23), and that is not cosmetic. G18 gave
+# defaultKvWriter the SAME `timeout: OAUTH_REQUEST_TIMEOUT_MS,` line, so the old
+# `assert count==1` began to fail. A failed python assert does NOT stop this script: it
+# runs under `set -u` with no `-e`, so the heredoc exits non-zero, the mutation is never
+# applied, run() then measures UNMUTATED code, reads ALL TESTS PASSED, and the
+# undeclared-green gate exits 1 naming a case that was never exercised. Both blocks now
+# assert count==2 and target the LAST occurrence, which is postJson, exactly as M13
+# already did for the shared `const req` line. Anchor counts are recorded in E6 16.6.
 python3 - <<'EOF'
 import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
 old="      timeout: OAUTH_REQUEST_TIMEOUT_MS,\n"
-assert s.count(old)==1, 'M1 anchor %d' % s.count(old)
-io.open(p,'w',encoding='utf-8').write(s.replace(old,""))
+# defaultKvWriter carries the same line since G18; postJson is the LAST of the two.
+assert s.count(old)==2, 'M1 anchor %d' % s.count(old)
+i=s.rfind(old)
+io.open(p,'w',encoding='utf-8').write(s[:i]+s[i+len(old):])
 EOF
-run "M1  G16: options.timeout deleted (connect phase unbounded again)"
+run "M1  G16: postJson's options.timeout deleted (its connect phase unbounded again)"
 
 python3 - <<'EOF'
 import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
 old="      timeout: OAUTH_REQUEST_TIMEOUT_MS,\n"
-assert s.count(old)==1
-io.open(p,'w',encoding='utf-8').write(s.replace(old,"      timeout: 99000,\n"))
+assert s.count(old)==2, 'M2 anchor %d' % s.count(old)
+i=s.rfind(old)
+io.open(p,'w',encoding='utf-8').write(s[:i]+"      timeout: 99000,\n"+s[i+len(old):])
 EOF
-run "M2  G16: option present but names a different limit than the message"
+run "M2  G16: postJson's option present but names a different limit than the message"
 
 python3 - <<'EOF'
 import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
@@ -203,6 +214,39 @@ i=s.rfind(reqline)
 io.open(p,'w',encoding='utf-8').write(s[:i]+timer+s[i:])
 EOF
 run "M13 G17 ORDER: the deadline armed BEFORE const req (a TDZ ReferenceError from inside the timer)"
+
+# -- M14 and M15, added by the G18/G19 pass, 2026-09-23 ----------------------
+# M14 is the kv site's whole-request deadline, the direct analogue of M11. It deletes the
+# DEADLINE only and leaves options.timeout and req.setTimeout standing, so what case 29
+# sees is the two remaining bounds COMPOSING to connect plus limit rather than an
+# unbounded hang. That is the single-guard form. A deletion of all three bounds is also
+# caught by case 29, through its STILL PENDING sentinel rather than its upper threshold.
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="""    deadline = setTimeout(() => {
+      deadline = null
+      req.destroy(Object.assign(new Error('kv_store request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
+    }, OAUTH_REQUEST_TIMEOUT_MS)"""
+assert s.count(old)==1, 'M14 anchor %d' % s.count(old)
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"    // kv whole-request deadline removed by mutation M14"))
+EOF
+run "M14 G18: defaultKvWriter's whole-request DEADLINE deleted (connect and idle compose additively)"
+
+# M15 is the G19 pass-start marker. Deleting it returns the daemon to the state E6 15.8
+# measured, where an outside observer cannot tell an idle daemon from one eight minutes
+# into a silent pass, and where no log line discriminates a G17 build from a pre-G17 one.
+# Case 30 is the only case that can see it.
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="""  console.log('[cred-refresher] pass start (g17-deadline, ' + OAUTH_REQUEST_TIMEOUT_MS +
+    'ms whole-request budget) accounts=' + ACCOUNTS.length + ' at ' + new Date().toISOString())
+"""
+assert s.count(old)==1, 'M15 anchor %d' % s.count(old)
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"  // pass-start marker removed by mutation M15\n"))
+EOF
+run "M15 G19: the pass-start marker deleted (out.log cannot distinguish idle from mid-pass)"
 
 echo ""
 echo "### RESTORED ###"

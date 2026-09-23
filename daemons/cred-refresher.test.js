@@ -1341,6 +1341,189 @@ function readBody(req) {
     }
   })
 
+  // ── TEST 29: G18, the SECOND request site is bounded too (E6 16.2) ──────────
+  //
+  // Section 15.5 opened G18: defaultKvWriter built its own transport.request with no
+  // timeout option and no req.setTimeout, so it was unbounded. It is unreachable on this
+  // Mac today because the daemon's env carries neither SUPABASE_URL nor
+  // SUPABASE_SERVICE_KEY, and that unreachability is a property of the CONTENTS of a
+  // credentials file this module dotenv-loads rather than of the daemon. One appended
+  // line turns it back on, inside the failure path, where _kvWriter is AWAITED from
+  // handleFailure with _passInFlight held.
+  //
+  // WHY IT DRIVES defaultKvWriter DIRECTLY. _setKvWriter REPLACES the writer, so it is
+  // the one seam that cannot test the default one. The alternative was three counted
+  // failures through handleFailure, which would have measured the escalation path and not
+  // the bound. G18 exports _defaultKvWriter for exactly this.
+  //
+  // THE SHAPE IS CASE 26'S, because the guard being asserted is the same one: a 700ms
+  // connect delay under a 1000ms limit reads about 1700ms when the connect bound and the
+  // idle bound compose, and about 1000ms when one deadline covers the whole request. The
+  // threshold at 1350 sits clear of both. The lower bound at 900 is there so a fixture
+  // whose DNS patch stopped taking effect, and which therefore failed fast for an
+  // unrelated reason, cannot read as a pass. M14 is its mutation, and M14 deletes the
+  // whole-request deadline ONLY: a deletion of all three bounds is caught here too,
+  // through the STILL PENDING sentinel rather than through the upper threshold.
+
+  await test('defaultKvWriter bounds a slow connect to an idle peer at the NAMED limit', async () => {
+    const dns = require('dns')
+    const realLookup = dns.lookup
+    const HOST = 'g18-slow-host.test'
+    const CONNECT_DELAY_MS = 700
+    const LIMIT_MS = 1000
+    dns.lookup = function g18DelayedLookup(hostname, options, cb) {
+      if (typeof options === 'function') { cb = options; options = {} }
+      if (hostname !== HOST) return realLookup.apply(dns, arguments)
+      setTimeout(() => {
+        if (options && options.all) return cb(null, [{ address: '127.0.0.1', family: 4 }])
+        cb(null, '127.0.0.1', 4)
+      }, CONNECT_DELAY_MS)
+    }
+    const sockets = []
+    const srv = net.createServer(sock => { sockets.push(sock) })   // accepts, never replies
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    // Not a credential. A literal placeholder the local server never reads, present only
+    // because defaultKvWriter's guard returns false unless BOTH names are set.
+    process.env.SUPABASE_URL = 'http://' + HOST + ':' + srv.address().port
+    process.env.SUPABASE_SERVICE_KEY = 'SK-fixture-placeholder-not-a-key'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = String(LIMIT_MS)
+    try {
+      const refresher = freshRequire()
+      if (typeof refresher._defaultKvWriter !== 'function') {
+        throw new Error('_defaultKvWriter is not exported, so this case cannot reach the default writer')
+      }
+      const t0 = Date.now()
+      const outcome = await Promise.race([
+        refresher._defaultKvWriter('creds.refresh_failure.fixture', { probe: true })
+          .then(v => 'RESOLVED:' + v, e => e),
+        new Promise(r => setTimeout(() => r('STILL PENDING'), 8000)),
+      ])
+      const elapsed = Date.now() - t0
+      if (outcome === 'STILL PENDING') {
+        throw new Error('nothing bounded the kv_store request at all; G18 is absent')
+      }
+      if (typeof outcome === 'string') {
+        throw new Error('an idle peer must not settle successfully, got ' + outcome)
+      }
+      // The connect must have COMPLETED, or this is measuring a blackhole and not a
+      // composition of two phase bounds.
+      if (sockets.length !== 1) {
+        throw new Error('expected exactly 1 accepted socket, saw ' + sockets.length +
+          '; the connect did not complete, so this case is not testing the composition')
+      }
+      // Assert WHY it ended, not merely that it ended.
+      if (outcome.code !== 'ETIMEDOUT') {
+        throw new Error('ended with ' + outcome.code + ', not the ETIMEDOUT a transient classifier reads')
+      }
+      if (!new RegExp('kv_store request timed out after ' + LIMIT_MS + 'ms').test(outcome.message)) {
+        throw new Error('the message must name BOTH the site and the limit that fired, got: ' + outcome.message)
+      }
+      if (elapsed >= 1350) {
+        throw new Error('bounded at ' + elapsed + 'ms, which is connect plus limit rather than the ' +
+          LIMIT_MS + 'ms it names; the whole-request deadline is gone and the two phase bounds compose')
+      }
+      if (elapsed < 900) {
+        throw new Error('ended at ' + elapsed + 'ms, too early for the ' + LIMIT_MS +
+          'ms limit; the fixture failed fast for some other reason and is not testing the bound')
+      }
+    } finally {
+      dns.lookup = realLookup
+      sockets.forEach(sock => sock.destroy())
+      await new Promise(r => srv.close(r))
+      // MUST be deleted. freshRequire installs no kv stub, so _kvWriter is
+      // defaultKvWriter in every later case, and a leaked SUPABASE_URL would turn every
+      // subsequent handleFailure escalation into a real request at a dead port.
+      delete process.env.SUPABASE_URL
+      delete process.env.SUPABASE_SERVICE_KEY
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+    }
+  })
+
+  // ── TEST 30: G19, the pass-start marker, and WHERE it sits (E6 16.4) ────────
+  //
+  // Section 15.8 measured the defect: out.log read 506 seconds quiet while pid 5643 was
+  // healthy and running, and that reading is equally consistent with an idle daemon and
+  // with a pass that began eight minutes ago and has logged nothing. Every stdout write
+  // in the daemon is a per-account OUTCOME or a lifecycle event, an ample-TTL account
+  // returns with no log at all, and handleFailure writes to stderr, so a pass whose three
+  // refreshes all time out wrote NOTHING to the file a restart gate stats.
+  //
+  // BOTH HALVES ARE ASSERTED, and the second is the one that pins the PLACEMENT. A real
+  // pass emits the marker exactly once. An entry that returns at the switch guard emits
+  // its own skip line and NOT the marker, because a marker that fired for a pass which
+  // never ran would hand a restart gate the same ambiguity in the other direction.
+  //
+  // THE THREE ACCOUNTS ARE GIVEN AMPLE TTL ON PURPOSE. refresh_account returns with no
+  // log when timeToExpiry exceeds REFRESH_THRESHOLD_MS, so a clean pass over three such
+  // accounts emits the marker and nothing else, which lets this case assert an exact
+  // count of one rather than a substring match in noise. M15 is its mutation.
+
+  await test('a real pass emits the G19 pass-start marker once, and a skipped entry emits none', async () => {
+    const lockDir = path.join(CREDS_DIR, '_g19', 'usage')
+    fs.mkdirSync(lockDir, { recursive: true })
+    const lockFile = path.join(lockDir, 'switch.lock')
+    const savedLock = process.env.SWITCH_LOCK_FILE
+    process.env.SWITCH_LOCK_FILE = lockFile
+    const realLog = console.log
+    let lines = []
+    console.log = (...a) => { lines.push(a.map(String).join(' ')) }
+    try {
+      for (const acct of ['tate', 'code', 'money']) {
+        writeAccountFile(acct, { claudeAiOauth: { expiresAt: Date.now() + 6 * 60 * 60 * 1000 } })
+      }
+
+      // HALF ONE: a real pass.
+      let refresher = freshRequire()
+      lines = []
+      await refresher._runOnce()
+      const markers = lines.filter(l => /pass start \(g17-deadline/.test(l))
+      if (markers.length !== 1) {
+        throw new Error('a real pass must emit exactly one pass-start marker, saw ' + markers.length +
+          '; stdout was ' + JSON.stringify(lines))
+      }
+      // The marker has to carry its own timestamp: launchd's stdout redirect stamps
+      // nothing, so without one this line's age is knowable only from the file mtime,
+      // which is the signal 15.8 showed blind.
+      if (!/\bat \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(markers[0])) {
+        throw new Error('the marker must end in its own ISO timestamp, got: ' + markers[0])
+      }
+      if (!/accounts=3/.test(markers[0])) {
+        throw new Error('the marker must name how many accounts the pass will touch, got: ' + markers[0])
+      }
+      // An ample-TTL account logs nothing, so a clean pass is the marker and nothing else.
+      if (lines.length !== 1) {
+        throw new Error('a pass over three ample-TTL accounts must emit the marker alone, got: ' +
+          JSON.stringify(lines))
+      }
+
+      // HALF TWO: an entry that returns at the switch guard. A live holder is our own
+      // pid with a fresh heartbeat, the same fixture case 12 uses.
+      fs.writeFileSync(lockFile, JSON.stringify({
+        pid: process.pid, stage: 'LOGIN_CLI', heartbeat_at: new Date().toISOString(),
+      }))
+      refresher = freshRequire()
+      if (!refresher._switchInFlight()) {
+        throw new Error('the lock fixture did not read as in-flight, so half two is not testing the guard')
+      }
+      lines = []
+      await refresher._runOnce()
+      if (lines.some(l => /pass start \(g17-deadline/.test(l))) {
+        throw new Error('an entry that returned at the switch guard emitted a pass-start marker; ' +
+          'the marker is above the guards and reports passes that never ran: ' + JSON.stringify(lines))
+      }
+      if (!lines.some(l => /a switch is in flight/.test(l))) {
+        throw new Error('the switch branch logged no skip of its own, so nothing marks this entry at all: ' +
+          JSON.stringify(lines))
+      }
+      if (refresher._clearRecheckTimer) refresher._clearRecheckTimer()
+    } finally {
+      console.log = realLog
+      try { fs.unlinkSync(lockFile) } catch (e) { /* already gone */ }
+      if (savedLock) process.env.SWITCH_LOCK_FILE = savedLock
+      else delete process.env.SWITCH_LOCK_FILE
+    }
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
