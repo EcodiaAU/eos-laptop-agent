@@ -28,12 +28,19 @@
 // on the same row with last_run_at forced to now. That pair proves the stamp was
 // the term defeating the retry, not a coincidence of the fixture.
 //
-// SAFETY. Only livenessReapPass is driven live, because it accepts a stubbed
-// liveness oracle: every non-fixture running row is reported LIVE, so the pass can
-// only ever touch the fixtures even if the pass itself is wrong. staleLeaseRecovery
-// takes no opts and would consult the real coord oracle against real running rows,
-// so it is NOT driven here; its two cron arms are asserted as source belts instead,
-// on the same file the daemon executes. Cap state is stubbed uncapped and restored
+// SAFETY. livenessReapPass is driven live because it accepts a stubbed liveness
+// oracle: every non-fixture running row is reported LIVE, so the pass can only ever
+// touch the fixtures even if the pass itself is wrong.
+//
+// staleLeaseRecovery IS ALSO DRIVEN LIVE, as of 08ffda1 (2026-09-23), which is the
+// whole point of that commit: the arm that actually lost 23fddbac is the one this
+// gate must exercise, not merely grep. This paragraph said it was NOT driven until
+// 2026-09-24, six lines above STALELEASE cases that plainly do, which is the shape
+// where a reader trusts the header and stops. It is bounded the same way the
+// fixtures are: the pass is entered only with the cap state stubbed uncapped, and
+// its cron arms carry bound_at IS NULL in the WHERE, so a real bound row cannot be
+// touched. The source belts below are kept as well, on the same file the daemon
+// executes, because a belt catches a build that never reaches the UPDATE at all. Cap state is stubbed uncapped and restored
 // in the finally, because both cron call sites invoke cronLaunchRetry without
 // opts.capped.
 //
