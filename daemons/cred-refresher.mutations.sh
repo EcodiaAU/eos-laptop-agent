@@ -52,7 +52,15 @@ old="""    req.setTimeout(OAUTH_REQUEST_TIMEOUT_MS, () => {
 assert s.count(old)==1, 'M3 anchor'
 io.open(p,'w',encoding='utf-8').write(s.replace(old,"    // handler removed by mutation M3"))
 EOF
-run "M3  G16: the timeout HANDLER deleted, option kept (nothing destroys the request)"
+# M3 IS EXPECTED GREEN SINCE G17, and that is a finding rather than a defect in the
+# cases. The G17 deadline destroys the request at the limit on its own, so deleting the
+# idle handler no longer leaves anything unbounded: every case still settles with
+# ETIMEDOUT and the same message. Before G17 this mutation made the suite HANG and burn
+# the full `timeout 300`; a fast green run here is the observable proof of the
+# redundancy. The live mutation for the destroy ACTION is now M11. The handler is kept
+# in the daemon anyway, because case 21 leans on options.timeout and belt-and-braces on
+# a credential path is cheap.
+run "M3  G16: the timeout HANDLER deleted, option kept (EXPECTED GREEN since G17: the deadline destroys it)"
 
 python3 - <<'EOF'
 import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
@@ -129,6 +137,22 @@ assert s.count(old)==1, 'M10 anchor %d' % s.count(old)
 io.open(p,'w',encoding='utf-8').write(s.replace(old,"    if (true) return\n"+old))
 EOF
 run "M10 the pass returns before the account loop (does nothing, clears the flag, looks healthy)"
+
+# ── M11, added by the G17 pass, 2026-09-23 ────────────────────────────────────
+# The whole-request deadline. Without it the connect bound and the idle bound compose
+# additively and one request can take connect_time plus OAUTH_REQUEST_TIMEOUT_MS. Case 26
+# is the only case that can see this: 19 and 20 connect instantly and 21 never connects.
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="""    deadline = setTimeout(() => {
+      deadline = null
+      req.destroy(Object.assign(new Error('OAuth request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
+    }, OAUTH_REQUEST_TIMEOUT_MS)"""
+assert s.count(old)==1, 'M11 anchor %d' % s.count(old)
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"    // whole-request deadline removed by mutation M11"))
+EOF
+run "M11 G17: the whole-request DEADLINE deleted (connect and idle compose additively again)"
 
 echo ""
 echo "### RESTORED ###"

@@ -1100,6 +1100,104 @@ function readBody(req) {
     }
   })
 
+  // ── TEST 26: connect and idle share ONE budget (E6 gap G17) ──────────────
+  //
+  // Cases 19 and 20 connect instantly and case 21 never connects at all, so none of
+  // them can see the bound this case asserts: a connect that is SLOW and then SUCCEEDS,
+  // followed by an idle peer. Before the G17 deadline, `timeout` in the request options
+  // bounded the connect phase and `req.setTimeout` bounded the idle phase, and the two
+  // composed ADDITIVELY, because net.js afterConnect calls _unrefTimer() and node's http
+  // client then arms its deferred req.setTimeout half at a fresh FULL budget at the
+  // moment of connect. Measured on node v22.22.3, 2026-09-23, limit 1000ms, connect delay
+  // 700ms: 1714/1703/1705 ms before the deadline and 1006/1001/1002 ms after it.
+  //
+  // At the 30-second default the old bound was up to 60 seconds for one request and 180
+  // for three sequential accounts. That is credential-damaging rather than merely slow:
+  // it broke the arithmetic behind the daemon's 120-second restart-quiet gate, so a
+  // SIGTERM could land inside a live pass, and a refresh answered by the vendor and not
+  // written to the snapshot spends a single-use Anthropic refresh token.
+  //
+  // CONSTRUCTION. dns.lookup is delayed for one fake hostname, which keeps the socket
+  // genuinely in the connecting state (net.js sets connecting = true before
+  // lookupAndConnect), so the pre-connect timer is armed against a real connecting socket
+  // rather than a stub. The peer is a local TCP server that accepts and never replies.
+  // The path under test is the production one: refresh_account into postJson, no seam.
+  //
+  // THE SOCKET COUNT IS THE FIXTURE-FAITHFULNESS PROBE and it is why this is not a second
+  // copy of case 21. Exactly one accepted socket proves the connect COMPLETED, so the
+  // reading is a composition of two phases. Zero would mean the pre-connect timer fired
+  // first and this case had silently degraded into the blackhole case.
+  //
+  // THE BOUNDS. 700ms delay under a 1000ms limit gives ~1700ms without the deadline and
+  // ~1000ms with it. The threshold sits at 1350, which is 350ms clear of both, against a
+  // measured spread of 11ms across three reps. The lower bound of 900ms is there so a
+  // fixture whose DNS patch stopped taking effect, and which therefore failed fast for an
+  // unrelated reason, cannot read as a pass.
+
+  await test('a slow connect followed by an idle peer ends at the NAMED limit, not connect plus limit', async () => {
+    const dns = require('dns')
+    const realLookup = dns.lookup
+    const HOST = 'g17-slow-host.test'
+    const CONNECT_DELAY_MS = 700
+    const LIMIT_MS = 1000
+    dns.lookup = function g17DelayedLookup(hostname, options, cb) {
+      if (typeof options === 'function') { cb = options; options = {} }
+      if (hostname !== HOST) return realLookup.apply(dns, arguments)
+      setTimeout(() => {
+        if (options && options.all) return cb(null, [{ address: '127.0.0.1', family: 4 }])
+        cb(null, '127.0.0.1', 4)
+      }, CONNECT_DELAY_MS)
+    }
+    const sockets = []
+    const srv = net.createServer(s => { sockets.push(s) })   // accepts, never replies
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    process.env.OAUTH_REFRESH_URL = 'http://' + HOST + ':' + srv.address().port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = String(LIMIT_MS)
+    try {
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+      const t0 = Date.now()
+      const outcome = await Promise.race([
+        refresher.refresh_account('money').then(() => 'resolved', e => e),
+        new Promise(r => setTimeout(() => r('STILL PENDING'), 8000)),
+      ])
+      const elapsed = Date.now() - t0
+      if (outcome === 'STILL PENDING') throw new Error('nothing bounded the request at all')
+      if (outcome === 'resolved') throw new Error('an idle peer must not resolve')
+      // The connect must have COMPLETED, or this case is measuring the blackhole path.
+      if (sockets.length !== 1) {
+        throw new Error('expected exactly 1 accepted socket, saw ' + sockets.length +
+          '; the connect did not complete, so this is case 21 again and not a composition')
+      }
+      // Assert WHY it ended, not merely that it ended.
+      if (outcome.code !== 'ETIMEDOUT') {
+        throw new Error('ended with ' + outcome.code + ', not the ETIMEDOUT the classifier reads as transient')
+      }
+      if (!new RegExp('timed out after ' + LIMIT_MS + 'ms').test(outcome.message)) {
+        throw new Error('the message must name the limit that fired, got: ' + outcome.message)
+      }
+      if (elapsed >= 1350) {
+        throw new Error('bounded at ' + elapsed + 'ms, which is connect plus limit rather than the ' +
+          LIMIT_MS + 'ms limit it names; the connect bound and the idle bound are composing')
+      }
+      if (elapsed < 900) {
+        throw new Error('ended at ' + elapsed + 'ms, too early for the ' + LIMIT_MS +
+          'ms limit; the fixture failed fast for some other reason and is not testing the deadline')
+      }
+      if (readAccountFile('money').claudeAiOauth.refreshToken !== 'RT-money-old') {
+        throw new Error('a timed-out request must not touch the snapshot')
+      }
+      if (refresher._failureCount.money !== 1) {
+        throw new Error('the timeout was not counted: ' + JSON.stringify(refresher._failureCount))
+      }
+    } finally {
+      dns.lookup = realLookup
+      sockets.forEach(s => s.destroy())
+      await new Promise(r => srv.close(r))
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+    }
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
