@@ -736,10 +736,6 @@ async function _runOnce() {
   // refresh_token, Anthropic refresh tokens are single-use (see the dead-snapshot
   // block above), so the first spends it and the second reads invalid_grant against a
   // snapshot that was healthy a second earlier. That is the 484-failure streak class.
-  if (_passInFlight) {
-    console.log('[cred-refresher] a pass is already running - skipping this entry')
-    return
-  }
   // SKIP THE WHOLE PASS WHILE A SWITCH IS IN FLIGHT (2026-08-02). Mid-switch, the
   // Keychain holds the INCOMING account's tokens while ~/.claude.json may still name the
   // outgoing one. A refresh pass landing in that window resolves "live" from the stale
@@ -764,6 +760,20 @@ async function _runOnce() {
       }, SWITCH_RECHECK_MS)
       _recheckTimer.unref?.()
     }
+    return
+  }
+  // ORDER IS LOAD-BEARING, and it was wrong in the first cut of this guard. The flag
+  // check sits AFTER the switch branch, because putting it first silently removed a
+  // behaviour the old code had: an interval tick landing while a pass was running AND
+  // a switch was in flight used to arm a recheck, and returning at the flag armed
+  // nothing, so that switch went unrevisited until the next 30-minute tick. One
+  // skipped tick makes the effective interval 60 minutes against a 45-minute refresh
+  // threshold, which is the inequality start_loop() warns about at :760. This ordering
+  // is safe with the single-chain handle: a recheck firing mid-pass re-arms while the
+  // switch holds, and once it clears it returns at the flag without re-arming, costing
+  // at most one tick.
+  if (_passInFlight) {
+    console.log('[cred-refresher] a pass is already running - skipping this entry')
     return
   }
   _passInFlight = true

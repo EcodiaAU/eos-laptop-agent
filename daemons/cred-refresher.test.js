@@ -945,7 +945,11 @@ function readBody(req) {
     fs.mkdirSync(lockDir, { recursive: true })
     const lockFile = path.join(lockDir, 'switch.lock')
     process.env.SWITCH_LOCK_FILE = lockFile
-    process.env.SWITCH_RECHECK_MS = '50'
+    // 60s, deliberately longer than this test's whole runtime. The case clears the
+    // handle itself and never needs the timer to FIRE; a short delay would let a
+    // recheck land mid-loop, re-arm, and take armLines to 2 for a reason that has
+    // nothing to do with the guard under test.
+    process.env.SWITCH_RECHECK_MS = '60000'
     fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, stage: 'LOGIN_CLI', heartbeat_at: new Date().toISOString() }))
     const realLog = console.log
     const armLines = []
