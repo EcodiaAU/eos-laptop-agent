@@ -336,6 +336,16 @@ function postJson(urlStr, headers, bodyObj) {
         'User-Agent':     OAUTH_USER_AGENT,
         ...headers,
       },
+      // G16 (ISO lane E6, 2026-09-23). req.setTimeout below arms the socket idle
+      // timer only once the socket CONNECTS, so a peer that drops the SYN never met
+      // OAUTH_REQUEST_TIMEOUT_MS at all. This option reaches net.Socket.connect and
+      // arms the same timer BEFORE connect, so the connect phase is inside the named
+      // limit. Measured against 192.0.2.1 with the limit at 300ms: with the option,
+      // 303/304/305/308 ms over four runs; without it, 5023 and 5003 ms (the
+      // undeclared http.globalAgent.options.timeout default of 5000) and 20003 and
+      // 20004 ms with no bound at all under a plain Agent, whose options carry no
+      // timeout key.
+      timeout: OAUTH_REQUEST_TIMEOUT_MS,
     }
     const req = transport.request(options, (res) => {
       let data = ''
@@ -346,9 +356,13 @@ function postJson(urlStr, headers, bodyObj) {
       // response-side error from ever going unhandled.
       res.on('error', reject)
     })
-    // Idle limit, so a silent peer ends as a counted TRANSIENT failure: the message
-    // says "timed out" and the code is ETIMEDOUT, both of which the shared
-    // classifier reads as transient.
+    // The ACTION on timeout, and it stays mandatory after the option above: node
+    // emits 'timeout' on the request and destroys nothing by itself, so without this
+    // handler the option would fire and the request would hang anyway. It gives the
+    // counted TRANSIENT failure its shape: the message says "timed out" and the code
+    // is ETIMEDOUT, both of which the shared classifier reads as transient. Message
+    // and option now name the SAME constant, so the "timed out after 30000ms" that
+    // actually fired at 5000ms cannot recur.
     req.setTimeout(OAUTH_REQUEST_TIMEOUT_MS, () => {
       req.destroy(Object.assign(new Error('OAuth request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
     })
@@ -704,10 +718,28 @@ function switchInFlight() {
   return (Date.now() - beat) < SWITCH_LOCK_STALE_MS
 }
 
+// Re-entry state for _runOnce (ISO lane E6 gap G15, 2026-09-23). Two separate
+// hazards, so two separate handles: _passInFlight covers an overlapping pass, and
+// _recheckTimer covers the switch-recheck chain that returns before the flag is set.
+let _passInFlight = false
+let _recheckTimer = null
+const SWITCH_RECHECK_MS = Number(process.env.SWITCH_RECHECK_MS) || 2 * 60 * 1000
+
 // Run a single pass over all accounts. Reads the live credentials ONCE
 // up-front and passes the snapshot to each account so the active-session
 // protection (skip + sync) is consistent across the pass.
 async function _runOnce() {
+  // G15a, RE-ENTRY (ISO lane E6, 2026-09-23). start_loop arms setInterval(_runOnce),
+  // and setInterval does NOT await an async callback, so a pass that outruns
+  // REFRESH_INTERVAL_MS overlaps the next tick. An overlap is credential-damaging
+  // rather than merely wasteful: both passes read the same snapshot and POST the same
+  // refresh_token, Anthropic refresh tokens are single-use (see the dead-snapshot
+  // block above), so the first spends it and the second reads invalid_grant against a
+  // snapshot that was healthy a second earlier. That is the 484-failure streak class.
+  if (_passInFlight) {
+    console.log('[cred-refresher] a pass is already running - skipping this entry')
+    return
+  }
   // SKIP THE WHOLE PASS WHILE A SWITCH IS IN FLIGHT (2026-08-02). Mid-switch, the
   // Keychain holds the INCOMING account's tokens while ~/.claude.json may still name the
   // outgoing one. A refresh pass landing in that window resolves "live" from the stale
@@ -715,22 +747,45 @@ async function _runOnce() {
   // one file now impersonating the other, which is the 2026-06-22 clobber class. The
   // switch runner owns the Keychain for the duration; we wait for it.
   if (switchInFlight()) {
-    console.log('[cred-refresher] a switch is in flight - skipping this pass (rechecking in 2min)')
-    setTimeout(() => { _runOnce().catch(() => {}) }, 2 * 60 * 1000).unref?.()
+    // G15b, RECHECK-CHAIN ACCUMULATION (ISO lane E6, 2026-09-23). This branch used to
+    // arm a fresh 2-minute chain on EVERY entry that saw a switch in flight, and each
+    // link of a chain re-armed its own successor. So a switch held across N interval
+    // ticks left N independent chains alive, all of them re-firing every 2 minutes,
+    // and every one of them fell through into a real pass in the same tick once the
+    // lock cleared. That is the concurrent-pass case G15a guards, reached from the one
+    // branch that RETURNS before G15a's flag is ever set, which is why one flag is not
+    // enough and this needs its own handle. One chain, ever.
+    if (!_recheckTimer) {
+      console.log('[cred-refresher] a switch is in flight - skipping this pass (rechecking in ' +
+        Math.round(SWITCH_RECHECK_MS / 1000) + 's)')
+      _recheckTimer = setTimeout(() => {
+        _recheckTimer = null
+        _runOnce().catch(() => {})
+      }, SWITCH_RECHECK_MS)
+      _recheckTimer.unref?.()
+    }
     return
   }
-  const live = readLiveCredentials()
-  for (const account of ACCOUNTS) {
-    if (DISABLED_ACCOUNTS.has(account)) {
-      // No-op + no failure count: this account is operator-paused.
-      continue
+  _passInFlight = true
+  try {
+    const live = readLiveCredentials()
+    for (const account of ACCOUNTS) {
+      if (DISABLED_ACCOUNTS.has(account)) {
+        // No-op + no failure count: this account is operator-paused.
+        continue
+      }
+      try {
+        await refresh_account(account, live)
+      } catch (e) {
+        // Error already logged and counted in refresh_account/handleFailure.
+        // Continue to next account.
+      }
     }
-    try {
-      await refresh_account(account, live)
-    } catch (e) {
-      // Error already logged and counted in refresh_account/handleFailure.
-      // Continue to next account.
-    }
+  } finally {
+    // finally, not a tail assignment: refresh_account is wrapped per account, and a
+    // throw from readLiveCredentials itself would otherwise leave the flag stuck true
+    // and wedge every later pass for the life of the process.
+    _passInFlight = false
   }
 }
 
@@ -763,6 +818,12 @@ module.exports = {
   _deadSnapshots,
   _deadSnapshotRetryAt,
   _isTransientReason: isTransientReason,
+  // G15 seams (2026-09-23): a primitive cannot be exported as a live binding, so the
+  // suite reads the guard state through accessors rather than asserting on a stale copy.
+  _isPassInFlight: () => _passInFlight,
+  _hasRecheckTimer: () => _recheckTimer !== null,
+  _clearRecheckTimer: () => { if (_recheckTimer) clearTimeout(_recheckTimer); _recheckTimer = null },
+  _SWITCH_RECHECK_MS: SWITCH_RECHECK_MS,
   _describeRequestError: reasonClass.describeRequestError,
   _deadSkipLoggedAt,
   _TRANSIENT_RETRY_MS: TRANSIENT_RETRY_MS,
