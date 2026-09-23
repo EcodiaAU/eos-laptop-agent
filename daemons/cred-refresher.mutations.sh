@@ -173,6 +173,37 @@ io.open(p,'w',encoding='utf-8').write(s.replace(old,"    // whole-request deadli
 EOF
 run "M11 G17: the whole-request DEADLINE deleted (connect and idle compose additively again)"
 
+# -- M12 and M13, added by the G17 verification pass, 2026-09-23 --------------
+# 14.6 left the leak path unmutated on the reasoning that it had no cheap observable
+# consequence. A Timeout-handle delta across a successful refresh is that observable,
+# and it is three lines. Case 27 is the only case that can see M12; case 28 the only
+# one that can see M13.
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="    const settleOk   = (v) => { clearDeadline(); resolve(v) }"
+assert s.count(old)==1, 'M12 anchor %d' % s.count(old)
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"    const settleOk   = (v) => { resolve(v) }"))
+EOF
+run "M12 G17: clearDeadline dropped from the SUCCESS settle path only (a timer outlives every successful refresh)"
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+timer="""    deadline = setTimeout(() => {
+      deadline = null
+      req.destroy(Object.assign(new Error('OAuth request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
+    }, OAUTH_REQUEST_TIMEOUT_MS)
+"""
+assert s.count(timer)==1, 'M13 timer anchor %d' % s.count(timer)
+s=s.replace(timer,"")
+reqline="    const req = transport.request(options, (res) => {"
+# defaultKvWriter has the same line, and postJson is the LAST of the two request sites.
+assert s.count(reqline)==2, 'M13 req anchors %d' % s.count(reqline)
+i=s.rfind(reqline)
+io.open(p,'w',encoding='utf-8').write(s[:i]+timer+s[i:])
+EOF
+run "M13 G17 ORDER: the deadline armed BEFORE const req (a TDZ ReferenceError from inside the timer)"
+
 echo ""
 echo "### RESTORED ###"
 git diff --stat -- daemons/cred-refresher.js

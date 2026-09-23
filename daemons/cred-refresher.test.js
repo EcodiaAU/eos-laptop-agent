@@ -1198,6 +1198,149 @@ function readBody(req) {
     }
   })
 
+
+  // ── TEST 27: the whole-request deadline is CLEARED on the success path (E6 15.3) ──
+  //
+  // Section 14.6 recorded this leak as having "no cheap observable consequence" and left
+  // it unmutated for that reason. The observability half of that is wrong: a delta on
+  // process.getActiveResourcesInfo() across a SUCCESSFUL refresh reads 0 against the
+  // shipped code and 1 against a settleOk that does not clearDeadline, in three lines.
+  // The consequence half is right, and this case does not contradict it: the leaked timer
+  // fires at the limit, calls req.destroy on an already-closed request, and raises nothing
+  // on node 22. Measured 2026-09-23, limit 400ms: 0/0/0 shipped, 0/1/0 mutated.
+  //
+  // WHY ASSERT A GUARD WHOSE LOSS IS CURRENTLY BENIGN. clearDeadline() on the success path
+  // is what stops a 30-second timer outliving every successful refresh, and a pass covers
+  // three accounts. "Benign" is a claim about node 22's destroy semantics rather than about
+  // this code, and this code is what a later reader will change. M12 is its mutation.
+  //
+  // CONSTRUCTION. The peer replies at once with a valid token body, so the success settle
+  // path is the one exercised; the limit is 400ms so the leaked timer fires INSIDE the case
+  // rather than after it, which is what lets the third reading show it clearing itself.
+
+  await test('the whole-request deadline is cleared when a refresh SUCCEEDS', async () => {
+    const LIMIT_MS = 400
+    const timeouts = () => process.getActiveResourcesInfo().filter(x => x === 'Timeout').length
+    const srv = http.createServer((req, res) => {
+      let b = ''
+      req.on('data', c => { b += c })
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ access_token: 'AT-new', refresh_token: 'RT-new', expires_in: 28800 }))
+      })
+    })
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    const savedUrl = process.env.OAUTH_REFRESH_URL
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + srv.address().port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = String(LIMIT_MS)
+    const raised = []
+    const onUncaught = e => raised.push('uncaughtException: ' + e.message)
+    process.on('uncaughtException', onUncaught)
+    try {
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+      const before = timeouts()
+      await refresher.refresh_account('money')
+      await new Promise(r => setImmediate(r))
+      const afterSettle = timeouts()
+      if (readAccountFile('money').claudeAiOauth.refreshToken !== 'RT-new') {
+        throw new Error('the refresh did not succeed, so this case is not measuring the success path')
+      }
+      if (afterSettle - before !== 0) {
+        throw new Error('the whole-request deadline was left armed after a SUCCESSFUL refresh: ' +
+          'Timeout handles went ' + before + ' to ' + afterSettle + '; clearDeadline() is not on the success path')
+      }
+      // Hold past the limit so a leaked timer would have fired by now, and assert the
+      // consequence claim 14.6 made rather than restating it.
+      //
+      // ONLY THE DELTA AT SETTLE IS ASSERTED, and the absolute count after the hold is
+      // NOT re-read. getActiveResourcesInfo is process-global, so inside this shared
+      // runner the 700ms hold lets unrelated timers from the suite's own retry and
+      // recheck paths appear: the first draft of this case read 2 here and failed
+      // against correct code. The delta across the settle is the reading M12 moves, and
+      // the standalone form of the third reading is recorded in section 15.3 of the E6
+      // document, taken in a process that owns nothing else.
+      await new Promise(r => setTimeout(r, LIMIT_MS + 300))
+      if (raised.length) {
+        throw new Error('a settled request raised on destroy: ' + raised.join('; '))
+      }
+      if (refresher._clearRecheckTimer) refresher._clearRecheckTimer()
+    } finally {
+      process.removeListener('uncaughtException', onUncaught)
+      await new Promise(r => srv.close(r))
+      if (savedUrl) process.env.OAUTH_REFRESH_URL = savedUrl
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+    }
+  })
+
+  // ── TEST 28: a synchronous throw from transport.request rejects, and raises nothing ──
+  //
+  // The deadline is armed AFTER `const req = transport.request(...)` on purpose. A timer
+  // created before that declaration references req in its temporal dead zone, so when
+  // transport.request throws synchronously the promise still rejects with the transport's
+  // own error AND, one limit-period later, a ReferenceError is raised from inside a timer
+  // nothing can clear. The daemon installs no uncaughtException handler, KeepAlive is true
+  // and ThrottleInterval is 30, so that second throw is a 30-second relaunch loop in place
+  // of one counted TRANSIENT failure, and the relaunch destroys the failure count that
+  // feeds FAILURE_ESCALATION_COUNT.
+  //
+  // MATCHED PAIR, 2026-09-23, limit 400ms, poisoned http.request, no handler installed:
+  // the shipped ordering exits 0 with the promise rejected; the same file with the timer
+  // block moved above `const req` exits 1 with "Cannot access 'req' before initialization"
+  // raised at the timer line. This case is the in-process form of that pair: it records
+  // uncaught throws instead of dying on them, so the ordering mutation fails it loudly.
+
+  await test('a synchronous throw from transport.request rejects and raises nothing later', async () => {
+    const LIMIT_MS = 300
+    const timeouts = () => process.getActiveResourcesInfo().filter(x => x === 'Timeout').length
+    const realRequest = http.request
+    const savedUrl = process.env.OAUTH_REFRESH_URL
+    const raised = []
+    const onUncaught = e => raised.push(e.message)
+    process.on('uncaughtException', onUncaught)
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:1/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = String(LIMIT_MS)
+    try {
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+      http.request = function poisonedTransport() {
+        throw new Error('POISONED TRANSPORT: synchronous throw')
+      }
+      const before = timeouts()
+      let outcome
+      try {
+        await refresher.refresh_account('money')
+        outcome = 'RESOLVED'
+      } catch (e) { outcome = e }
+      http.request = realRequest
+      if (outcome === 'RESOLVED') throw new Error('a throwing transport must not resolve')
+      if (!/POISONED TRANSPORT/.test(outcome.message)) {
+        throw new Error('the rejection lost the transport error: ' + outcome.message)
+      }
+      if (timeouts() - before !== 0) {
+        throw new Error('a deadline was armed despite transport.request throwing: ' +
+          before + ' to ' + timeouts())
+      }
+      // Hold past the limit: a timer armed BEFORE `const req` would fire here and raise
+      // a TDZ ReferenceError, which in the daemon is an unhandled crash under KeepAlive.
+      await new Promise(r => setTimeout(r, LIMIT_MS + 300))
+      if (raised.length) {
+        throw new Error('a throw escaped after the rejection, which under launchd KeepAlive ' +
+          'is a relaunch rather than a counted failure: ' + raised.join('; '))
+      }
+      if (refresher._failureCount.money !== 1) {
+        throw new Error('the synchronous throw was not counted as one failure: ' +
+          JSON.stringify(refresher._failureCount))
+      }
+      if (refresher._clearRecheckTimer) refresher._clearRecheckTimer()
+    } finally {
+      http.request = realRequest
+      process.removeListener('uncaughtException', onUncaught)
+      if (savedUrl) process.env.OAUTH_REFRESH_URL = savedUrl
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+    }
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {
