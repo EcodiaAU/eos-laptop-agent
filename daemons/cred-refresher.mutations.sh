@@ -18,10 +18,29 @@ report() {
     | grep -E -e '^fail ' -e '^ALL TESTS' -e 'test\(s\) FAILED' | sed 's/^/    /'
 }
 
+# UNDECLARED-GREEN GATE (G17 pass, 2026-09-23). The header rule above says a mutation
+# that leaves the suite green means the case agrees with the code rather than testing it.
+# That rule was PROSE and nothing counted it, so M7 and M9 sat green through an entire
+# pass before anyone noticed. It is now mechanical: a green mutation is only acceptable if
+# its own label declares it, with the reason, as EXPECTED GREEN. The battery exits 1
+# otherwise, so a fix that quietly subsumes a guard cannot ride out as a clean run.
+UNDECLARED_GREEN=0
+
 run() {
   echo ""
   echo "MUTATION: $1"
-  report
+  out=$(report)
+  printf '%s\n' "$out"
+  if printf '%s' "$out" | grep -q 'ALL TESTS PASSED'; then
+    if printf '%s' "$1" | grep -q 'EXPECTED GREEN'; then
+      echo "    (green, and its own label declares it: the guard this breaks is bounded elsewhere)"
+    else
+      echo "    *** UNDECLARED GREEN: this mutation broke a guard and not one case noticed."
+      echo "    *** Either write the case that catches it, or add EXPECTED GREEN plus the"
+      echo "    *** reason to this mutation's label so the next reader is not told a lie."
+      UNDECLARED_GREEN=$((UNDECLARED_GREEN + 1))
+    fi
+  fi
   restore
 }
 
@@ -158,3 +177,11 @@ echo ""
 echo "### RESTORED ###"
 git diff --stat -- daemons/cred-refresher.js
 echo "(no diff line above means the tree is back to the shipped code)"
+
+echo ""
+if [ "$UNDECLARED_GREEN" -gt 0 ]; then
+  echo "### $UNDECLARED_GREEN UNDECLARED GREEN MUTATION(S) ###"
+  echo "The suite agrees with the code on those guards rather than testing them."
+  exit 1
+fi
+echo "### every green mutation declared itself ###"
