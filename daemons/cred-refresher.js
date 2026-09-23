@@ -347,15 +347,49 @@ function postJson(urlStr, headers, bodyObj) {
       // timeout key.
       timeout: OAUTH_REQUEST_TIMEOUT_MS,
     }
+    // G17 DEADLINE, part 1 of 2: the settle paths. Every terminal path clears the
+    // whole-request deadline armed just below the request. Not unref'd on purpose: an
+    // unref'd timer that never fires would leave this promise pending forever if the
+    // socket also stopped holding the loop open, so clearing on all three settle paths
+    // is the leak guarantee instead.
+    let deadline = null
+    const clearDeadline = () => { if (deadline) { clearTimeout(deadline); deadline = null } }
+    const settleOk   = (v) => { clearDeadline(); resolve(v) }
+    const settleFail = (e) => { clearDeadline(); reject(e) }
+
     const req = transport.request(options, (res) => {
       let data = ''
       res.on('data', c => { data += c })
-      res.on('end', () => resolve({ status: res.statusCode, body: data }))
+      res.on('end', () => settleOk({ status: res.statusCode, body: data }))
       // Defensive only. A body that stalls after the headers is still ended by the
       // idle limit below, whose error reaches req on node 22 (test 20); this keeps a
       // response-side error from ever going unhandled.
-      res.on('error', reject)
+      res.on('error', settleFail)
     })
+
+    // G17 DEADLINE, part 2 of 2 (ISO lane E6, 2026-09-23). THE WHOLE-REQUEST BUDGET.
+    // The two timers below bound two PHASES and compose ADDITIVELY. `timeout` in the
+    // options above arms the socket idle timer before connect; net.js afterConnect calls
+    // _unrefTimer(), which RESETS it; and node's http client, which defers req.setTimeout
+    // to a 'connect' listener while the socket is still connecting, then arms a fresh FULL
+    // budget at that same moment. Measured on node v22.22.3 against a DNS-delayed local
+    // peer that accepts and never replies, limit 1000ms: connect delay 700ms gave
+    // 1714/1703/1705 ms, which is connect PLUS limit, against 1008/1003 ms at connect
+    // delay 0. At the 30-second default that is up to 60 seconds for ONE request and 180
+    // for three sequential accounts. That broke the arithmetic behind this daemon's
+    // 120-second restart-quiet gate and put a SIGTERM inside a live pass: a refresh
+    // answered by the vendor and not written to the snapshot spends a single-use Anthropic
+    // refresh token and leaves that account invalid_grant until something re-seeds it.
+    // Armed ONCE here and NEVER reset, so DNS, connect, TLS, headers and body share ONE
+    // budget. It is armed AFTER transport.request on purpose: referencing `req` from a
+    // timer created before its declaration would throw a TDZ ReferenceError inside the
+    // timer if transport.request itself threw synchronously, which would crash the daemon
+    // rather than reject the promise. The error shape matches the idle handler byte for
+    // byte, because the shared classifier reads "timed out" plus ETIMEDOUT as TRANSIENT.
+    deadline = setTimeout(() => {
+      deadline = null
+      req.destroy(Object.assign(new Error('OAuth request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
+    }, OAUTH_REQUEST_TIMEOUT_MS)
     // The ACTION on timeout, and it stays mandatory after the option above: node
     // emits 'timeout' on the request and destroys nothing by itself, so without this
     // handler the option would fire and the request would hang anyway. It gives the
@@ -366,7 +400,7 @@ function postJson(urlStr, headers, bodyObj) {
     req.setTimeout(OAUTH_REQUEST_TIMEOUT_MS, () => {
       req.destroy(Object.assign(new Error('OAuth request timed out after ' + OAUTH_REQUEST_TIMEOUT_MS + 'ms'), { code: 'ETIMEDOUT' }))
     })
-    req.on('error', reject)
+    req.on('error', settleFail)
     req.write(body)
     req.end()
   })
