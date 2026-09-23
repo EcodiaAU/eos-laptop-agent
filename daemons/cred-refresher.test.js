@@ -972,6 +972,134 @@ function readBody(req) {
     }
   })
 
+  // ── TEST 24: the guard INTERSECTION, a running pass AND a held switch ────
+  //
+  // Section 12.8 of the E6 lane document recorded that the guard ORDER is load-bearing
+  // and that no case covered it: test 22 holds no switch lock and test 23 has no pass in
+  // flight, so the behaviour lives in their intersection. Measured 2026-09-23 by the
+  // verification pass with mutation M9 (order swapped back to flag-first), the WHOLE
+  // suite stayed green, which turned a documented hazard into a confirmed coverage hole.
+  // This case is that intersection. With the flag checked first, a tick landing on both
+  // conditions returns at the flag and arms nothing, so the held switch goes unrevisited
+  // until the next 30-minute tick; the effective interval becomes 60 minutes against a
+  // 45-minute refresh threshold, which is the inequality start_loop() warns about.
+
+  await test('a tick landing on BOTH a running pass and a held switch still arms a recheck', async () => {
+    const sockets = []
+    const srv = net.createServer(s => { sockets.push(s) })   // accepts, never replies
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    const lockDir = path.join(CREDS_DIR, '_intersect', 'usage')
+    fs.mkdirSync(lockDir, { recursive: true })
+    const lockFile = path.join(lockDir, 'switch.lock')
+    process.env.SWITCH_LOCK_FILE = lockFile
+    // 60s, deliberately longer than this case's runtime, for the reason test 23 gives:
+    // a recheck that FIRES mid-case would re-arm and take armLines to 2 for a reason
+    // that has nothing to do with the guard under test.
+    process.env.SWITCH_RECHECK_MS = '60000'
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + srv.address().port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = '400'
+    process.env.CLAUDE_CREDENTIALS_PATH = path.join(TMP, 'no-live-credentials.json')
+    const realLog = console.log
+    const armLines = []
+    let refresher = null
+    try {
+      writeAccountFile('tate')   // 1h TTL, above threshold, skipped without a request
+      writeAccountFile('code',  { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      refresher = freshRequire()
+      // NEGATIVE CONTROL FIRST. If the lock already read in-flight, the pass below would
+      // never start and the case would assert an arm that had nothing to do with an
+      // intersection.
+      if (refresher._switchInFlight()) throw new Error('the lock reads in-flight before this case wrote one, so the fixture is not hermetic')
+
+      const first = refresher._runOnce()
+      if (!refresher._isPassInFlight()) throw new Error('the first pass did not set the in-flight flag, so there is no intersection to test')
+      // The switch starts MID-PASS. Both conditions now hold at once, which is the state
+      // neither test 22 nor test 23 can reach.
+      fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, stage: 'LOGIN_CLI', heartbeat_at: new Date().toISOString() }))
+      if (!refresher._switchInFlight()) throw new Error('fixture lock does not read as in-flight, so this case proves nothing')
+
+      console.log = (...a) => { const s = a.join(' '); if (/rechecking in/.test(s)) armLines.push(s) }
+      await refresher._runOnce()
+      console.log = realLog
+      if (armLines.length !== 1) {
+        throw new Error('a tick landing on a running pass AND a held switch armed ' + armLines.length +
+          ' recheck chains, not 1; at 0 the switch is unrevisited until the next 30-min tick, which puts the effective interval past the 45-min threshold')
+      }
+      if (!refresher._hasRecheckTimer()) throw new Error('no recheck chain is armed, so the held switch is never revisited')
+      await first
+      // And the flag still clears, so the intersection did not wedge the daemon.
+      if (refresher._isPassInFlight()) throw new Error('the flag stayed true after the pass finished')
+    } finally {
+      console.log = realLog
+      if (refresher && refresher._clearRecheckTimer) refresher._clearRecheckTimer()
+      sockets.forEach(s => s.destroy())
+      await new Promise(r => srv.close(r))
+      try { fs.unlinkSync(lockFile) } catch (e) {}
+      delete process.env.SWITCH_RECHECK_MS
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+      delete process.env.CLAUDE_CREDENTIALS_PATH
+      process.env.SWITCH_LOCK_FILE = path.join(TMP, 'coordination', 'usage', 'switch.lock')
+    }
+  })
+
+  // ── TEST 25: the flag clears in a FINALLY, not in a tail assignment ──────
+  //
+  // Mutation M7 on 2026-09-23 downgraded the finally to a tail assignment and the whole
+  // suite stayed green, so the comment at daemons/cred-refresher.js:792 was describing a
+  // guard nothing tested. The hazard is one-way and permanent: a throw that escapes the
+  // account loop leaves _passInFlight true for the life of the process, every later pass
+  // returns at the G15a guard, and the daemon stops refreshing while logging that it is
+  // skipping politely. readLiveCredentials() swallows its own file and parse errors
+  // (daemons/cred-refresher.js:433-452), so the reachable throw is the Keychain read it
+  // calls first, reached through the same injected seam the rest of this suite uses.
+  //
+  // PLATFORM CLAIM, STATED RATHER THAN ASSUMED: this case reaches the throw through the
+  // USE_KEYCHAIN branch, which is `process.platform === 'darwin'`. The daemon is a
+  // darwin launchd job and the suite runs where the daemon runs, so the case asserts
+  // that precondition out loud instead of passing vacuously somewhere else.
+
+  await test('a throw from the live-credentials read clears the in-flight flag rather than wedging the daemon', async () => {
+    if (process.platform !== 'darwin') {
+      throw new Error('this case reaches the throw path through the darwin Keychain branch and this host is ' + process.platform +
+        '; the daemon it covers is a darwin launchd job, so a non-darwin run is not testing the production surface')
+    }
+    const sockets = []
+    const srv = net.createServer(s => { sockets.push(s) })   // accepts, never replies
+    await new Promise(r => srv.listen(0, '127.0.0.1', r))
+    process.env.OAUTH_REFRESH_URL = 'http://127.0.0.1:' + srv.address().port + '/v1/oauth/token'
+    process.env.OAUTH_REQUEST_TIMEOUT_MS = '300'
+    process.env.CLAUDE_CREDENTIALS_PATH = path.join(TMP, 'no-live-credentials.json')
+    process.env.SWITCH_LOCK_FILE = path.join(TMP, 'no-switch-25.lock')
+    try {
+      writeAccountFile('tate')   // 1h TTL, above threshold, skipped without a request
+      writeAccountFile('code',  { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      writeAccountFile('money', { claudeAiOauth: { expiresAt: Date.now() + 25 * 60 * 1000 } })
+      const refresher = freshRequire()
+      refresher._setKeychainReader(() => { throw new Error('security: SecKeychainSearchCopyNext returned -25300') })
+
+      let threw = null
+      await refresher._runOnce().catch(e => { threw = e })
+      if (!threw) throw new Error('the injected Keychain read did not throw, so this case never exercised the escape path')
+      if (sockets.length !== 0) throw new Error('the throw did not escape before the account loop, saw ' + sockets.length + ' attempt(s)')
+      if (refresher._isPassInFlight()) {
+        throw new Error('the flag stayed true after a throw escaped the account loop; every later pass now returns at the re-entry guard and this daemon never refreshes again')
+      }
+      // THE WEDGE CONSEQUENCE, asserted rather than inferred from the flag alone.
+      refresher._setKeychainReader(() => null)
+      await refresher._runOnce()
+      if (sockets.length !== 2) {
+        throw new Error('expected 2 OAuth attempts from the pass after the throw, saw ' + sockets.length + '; the daemon is wedged')
+      }
+    } finally {
+      sockets.forEach(s => s.destroy())
+      await new Promise(r => srv.close(r))
+      delete process.env.OAUTH_REQUEST_TIMEOUT_MS
+      delete process.env.CLAUDE_CREDENTIALS_PATH
+      process.env.SWITCH_LOCK_FILE = path.join(TMP, 'coordination', 'usage', 'switch.lock')
+    }
+  })
+
   // ── summary ───────────────────────────────────────────────────────────────
 
   if (failures > 0) {

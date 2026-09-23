@@ -81,6 +81,55 @@ io.open(p,'w',encoding='utf-8').write(s.replace(old,"    if (true) {"))
 EOF
 run "M6  G15b: the single-chain handle bypassed (one chain armed per entry)"
 
+# ── M7 to M10, added by the verification pass, 2026-09-23 ─────────────────────
+# M7 and M9 both left the 23-case suite GREEN when they were first run, which is
+# what earned cases 24 and 25. They are kept here because a mutation that is now
+# caught is the only proof that the case catching it is doing work.
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="""  } finally {
+    // finally, not a tail assignment: refresh_account is wrapped per account, and a
+    // throw from readLiveCredentials itself would otherwise leave the flag stuck true
+    // and wedge every later pass for the life of the process.
+    _passInFlight = false
+  }"""
+assert s.count(old)==1, 'M7 anchor %d' % s.count(old)
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"""  } catch (e) { throw e }
+  _passInFlight = false"""))
+EOF
+run "M7  G15a: finally downgraded to a TAIL assignment (a throw wedges the flag true forever)"
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="    if (!_recheckTimer) {"
+assert s.count(old)==1, 'M8 anchor'
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"    if (_recheckTimer) {"))
+EOF
+run "M8  G15b: the single-chain test INVERTED (the first entry arms no chain at all)"
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+flag="""  if (_passInFlight) {
+    console.log('[cred-refresher] a pass is already running - skipping this entry')
+    return
+  }
+"""
+assert s.count(flag)==1, 'M9 flag anchor'
+sw="  if (switchInFlight()) {"
+assert s.count(sw)==1, 'M9 switch anchor'
+io.open(p,'w',encoding='utf-8').write(s.replace(flag,"").replace(sw, flag + sw))
+EOF
+run "M9  G15 ORDER: _passInFlight checked BEFORE switchInFlight (section 12.8's removed behaviour)"
+
+python3 - <<'EOF'
+import io; p='daemons/cred-refresher.js'; s=io.open(p,encoding='utf-8').read()
+old="    const live = readLiveCredentials()\n"
+assert s.count(old)==1, 'M10 anchor %d' % s.count(old)
+io.open(p,'w',encoding='utf-8').write(s.replace(old,"    if (true) return\n"+old))
+EOF
+run "M10 the pass returns before the account loop (does nothing, clears the flag, looks healthy)"
+
 echo ""
 echo "### RESTORED ###"
 git diff --stat -- daemons/cred-refresher.js
