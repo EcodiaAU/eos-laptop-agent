@@ -410,6 +410,21 @@ const _CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
 // Returns null (not []) when the bridge is unreachable, because "no snapshot"
 // and "no tabs" must not collapse into the same value: differencing against an
 // empty set would call every live tab new.
+// How many times the focus+Return chain is attempted before the dispatch gives
+// the tab back. Two: the first attempt covers the ordinary case, the second (with
+// a longer settle) covers a focus chain that was still settling. A third would be
+// pressing Return into a window whose state we have already twice failed to
+// read, which is the wrong-chat risk rather than a recovery.
+const SUBMIT_MAX_ATTEMPTS = 2
+
+// Budget for the "did a session start" poll per attempt. A cold Claude Code
+// worker loads skills, auto-memory and every MCP server before its first model
+// call, and the transcript's first line lands when the turn STARTS, so this waits
+// on process start rather than on the model. Long enough for an observed cold
+// start; a miss is answered by retrying, not by waiting longer, because a longer
+// single wait cannot tell a slow start from a dead keystroke.
+const SUBMIT_VERIFY_TIMEOUT_MS = 25000
+
 const _SPAWN_DIFF_SNAPSHOT_TIMEOUT_MS =
   Number(process.env.DISPATCH_SPAWN_DIFF_TIMEOUT_MS || 2500)
 
@@ -431,6 +446,167 @@ async function _ccTabIdSnapshot() {
   } catch (e) {
     return null
   }
+}
+
+// _abandonRegistration - a dispatch that produced no running session must not
+// leave a live-looking worker row behind.
+//
+// register-worker runs BEFORE the spawn, so every failure mode downstream of it
+// used to orphan a fully-formed row: registered_at === last_heartbeat_at, no
+// terminated_at, tab_handle null. Measured 2026-09-17 over 48h: 500 rows, 466
+// with a null tab_handle and 481 whose heartbeat never moved. Every registry
+// consumer reads those as a booting worker, which is why the orphan sweep
+// reported "closed=0 of 70 candidates (leaked=70)" fire after fire - it was
+// looking for tabs belonging to workers that had never existed.
+async function _abandonRegistration(tab_id, reason) {
+  try {
+    const coord = require('./coord')
+    if (typeof coord.abandonWorkerRow === 'function') {
+      return coord.abandonWorkerRow(tab_id, reason)
+    }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+  return { ok: false, error: 'abandonWorkerRow unavailable' }
+}
+
+// _closeIdentifiedTab - close a tab we can name, and refuse otherwise.
+//
+// Position is re-read LIVE off the stable id rather than trusted from the
+// handle, because tabs shift index whenever a sibling opens or closes and this
+// runs tens of seconds after the spawn. No id means no close: the 2026-07-21
+// mass-close lesson still governs, and a leaked ghost costs memory while a
+// wrong close costs someone's session.
+async function _closeIdentifiedTab(tab_handle) {
+  if (!tab_handle || !tab_handle.tabId) {
+    return { ok: false, refused: 'no_stable_tab_id' }
+  }
+  let tabs = null
+  try {
+    const coord = require('./coord')
+    if (typeof coord._liveCcTabsWithIds === 'function') {
+      tabs = await coord._liveCcTabsWithIds(undefined)
+    }
+  } catch (e) { /* fall through to refuse */ }
+  if (!Array.isArray(tabs)) return { ok: false, refused: 'no_live_tab_listing' }
+  const match = tabs.filter((t) => t && t.tabId === tab_handle.tabId)
+  if (match.length !== 1) {
+    return { ok: false, refused: match.length === 0 ? 'tab_already_gone' : 'ambiguous_id' }
+  }
+  const t = match[0]
+  try {
+    const r = await ide.tabsClose({ viewColumn: t.viewColumn, tabIndex: t.index })
+    return { ok: true, closed_tab_id: t.tabId, viewColumn: t.viewColumn, tabIndex: t.index, result: r }
+  } catch (e) {
+    return { ok: false, refused: 'tabs_close_threw: ' + e.message }
+  }
+}
+
+// _runSubmitChain - focus the worker's tab and press Return once.
+//
+// Extracted from the inline block so it can be RE-RUN. It is the only
+// focus-dependent step left in dispatch (the CC extension contributes no submit
+// command - probed exhaustively 2026-09-17 against 2.1.251: 23 contributed
+// commands, 23 registerCommand sites, none of them submits), so it is the step
+// that fails when the window shared with Tate changes focus inside the settle.
+// A single unverified attempt was the whole bug.
+async function _runSubmitChain(tab_handle, tab_id, attempt) {
+  const steps = []
+  const focusGroupCmd = (vc) => {
+    if (vc === 1) return 'workbench.action.focusFirstEditorGroup'
+    if (vc === 2) return 'workbench.action.focusSecondEditorGroup'
+    if (vc === 3) return 'workbench.action.focusThirdEditorGroup'
+    if (vc === 4) return 'workbench.action.focusFourthEditorGroup'
+    if (vc === 5) return 'workbench.action.focusFifthEditorGroup'
+    return null
+  }
+  // Re-read the tab's LIVE position when we can name it. On a retry the index
+  // has usually moved, and re-asserting a stale index is how a Return lands in
+  // a stranger's tab.
+  let viewColumn = tab_handle.viewColumn
+  let tabIndex = tab_handle.tabIndex
+  if (tab_handle.tabId) {
+    try {
+      const coord = require('./coord')
+      const tabs = await Promise.race([
+        coord._liveCcTabsWithIds(undefined),
+        new Promise((resolve) => setTimeout(() => resolve(null), _SPAWN_DIFF_SNAPSHOT_TIMEOUT_MS)),
+      ])
+      if (Array.isArray(tabs)) {
+        const m = tabs.filter((t) => t && t.tabId === tab_handle.tabId)
+        if (m.length === 1) {
+          viewColumn = m[0].viewColumn
+          tabIndex = m[0].index
+          steps.push('live_position_reresolved')
+        } else if (m.length === 0) {
+          return { ok: false, aborted: 'tab_gone_before_submit', steps }
+        } else {
+          steps.push('live_position_ambiguous_kept_handle')
+        }
+      }
+    } catch (e) { steps.push('live_position_probe_threw') }
+  }
+  const focusCmd = focusGroupCmd(viewColumn)
+  if (focusCmd) {
+    try {
+      await Promise.race([
+        ide.command({ cmd: focusCmd }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('focus_cmd_timeout_3s')), 3000)),
+      ])
+      await sleep(200)
+      steps.push('focus_group')
+    } catch (_e) { steps.push('focus_group_failed') }
+  }
+  if (typeof tabIndex === 'number' && tabIndex >= 0 && tabIndex < 40) {
+    try {
+      // The numbered workbench.action.openEditorAtIndex<N> only exists for
+      // N=1..9; past that use the generic command with an index arg.
+      const cmd = tabIndex < 9
+        ? { cmd: 'workbench.action.openEditorAtIndex' + (tabIndex + 1) }
+        : { cmd: 'workbench.action.openEditorAtIndex', args: [tabIndex] }
+      await Promise.race([
+        ide.command(cmd),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('open_at_index_timeout_3s')), 3000)),
+      ])
+      await sleep(150)
+      steps.push('open_at_index')
+    } catch (_e) { steps.push('open_at_index_failed') }
+  }
+  try {
+    await Promise.race([
+      ide.command({ cmd: 'claude-vscode.focus' }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('cc_focus_timeout_3s')), 3000)),
+    ])
+    steps.push('cc_focus_input')
+  } catch (e) {
+    steps.push('cc_focus_input_failed')
+    process.stderr.write('[mac-dispatcher] claude-vscode.focus failed for ' + tab_id + ': ' + e.message + '\n')
+  }
+  try {
+    await applescript.activate_app({ app: 'Visual Studio Code' })
+    steps.push('activate_app')
+  } catch (e) { steps.push('activate_app_failed') }
+  // Settle for populate + focus to land. Longer on a retry: the commonest cause
+  // of a lost Return is the focus chain still settling, and the retry exists to
+  // give it room rather than to repeat the same timing.
+  const settle = attempt > 1 ? 2200 : 1200
+  await sleep(settle)
+  let keystroke_ok = null
+  try {
+    const kr = await applescript.keystroke({ key: 36 })  // key code 36 = Return
+    keystroke_ok = !(kr && kr.ok === false)
+    if (!keystroke_ok) {
+      process.stderr.write('[mac-dispatcher] submit Return keystroke not ok for ' + tab_id
+        + ' (attempt ' + attempt + '): ' + JSON.stringify(kr).slice(0, 300) + '\n')
+    }
+    steps.push('return_keystroke')
+  } catch (e) {
+    keystroke_ok = false
+    steps.push('return_keystroke_threw')
+    process.stderr.write('[mac-dispatcher] submit Return keystroke threw for ' + tab_id
+      + ' (attempt ' + attempt + '): ' + e.message + '\n')
+  }
+  return { ok: true, keystroke_ok, settle_ms: settle, viewColumn, tabIndex, steps }
 }
 
 // The set difference. Exactly one new id is the answer; anything else refuses.
@@ -677,6 +853,15 @@ async function dispatch_worker(params) {
   let tab_handle = null
   let spawn_error = null
   let submit_path = null
+  // null = never determined (no chain ran, or the verify scan was capped and so
+  // could not have seen the evidence). false = the chain ran and no session ever
+  // started. The three-way distinction is load-bearing: only `false` licenses
+  // closing the tab, because closing on `null` would reap a worker the pass was
+  // simply unable to observe.
+  let submit_verified = null
+  let submit_transcript = null
+  let submit_attempts = []
+  let tab_identify_refused = false
   // Snapshot the live CC-chat id set immediately before the open. Taken INSIDE
   // the try so a bridge outage here fails the dispatch the same way the open
   // itself would, rather than half-arming the diff.
@@ -719,120 +904,123 @@ async function dispatch_worker(params) {
         // capture unchanged, so this is a missing improvement, not a regression.
         tab_handle.tabId_spawn_diff_declined = spawned.reason
       }
-      // DIAGNOSTIC ONLY, deliberately changing no behaviour this pass. The
-      // bridge's /ide/chat/send_message keys its own new-tab diff on
-      // viewColumn + '|' + label, so fire N of a cron whose fire N-1 corpse is
-      // still open is filtered out as already-seen and it falls through to
-      // `active_fallback`, which picks whichever CC chat is ACTIVE. That is how
-      // a dispatch can register a worker whose stored position points at the
-      // conductor's own tab. Recording it makes the size of that population
-      // measurable for the first time; correcting the submit target is a
-      // separate change against the most load-bearing path in the fleet and
-      // wants its own evidence before it ships.
       if (ot && ot.via) tab_handle.bridge_opened_via = ot.via
-      if (spawned.ok && ot && typeof ot.viewColumn === 'number'
-          && spawned.tab.viewColumn !== ot.viewColumn) {
-        tab_handle.bridge_position_disagrees = 'bridge_vc=' + ot.viewColumn
-          + ' spawn_diff_vc=' + spawned.tab.viewColumn
+
+      // IDENTIFICATION GATE, and the submit target is now the diff's answer.
+      //
+      // The bridge keys its own new-tab diff on viewColumn + '|' + label. Every
+      // freshly opened Claude Code chat is labelled "Claude Code", so the second
+      // dispatch made while any such tab is still open collides with the first,
+      // is filtered as already-seen, and falls through to `active_fallback` -
+      // which returns whichever CC chat happens to be ACTIVE. Reproduced on
+      // demand 2026-09-17: opening one tab then calling the route returned
+      // via:"active_fallback" with index 6 on a window whose new tab was not
+      // index 6. Measured over the previous 48h, 19 of the 34 dispatches that
+      // captured a tab at all carried that via.
+      //
+      // The consequence was not a mislabelled field. The submit chain read
+      // tabIndex off that handle, so it activated a tab belonging to someone
+      // else and pressed Return there, while the worker's real tab sat holding
+      // the brief with nobody ever submitting it. That is precisely what Tate
+      // reported: tabs stuck with the prompts pasted.
+      //
+      // The spawn diff is the independent answer. It compares stable tab ids
+      // either side of the open, so it is immune to the label collision. When it
+      // resolves, its position OVERRIDES the bridge's - the handle was already
+      // trusted this way on the close path, and the submit path reading the
+      // bridge's position instead is the whole defect. When it does NOT resolve
+      // and the bridge admits it fell back, nothing here can name the tab, so
+      // the dispatch REFUSES rather than pressing Return into a stranger.
+      if (spawned.ok) {
+        if (ot && typeof ot.viewColumn === 'number' && spawned.tab.viewColumn !== ot.viewColumn) {
+          tab_handle.bridge_position_disagrees = 'bridge_vc=' + ot.viewColumn
+            + ' spawn_diff_vc=' + spawned.tab.viewColumn
+        }
+        if (typeof ot?.index === 'number' && spawned.tab.index !== ot.index) {
+          tab_handle.bridge_index_disagrees = 'bridge_idx=' + ot.index
+            + ' spawn_diff_idx=' + spawned.tab.index
+        }
+        tab_handle.viewColumn = spawned.tab.viewColumn
+        tab_handle.tabIndex = spawned.tab.index
+        tab_handle.position_source = 'spawn_diff'
+      } else if (tab_handle.bridge_opened_via === 'active_fallback') {
+        spawn_error = 'tab_identify_refused: bridge fell back to the active chat'
+          + ' (' + (spawned.reason || 'no_reason') + ') and the spawn diff could not'
+          + ' name a new tab, so the submit target is unknown'
+        tab_identify_refused = true
+      } else {
+        tab_handle.position_source = 'bridge_label_diff'
       }
     }
-    // Submit step. The bridge has populated the textarea; the 1200ms settle
-    // below guarantees populate has finished before the Enter lands, so a
-    // single Return reliably submits the already-prefilled brief. (History:
-    // this used to fire 4x Enter spaced 800ms as belt-and-suspenders against a
-    // populate/submit race, but the settle already closes that race and the
-    // first Enter is the only one that ever submitted - the extra 3 were
-    // no-ops landing on whatever surface had focus. Cut to 1x on 2026-06-21
-    // per Tate: the trailing presses were disruptive, not load-bearing.)
-    // Mac mirror:
-    //   1) bridge ide.command focusNthEditorGroup (by viewColumn) - already
-    //      moves keyboard focus into that group from the extension host
-    //   2) applescript.activate_app (Apple Events activate, no focus steal
-    //      beyond bringing VS Code forward)
-    //   3) 1200ms settle for populate to finish
-    //   4) 1x applescript.keystroke 'return'
+
+    // Submit, then PROVE it submitted, then retry, then clean up.
+    //
+    // The submit is one System Events Return. The CC extension contributes no
+    // submit command (probed exhaustively 2026-09-17 against 2.1.251: 23
+    // contributed commands, 23 registerCommand sites, not one of them submits),
+    // and the extension host cannot dispatch DOM events into another
+    // extension's webview, so there is no focusless primitive to use instead.
+    // A keystroke into a window shared with a human is inherently lossy.
+    //
+    // What was missing was not a better keystroke, it was a check. The old path
+    // pressed Return once, recorded a submit_path string, and returned ok:true
+    // whether or not a session ever started. Measured over 48h: 481 of 500
+    // registered workers never advanced a heartbeat past registration.
+    //
+    // dispatch-submit-verify answers it from the only unforgeable signal - a
+    // transcript carrying THIS brief's tab_credential in the brief's own byte
+    // form. On a miss we retry the chain once with a longer settle; on a second
+    // miss the tab is closed by its stable id and the registration is abandoned,
+    // so the scheduler re-leases a free lane instead of a lane held by a tab
+    // that will never speak.
     if (tab_handle && !spawn_error) {
-      try {
-        // 1. Focus the editor group hosting the new chat tab via bridge.
-        const focusGroupCmd = (vc) => {
-          if (vc === 1) return 'workbench.action.focusFirstEditorGroup'
-          if (vc === 2) return 'workbench.action.focusSecondEditorGroup'
-          if (vc === 3) return 'workbench.action.focusThirdEditorGroup'
-          if (vc === 4) return 'workbench.action.focusFourthEditorGroup'
-          if (vc === 5) return 'workbench.action.focusFifthEditorGroup'
-          return null
-        }
-        const focusCmd = focusGroupCmd(tab_handle.viewColumn)
-        if (focusCmd) {
-          try {
-            await Promise.race([
-              ide.command({ cmd: focusCmd }),
-              new Promise((_, rej) => setTimeout(() => rej(new Error('focus_cmd_timeout_3s')), 3000)),
-            ])
-            await sleep(200)
-          } catch (_e) { /* tolerate */ }
-        }
-        // 1b. Re-activate the worker tab by index (guards against the human
-        //     switching tabs between the bridge open and this submit chain -
-        //     the window is shared with Tate's live session).
-        //     workbench.action.openEditorAtIndexN is 1-based over the active
-        //     group; opened_tab.index is 0-based.
-        if (typeof tab_handle.tabIndex === 'number' && tab_handle.tabIndex >= 0 && tab_handle.tabIndex < 40) {
-          try {
-            // The numbered workbench.action.openEditorAtIndex<N> only exists for
-            // N=1..9, so re-asserting a worker tab past the 9th position silently
-            // no-oped and the brief could submit into whatever tab was active
-            // (wrong-chat bug). Use the numbered command for index<9 and the
-            // GENERIC openEditorAtIndex with an index arg for index>=9 (works at
-            // any position). Doctrine: coord-deliver-by-session-not-editor-index-2026-08-21.
-            const idx = tab_handle.tabIndex
-            const cmd = idx < 9
-              ? { cmd: 'workbench.action.openEditorAtIndex' + (idx + 1) }
-              : { cmd: 'workbench.action.openEditorAtIndex', args: [idx] }
-            await Promise.race([
-              ide.command(cmd),
-              new Promise((_, rej) => setTimeout(() => rej(new Error('open_at_index_timeout_3s')), 3000)),
-            ])
-            await sleep(150)
-          } catch (_e) { /* tolerate */ }
-        }
-        // 1c. Explicitly focus the Claude Code chat INPUT. Since CC extension
-        //     2.1.211 (loaded at the 2026-07-17 08:17 window restart),
-        //     claude-vscode.editor.open populates the input but no longer
-        //     leaves keyboard focus inside the webview textarea, so a naked
-        //     Return dies at the editor-group wrapper and the brief sits
-        //     unsubmitted forever (zero worker sessions, tab labels showing
-        //     raw brief text). claude-vscode.focus is CC's own "Focus input"
-        //     command and restores the pre-2.1.211 focus state. Proven
-        //     end-to-end 2026-07-17: without it 3/3 probes never submitted;
-        //     with it 2/2 probes submitted and a transcript appeared in <5s.
+      const verify = require('./dispatch-submit-verify')
+      const t0 = Date.now()
+      const attempts = []
+      for (let attempt = 1; attempt <= SUBMIT_MAX_ATTEMPTS; attempt++) {
+        let chain
         try {
-          await Promise.race([
-            ide.command({ cmd: 'claude-vscode.focus' }),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('cc_focus_timeout_3s')), 3000)),
-          ])
+          chain = await _runSubmitChain(tab_handle, tab_id, attempt)
         } catch (e) {
-          process.stderr.write('[mac-dispatcher] claude-vscode.focus failed for ' + tab_id + ': ' + e.message + '\n')
+          chain = { ok: false, aborted: 'submit_chain_threw: ' + e.message, steps: [] }
         }
-        // 2. Activate VS Code (Apple Events; gentler than Win32 WinActivate).
-        await applescript.activate_app({ app: 'Visual Studio Code' })
-        // 3. Settle for the bridge's editor.open + textarea-populate to finish.
-        await sleep(1200)
-        // 4. Single Enter. The 1200ms settle above guarantees the populated
-        //    textarea is ready, so one Return submits the brief.
-        try {
-          const kr = await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
-          if (kr && kr.ok === false) {
-            process.stderr.write('[mac-dispatcher] submit Return keystroke not ok for ' + tab_id + ': ' + JSON.stringify(kr).slice(0, 300) + '\n')
-          }
-        } catch (e) {
-          // tab is open + prefilled, recoverable by hand - but never swallow silently
-          process.stderr.write('[mac-dispatcher] submit Return keystroke threw for ' + tab_id + ': ' + e.message + '\n')
+        const rec = { attempt, chain_steps: (chain.steps || []).join('+'), keystroke_ok: chain.keystroke_ok }
+        if (chain.aborted) {
+          rec.aborted = chain.aborted
+          attempts.push(rec)
+          submit_verified = false
+          submit_path = 'aborted:' + chain.aborted
+          break
         }
-        submit_path = 'focus_group+open_at_index+cc_focus_input+activate+1200ms_settle+1x_return'
-      } catch (e) {
-        submit_path = 'submit_chain_threw: ' + e.message
+        const ev = await verify.waitForSubmit({
+          credential: tab_credential,
+          sinceMs: t0,
+          timeoutMs: SUBMIT_VERIFY_TIMEOUT_MS,
+          pollMs: 1000,
+        })
+        rec.verified = !!ev.found
+        rec.verify_polls = ev.polls
+        rec.verify_scanned = ev.scanned
+        if (ev.candidate_cap_hit) rec.verify_candidate_cap_hit = true
+        attempts.push(rec)
+        if (ev.found) {
+          submit_verified = true
+          submit_transcript = ev.file
+          submit_path = 'verified_on_attempt_' + attempt
+          break
+        }
+        // A capped scan could not have seen the evidence, so it is not an
+        // absence. Treat it as unproven rather than as a failed submit: the
+        // worker keeps its tab and the row stays live for the ack timeout.
+        if (ev.candidate_cap_hit) {
+          submit_verified = null
+          submit_path = 'unproven_verify_scan_capped'
+          break
+        }
+        submit_verified = false
+        submit_path = 'unverified_after_attempt_' + attempt
       }
+      submit_attempts = attempts
     }
   } catch (e) {
     spawn_error = e.message
@@ -845,10 +1033,54 @@ async function dispatch_worker(params) {
         usage._markFlaky(account_active_when_spawned, 'mac_dispatch_populate_failed: ' + (spawn_error || 'unknown'))
       }
     } catch (e) {}
+    // The registration was written before the spawn, so walking away here is
+    // what left 466 of 500 rows over 48h looking like live booting workers.
+    // Stamp it dead with the reason; the caller defers the scheduler row on
+    // ok:false, so the lane frees instead of being held by a worker that never
+    // existed.
+    const abandoned = await _abandonRegistration(tab_id,
+      tab_identify_refused
+        ? ('tab_identify_refused: ' + (spawn_error || 'unknown'))
+        : ('populate_failed: ' + (spawn_error || 'no opened_tab returned')))
     return {
       ok: false, tab_id,
-      error: 'populate failed (editor.open): ' + (spawn_error || 'no opened_tab returned'),
+      error: (tab_identify_refused ? 'tab identify refused: ' : 'populate failed (editor.open): ')
+        + (spawn_error || 'no opened_tab returned'),
+      tab_identify_refused,
+      registration_abandoned: !!(abandoned && abandoned.ok),
       account_marked_flaky: account_active_when_spawned,
+    }
+  }
+
+  // An unverified submit means a tab is sitting there holding a brief that
+  // nobody will ever send, and that tab is not inert: any later focus chain that
+  // lands on it presses Return on a stale brief. So a proven-unsubmitted tab is
+  // closed by its stable id and the registration abandoned, which hands the lane
+  // back to the scheduler clean.
+  //
+  // Only `false` reaches here. `null` (no chain ran, or a capped scan) leaves the
+  // tab alone and lets the ordinary worker-ack timeout judge it, because a pass
+  // that could not observe the evidence has not earned a close.
+  if (submit_verified === false) {
+    const closed = await _closeIdentifiedTab(tab_handle)
+    const abandoned = await _abandonRegistration(tab_id,
+      'submit_unverified after ' + submit_attempts.length + ' attempt(s); '
+      + (closed.ok ? 'tab closed' : 'tab NOT closed (' + (closed.refused || 'unknown') + ')'))
+    process.stderr.write('[mac-dispatcher] submit unverified for ' + tab_id
+      + ' lane=' + (lane_name || '?')
+      + ' attempts=' + JSON.stringify(submit_attempts)
+      + ' tab_closed=' + (closed.ok ? 'yes' : 'no:' + (closed.refused || '?')) + '\n')
+    return {
+      ok: false, tab_id, task_id,
+      error: 'submit unverified: the brief was pasted but no session ever started'
+        + ' after ' + submit_attempts.length + ' Return attempt(s)',
+      submit_verified: false,
+      submit_attempts,
+      submit_path,
+      tab_closed: !!closed.ok,
+      tab_close_refused: closed.ok ? null : (closed.refused || 'unknown'),
+      registration_abandoned: !!(abandoned && abandoned.ok),
+      tab_handle,
     }
   }
 
@@ -958,6 +1190,9 @@ async function dispatch_worker(params) {
     ack_elapsed_ms,
     dispatcher: 'mac-dispatcher',
     submit_path,
+    submit_verified,
+    submit_transcript,
+    submit_attempts,
     note: ackTimeoutMs > 0
       ? ('Worker acknowledged in ' + ack_elapsed_ms + 'ms via ' + ack_via +
          '. Mac path: ide.chat_send_message + applescript Enter.')
