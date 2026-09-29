@@ -3,13 +3,13 @@
   "prechecks": {
     "gmail-inbox-poll": {
       "enabled": true,
-      "types": ["cron"],
+      "types": [
+        "cron"
+      ],
       "timeout_ms": 170000,
       "argv": [
         "/opt/homebrew/bin/node",
-        "/Users/ecodia/.code/ecodiaos/backend/scripts/gmail-inbox-poll-precheck.cjs",
-        "--max-skip-hours",
-        "24"
+        "/Users/ecodia/.code/ecodiaos/backend/scripts/gmail-inbox-poll-precheck.cjs"
       ]
     }
   }
