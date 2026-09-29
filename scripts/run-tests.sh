@@ -121,7 +121,7 @@ SYNTAX_FILES=(
 )
 # New rebuild modules are gated too, once they exist.
 for extra in tools/usage-config.js tools/usage-real.js tools/accounts-registry.js \
-             tools/switch-core.js tools/usage-capacity.js scripts/switch-run.js; do
+             tools/switch-core.js tools/usage-capacity.js scripts/switch-run.js tools/pace-governor.js; do
   [ -f "$ROOT/$extra" ] && SYNTAX_FILES+=("$extra")
 done
 syntax_fails=0
@@ -151,6 +151,19 @@ if [ -f "$ROOT/tools/scheduler-lease-pager.test.js" ]; then
   else
     fails=$((fails+1)); echo "  FAIL  scheduler-lease-pager --mutate"
     printf '%s\n' "$out" | tail -10 | sed 's/^/        /'
+  fi
+fi
+
+# Weekly pace governor (lane G7, 2026-09-29): ten mutations, each deleting one gate
+# (the lease-path defer, the pace rule, the weekly line, both core exemptions, the SQL
+# core list, the signature write, the reading-age bound, single-account activation,
+# the FREEZE-EXEMPT line anchor) from a COPY of the source; each control must go RED.
+if [ -f "$ROOT/tools/pace-governor.test.js" ]; then
+  if out="$(node "$ROOT/tools/pace-governor.test.js" --mutate 2>&1 | redact)"; then
+    passes=$((passes+1)); echo "  PASS  pace-governor --mutate"
+  else
+    fails=$((fails+1)); echo "  FAIL  pace-governor --mutate"
+    printf '%s\n' "$out" | tail -12 | sed 's/^/        /'
   fi
 fi
 
