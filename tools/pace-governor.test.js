@@ -222,6 +222,9 @@ async function run() {
        /AND NOT \(\(d\.type = 'cron'/.test(sq.sql) && /IS DISTINCT FROM \$1/.test(sq.sql) &&
        !/next_run_at =|status = 'dispatching'|leased_by =/.test(sq.sql.split('WHERE')[0]),
       'W2. deferring: the SIGNATURE is written to the held-back non-core rows, guarded, touching no schedule column')
+    ok(!!sq && sq.sql.includes('retry_count = ' + scheduler.EFFECTIVE_RETRY_COUNT_SQL + ',') &&
+       sq.sql.indexOf('retry_count =') < sq.sql.indexOf(' WHERE '),
+      'W2c. deferring: the signature write rewrites retry_count to its EFFECTIVE value, so a replaced cap marker takes its borrowed count with it')
     ok(cap.lines.some(l => /pace-governor: DEFERRED 1 non-core row\(s\)/.test(l) && /cowork\.studio-lane-S1-build/.test(l)),
       'W2l. ...and the deferral is logged by name')
     ok(Array.isArray(rows) && rows.length === 0, 'W2r. leaseDueRows still returns its batch normally')
@@ -264,6 +267,9 @@ async function run() {
     ok(released === true && !!bq && bq.params[0] === 'r1' && bq.params[1] === 'L1' &&
        /^pace-governor: deferred/.test(bq.params[2]) && !/next_run_at =/.test(bq.sql),
       'W6. dispatch-time twin: a non-core row leased before the reading turned hot is released WITH the signature')
+    ok(!!bq && bq.sql.includes('retry_count = ' + scheduler.EFFECTIVE_RETRY_COUNT_SQL + ',') &&
+       bq.sql.indexOf('retry_count =') < bq.sql.indexOf(' WHERE '),
+      'W6c. dispatch-time twin: the release rewrites retry_count to its EFFECTIVE value in the same statement that replaces the marker')
   }
   {
     setup(gov, { reading: reading(0.90, 0.95) })
@@ -319,6 +325,12 @@ const MUTATIONS = [
   { id: 'M10', file: 'pace-governor.js', gate: 'the FREEZE-EXEMPT line anchor', expect: 'P4h.',
     from: 'const FREEZE_EXEMPT_RE = /(^|\\n)[ \\t\\n\\r\\f\\v]*FREEZE-EXEMPT/',
     to: 'const FREEZE_EXEMPT_RE = /FREEZE-EXEMPT/' },
+  { id: 'M11', file: 'scheduler.js', gate: 'the cap neutralisation in the signature write', expect: 'W2c.',
+    from: 'SET last_error = $1, retry_count = ${exports.EFFECTIVE_RETRY_COUNT_SQL}, updated_at = NOW()',
+    to: 'SET last_error = $1, updated_at = NOW()' },
+  { id: 'M12', file: 'scheduler.js', gate: 'the cap neutralisation in the dispatch-time twin', expect: 'W6c.',
+    from: 'last_error = $3, retry_count = ${exports.EFFECTIVE_RETRY_COUNT_SQL}, updated_at = NOW()',
+    to: 'last_error = $3, updated_at = NOW()' },
 ]
 
 if (process.argv.indexOf('--mutate') !== -1) {

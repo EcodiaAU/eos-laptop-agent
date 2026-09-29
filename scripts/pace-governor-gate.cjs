@@ -98,6 +98,74 @@ const ok = (c, l) => { c ? (pass++, console.log('  ok   ' + l)) : (fail++, conso
         ' bound parameters' + (err ? ' (' + err + ')' : ''))
     }
 
+    // ── half 4: the cap-marker matched pair, EXECUTED (still rolled back) ───────
+    // Both governor writes replace last_error. A row whose last_error carries the
+    // AllAccountsCappedError marker holds a retry_count BORROWED by the capped defer,
+    // which markFailed and EFFECTIVE_RETRY_COUNT_SQL read as 0 only while the marker is
+    // there. Each captured statement is executed here on two otherwise identical rows,
+    // one marked and one not: the marked row must come out at retry_count 0 and the
+    // control must keep its 2, so the neutralisation is proved to be conditional
+    // rather than a blanket reset. The signature statement is scoped to the pair by an
+    // appended id filter, so no live row is touched even inside the transaction.
+    const MARK = scheduler.CAPPED_MARKER_TOKEN
+    const mkPair = async (tag, status) => {
+      const out = {}
+      for (const [key, err] of [['capped', MARK + ': every enabled account is capped (gate ' + tag + ')'],
+                                ['plain', 'transient dispatch error (gate ' + tag + ' control)']]) {
+        const r = await c.query(
+          `INSERT INTO os_scheduled_tasks (type, name, prompt, status, next_run_at, retry_count, last_error, leased_by, leased_at)
+           VALUES ('delayed', $1, 'an ordinary worker brief', $2, NOW() - interval '1 minute', 2, $3, $4, $5) RETURNING id`,
+          ['cowork.pgtestg7-' + tag + '-' + key, status, err,
+           status === 'dispatching' ? 'gate-lease' : null, status === 'dispatching' ? new Date() : null])
+        out[key] = r.rows[0].id
+        ids.push(out[key]) // half 3 counts the live population without the gate's own rows
+      }
+      return out
+    }
+    const readPair = async (p) => {
+      const r = await c.query('SELECT id, retry_count, last_error, status, leased_by FROM os_scheduled_tasks WHERE id = ANY($1::uuid[])',
+        [[p.capped, p.plain]])
+      const by = {}
+      for (const row of r.rows) by[row.id === p.capped ? 'capped' : 'plain'] = row
+      return by
+    }
+
+    const sp = await mkPair('sig', 'active')
+    const scoped = sig.sql.replace(/RETURNING d\.id, d\.name\s*$/,
+      'AND d.id = ANY($' + (sig.params.length + 1) + '::uuid[]) RETURNING d.id, d.name')
+    ok(scoped !== sig.sql, 'G7-7. the signature statement can be scoped to the test pair (its RETURNING tail is where the gate expects it)')
+    const sigRun = await c.query(scoped, [...sig.params, [sp.capped, sp.plain]])
+    const s1 = await readPair(sp)
+    ok(sigRun.rowCount === 2 && s1.capped.last_error === deferState.signature && s1.plain.last_error === deferState.signature,
+      'G7-8. the signature write lands on both held non-core rows (' + sigRun.rowCount + ')')
+    ok(s1.capped.retry_count === 0,
+      'G7-9. signature write: the CAP-MARKED row loses its borrowed retry_count with its marker (2 -> ' + s1.capped.retry_count + ')')
+    ok(s1.plain.retry_count === 2,
+      'G7-10. CONTROL signature write: an identical row without the marker keeps its real failure count (2 -> ' + s1.plain.retry_count + ')')
+    const sigAgain = await c.query(scoped, [...sig.params, [sp.capped, sp.plain]])
+    ok(sigAgain.rowCount === 0, 'G7-11. the IS DISTINCT FROM guard holds: an unchanged reading re-signs nothing (' + sigAgain.rowCount + ')')
+
+    const tp = await mkPair('twin', 'dispatching')
+    for (const key of ['capped', 'plain']) {
+      const cap2 = []
+      const twinPool = { async query(sql, params) {
+        cap2.push({ sql, params })
+        return /^\s*SELECT name, type, prompt/.test(sql)
+          ? { rows: [{ name: 'cowork.pgtestg7-twin-' + key, type: 'delayed', prompt: 'an ordinary worker brief' }], rowCount: 1 }
+          : { rows: [], rowCount: 1 }
+      } }
+      const released = await scheduler.paceDispatchGate(twinPool, { id: tp[key], leased_by: 'gate-lease' })
+      const upd = cap2.find(x => /PRE-SPAWN-BAIL: the pace governor/.test(x.sql))
+      ok(released === true && !!upd, 'G7-12. the dispatch-time twin emits its release for the ' + key + ' row')
+      if (upd) await c.query(upd.sql, upd.params)
+    }
+    const t1 = await readPair(tp)
+    ok(t1.capped.status === 'active' && t1.capped.leased_by === null && t1.capped.last_error === deferState.signature &&
+       t1.capped.retry_count === 0,
+      'G7-13. dispatch-time twin: the CAP-MARKED row is released and loses its borrowed retry_count (2 -> ' + t1.capped.retry_count + ')')
+    ok(t1.plain.status === 'active' && t1.plain.retry_count === 2,
+      'G7-14. CONTROL dispatch-time twin: an identical row without the marker keeps its real failure count (2 -> ' + t1.plain.retry_count + ')')
+
     // ── half 3: the live population, counted ──────────────────────────────────
     const live = await c.query(
       `SELECT count(*) FILTER (WHERE ${gov.sqlCorePredicate('d', 1)})::int AS core,
