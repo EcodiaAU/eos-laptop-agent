@@ -120,6 +120,10 @@ function makeReclaimBailPool(rowsForSelect) {
 // ── import scheduler ──────────────────────────────────────────────────────────
 
 const scheduler = require('./scheduler')
+// The weekly pace governor reads the live accounts registry and probes the vendor usage
+// endpoint. These suites exercise other lease logic, so the governor is detached here
+// and has its own hermetic suite (tools/pace-governor.test.js).
+scheduler._setPaceGovernor(null)
 const credsModule = require('./creds')
 const coordModule = require('./coord')
 

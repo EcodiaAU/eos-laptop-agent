@@ -71,6 +71,24 @@ try {
 }
 exports._setAusterityCfg = function (c) { _austerityCfg = c } // test seam
 
+// ── Weekly pace governor (lane G7, 2026-09-29) ───────────────────────────────
+// Single-account operation: leaseDueRows leases CORE rows only while the one live
+// plan is spending its 7d window ahead of pace, and dispatchOne carries the twin.
+// Self-contained and fail-open; see tools/pace-governor.js for the thresholds and
+// the core definition (read from the band table above, never retyped here).
+let _paceGovernor = null
+try {
+  _paceGovernor = require('./pace-governor')
+} catch (e) {
+  process.stderr.write('[scheduler] pace-governor unavailable (' +
+    (e && e.message || e) + '); leasing without the weekly brake\n')
+}
+exports._setPaceGovernor = function (g) { _paceGovernor = g } // test seam
+async function readPaceGovernor() {
+  if (!_paceGovernor || typeof _paceGovernor.evaluate !== 'function') return null
+  try { return await _paceGovernor.evaluate({ austerityCfg: _austerityCfg }) } catch (_) { return null }
+}
+
 // Read the live PRESENCE POSTURE {mode,lean,frozen} from kv_store (the same key
 // the lever writes: POSTURE_KV_KEY = scheduler.presence_posture). Returns a
 // normalized state object, or null when the key is absent / read fails - the
@@ -1619,6 +1637,27 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
   // Chain rows with chain_after set sit parked at next_run_at=NULL until the
   // parent completes (markComplete wakes them). Without the NULL-guard, the
   // existing "next_run_at IS NULL" branch would lease them immediately.
+  //
+  // 2026-09-29 lane G7 WEEKLY PACE GOVERNOR. With one Claude plan and no failover, a
+  // week spent early stalls every worker, inbound triage included, until the 7d
+  // reset. When the governor says the live account is ahead of pace, the
+  // due set narrows to CORE rows (frozen-survivor and compliance crons, the
+  // Continuity Engine's rows, FREEZE-EXEMPT prompts). The exclusion lives HERE, in
+  // the lease predicate, and not as a lease-then-release: a released row is still
+  // due, so it would be re-leased every 30s (the 2026-08-26 austerity spin, 28,197
+  // log lines from one row), and with ORDER BY priority LIMIT n a batch of deferred
+  // high-priority rows would fill every pass and starve a priority-3 core cron.
+  // Deferred rows are not touched here; the guarded signature UPDATE below marks
+  // them. evaluate() never throws and fails open, because this function's caller
+  // pages Tate on a throw.
+  const pace = await readPaceGovernor()
+  const paceDefer = !!(pace && pace.active && pace.defer && Array.isArray(pace.coreCrons))
+  // Clause and parameters are built together: with no governor module there is no
+  // clause AND no extra parameters, since a bind carrying unreferenced $N fails.
+  const coreParams = paceDefer ? _paceGovernor.sqlCoreParams(pace.coreCrons) : []
+  const paceClause = paceDefer
+    ? `AND ${_paceGovernor.sqlCorePredicate('d', 3)}`
+    : ''
   const sql = `
     WITH due AS (
       SELECT id FROM os_scheduled_tasks d
@@ -1662,6 +1701,7 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
         AND (austerity_paused IS NOT TRUE OR type <> 'cron')
         AND (next_run_at IS NULL OR next_run_at <= NOW())
         AND (chain_after IS NULL OR next_run_at IS NOT NULL)
+        ${paceClause}
       ORDER BY priority ASC, next_run_at ASC NULLS FIRST
       LIMIT $1
       FOR UPDATE SKIP LOCKED
@@ -1675,7 +1715,42 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
     WHERE t.id = due.id
     RETURNING t.*
   `
-  const result = await pool.query(sql, [n, leaseId])
+  const result = await pool.query(sql, [n, leaseId, ...coreParams])
+
+  // Pace-governor SIGNATURE. A deferral that leaves no trace makes every caller
+  // believe its row is simply late (patterns/a-suppression-gate-that-leaves-no-
+  // signature-makes-every-caller-believe-it-succeeded-2026-09-13.md). Stamp the
+  // reason on every due non-core row the predicate above held back, and log them.
+  // Guarded on IS DISTINCT FROM so it writes only when the rounded reading changes
+  // (at most once per probe TTL), never once per 30s pass. markComplete clears
+  // last_error, so the trace disappears on the first successful run after pace
+  // recovers. Never status, next_run_at or lease columns: the row stays due.
+  if (paceDefer && pace.signature) {
+    try {
+      const signed = await pool.query(
+        `UPDATE os_scheduled_tasks d
+         SET last_error = $1, updated_at = NOW()
+         WHERE d.status = 'active' AND d.archived_at IS NULL
+           AND (d.last_status IS NULL OR d.last_status NOT IN ('paused', 'cancelled'))
+           AND (d.austerity_paused IS NOT TRUE OR d.type <> 'cron')
+           AND (d.next_run_at IS NULL OR d.next_run_at <= NOW())
+           AND (d.chain_after IS NULL OR d.next_run_at IS NOT NULL)
+           AND NOT ${_paceGovernor.sqlCorePredicate('d', 2)}
+           AND d.last_error IS DISTINCT FROM $1
+         RETURNING d.id, d.name`,
+        [pace.signature, ...coreParams]
+      )
+      if (signed.rowCount > 0) {
+        const names = signed.rows.map(r => r.name || r.id)
+        process.stderr.write('[scheduler] pace-governor: DEFERRED ' + signed.rowCount +
+          ' non-core row(s), signature written [' + pace.signature + ']: ' +
+          names.slice(0, 12).join(', ') + (names.length > 12 ? ' (+' + (names.length - 12) + ' more)' : '') + '\n')
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] pace-governor: signature write FAILED (' +
+        ((e && e.message) || e) + '); rows are still deferred, but unmarked this pass\n')
+    }
+  }
 
   // Post-lease re-entry guard. The due-query above tests next_run_at <= NOW()
   // only; a row whose next_run_at was clobbered into the past while it already
@@ -1736,6 +1811,49 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
     dispatchable.push(row)
   }
   return dispatchable
+}
+
+// ── paceDispatchGate (dispatch-time twin of the weekly pace governor) ─────────
+//
+// Lane G7, 2026-09-29. A batch leased on a pass where the governor said "lease all"
+// can wait minutes for its turn under the launch-lock, and the reading can turn hot
+// in between. Same predicate as the lease-time clause (isCoreRow is the JS twin of
+// sqlCorePredicate), read off a FRESH select of the row so a caller that handed
+// dispatchOne a row without its prompt cannot misread a FREEZE-EXEMPT row as
+// non-core. The release cannot spin: the next lease pass excludes the row in SQL for
+// as long as the governor defers. Release and signature are one statement.
+// Returns true when it released the lease (the caller must stop), false otherwise.
+// Never throws: a failure here must not become a failed dispatch.
+exports.paceDispatchGate = async function paceDispatchGate(pool, row) {
+  try {
+    if (!row || !row.id || !_paceGovernor) return false
+    const pace = await readPaceGovernor()
+    if (!(pace && pace.active && pace.defer && pace.signature)) return false
+    const f = await pool.query(
+      `SELECT name, type, prompt FROM os_scheduled_tasks WHERE id = $1`, [row.id])
+    const fresh = f.rows[0] || null
+    if (!fresh || _paceGovernor.isCoreRow(fresh, _austerityCfg)) return false
+    await pool.query(
+      `UPDATE os_scheduled_tasks
+       -- PRE-SPAWN-BAIL: the pace governor releases the lease here BEFORE any worker
+       -- is spawned. The due time is deliberately left as it was: the row must lease
+       -- on the first pass after the weekly pace recovers, and the lease predicate
+       -- keeps excluding it until then.
+       SET status = 'active', leased_by = NULL, leased_at = NULL,
+           last_error = $3, updated_at = NOW()
+       WHERE id = $1
+         AND status = 'dispatching'
+         AND leased_by IS NOT DISTINCT FROM $2`,
+      [row.id, row.leased_by || null, pace.signature]
+    )
+    process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' + (fresh.name || '?') +
+      ') - pace governor [' + pace.signature + ']; lease released without retry\n')
+    return true
+  } catch (e) {
+    process.stderr.write('[scheduler] pace-governor: dispatch-time twin errored (' +
+      ((e && e.message) || e) + '); dispatching normally\n')
+    return false
+  }
 }
 
 // ── markFailed ───────────────────────────────────────────────────────────────
@@ -2057,6 +2175,11 @@ exports.dispatchOne = async function dispatchOne(row) {
         return
       }
     }
+
+    // 0-pace. Dispatch-time twin of the weekly pace governor (lane G7, 2026-09-29).
+    // See paceDispatchGate: releases a non-core row's lease before any spawn while the
+    // single live plan is ahead of its weekly pace.
+    if (await exports.paceDispatchGate(pool, row)) return
 
     // 0a. CONDUCTOR CLAIM INTERLOCK (2026-08-28, lane R1 coord rebuild).
     //

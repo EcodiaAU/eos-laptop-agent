@@ -27,6 +27,9 @@
 
 const assert = require('assert')
 const scheduler = require('./scheduler')
+// Detach the weekly pace governor: it would read the live registry and probe the vendor
+// usage endpoint. It has its own hermetic suite (tools/pace-governor.test.js).
+scheduler._setPaceGovernor(null)
 
 const RETRY_BACKOFF_MS = 5 * 60 * 1000   // contract: matches scheduler.js
 const HOUR = 60 * 60 * 1000
@@ -260,14 +263,16 @@ function check(label, fn) {
 
   // Anti-vacuous-green pin. A scanner that matches nothing reports zero offenders
   // and reads exactly like a pass. Assert it actually SAW the population it grades:
-  // the live file carries a dozen active-setting UPDATEs and exactly two sanctioned
-  // pre-spawn bails.
+  // the live file carries a dozen active-setting UPDATEs and exactly three sanctioned
+  // pre-spawn bails. The third (2026-09-29, lane G7) is the weekly pace governor's
+  // dispatch-time twin: it releases the lease before any worker exists, and the lease
+  // predicate keeps excluding the row, so leaving the due time alone cannot spin.
   check('case 7: the scanner is not vacuous (it sees the real population)', () => {
     assert.ok(real.activeBlocks.length >= 10,
       'scanner matched only ' + real.activeBlocks.length + ' active-setting UPDATE blocks; ' +
       'the regex has gone blind and every assertion above it is vacuous')
-    assert.strictEqual(real.exempted.length, 2,
-      'expected exactly 2 marked pre-spawn bails (austerity gate, aggregate breaker), got ' +
+    assert.strictEqual(real.exempted.length, 3,
+      'expected exactly 3 marked pre-spawn bails (austerity gate, pace governor, aggregate breaker), got ' +
       real.exempted.length + ' at lines ' + real.exempted.join(', ') +
       '. A new marker means someone opted a statement out of the class guard.')
   })
