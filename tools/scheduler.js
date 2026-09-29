@@ -1725,11 +1725,25 @@ exports.leaseDueRows = async function leaseDueRows(limit) {
   // (at most once per probe TTL), never once per 30s pass. markComplete clears
   // last_error, so the trace disappears on the first successful run after pace
   // recovers. Never status, next_run_at or lease columns: the row stays due.
+  //
+  // THE OVERWRITE MUST CARRY THE CAP NEUTRALISATION WITH IT (G7 verify, 2026-09-29).
+  // last_error is not only a trace: a row carrying the AllAccountsCappedError marker
+  // holds a retry_count BORROWED by the capped defer, and markFailed and
+  // EFFECTIVE_RETRY_COUNT_SQL read that count as 0 only while the marker is present.
+  // Replacing the marker with this signature and leaving the count would hand the
+  // row its borrowed count as a spent failure budget the moment pace recovers (the
+  // thundering herd, when a transient error is likeliest), so a one-shot row could be
+  // permanently failed on its first real error, and scheduler-health.sh would read
+  // it as retry_churn. That is the 2026-08-29 D1 hazard, re-opened by a second
+  // writer. So the count is rewritten to its EFFECTIVE value in the same statement:
+  // 0 exactly when the marker was there, unchanged otherwise. The capped_churn
+  // detector loses nothing it needs, because core rows are never signed and keep
+  // their marker.
   if (paceDefer && pace.signature) {
     try {
       const signed = await pool.query(
         `UPDATE os_scheduled_tasks d
-         SET last_error = $1, updated_at = NOW()
+         SET last_error = $1, retry_count = ${exports.EFFECTIVE_RETRY_COUNT_SQL}, updated_at = NOW()
          WHERE d.status = 'active' AND d.archived_at IS NULL
            AND (d.last_status IS NULL OR d.last_status NOT IN ('paused', 'cancelled'))
            AND (d.austerity_paused IS NOT TRUE OR d.type <> 'cron')
@@ -1838,9 +1852,12 @@ exports.paceDispatchGate = async function paceDispatchGate(pool, row) {
        -- PRE-SPAWN-BAIL: the pace governor releases the lease here BEFORE any worker
        -- is spawned. The due time is deliberately left as it was: the row must lease
        -- on the first pass after the weekly pace recovers, and the lease predicate
-       -- keeps excluding it until then.
+       -- keeps excluding it until then. The lease never clears last_error, so a
+       -- cap-marked row arrives here still carrying the marker and its borrowed
+       -- retry_count: the count is rewritten to its effective value in the same
+       -- statement that replaces the marker (see the signature write above).
        SET status = 'active', leased_by = NULL, leased_at = NULL,
-           last_error = $3, updated_at = NOW()
+           last_error = $3, retry_count = ${exports.EFFECTIVE_RETRY_COUNT_SQL}, updated_at = NOW()
        WHERE id = $1
          AND status = 'dispatching'
          AND leased_by IS NOT DISTINCT FROM $2`,
