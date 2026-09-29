@@ -39,6 +39,8 @@ const coord = require('./coord')
 // os_scheduled_tasks and the SET fragment dispatchOne uses to clear them, so
 // the writer (coord.signal_*) and the reader (here) cannot drift apart.
 const taskSignals = require('./task-signals')
+// 2026-09-29: zero-token pre-spawn gate, registry at tools/dispatch-prechecks.json.
+const dispatchPrecheck = require('./dispatch-precheck')
 // Injection seam: tests pass a stub coord implementing { list_workers }.
 // Only the stale-lease liveness check routes through getCoord(); the other
 // coord call sites (completionPass) read coord directly to avoid behaviour
@@ -2252,6 +2254,55 @@ exports.dispatchOne = async function dispatchOne(row) {
       // Both brakes clear. The dispatch is NOT recorded here - see the
       // breakerRecordDispatch call after the confirmed tab spawn below.
       breakerRowName = rowName
+    }
+
+    // 0c. PRE-SPAWN PRECHECK (2026-09-29). A cron named in tools/dispatch-prechecks.json
+    // first runs its zero-token check; a "skip" verdict services the slot without a tab.
+    // Measured before this existed: gmail-inbox-poll spent a median 10.4M cache-read
+    // tokens per fire, and fires whose own Phase 0 found nothing to judge cost the same.
+    //
+    // Placed AFTER the austerity, claim and breaker gates, so a suppressed row never
+    // pays for a precheck, and BEFORE the account pick, worktree and spawn, so a skip
+    // costs nothing but the check. dispatchPrecheck.run never rejects and FAILS OPEN:
+    // every error, timeout or unparseable answer is a spawn, which is the old path.
+    //
+    // DISPOSITION MIRRORS THE CLAIM INTERLOCK'S CRON BRANCH, NOT THE PRE-SPAWN-BAIL.
+    // Releasing the lease with next_run_at still past due would re-lease the row on
+    // the next 30s poll and re-run a ~60s check under the launch-lock, forever. So the
+    // row is deferred to its next slot. last_run_at is stamped (the slot WAS serviced,
+    // and every liveness surface reads that column) and last_result says precheck-skip;
+    // run_count is NOT bumped, so it keeps counting worker fires only. Cron-only by
+    // construction: entryFor() refuses any type the registry entry does not list, and
+    // a one-shot has no next slot to defer to.
+    {
+      const pc = await dispatchPrecheck.run(row)
+      if (pc.cause !== 'no-entry') {
+        process.stderr.write('[scheduler] dispatchOne: precheck ' + row.id + ' (' + (row.name || '?') +
+          ') verdict=' + pc.verdict + ' cause=' + pc.cause + ' ms=' + pc.ms +
+          (pc.reason ? ' reason=' + String(pc.reason).slice(0, 240) : '') + '\n')
+      }
+      if (pc.verdict === 'skip' && row.type === 'cron' && row.cron_expression) {
+        let nextRunAt
+        try { nextRunAt = exports.computeNextRunAt(row) }
+        catch (e) { nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() }
+        const skipRes = await pool.query(
+          `UPDATE os_scheduled_tasks
+           SET status = 'active', last_run_at = NOW(), next_run_at = $3,
+               leased_by = NULL, leased_at = NULL,
+               last_result = $4, last_error = NULL,
+               retry_count = 0, launch_retry_count = 0,
+               updated_at = NOW()
+           WHERE id = $1
+             AND status = 'dispatching'
+             AND leased_by IS NOT DISTINCT FROM $2`,
+          [row.id, row.leased_by || null, nextRunAt,
+           ('precheck-skip: no worker tab opened. ' + pc.reason).slice(0, 2000)]
+        )
+        process.stderr.write('[scheduler] dispatchOne: SKIP ' + row.id + ' (' + (row.name || '?') +
+          ') - precheck said nothing to do; CRON DEFERRED to ' + nextRunAt + ', no tab spawned' +
+          (skipRes && skipRes.rowCount ? '' : ' (lease no longer held, row left as found)') + '\n')
+        return
+      }
     }
 
     // 1. Dispatch on the account that is ALREADY live. No per-dispatch rotation.
