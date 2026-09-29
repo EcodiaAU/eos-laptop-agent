@@ -1,0 +1,16 @@
+{
+  "_doc": "Zero-token gates run by tools/dispatch-precheck.js before dispatchOne opens a worker tab. Key = EXACT os_scheduled_tasks.name. The argv's last stdout line must be JSON {verdict: skip|spawn, reason}; anything else spawns. Re-read on every dispatch, so edits need no restart. Set enabled:false to bypass one. Doctrine: backend/patterns/a-cron-whose-mechanical-half-can-say-nothing-to-do-should-not-open-a-tab-2026-09-29.md",
+  "prechecks": {
+    "gmail-inbox-poll": {
+      "enabled": true,
+      "types": ["cron"],
+      "timeout_ms": 170000,
+      "argv": [
+        "/opt/homebrew/bin/node",
+        "/Users/ecodia/.code/ecodiaos/backend/scripts/gmail-inbox-poll-precheck.cjs",
+        "--max-skip-hours",
+        "24"
+      ]
+    }
+  }
+}
