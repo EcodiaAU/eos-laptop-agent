@@ -14,6 +14,12 @@
   WHY LAUNCHD. It must run when Claude cannot, so it is node + security + canonical CDP
   only, with no Claude budget and no Supabase in the path.
 
+  WHY THE CELLAR NODE. Full Disk Access (chat.db) and Automation (Messages) are keyed to
+  the exact node binary, and the 2026-10-23 relink left /opt/homebrew/bin/node without
+  either, so a failure text from this job would hang and never send. 22.22.3 still holds
+  both; it loads with the compat dylib on DYLD_FALLBACK_LIBRARY_PATH. Doctrine:
+  a-node-relink-revokes-full-disk-access-for-launchd-jobs-2026-10-26.md
+
   CADENCE. Daily at 17:43 AEST plus RunAtLoad. A calendar fire missed while the Mac sleeps
   runs once on wake; RunAtLoad covers a reboot. A plain 14-day StartInterval would reset on
   every reboot and never catch up, and a single missed fire there could lose the whole
@@ -30,13 +36,14 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>au.ecodia.claude-relogin-guard</string>
   <key>ProgramArguments</key><array>
-    <string>/opt/homebrew/bin/node</string>
+    <string>/opt/homebrew/Cellar/node@22/22.22.3/bin/node</string>
     <string>/Users/ecodia/.code/eos-laptop-agent/scripts/claude-relogin-guard.js</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/ecodia/.code/eos-laptop-agent</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key><string>/Users/ecodia</string>
+    <key>DYLD_FALLBACK_LIBRARY_PATH</key><string>/Users/ecodia/.ecodiaos/node22-compat/lib</string>
   </dict>
   <key>StartCalendarInterval</key><dict>
     <key>Hour</key><integer>17</integer><key>Minute</key><integer>43</integer>

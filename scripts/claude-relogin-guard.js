@@ -122,7 +122,9 @@ function alarm(state, msg, daysLeft) {
   const critical = daysLeft === null || daysLeft < 3
   const last = state.last_alarm_at ? Date.parse(state.last_alarm_at) : 0
   if (!critical && Date.now() - last < ALARM_COOLDOWN_MS) { log('alarm suppressed (cooldown): ' + msg); return }
-  const r = spawnSync('node', [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency', critical ? 'critical' : 'decision', msg],
+  // process.execPath, never a bare `node`: under launchd only the plist's own (TCC-granted)
+  // binary can read chat.db and drive Messages; PATH resolves to the ungranted one.
+  const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency', critical ? 'critical' : 'decision', msg],
     { encoding: 'utf8', timeout: 60000, cwd: path.join(os.homedir(), '.code', 'ecodiaos', 'backend') })
   log('alarm text exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().slice(0, 200))
   state.last_alarm_at = new Date().toISOString()
@@ -141,6 +143,16 @@ function runRelogin() {
 function main() {
   const argv = process.argv.slice(2)
   if (argv.includes('--selftest')) return selftest()
+  if (argv.includes('--alarm-dry-run')) {
+    // Proves the failure text would get out FROM THIS PROCESS'S CONTEXT (run it under
+    // launchd): the gate reads the thread from chat.db, which needs this binary's Full Disk
+    // Access. Sends nothing.
+    const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency', 'decision', '--dry-run',
+      'Claude login renewal alarm path probe (dry run, not sent).'], { encoding: 'utf8', timeout: 60000, cwd: path.join(os.homedir(), '.code', 'ecodiaos', 'backend') })
+    log('alarm dry-run via ' + process.execPath + ' exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ').slice(0, 300))
+    process.exitCode = r.status === 0 ? 0 : 1
+    return
+  }
   const CHECK = argv.includes('--check')
   const FORCE = argv.includes('--force')
   const sim = argv.indexOf('--days-left')
