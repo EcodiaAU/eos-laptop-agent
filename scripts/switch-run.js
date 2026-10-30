@@ -58,6 +58,7 @@ const PIN_TARGET = args.includes('--pin-target')
 // scripts/claude-relogin-guard.js (launchd au.ecodia.claude-relogin-guard). A relogin is not a
 // switch: it writes no switch-request, pings no conductor and arms no reawaken.
 const FORCE_RELOGIN = args.includes('--force-relogin') || process.env.SWITCH_FORCE_RELOGIN === '1'
+const NO_SOLVER = process.env.SWITCH_NO_CAPTCHA_SOLVER === '1'
 // AGENT-PRIMARY (2026-08-20). --external-drive: switch-run does NOT spawn the blind macro; it
 // emits the OAuth URL + CODE_FILE and waits for an external agent (a CC worker that reads the
 // page with its own vision and drives CDP) to write the code. All orchestration stays here.
@@ -452,10 +453,13 @@ async function runLogin(target, row) {
       PW_MIRROR_PATH: row.pw_mirror || '',
       // hCaptcha solver key (2026-08-03). From env or the local cred mirror; empty is fine,
       // the browser driver just exhausts on the captcha as before when it is absent.
-      CAPSOLVER_API_KEY: process.env.CAPSOLVER_API_KEY ||
-        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
-      TWOCAPTCHA_API_KEY: process.env.TWOCAPTCHA_API_KEY ||
-        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })(),
+      // SWITCH_NO_CAPTCHA_SOLVER=1 (2026-10-30) passes NO solver key, so a visible challenge
+      // is held and the leg exhausts instead of being sent to a solving service. The relogin
+      // guard sets it: a challenge it meets goes to a human (Tate's phone), never a solver.
+      CAPSOLVER_API_KEY: NO_SOLVER ? '' : (process.env.CAPSOLVER_API_KEY ||
+        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/capsolver_api_key', 'utf8').trim() } catch (_e) { return '' } })()),
+      TWOCAPTCHA_API_KEY: NO_SOLVER ? '' : (process.env.TWOCAPTCHA_API_KEY ||
+        (() => { try { return require('fs').readFileSync(require('os').homedir() + '/PRIVATE/ecodia-creds/kv-mirror/twocaptcha_api_key', 'utf8').trim() } catch (_e) { return '' } })()),
     }),
   })
 
@@ -488,6 +492,13 @@ async function runLogin(target, row) {
     if (/^DONE:/m.test(text)) { terminal = 'DONE'; break }
     if (/^(FAILED|TIMEOUT):/m.test(text)) { terminal = 'FAILED'; break }
     if (child.exitCode !== null && (browser ? browser.exitCode !== null : true)) { terminal = child.exitCode === 0 ? 'DONE' : 'FAILED'; break }
+    // In macro mode nothing but the macro writes the code, so a macro that has EXITED
+    // non-zero (EXHAUSTED) means no code can ever arrive. End the leg now rather than idle
+    // out the CLI's full code wait (12 minutes per attempt, measured 2026-10-30).
+    if (!EXTERNAL_DRIVE && browser && browser.exitCode !== null && browser.exitCode !== 0) {
+      const codeWritten = (() => { try { return fs.statSync(codeFile).size > 0 } catch (_e) { return false } })()
+      if (!codeWritten) { terminal = 'FAILED'; break }
+    }
 
     // GUARANTEE A: agent-primary with a macro backstop. If we handed off to an agent and it
     // has neither written the code nor kept its .driving heartbeat fresh, take over with the
