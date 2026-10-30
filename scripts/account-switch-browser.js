@@ -430,6 +430,14 @@ async function run() {
   // told to return ONLY a link that arrived at/after this, so a stale link from a prior
   // attempt (still <1h old) can never be picked up and looped over.
   let moneySendMs = 0
+  // DEAD-END RECOVERY (2026-10-30). Observed on a tate@ relogin: trusted Authorize click ->
+  // a VISIBLE hCaptcha grid -> 2Captcha ERROR_CAPTCHA_UNSOLVABLE -> the page then showed no
+  // Authorize, no challenge and no code, signed in as the target. No branch below matches
+  // that state, so the loop idled 49 passes to EXHAUSTED. Reloading the same OAUTH_URL (the
+  // CLI's PKCE flow is still waiting on it) brings back a fresh consent page, where a lone
+  // trusted click is what normally passes the invisible captcha. Bounded and narrow: only
+  // when signed in as the target, after 6 consecutive idle passes, at most 3 reloads.
+  let lastIdleIter = -2, idleStreak = 0, deadEndReloads = 0
   for (let i = 0; i < 50; i++) {
     let st
     try { st = await readState(page) } catch (e) { log('read err', e.message); await sleep(1500); continue }
@@ -587,6 +595,17 @@ async function run() {
       continue
     }
 
+    idleStreak = (lastIdleIter === i - 1) ? idleStreak + 1 : 1
+    lastIdleIter = i
+    if (st.loggedInAs === EMAIL && idleStreak >= 6 && deadEndReloads < 3) {
+      deadEndReloads++
+      idleStreak = 0
+      log('dead-end: signed in as ' + EMAIL + ' with no Authorize, challenge or code for 6 passes - reloading the consent page (' + deadEndReloads + '/3)')
+      await page.goto(OAUTH_URL, { waitUntil: 'domcontentloaded' }).catch(() => {})
+      await focusless(page)
+      await sleep(3500)
+      continue
+    }
     await sleep(1500)
   }
   log('EXHAUSTED without writing code')
