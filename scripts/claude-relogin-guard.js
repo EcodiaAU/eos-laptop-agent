@@ -3,13 +3,17 @@
 // scripts/claude-relogin-guard.js - keeps the live Claude OAuth session from ever reaching
 // its hard expiry, by forcing a fresh login well before it.
 //
-// WHY THIS EXISTS (2026-10-30). A Claude Code OAuth login is a fixed 30-day session. The
-// Keychain entry "Claude Code-credentials" carries it as claudeAiOauth.refreshTokenExpiresAt.
-// The 8-hour access-token refreshes rotate the refresh token but never move that expiry
-// (measured 2026-10-30: Keychain mdat 11:46Z today, session expiry still 30 days after the
-// 2026-10-28 22:22Z login). Nothing warned, nothing relogged. On 2026-10-29/30 the session
-// lapsed, every scheduled tab came up logged out and could not run Claude to fix itself, VS
-// Code tabs retried until each held ~2GB of history and VS Code crashed. About 2 days dark.
+// WHY THIS EXISTS (2026-10-30). A Claude Code OAuth login has a hard end, carried in the
+// Keychain entry "Claude Code-credentials" as claudeAiOauth.refreshTokenExpiresAt. The 8-hour
+// access-token refreshes do NOT move it. Measured 2026-10-30/31: the refresh at 20:10:15Z
+// (Keychain mdat; expiresAt became mdat + 8h) left it at 2026-11-27T22:22:26.329Z against
+// 22:22:27.928Z before, a few seconds of re-stamp jitter where a sliding window would have
+// added 8.4 hours. How long a fresh login is granted (30 days, or the 28.44 days the
+// 2026-10-30 recovery login appeared to get) is UNVERIFIED until the first renewal succeeds;
+// see patterns/claude-oauth-session-is-30-days-and-only-a-relogin-resets-it-2026-10-30.md.
+// Nothing warned, nothing relogged. On 2026-10-29/30 the session lapsed, every scheduled tab
+// came up logged out and could not run Claude to fix itself, VS Code tabs retried until each
+// held ~2GB of history and VS Code crashed. About 2 days dark.
 //
 // THE RULE. Read the session expiry daily. When fewer than RELOGIN_DAYS_LEFT days remain
 // (default 10, i.e. the session is older than ~20 days on a 30-day lifetime), run a real
@@ -68,6 +72,14 @@ const RELOGIN_DAYS_LEFT = Number(process.env.RELOGIN_DAYS_LEFT) || 10
 const MIN_RENEWED_DAYS = 25
 const SWITCH_TIMEOUT_MS = Number(process.env.RELOGIN_SWITCH_TIMEOUT_MS) || 40 * 60 * 1000
 const ALARM_COOLDOWN_MS = 20 * 3600 * 1000
+// `claude auth login` opens its authorize link with $BROWSER when set (probed 2026-10-31: a
+// marker script set as BROWSER received the URL and nothing opened). Unset, it lands in the
+// Mac's default browser, which is a second non-canonical Chrome Beta with no CDP, leaking one
+// tab per run. Nobody on the Mac needs that tab: the macro opens the URL itself in canonical
+// Chrome over CDP, and in the phone handshake Tate opens it on his phone.
+// RELOGIN_BROWSER overrides it only so a probe can point it at a marker script and prove the
+// variable reaches the CLI through account-switch.sh, switch-run and the login script.
+const NO_BROWSER = process.env.RELOGIN_BROWSER || '/usr/bin/true'
 
 // ── pure judgement ───────────────────────────────────────────────────────────
 
@@ -135,6 +147,23 @@ function pickRelayReply(rows, sentAtMs, expectedState) {
   return null
 }
 
+// What Tate hears after he texted a code that the CLI took. He did a manual step on his phone,
+// and the live iMessage agent will also answer that text without knowing whether it worked, so
+// the guard's own read of the Keychain is what tells him. Returns the text, or null when no
+// code of his was used.
+// Worded to share few words with the guard's other texts: the send gate refuses a text that is
+// 60% the same as anything we sent Tate in the last 12h (measured 2026-10-31: "Done, your code
+// worked. The Mac Claude login is renewed until 28 Dec" scored 62% against the 2026-10-30
+// login-status text and was refused too_similar; this wording scores 40% there, 10% against
+// the handshake ask). The date is when the guard will next need him, not the session end.
+function afterCodeText(renewed, afterExpiresAt) {
+  if (typeof afterExpiresAt !== 'number') return renewed ? null : 'Your code went through, thanks, but the Mac login did not extend. Nothing more from you right now. I have logged it and will retry tomorrow.'
+  const day = (ms) => new Date(ms).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', timeZone: 'Australia/Brisbane' })
+  if (renewed) return 'Thanks, that did it. All set, nothing else needed from you on this until about ' + day(afterExpiresAt - RELOGIN_DAYS_LEFT * DAY) + '.'
+  return 'Your code went through, thanks, but the Mac login did not extend (it still ends ' + day(afterExpiresAt) + '). ' +
+    'Nothing more from you right now. I have logged it and will retry tomorrow.'
+}
+
 function parseSwitchResult(stdout) {
   const lines = String(stdout || '').split('\n').filter(l => l.startsWith('SWITCH_RESULT='))
   if (!lines.length) return null
@@ -175,7 +204,8 @@ function alarm(state, msg, daysLeft, opts) {
   if (!critical && Date.now() - last < ALARM_COOLDOWN_MS) { log('alarm suppressed (cooldown): ' + msg); return }
   // process.execPath, never a bare `node`: under launchd only the plist's own (TCC-granted)
   // binary can read chat.db and drive Messages; PATH resolves to the ungranted one.
-  const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency', critical ? 'critical' : 'decision', msg],
+  const urgency = (opts && opts.urgency) || (critical ? 'critical' : 'decision')
+  const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency', urgency].concat(opts && opts.reply ? ['--reply'] : [], [msg]),
     { encoding: 'utf8', timeout: 60000, cwd: path.join(os.homedir(), '.code', 'ecodiaos', 'backend') })
   log('alarm text exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().slice(0, 200))
   state.last_alarm_at = new Date().toISOString()
@@ -186,7 +216,7 @@ function alarm(state, msg, daysLeft, opts) {
 function runRelogin() {
   const r = spawnSync('bash', [SWITCH_SH, TARGET, '--force-relogin', '--pin-target'], {
     encoding: 'utf8', timeout: SWITCH_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
-    env: Object.assign({}, process.env, { SWITCH_REASON: 'relogin-guard', SWITCH_NO_CAPTCHA_SOLVER: '1' }),
+    env: Object.assign({}, process.env, { SWITCH_REASON: 'relogin-guard', SWITCH_NO_CAPTCHA_SOLVER: '1', BROWSER: NO_BROWSER }),
   })
   const out = String(r.stdout || '')
   for (const line of out.split('\n').filter(l => /^\[switch-run|^SWITCH_RESULT=|^(DONE|FAILED|TIMEOUT|LOGIN_OK)/.test(l)).slice(-12)) log('  ' + line.slice(0, 300))
@@ -201,9 +231,10 @@ function readThreadRows() {
   try { return { ok: true, rows: JSON.parse(r.stdout).messages || [] } } catch (e) { return { ok: false, rows: [], err: String(r.stderr || e.message).slice(0, 200) } }
 }
 
-// `claude auth login` opens its authorize link in the Mac's default browser (canonical
-// Chrome). In the phone handshake nobody drives that tab, so close any page carrying this
-// flow's state once we are done. Only this flow's tabs; never the browser.
+// Belt for the tab leak NO_BROWSER closes: if any page in canonical Chrome still carries this
+// flow's state when we are done, close it. Only this flow's tabs; never the browser. (Without
+// NO_BROWSER the CLI's own tab landed in Chrome Beta, out of reach of :9222, which is why the
+// relay dry-run always reported closed_tabs=0.)
 function closeFlowTabs(stateParam) {
   const list = spawnSync('curl', ['-s', '-m', '4', 'http://127.0.0.1:9222/json'], { encoding: 'utf8' })
   let n = 0
@@ -217,8 +248,9 @@ function closeFlowTabs(stateParam) {
   return n
 }
 
-function killGroup(child) {
-  try { process.kill(-child.pid, 'SIGTERM') } catch (_e) { try { child.kill('SIGTERM') } catch (_e2) {} }
+function killGroup(child, sig) {
+  const s = sig || 'SIGTERM'
+  try { process.kill(-child.pid, s) } catch (_e) { try { child.kill(s) } catch (_e2) {} }
 }
 
 // The phone handshake. switch-run runs in --external-drive mode (it waits for someone else
@@ -235,63 +267,76 @@ async function runRelay(state, daysLeft, opts) {
       SWITCH_REASON: 'relogin-guard:phone', SWITCH_NO_CAPTCHA_SOLVER: '1', SWITCH_MAX_ATTEMPTS: '1',
       SWITCH_AGENT_FALLBACK_MS: String(365 * DAY), SWITCH_LEG_TIMEOUT_MS: String(waitMs + 5 * 60000),
       ACCOUNT_LOGIN_SH: RELAY_LOGIN_SH, EOS_LOGIN_CODE_WAIT_SECS: String(Math.round(waitMs / 1000) + 60),
+      BROWSER: NO_BROWSER,
     }),
   })
   let out = ''
   child.stdout.on('data', d => { out += d }); child.stderr.on('data', d => { out += d })
   const exited = new Promise(r => child.on('exit', (code, signal) => r({ code, signal })))
-  let expectedState = null
+  let expectedState = null, texted = false
+  // Every exit from the handshake comes through here, including a throw (see the catch at the
+  // bottom): left running, the held flow keeps the switch lock and a live login CLI for up to
+  // its 65-minute leg timeout with nobody reading the thread. SIGTERM the group, and SIGKILL it
+  // if the leader is still up 30s later.
   const finish = async (extra) => {
-    if (child.exitCode === null) killGroup(child)
-    await Promise.race([exited, sleep(30000)])
+    if (child.exitCode === null) {
+      killGroup(child, 'SIGTERM')
+      const gone = await Promise.race([exited.then(() => true), sleep(30000).then(() => false)])
+      if (!gone && child.exitCode === null) { killGroup(child, 'SIGKILL'); await Promise.race([exited, sleep(5000)]) }
+    }
     const closedTabs = expectedState ? closeFlowTabs(expectedState) : 0
     return Object.assign({ result: parseSwitchResult(out), closedTabs }, extra)
   }
 
-  let url = null, codeFile = null
-  for (const t0 = Date.now(); Date.now() - t0 < 120000 && child.exitCode === null;) {
-    const u = out.match(/^SWITCH_OAUTH_URL=(\S+)$/m), c = out.match(/^SWITCH_CODE_FILE=(\S+)$/m)
-    if (u && c) { url = u[1]; codeFile = c[1]; break }
-    await sleep(500)
-  }
-  if (!url) return finish({ relayed: false, reason: 'switch-run never offered an authorize link: ' + (parseSwitchResult(out) || {}).reason })
-  try { expectedState = new URL(url).searchParams.get('state') } catch (_e) {}
-  if (!expectedState) return finish({ relayed: false, reason: 'authorize link carried no state parameter' })
-  log('phone handshake: link ready (host ' + new URL(url).host + ', ' + url.length + ' chars), code file armed' + (dryRun ? ' [DRY RUN: not texting]' : ''))
+  try {
+    let url = null, codeFile = null
+    for (const t0 = Date.now(); Date.now() - t0 < 120000 && child.exitCode === null;) {
+      const u = out.match(/^SWITCH_OAUTH_URL=(\S+)$/m), c = out.match(/^SWITCH_CODE_FILE=(\S+)$/m)
+      if (u && c) { url = u[1]; codeFile = c[1]; break }
+      await sleep(500)
+    }
+    if (!url) return finish({ relayed: false, reason: 'switch-run never offered an authorize link: ' + (parseSwitchResult(out) || {}).reason })
+    try { expectedState = new URL(url).searchParams.get('state') } catch (_e) {}
+    if (!expectedState) return finish({ relayed: false, reason: 'authorize link carried no state parameter' })
+    log('phone handshake: link ready (host ' + new URL(url).host + ', ' + url.length + ' chars), code file armed' + (dryRun ? ' [DRY RUN: not texting]' : ''))
 
-  const sentAt = Date.now()
-  if (!dryRun) {
-    const dl = daysLeft === null ? 'is unreadable' : 'ends in ' + daysLeft.toFixed(1) + ' days'
-    // The send gate's HARD ceiling is 700 chars even with --long (measured 2026-10-30: a
-    // 708-char version with a 473-char link was refused too_long), and a --follow-up is capped
-    // at 300, so the link cannot ride in a second text. Keep the prose short enough that one
-    // message fits; a link that still does not fit fails loudly to the ordinary alarm.
-    const prose = 'Claude login needs one tap (Mac login ' + dl + '; a captcha blocked auto-renew). ' +
-      'Open on your phone, tap Authorize, text me the code. Open ' + Math.round(waitMs / 60000) + ' min:'
-    const msg = prose + ' ' + url
-    if (msg.length > MAX_TEXT_CHARS) return finish({ relayed: false, reason: 'authorize link too long for one text (' + msg.length + ' chars)' })
-    const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency',
-      (daysLeft !== null && daysLeft < 3) ? 'critical' : 'decision', '--long', 'carries the one-time OAuth authorize link', msg],
-    { encoding: 'utf8', timeout: 60000, cwd: path.join(os.homedir(), '.code', 'ecodiaos', 'backend') })
-    log('phone handshake text (' + msg.length + ' chars) exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ').slice(0, 200))
-    if (r.status !== 0) return finish({ relayed: false, reason: 'could not text the link (exit ' + r.status + ')' })
-    state.last_alarm_at = new Date().toISOString()
-  }
+    const sentAt = Date.now()
+    if (!dryRun) {
+      const dl = daysLeft === null ? 'is unreadable' : 'ends in ' + daysLeft.toFixed(1) + ' days'
+      // The send gate's HARD ceiling is 700 chars even with --long (measured 2026-10-30: a
+      // 708-char version with a 473-char link was refused too_long), and a --follow-up is capped
+      // at 300, so the link cannot ride in a second text. Keep the prose short enough that one
+      // message fits; a link that still does not fit fails loudly to the ordinary alarm.
+      const prose = 'Claude login needs one tap (Mac login ' + dl + '; a captcha blocked auto-renew). ' +
+        'Open on your phone, tap Authorize, text me the code. Open ' + Math.round(waitMs / 60000) + ' min:'
+      const msg = prose + ' ' + url
+      if (msg.length > MAX_TEXT_CHARS) return finish({ relayed: false, reason: 'authorize link too long for one text (' + msg.length + ' chars)' })
+      const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency',
+        (daysLeft !== null && daysLeft < 3) ? 'critical' : 'decision', '--long', 'carries the one-time OAuth authorize link', msg],
+      { encoding: 'utf8', timeout: 60000, cwd: path.join(os.homedir(), '.code', 'ecodiaos', 'backend') })
+      log('phone handshake text (' + msg.length + ' chars) exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ').slice(0, 200))
+      if (r.status !== 0) return finish({ relayed: false, reason: 'could not text the link (exit ' + r.status + ')' })
+      state.last_alarm_at = new Date().toISOString()
+      texted = true
+    }
 
-  let got = null, reads = 0, readFail = null
-  while (Date.now() - sentAt < waitMs && child.exitCode === null) {
-    const th = readThreadRows(); reads++
-    if (!th.ok) readFail = th.err
-    got = pickRelayReply(th.rows, sentAt, expectedState)
-    if (got) break
-    await sleep(dryRun ? 5000 : 15000)
-  }
-  if (!got) return finish({ relayed: true, reason: 'no usable code from Tate within ' + Math.round(waitMs / 60000) + ' min (' + reads + ' thread reads' + (readFail ? ', last read failed: ' + readFail : '') + ')', reads })
+    let got = null, reads = 0, readFail = null
+    while (Date.now() - sentAt < waitMs && child.exitCode === null) {
+      const th = readThreadRows(); reads++
+      if (!th.ok) readFail = th.err
+      got = pickRelayReply(th.rows, sentAt, expectedState)
+      if (got) break
+      await sleep(dryRun ? 5000 : 15000)
+    }
+    if (!got) return finish({ relayed: true, reason: 'no usable code from Tate within ' + Math.round(waitMs / 60000) + ' min (' + reads + ' thread reads' + (readFail ? ', last read failed: ' + readFail : '') + ')', reads })
 
-  fs.writeFileSync(codeFile, got.code + '\n')
-  log('phone handshake: code from Tate (rowid ' + got.rowid + ') written; waiting for the CLI to exchange it')
-  await Promise.race([exited, sleep(10 * 60000)])
-  return finish({ relayed: true, codeRowid: got.rowid })
+    fs.writeFileSync(codeFile, got.code + '\n')
+    log('phone handshake: code from Tate (rowid ' + got.rowid + ') written; waiting for the CLI to exchange it')
+    await Promise.race([exited, sleep(10 * 60000)])
+    return finish({ relayed: true, codeRowid: got.rowid })
+  } catch (e) {
+    return finish({ relayed: texted, reason: 'phone handshake threw: ' + String((e && e.message) || e).slice(0, 200) })
+  }
 }
 
 async function main() {
@@ -374,6 +419,9 @@ async function main() {
     state.consecutive_failures = 0
     log('RENEWED: session expiry ' + iso(before.refreshExpiresAt) + ' -> ' + iso(after.refreshExpiresAt) +
       (res.ok ? '' : ' (switch-run reported ' + (res.reason || 'not ok') + ', but the session itself is renewed)'))
+    // Tate did the manual step: he gets the guard's own answer, not only the live iMessage
+    // agent's reply to his code text, which cannot know whether the exchange worked.
+    if (relay && relay.codeRowid) alarm(state, afterCodeText(true, after.refreshExpiresAt), state.days_left, { bypassCooldown: true, urgency: 'fyi', reply: true })
     writeState(state); process.exitCode = 0; return
   }
 
@@ -392,8 +440,7 @@ async function main() {
     // Tate did his part and the CLI took the code, yet the session did not move out past 25
     // days. That is also the observation that settles whether a re-auth through the same
     // claude.ai web session is capped at that session's expiry. Tell him once, past cooldown.
-    alarm(state, 'Your code went through, thanks, but the Mac login did not extend (it still ends ' + (iso(after.refreshExpiresAt) || 'unknown').slice(0, 10) + '). ' +
-      'Nothing more from you right now. I have logged it and will retry tomorrow.', dl, { bypassCooldown: true })
+    alarm(state, afterCodeText(false, after.refreshExpiresAt), dl, { bypassCooldown: true, reply: true })
   } else if (!(relay && relay.relayed) || (dl !== null && dl < 3)) {
     alarm(state, 'My daily Claude login renewal failed (' + state.consecutive_failures + ' in a row) and ' + when + '. ' +
       (relay && relay.relayed ? 'The one-tap link I sent was not completed. ' : '') +
@@ -457,10 +504,19 @@ function selftest() {
   const pick = pickRelayReply(rows, sent, ST)
   ok(pick && pick.rowid === 4, 'picks Tate\'s reply after the ask, skipping his older code and our own message')
   ok(pickRelayReply(rows.slice(0, 3), sent, ST) === null, 'nothing usable yet means keep waiting')
+  ok(pickRelayReply([{ from: 'tate', ms: sent + 5000, rowid: 5, text: '￼P0' }, { from: 'tate', ms: sent + 6000, rowid: 6, audio: true, text: '[voice message, not transcribed]' }], sent, ST) === null,
+    'a screenshot or voice reply is never read as a code')
+
+  console.log('-- after Tate\'s code: the guard tells him what happened --')
+  const end = Date.parse('2026-12-27T22:22:27Z')
+  ok(/that did it.*until about 18 Dec\.$/.test(afterCodeText(true, end) || ''), 'renewed: says so, with the date the guard will next need him (end minus 10 days, AEST)')
+  ok(/did not extend \(it still ends 28 Nov\)/.test(afterCodeText(false, Date.parse('2026-11-27T22:22:27Z')) || ''), 'not extended: says so, with the unchanged end date')
+  ok(/did not extend/.test(afterCodeText(false, undefined) || ''), 'not extended and unreadable: still says so')
+  ok(afterCodeText(true, end).length < 200 && afterCodeText(false, end).length < 300, 'both fit one short text')
 
   console.log(failed ? '\nSELFTEST FAILED (' + failed + ')' : '\nSELFTEST PASSED')
   process.exitCode = failed ? 1 : 0
 }
 
-module.exports = { decide, sessionRenewed, parseSwitchResult, extractAuthCode, pickRelayReply }
+module.exports = { decide, sessionRenewed, parseSwitchResult, extractAuthCode, pickRelayReply, afterCodeText }
 if (require.main === module) main().catch(e => { log('FATAL ' + (e && e.stack || e)); process.exitCode = 1 })
