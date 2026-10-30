@@ -29,6 +29,7 @@ const crypto = require('crypto')
 
 const ide = require('./ide')
 const applescript = require('./applescript')
+const dispatchWindowGuard = require('./dispatch-window-guard')
 const cowork = require('./cowork')  // for kill_worker, cleanup_orphan_workers, helpers
 
 // Match cowork.js path resolution exactly (env var > platform default).
@@ -681,6 +682,9 @@ async function dispatch_worker(params) {
   // the try so a bridge outage here fails the dispatch the same way the open
   // itself would, rather than half-arming the diff.
   const ccTabsBefore = await _ccTabIdSnapshot()
+  // Loud, never blocking: a bridge window with no folder opens every worker in
+  // the home folder with no coord tools. Board d3c6e7cd item (5).
+  try { dispatchWindowGuard.checkBridgeWindowFolder() } catch (_e) {}
   try {
     const sendRes = await ide.chat_send_message({ prompt: composedBrief, submit: false })
     const inner = (sendRes && (sendRes.result || sendRes)) || {}
@@ -815,21 +819,34 @@ async function dispatch_worker(params) {
           process.stderr.write('[mac-dispatcher] claude-vscode.focus failed for ' + tab_id + ': ' + e.message + '\n')
         }
         // 2. Activate VS Code (Apple Events; gentler than Win32 WinActivate).
-        await applescript.activate_app({ app: 'Visual Studio Code' })
-        // 3. Settle for the bridge's editor.open + textarea-populate to finish.
-        await sleep(1200)
-        // 4. Single Enter. The 1200ms settle above guarantees the populated
-        //    textarea is ready, so one Return submits the brief.
-        try {
-          const kr = await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
-          if (kr && kr.ok === false) {
-            process.stderr.write('[mac-dispatcher] submit Return keystroke not ok for ' + tab_id + ': ' + JSON.stringify(kr).slice(0, 300) + '\n')
+        //    With two VS Code windows the Return goes to whichever is KEY.
+        //    activate_app AXRaises the bridged window and reads the front one
+        //    back; if it is not in front, pressing Return could submit into the
+        //    other window's chat, so the Return is skipped and the tab is left
+        //    prefilled for the worker-ack timeout to judge. One window
+        //    (ide_window.skipped) presses exactly as before.
+        const activateRes = await applescript.activate_app({ app: 'Visual Studio Code' })
+        const gate = dispatchWindowGuard.returnGate(activateRes)
+        if (!gate.press) {
+          process.stderr.write('[mac-dispatcher] submit Return SKIPPED for ' + tab_id + ': '
+            + gate.step + ': ' + gate.reason + '\n')
+          submit_path = 'focus_group+open_at_index+cc_focus_input+activate+return_skipped:' + gate.step
+        } else {
+          // 3. Settle for the bridge's editor.open + textarea-populate to finish.
+          await sleep(1200)
+          // 4. Single Enter. The 1200ms settle above guarantees the populated
+          //    textarea is ready, so one Return submits the brief.
+          try {
+            const kr = await applescript.keystroke({ key: 36 })  // key code 36 = Return; passing string 'return' types the literal word
+            if (kr && kr.ok === false) {
+              process.stderr.write('[mac-dispatcher] submit Return keystroke not ok for ' + tab_id + ': ' + JSON.stringify(kr).slice(0, 300) + '\n')
+            }
+          } catch (e) {
+            // tab is open + prefilled, recoverable by hand - but never swallow silently
+            process.stderr.write('[mac-dispatcher] submit Return keystroke threw for ' + tab_id + ': ' + e.message + '\n')
           }
-        } catch (e) {
-          // tab is open + prefilled, recoverable by hand - but never swallow silently
-          process.stderr.write('[mac-dispatcher] submit Return keystroke threw for ' + tab_id + ': ' + e.message + '\n')
+          submit_path = 'focus_group+open_at_index+cc_focus_input+activate+1200ms_settle+1x_return'
         }
-        submit_path = 'focus_group+open_at_index+cc_focus_input+activate+1200ms_settle+1x_return'
       } catch (e) {
         submit_path = 'submit_chain_threw: ' + e.message
       }
