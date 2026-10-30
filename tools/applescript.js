@@ -246,7 +246,65 @@ async function keystroke(opts) {
 async function activateApp(opts) {
   opts = opts || {}
   if (!opts.app) throw new Error('app required')
-  return tellApp({ app: opts.app, script: 'activate' })
+  const res = await tellApp({ app: opts.app, script: 'activate' })
+  if (!/^(visual studio code|code)$/i.test(String(opts.app))) return res
+  let ide_window
+  try { ide_window = await _raiseBridgedIdeWindow() } catch (e) { ide_window = { ok: false, reason: 'threw: ' + e.message } }
+  return Object.assign({}, res, { ide_window })
+}
+
+// _raiseBridgedIdeWindow - with more than one VS Code window open, make the
+// window the ide bridge answers from the key window.
+//
+// `activate` raises whichever window was last key. Every focus step before a
+// submit Return (focus<N>EditorGroup, openEditorAtIndex, claude-vscode.focus)
+// runs inside ONE window's renderer through that window's bridge, and none of
+// them raises an OS window. So with two windows the Return can land in the
+// other window's focused chat. This raises the window ide._pickInstance names
+// (the one rooted in the EcodiaOS workspace) and reads back the front window,
+// so the result says which window the next keystroke will reach.
+// One window: nothing to choose, nothing done. Board b2afd838, 2026-10-31.
+const _VSCODE_BUNDLE_ID = 'com.microsoft.VSCode'
+const _TITLE_SEP = ' \u2014 '
+
+function _titleIsFolderWindow(name, base) {
+  const app = _TITLE_SEP + 'Visual Studio Code'
+  const n = name.endsWith(app) ? name.slice(0, -app.length) : name
+  return n === base || n.endsWith(_TITLE_SEP + base)
+}
+
+async function _raiseBridgedIdeWindow() {
+  const ide = require('./ide')
+  const instances = (await ide.list_instances()).instances || []
+  if (instances.length < 2) return { ok: true, skipped: 'single_window' }
+  const inst = ide._pickInstance({})
+  const root = (inst.workspaceRoots || [])[0]
+  if (!root) return { ok: false, reason: 'picked_window_has_no_folder' }
+  const base = path.basename(String(root).replace(/[\\/]+$/, ''))
+  const proc = `(first process whose bundle identifier is "${_VSCODE_BUNDLE_ID}")`
+  const list = await _runOsascript({ body:
+    `tell application "System Events" to tell ${proc}\n` +
+    `set out to ""\nrepeat with w in windows\nset out to out & (name of w) & linefeed\nend repeat\nreturn out\nend tell` })
+  if (!list.ok) return { ok: false, reason: 'window_list_failed: ' + list.error }
+  const names = String(list.stdout || '').split('\n').filter((n) => n.length > 0)
+  // On this Mac VS Code titles a folder window "<editor> SEP <folder>" and a
+  // folderless one "<editor>", SEP being an em dash with a space either side
+  // (read live 2026-10-31: "Welcome SEP backend" and "Worker tab folder fix").
+  // The editor part drops when no editor is open, and some title settings append
+  // "SEP Visual Studio Code", so both shapes are accepted. Anchor on the folder
+  // segment at the end so an editor tab whose own name merely contains the folder
+  // name cannot match, and refuse unless exactly one window matches.
+  const hits = []
+  names.forEach((n, i) => { if (_titleIsFolderWindow(n, base)) hits.push(i + 1) })
+  if (hits.length !== 1) return { ok: false, reason: 'window_match_' + hits.length + ' for folder ' + base, windows: names.length }
+  const raise = await _runOsascript({ body:
+    `tell application "System Events" to tell ${proc}\nperform action "AXRaise" of window ${hits[0]}\nend tell` })
+  if (!raise.ok) return { ok: false, reason: 'axraise_failed: ' + raise.error }
+  const front = await _runOsascript({ body:
+    `tell application "System Events" to tell ${proc} to return name of window 1` })
+  const frontName = front.ok ? String(front.stdout || '') : null
+  const isFront = _titleIsFolderWindow(frontName || '', base)
+  return { ok: isFront, raised_folder: base, port: inst.port, front_is_bridged_window: isFront }
 }
 
 async function appsRunning() {

@@ -65,7 +65,52 @@ function pickInstance(opts) {
   if (pool.length === 0) {
     throw new Error('no IDE instance matched filters. Available: ' + JSON.stringify(instances.map(i => ({ ide: i.ide, pid: i.pid, port: i.port, workspaceRoots: i.workspaceRoots }))));
   }
-  return pool[0];
+  if (pool.length === 1 || opts.pid || opts.workspace) return pool[0];
+  return preferredOf(pool, instances);
+}
+
+// When more than one window is registered and the caller named none, pick the
+// window rooted in the EcodiaOS workspace, never whichever pid sorts first.
+//
+// WHY (2026-10-31, board b2afd838): a Claude Code tab takes its cwd from its
+// window's first folder, or the home folder when the window has none. After the
+// 30 Oct VS Code reopen the only bridged window was folderless, so every worker
+// opened in /Users/ecodia, loaded no project .mcp.json, and could not bind. The
+// fix is a second window rooted at the backend folder, and this rule is what
+// makes the dispatcher use it. The old `return pool[0]` was pid-order roulette:
+// registry keys sort numerically, so a second window silently took (or did not
+// take) every unfiltered call depending on whether its pid had wrapped.
+//
+// `ide_port` is deliberately NOT a filter. coord passes conductor.ide_bridge_port
+// on its close paths, and it has always been ignored here; honouring it now
+// would point those paths at the folderless window while workers open in the
+// rooted one, and listing two windows trades stable tab ids between them (both
+// bridges share one ide-tab-ids.json). One window answers everything.
+//
+// Several rooted windows: the earliest-started wins, so the choice cannot flip
+// between a worker's open and its close when a third window appears. No rooted
+// window at all: throw, because guessing is how a Return lands in a stranger's
+// chat.
+const PREFERRED_WORKSPACE = (process.env.EOS_IDE_PREFERRED_WORKSPACE
+  || path.join(os.homedir(), '.code', 'ecodiaos')).replace(/\\/g, '/').replace(/\/+$/, '');
+
+function isRootedInPreferred(inst) {
+  const want = PREFERRED_WORKSPACE.toLowerCase();
+  return (inst.workspaceRoots || []).some((r) => {
+    const root = String(r).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return root === want || root.startsWith(want + '/');
+  });
+}
+
+function preferredOf(pool, instances) {
+  const rooted = pool.filter(isRootedInPreferred);
+  if (rooted.length === 0) {
+    throw new Error('ambiguous IDE instance: ' + pool.length + ' windows registered and none is rooted in '
+      + PREFERRED_WORKSPACE + '. Pass {pid} or {workspace}. Available: '
+      + JSON.stringify(instances.map(i => ({ ide: i.ide, pid: i.pid, port: i.port, workspaceRoots: i.workspaceRoots }))));
+  }
+  rooted.sort((a, b) => String(a.startedAt || '').localeCompare(String(b.startedAt || '')) || a.pid - b.pid);
+  return rooted[0];
 }
 
 function httpCall(port, method, route, body, timeoutMs) {
@@ -379,6 +424,9 @@ async function message(params) {
 }
 
 module.exports = {
+  // Not a tool: the resolver applescript.activate_app uses to raise the same
+  // window every bridge call is answered by.
+  _pickInstance: pickInstance,
   list_instances: listAll,
   info,
   routes,
