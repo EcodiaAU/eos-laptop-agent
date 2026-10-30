@@ -75,8 +75,12 @@ function lockVerdict(lock, opts) {
 
 // Everything that can be known BEFORE any side effect. A refusal here costs nothing; the
 // same refusal after `claude auth login` has rewritten the Keychain is a half-switch.
+// `force` (2026-10-30) is the relogin guard's input: a fresh login into the account that is
+// ALREADY live, to restart its 30-day session clock. It bypasses ONLY the already-on-target
+// no-op. A pin to another account, a disabled row, dead CDP and a missing prerequisite all
+// still refuse, because none of them is about which account is live.
 function preflightVerdict(input) {
-  const { target, registry, pinRaw, currentShort, cdpAlive, prereq } = input || {}
+  const { target, registry, pinRaw, currentShort, cdpAlive, prereq, force } = input || {}
   if (!target) return { ok: false, code: EXIT.USAGE, reason: 'no target given' }
 
   const pin = cfg.parsePin(pinRaw)
@@ -89,7 +93,7 @@ function preflightVerdict(input) {
   if (row.enabled === false) {
     return { ok: false, code: EXIT.NOOP, reason: target + ' is disabled in the registry' + (row.disabled_reason ? ' (' + row.disabled_reason + ')' : '') }
   }
-  if (currentShort && currentShort === target) {
+  if (currentShort && currentShort === target && !force) {
     return { ok: false, code: EXIT.NOOP, reason: 'already live on ' + target, alreadyOnTarget: true }
   }
   if (cdpAlive === false) {
@@ -98,14 +102,15 @@ function preflightVerdict(input) {
   if (prereq && prereq.ok === false) {
     return { ok: false, code: EXIT.FAILED, reason: 'prereq:' + (prereq.which || 'unknown') + ' - ' + (prereq.detail || '') }
   }
-  return { ok: true, pin, row }
+  return { ok: true, pin, row, relogin: !!(force && currentShort && currentShort === target) }
 }
 
 // ── verify ───────────────────────────────────────────────────────────────────
 
 // All inputs injected, so every branch is fixture-testable.
 function verifyIdentity(input) {
-  const { targetEmail, preTokenSha, keychainTokenSha, claudeJsonEmail, activeAccountEmail, authStatusText, probe } = input || {}
+  const { targetEmail, preTokenSha, keychainTokenSha, claudeJsonEmail, activeAccountEmail, authStatusText, probe,
+    requireSessionRenewal, preRefreshExpiresAt, refreshExpiresAt, nowMs } = input || {}
   const eq = (a, b) => !!a && !!b && String(a).trim().toLowerCase() === String(b).trim().toLowerCase()
 
   const checks = {
@@ -119,6 +124,16 @@ function verifyIdentity(input) {
     auth_status: !!authStatusText && String(authStatusText).toLowerCase().includes(String(targetEmail).toLowerCase()),
     // The vendor agrees, using the NEW token. Nothing else proves the token works.
     usage_probe: !!(probe && probe.ok),
+  }
+  // A relogin's whole purpose is a NEW 30-day session, so it is checked directly: the
+  // Keychain's refreshTokenExpiresAt must have moved forward and now sit at least 25 days
+  // out. token_changed alone cannot prove it, because an ordinary access refresh also
+  // changes the token while leaving the session expiry exactly where it was.
+  if (requireSessionRenewal) {
+    const now = nowMs || Date.now()
+    checks.session_renewed = typeof refreshExpiresAt === 'number' &&
+      refreshExpiresAt > (typeof preRefreshExpiresAt === 'number' ? preRefreshExpiresAt : 0) + 60000 &&
+      (refreshExpiresAt - now) > 25 * 86400000
   }
   const failed = Object.keys(checks).filter(k => !checks[k])
   return {
@@ -244,6 +259,20 @@ function selftest() {
   ok(preflightVerdict({ target: 'code', registry: reg, cdpAlive: true, prereq: { ok: false, which: 'pw_mirror', detail: 'missing' } }).reason.startsWith('prereq:pw_mirror'),
     'a missing password mirror fails BEFORE the Keychain is touched')
 
+  console.log('-- preflight: force relogs the live account and nothing else --')
+  let fv = preflightVerdict({ target: 'tate', registry: reg, currentShort: 'tate', cdpAlive: true, force: true })
+  ok(fv.ok && fv.relogin === true, 'force on the live account passes and is marked a relogin')
+  ok(preflightVerdict({ target: 'tate', registry: reg, currentShort: null, cdpAlive: true, force: true }).relogin === false,
+    'force with no identifiable live account is an ordinary login, not a relogin (the logged-out recovery path)')
+  ok(preflightVerdict({ target: 'tate', registry: reg, currentShort: 'tate', cdpAlive: true, force: true, pinRaw: 'code' }).code === EXIT.NOOP,
+    'force does NOT override a pin to another account')
+  ok(preflightVerdict({ target: 'money', registry: reg, currentShort: 'money', cdpAlive: true, force: true }).code === EXIT.NOOP,
+    'force does NOT override a disabled registry row')
+  ok(preflightVerdict({ target: 'tate', registry: reg, currentShort: 'tate', cdpAlive: false, force: true }).reason.startsWith('cdp_dead'),
+    'force still fails on dead CDP')
+  ok(preflightVerdict({ target: 'tate', registry: reg, currentShort: 'tate', cdpAlive: true }).alreadyOnTarget === true,
+    'without force, already-on-target is still a no-op')
+
   console.log('-- preflight: the pin is force-proof and understands both formats --')
   ok(preflightVerdict({ target: 'code', registry: reg, cdpAlive: true, pinRaw: 'tate' }).code === EXIT.NOOP, 'a legacy bare-string pin still blocks')
   ok(preflightVerdict({ target: 'code', registry: reg, cdpAlive: true, pinRaw: JSON.stringify({ account: 'tate', reason: 'debugging' }) }).code === EXIT.NOOP,
@@ -265,6 +294,15 @@ function selftest() {
   ok(verifyIdentity(Object.assign({}, good, { probe: { ok: false } })).failed[0] === 'usage_probe', 'a token the vendor rejects fails')
   ok(verifyIdentity(Object.assign({}, good, { authStatusText: '' })).failed[0] === 'auth_status', 'no CLI confirmation fails')
   ok(verifyIdentity(Object.assign({}, good, { activeAccountEmail: null })).failed[0] === 'active_account', 'a missing coord marker fails')
+  ok(!('session_renewed' in verifyIdentity(good).checks), 'an ordinary switch does not grow a sixth check')
+  const D = 86400000
+  const relog = Object.assign({}, good, { requireSessionRenewal: true, nowMs: now, preRefreshExpiresAt: now + 28 * D })
+  ok(verifyIdentity(Object.assign({}, relog, { refreshExpiresAt: now + 30 * D })).ok, 'a relogin whose session expiry moved to 30 days out verifies')
+  ok(verifyIdentity(Object.assign({}, relog, { refreshExpiresAt: now + 28 * D })).failed[0] === 'session_renewed',
+    'a relogin whose session expiry did NOT move fails: a new access token alone is not a new session')
+  ok(verifyIdentity(Object.assign({}, relog, { preRefreshExpiresAt: now + 2 * D, refreshExpiresAt: now + 10 * D })).failed[0] === 'session_renewed',
+    'an expiry that moved but sits under 25 days out fails')
+  ok(verifyIdentity(Object.assign({}, relog, { refreshExpiresAt: undefined })).failed[0] === 'session_renewed', 'an unreadable post-login expiry fails')
 
   console.log('-- fail ladder: never log into a third account after the flip --')
   ok(failLadder({ flipped: false, attempt: 1, remainingTargets: ['money'] }).action === 'retry_same', 'pre-flip retries the same target once')

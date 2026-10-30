@@ -28,5 +28,7 @@
 # account when this was rewritten).
 #
 # Flags: --dry (preflight only, no side effects), --pin-target (never fall through to
-# another account; used by the switch matrix).
+# another account; used by the switch matrix), --force-relogin (a fresh login into the
+# account that is ALREADY live, to restart its fixed 30-day OAuth session; used daily by
+# scripts/claude-relogin-guard.js under launchd au.ecodia.claude-relogin-guard).
 exec node /Users/ecodia/.code/eos-laptop-agent/scripts/switch-run.js "$@"

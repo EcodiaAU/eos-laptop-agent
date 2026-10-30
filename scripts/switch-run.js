@@ -50,6 +50,14 @@ const args = process.argv.slice(2)
 const TARGET = (args.find(a => !a.startsWith('-')) || '').trim().toLowerCase()
 const DRY = args.includes('--dry')
 const PIN_TARGET = args.includes('--pin-target')
+// RELOGIN (2026-10-30). --force-relogin runs a full fresh login into the account that is
+// ALREADY live, to restart its fixed 30-day OAuth session (Keychain
+// claudeAiOauth.refreshTokenExpiresAt). Access-token refreshes rotate the refresh token but
+// never move that expiry, so without a periodic relogin the session dies on day 30 with no
+// warning: that took the machine down for ~2 days on 2026-10-29/30. Driven daily by
+// scripts/claude-relogin-guard.js (launchd au.ecodia.claude-relogin-guard). A relogin is not a
+// switch: it writes no switch-request, pings no conductor and arms no reawaken.
+const FORCE_RELOGIN = args.includes('--force-relogin') || process.env.SWITCH_FORCE_RELOGIN === '1'
 // AGENT-PRIMARY (2026-08-20). --external-drive: switch-run does NOT spawn the blind macro; it
 // emits the OAuth URL + CODE_FILE and waits for an external agent (a CC worker that reads the
 // page with its own vision and drives CDP) to write the code. All orchestration stays here.
@@ -201,6 +209,14 @@ function keychainRaw() {
 function keychainTokenSha() {
   try { return sha(JSON.parse(keychainRaw()).claudeAiOauth.accessToken) } catch (e) { return null }
 }
+// The session's hard expiry (ms epoch). A timestamp, never a secret, so it is safe to log.
+function keychainRefreshExpiresAt() {
+  try {
+    const v = JSON.parse(keychainRaw()).claudeAiOauth.refreshTokenExpiresAt
+    return typeof v === 'number' ? v : null
+  } catch (e) { return null }
+}
+function isoOrNull(ms) { return typeof ms === 'number' ? new Date(ms).toISOString() : null }
 function claudeJsonEmail() {
   try { return readJson(CLAUDE_JSON, {}).oauthAccount.emailAddress || null } catch (e) { return null }
 }
@@ -518,11 +534,14 @@ async function verify(target) {
     activeAccountEmail: activeAccountEmail(),
     authStatusText: authStatusText(),
     probe,
+    requireSessionRenewal: FORCE_RELOGIN,
+    preRefreshExpiresAt: global.__PRE_REFRESH_EXP,
+    refreshExpiresAt: keychainRefreshExpiresAt(),
   })
 }
 
 async function main() {
-  if (!TARGET) return emit({ ok: false, code: core.EXIT.USAGE, reason: 'usage: switch-run.js <tate|code|money> [--dry] [--pin-target]' })
+  if (!TARGET) return emit({ ok: false, code: core.EXIT.USAGE, reason: 'usage: switch-run.js <tate|code|money> [--dry] [--pin-target] [--force-relogin]' })
 
   // Lock first, so two triggers can never drive two concurrent logins into one Keychain.
   // ATOMIC: acquireLock uses O_EXCL so exactly one process wins even on a simultaneous fire.
@@ -559,11 +578,20 @@ async function main() {
   const pre = core.preflightVerdict({
     target: TARGET, registry: reg, pinRaw, currentShort,
     cdpAlive: DRY ? await cdpAlive() : await ensureCdp(), prereq: loginPrereq(row),
+    force: FORCE_RELOGIN,
   })
   if (!pre.ok) return emit({ ok: false, code: pre.code, reason: pre.reason, from: currentEmail })
-  if (DRY) return emit({ ok: true, code: core.EXIT.VERIFIED, dry: true, target: TARGET, from: currentEmail, reason: 'preflight clean' })
+  const RELOGIN = !!pre.relogin
+  if (DRY) {
+    return emit({
+      ok: true, code: core.EXIT.VERIFIED, dry: true, target: TARGET, from: currentEmail, relogin: RELOGIN,
+      refresh_expires_at: isoOrNull(keychainRefreshExpiresAt()), reason: 'preflight clean',
+    })
+  }
 
   global.__PRE_TOKEN_SHA = keychainTokenSha()
+  global.__PRE_REFRESH_EXP = keychainRefreshExpiresAt()
+  if (FORCE_RELOGIN) log('force-relogin: ' + (RELOGIN ? 'fresh login into the live account ' : 'login into ') + TARGET + ', session expiry before = ' + isoOrNull(global.__PRE_REFRESH_EXP))
   const drainDeadline = new Date(Date.now() + cfg.TRIGGERS.POST_SWITCH_GRACE_MS).toISOString()
 
   // Seed the OUTGOING account from the Keychain before the login overwrites it, and
@@ -597,15 +625,26 @@ async function main() {
           ok: true, code: core.EXIT.VERIFIED, target: TARGET, to: TARGET + '@ecodia.au',
           from: currentEmail, attempt, verify: v.checks, drain_deadline: drainDeadline, run_id: RUN_ID,
         }
-        appendSwapHistory(Object.assign({ at: new Date().toISOString(), result: 'verified' }, result))
-        writeJsonAtomic(cfg.PATHS.SWITCH_REQUEST_FILE, {
-          target: TARGET + '@ecodia.au', from: currentEmail, reason: process.env.SWITCH_REASON || 'switch-run',
-          via: 'account-switch.sh', result: 'verified', drain_deadline: drainDeadline,
-          raised_at: new Date().toISOString(),
-        })
-        try { registry.recordSwitchResult(TARGET, true, null, { by: 'switch-run' }) } catch (e) {}
-        notifyConductor(result)
-        reawakenConductor(result)
+        if (FORCE_RELOGIN) {
+          result.relogin = RELOGIN
+          result.refresh_expires_before = isoOrNull(global.__PRE_REFRESH_EXP)
+          result.refresh_expires_after = isoOrNull(keychainRefreshExpiresAt())
+        }
+        appendSwapHistory(Object.assign({ at: new Date().toISOString(), result: RELOGIN ? 'relogin_verified' : 'verified' }, result))
+        if (!RELOGIN) {
+          // A same-account relogin changes no account, so nothing that reacts to a switch
+          // (drain window, conductor ping, reawaken tab) should see one.
+          writeJsonAtomic(cfg.PATHS.SWITCH_REQUEST_FILE, {
+            target: TARGET + '@ecodia.au', from: currentEmail, reason: process.env.SWITCH_REASON || 'switch-run',
+            via: 'account-switch.sh', result: 'verified', drain_deadline: drainDeadline,
+            raised_at: new Date().toISOString(),
+          })
+        }
+        try { registry.recordSwitchResult(TARGET, true, null, { by: RELOGIN ? 'switch-run:relogin' : 'switch-run' }) } catch (e) {}
+        if (!RELOGIN) {
+          notifyConductor(result)
+          reawakenConductor(result)
+        }
         beat('DONE')
         return emit(result)
       }
@@ -628,6 +667,11 @@ async function main() {
   const failResult = {
     ok: false, code: core.EXIT.FAILED, target: TARGET, from: currentEmail,
     attempts: attempt, reason: lastReason, run_id: RUN_ID,
+  }
+  if (FORCE_RELOGIN) {
+    failResult.relogin = RELOGIN
+    failResult.refresh_expires_before = isoOrNull(global.__PRE_REFRESH_EXP)
+    failResult.refresh_expires_after = isoOrNull(keychainRefreshExpiresAt())
   }
   appendSwapHistory(Object.assign({ at: new Date().toISOString(), result: 'failed' }, failResult))
   await reconcile('after a failed switch')

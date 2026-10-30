@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps the live Claude OAuth session from reaching its hard 30-day expiry.
+
+  The session expiry is claudeAiOauth.refreshTokenExpiresAt in the Keychain entry
+  "Claude Code-credentials". Access-token refreshes never move it. When it lapsed on
+  2026-10-29/30 the Mac sat logged out for ~2 days, because a logged-out machine cannot
+  open a Claude tab to fix itself. This job reads that expiry once a day and, when fewer
+  than 10 days remain (session older than ~20 days), forces a fresh login via
+  scripts/account-switch.sh tate (with force-relogin and pin-target), then proves the
+  expiry moved out past 25 days. Failure texts Tate over the free iMessage path.
+
+  WHY LAUNCHD. It must run when Claude cannot, so it is node + security + canonical CDP
+  only, with no Claude budget and no Supabase in the path.
+
+  CADENCE. Daily at 17:43 AEST plus RunAtLoad. A calendar fire missed while the Mac sleeps
+  runs once on wake; RunAtLoad covers a reboot. A plain 14-day StartInterval would reset on
+  every reboot and never catch up, and a single missed fire there could lose the whole
+  margin. Here a missed fire costs one day of a 10-day window, and every day inside the
+  window is another attempt.
+
+  Install:
+    cp launchd/au.ecodia.claude-relogin-guard.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/au.ecodia.claude-relogin-guard.plist
+  Verify:   launchctl list | grep claude-relogin-guard
+  Manual:   node scripts/claude-relogin-guard.js check   (prefix with two dashes; also: force, selftest)
+  Doctrine: ecodiaos backend patterns/claude-oauth-session-is-30-days-and-only-a-relogin-resets-it-2026-10-30.md
+-->
+<plist version="1.0"><dict>
+  <key>Label</key><string>au.ecodia.claude-relogin-guard</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/ecodia/.code/eos-laptop-agent/scripts/claude-relogin-guard.js</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/ecodia/.code/eos-laptop-agent</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/ecodia</string>
+  </dict>
+  <key>StartCalendarInterval</key><dict>
+    <key>Hour</key><integer>17</integer><key>Minute</key><integer>43</integer>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/ecodia/Library/Logs/ecodiaos/claude-relogin-guard.log</string>
+  <key>StandardErrorPath</key><string>/Users/ecodia/Library/Logs/ecodiaos/claude-relogin-guard.log</string>
+</dict></plist>
