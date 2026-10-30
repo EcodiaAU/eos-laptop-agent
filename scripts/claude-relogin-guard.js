@@ -60,6 +60,7 @@ const THREAD_TAIL = path.join(os.homedir(), '.code', 'ecodiaos', 'backend', 'ime
 // taps Authorize on his phone and texts back the code. RELOGIN_RELAY=0 turns it off.
 const RELAY_ENABLED = process.env.RELOGIN_RELAY !== '0'
 const RELAY_WAIT_MS = Number(process.env.RELOGIN_RELAY_WAIT_MS) || 60 * 60 * 1000
+const MAX_TEXT_CHARS = 690 // text-tate's hard ceiling is 700
 const COORD_ROOT = process.env.COORD_ROOT || path.join(os.homedir(), '.ecodiaos', 'coordination')
 const STATE_FILE = process.env.RELOGIN_STATE_FILE || path.join(COORD_ROOT, 'relogin-guard.json')
 const TARGET = process.env.RELOGIN_ACCOUNT || 'tate'
@@ -168,8 +169,8 @@ function writeState(s) {
 // Free iMessage to Tate. --read-thread is the non-interactive ack (a launchd job cannot
 // satisfy --ack-thread). Rate-limited so a daily retry loop is one text a day at most,
 // unless the session is about to die.
-function alarm(state, msg, daysLeft) {
-  const critical = daysLeft === null || daysLeft < 3
+function alarm(state, msg, daysLeft, opts) {
+  const critical = daysLeft === null || daysLeft < 3 || !!(opts && opts.bypassCooldown)
   const last = state.last_alarm_at ? Date.parse(state.last_alarm_at) : 0
   if (!critical && Date.now() - last < ALARM_COOLDOWN_MS) { log('alarm suppressed (cooldown): ' + msg); return }
   // process.execPath, never a bare `node`: under launchd only the plist's own (TCC-granted)
@@ -256,18 +257,23 @@ async function runRelay(state, daysLeft, opts) {
   if (!url) return finish({ relayed: false, reason: 'switch-run never offered an authorize link: ' + (parseSwitchResult(out) || {}).reason })
   try { expectedState = new URL(url).searchParams.get('state') } catch (_e) {}
   if (!expectedState) return finish({ relayed: false, reason: 'authorize link carried no state parameter' })
-  log('phone handshake: link ready (host ' + new URL(url).host + '), code file armed' + (dryRun ? ' [DRY RUN: not texting]' : ''))
+  log('phone handshake: link ready (host ' + new URL(url).host + ', ' + url.length + ' chars), code file armed' + (dryRun ? ' [DRY RUN: not texting]' : ''))
 
   const sentAt = Date.now()
   if (!dryRun) {
     const dl = daysLeft === null ? 'is unreadable' : 'ends in ' + daysLeft.toFixed(1) + ' days'
-    const msg = 'Claude login renewal needs one tap. The Mac login ' + dl + ' and the automatic renewal hit a captcha. ' +
-      'On your phone: open this link, sign in as tate@ if asked, tap Authorize, then text me back the code it shows. ' +
-      'Open for ' + Math.round(waitMs / 60000) + ' min. ' + url
+    // The send gate's HARD ceiling is 700 chars even with --long (measured 2026-10-30: a
+    // 708-char version with a 473-char link was refused too_long), and a --follow-up is capped
+    // at 300, so the link cannot ride in a second text. Keep the prose short enough that one
+    // message fits; a link that still does not fit fails loudly to the ordinary alarm.
+    const prose = 'Claude login needs one tap (Mac login ' + dl + '; a captcha blocked auto-renew). ' +
+      'Open on your phone, tap Authorize, text me the code. Open ' + Math.round(waitMs / 60000) + ' min:'
+    const msg = prose + ' ' + url
+    if (msg.length > MAX_TEXT_CHARS) return finish({ relayed: false, reason: 'authorize link too long for one text (' + msg.length + ' chars)' })
     const r = spawnSync(process.execPath, [TEXT_TATE, '--from', 'relogin-guard', '--read-thread', '--urgency',
       (daysLeft !== null && daysLeft < 3) ? 'critical' : 'decision', '--long', 'carries the one-time OAuth authorize link', msg],
     { encoding: 'utf8', timeout: 60000, cwd: path.join(os.homedir(), '.code', 'ecodiaos', 'backend') })
-    log('phone handshake text exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ').slice(0, 200))
+    log('phone handshake text (' + msg.length + ' chars) exit=' + r.status + ' ' + String((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ').slice(0, 200))
     if (r.status !== 0) return finish({ relayed: false, reason: 'could not text the link (exit ' + r.status + ')' })
     state.last_alarm_at = new Date().toISOString()
   }
@@ -382,7 +388,13 @@ async function main() {
   log('FAILED: switch code=' + res.code + ' reason=' + String(res.reason || run.signal || 'no SWITCH_RESULT').slice(0, 300) + '; expiry after=' + iso(after.refreshExpiresAt))
   // If Tate was already texted the link today, that text was the ask; only a near-dead
   // session earns a second message.
-  if (!(relay && relay.relayed) || (dl !== null && dl < 3)) {
+  if (relay && relay.codeRowid) {
+    // Tate did his part and the CLI took the code, yet the session did not move out past 25
+    // days. That is also the observation that settles whether a re-auth through the same
+    // claude.ai web session is capped at that session's expiry. Tell him once, past cooldown.
+    alarm(state, 'Your code went through, thanks, but the Mac login did not extend (it still ends ' + (iso(after.refreshExpiresAt) || 'unknown').slice(0, 10) + '). ' +
+      'Nothing more from you right now. I have logged it and will retry tomorrow.', dl, { bypassCooldown: true })
+  } else if (!(relay && relay.relayed) || (dl !== null && dl < 3)) {
     alarm(state, 'My daily Claude login renewal failed (' + state.consecutive_failures + ' in a row) and ' + when + '. ' +
       (relay && relay.relayed ? 'The one-tap link I sent was not completed. ' : '') +
       'I retry every day and text you a one-tap link each time. Log: ~/Library/Logs/ecodiaos/claude-relogin-guard.log', dl)
