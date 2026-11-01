@@ -281,6 +281,7 @@ async function trustedClickText(page, re) {
 // Drive a Google GSI page (popup or same-tab) to select EMAIL + pass pw/2FA. Focusless.
 async function driveGoogle(gp) {
   await focusless(gp)
+  const steer = { tries: 0 }
   for (let i = 0; i < 40; i++) {
     if (gp.isClosed && gp.isClosed()) { log('google page closed (handshake done)'); return true }
     let st
@@ -333,6 +334,35 @@ async function driveGoogle(gp) {
           continue
         }
         log('2FA code prompt but no enrolled seed for ' + TARGET + ' - falling back to phone approval')
+      }
+      // STEER TO THE AUTHENTICATOR (2026-11-02, worker 224ae858). Google picks the
+      // challenge, and for code@ it now defaults to "Check your phone". That screen has no
+      // code box, so the TOTP branch above never fired and an unattended login waited on a
+      // phone tap until the budget ran out (seen 2026-11-02: 40 iterations of WAITING_2FA
+      // while the vault could mint a valid code the whole time). If this account has a
+      // vault seed, click "Try another way", then the Google Authenticator option; the
+      // next iteration finds the code box and the branch above fills it. Bounded so it
+      // can never cycle between the two screens.
+      if (!codeBox && steer.tries < 4 && mintTotp()) {
+        const pick = await gp.evaluate(() => {
+          const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 2 && r.height > 2 }
+          const area = (e) => { const r = e.getBoundingClientRect(); return r.width * r.height }
+          const els = [].slice.call(document.querySelectorAll('button,[role=button],[role=link],a,li,[data-challengetype],[data-action]')).filter(vis)
+          const smallest = (re) => els.filter((e) => re.test((e.innerText || '').trim())).sort((a, b) => area(a) - area(b))[0]
+          const auth = smallest(/google authenticator|authenticator app/i)
+          const other = smallest(/^try another way$/i)
+          const el = auth || other
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          return { kind: auth ? 'authenticator' : 'try-another-way', x: r.x + r.width / 2, y: r.y + r.height / 2 }
+        }).catch(() => null)
+        if (pick) {
+          steer.tries++
+          log('2FA steer: clicking ' + pick.kind + ' (attempt ' + steer.tries + ')')
+          await gp.mouse.click(pick.x, pick.y)
+          await sleep(3000)
+          continue
+        }
       }
       log('WAITING_2FA - needs an approval tap on the phone')
       await sleep(3000)
