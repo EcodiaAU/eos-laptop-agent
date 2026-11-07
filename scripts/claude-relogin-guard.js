@@ -85,11 +85,31 @@ const NO_BROWSER = process.env.RELOGIN_BROWSER || '/usr/bin/true'
 
 // session: { ok, refreshExpiresAt, reason } from readSession(). lastVerifiedAt: ms of our
 // own last proven relogin, used only when the Keychain stops carrying the expiry field.
+//
+// lastGoodExpiresAt: ms of the last session end this guard actually READ from the Keychain.
+// Older Claude clients that share this one Keychain entry do not know refreshTokenExpiresAt
+// (measured 2026-11-07: VS Code extension 2.1.281 and the Agent SDK 0.2.141 that the iMessage
+// agent runs, which bundles Claude Code 2.1.141), so whenever one of them does the 8-hourly
+// access refresh it writes the blob back WITHOUT the field, and the field stays missing until a
+// newer client refreshes. That shape is a live session, not a logout: on 2026-11-07 07:43Z it
+// paged Tate to re-auth a login that still had 20 days left. It counts as live only on positive
+// evidence: an unexpired access token proves a refresh succeeded inside the last 8 hours, and
+// the session end is a fixed anchor that only a relogin moves, so the last anchor we read
+// stands in for the missing field. An expired access token, or no anchor on record, keeps the
+// author's behaviour and relogs.
 function decide(input) {
-  const { session, nowMs, thresholdDays, lastVerifiedAt } = input || {}
+  const { session, nowMs, thresholdDays, lastVerifiedAt, lastGoodExpiresAt } = input || {}
   const now = nowMs || Date.now()
   const th = typeof thresholdDays === 'number' ? thresholdDays : RELOGIN_DAYS_LEFT
   if (!session || !session.ok) {
+    if (session && session.reason === 'no_refresh_expiry' && typeof session.accessExpiresAt === 'number' &&
+        session.accessExpiresAt > now && typeof lastGoodExpiresAt === 'number' && lastGoodExpiresAt > now) {
+      const dl = (lastGoodExpiresAt - now) / DAY
+      const why = 'Keychain blob carries no session expiry (an older client wrote the last access refresh); access token live to ' +
+        new Date(session.accessExpiresAt).toISOString() + ', last read session end ' + new Date(lastGoodExpiresAt).toISOString()
+      if (dl >= th) return { act: false, daysLeft: dl, reason: why + ' is ' + dl.toFixed(2) + 'd out, threshold ' + th + 'd' }
+      return { act: true, daysLeft: dl, reason: why + ' is ' + dl.toFixed(2) + 'd out, under the ' + th + 'd threshold' }
+    }
     if (session && session.reason === 'no_refresh_expiry' && typeof lastVerifiedAt === 'number') {
       const ageDays = (now - lastVerifiedAt) / DAY
       if (ageDays < 30 - th) {
@@ -374,9 +394,16 @@ async function main() {
   let session = readSession()
   if (CHECK && sim !== -1) session = { ok: true, refreshExpiresAt: now + Number(argv[sim + 1]) * DAY, simulated: true }
   const lastVerifiedAt = state.last_verified_relogin_at ? Date.parse(state.last_verified_relogin_at) : undefined
+  // Remember every session end we actually read, and never null it on a field-less read, so
+  // decide() has an anchor when an older client strips the field (see decide()).
+  if (session.ok && !session.simulated) {
+    state.last_good_session_expires_at = iso(session.refreshExpiresAt)
+    state.last_good_read_at = new Date(now).toISOString()
+  }
+  const lastGoodExpiresAt = state.last_good_session_expires_at ? Date.parse(state.last_good_session_expires_at) : undefined
   const verdict = FORCE
     ? { act: true, daysLeft: session.ok ? (session.refreshExpiresAt - now) / DAY : null, reason: 'forced by hand' }
-    : decide({ session, nowMs: now, lastVerifiedAt })
+    : decide({ session, nowMs: now, lastVerifiedAt, lastGoodExpiresAt })
 
   log((verdict.act ? 'RELOGIN' : 'SKIP') + ' target=' + TARGET + ' session_expires=' + iso(session.refreshExpiresAt) +
     (session.simulated ? ' (SIMULATED)' : '') + ' :: ' + verdict.reason)
@@ -472,6 +499,23 @@ function selftest() {
   ok(decide({ session: { ok: false, reason: 'no_refresh_expiry' }, nowMs: now, thresholdDays: 10, lastVerifiedAt: now - 21 * DAY }).act === true,
     'and relogs once that is past the 20-day mark')
   ok(decide({ session: { ok: false, reason: 'no_refresh_expiry' }, nowMs: now }).act === true, 'with neither, it relogs')
+
+  console.log('-- decide: a field-less blob from an older client is a LIVE session (2026-11-07 false page) --')
+  const fl = (accessH) => ({ ok: false, reason: 'no_refresh_expiry', accessExpiresAt: now + accessH * 3600e3 })
+  ok(decide({ session: fl(4), nowMs: now, thresholdDays: 10, lastGoodExpiresAt: now + 20.33 * DAY }).act === false,
+    'access token live + last read end 20.33d out: SKIP (the exact 2026-11-07 07:43Z shape)')
+  ok(decide({ session: fl(4), nowMs: now, thresholdDays: 10, lastGoodExpiresAt: now + 5 * DAY }).act === true,
+    'access token live but last read end 5d out: relogs')
+  ok(decide({ session: fl(4), nowMs: now, thresholdDays: 10, lastGoodExpiresAt: now + 5 * DAY }).daysLeft > 4.9,
+    'and carries the real days left, so the under-3-day urgency still works')
+  ok(decide({ session: fl(-1), nowMs: now, thresholdDays: 10, lastGoodExpiresAt: now + 20 * DAY }).act === true,
+    'access token EXPIRED: no proof of a live session, relogs even with a good anchor')
+  ok(decide({ session: fl(4), nowMs: now, thresholdDays: 10 }).act === true,
+    'access token live but no anchor on record: relogs (author behaviour)')
+  ok(decide({ session: fl(4), nowMs: now, thresholdDays: 10, lastGoodExpiresAt: now - 1 * DAY }).act === true,
+    'an anchor already in the past never skips')
+  ok(decide({ session: { ok: false, reason: 'no_keychain_entry', accessExpiresAt: now + 4 * 3600e3 }, nowMs: now, thresholdDays: 10, lastGoodExpiresAt: now + 20 * DAY }).act === true,
+    'the fallback is only for no_refresh_expiry: a missing entry still relogs')
 
   console.log('-- sessionRenewed: the verify gate --')
   ok(sessionRenewed(s(9), s(30), now), 'expiry moved from 9d to 30d out: renewed')
