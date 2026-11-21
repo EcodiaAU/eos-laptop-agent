@@ -458,6 +458,117 @@ const coord = require('./coord.js')
   assert(r.tabId === 'ttab_prior_1_1' && r.reason === 'threw',
     'REPLACE-ONLY: a THROW returns the PRIOR id, never null (got ' + r.tabId + '/' + r.reason + ')')
 
+  // ── Part 2d: a slot that already names a LIVE worker heals itself ──────────
+  // Board ce638fbf, 2026-09-21. Every probe above asks whether a capture ADOPTS
+  // a worker's id. The incident was a capture that had ALREADY landed on one (a
+  // headless session beat inside a worker's spawn window, before its tab_handle
+  // existed), after which replace-only carried the worker's id through every
+  // beat: all_claimed_by_workers returned the prior, and the prior WAS the
+  // worker's. The worker's close_my_tab was refused conductor_stable_id_protected
+  // and its tab leaked. Separately the title_match came to name a second, live
+  // worker's tab, whose close belt 2 would refuse by label.
+  console.log('Part 2d: a live worker\'s id or label is evicted from the slot')
+  const W = path.join(tmpRoot, 'workers')
+  const C = path.join(tmpRoot, 'conductors')
+  const saved = {}
+  for (const f of ['current.json', 'default.json']) {
+    try { saved[f] = fs.readFileSync(path.join(C, f), 'utf8') } catch (e) { saved[f] = null }
+  }
+  const putWorker = (tabId, ttab, terminated) => fs.writeFileSync(path.join(W, tabId + '.json'), JSON.stringify({
+    tab_id: tabId, tab_handle: { tabId: ttab, viewColumn: 1 },
+    terminated_at: terminated ? '2026-09-21T01:10:51.229Z' : null,
+  }))
+  const putSlot = (row) => {
+    const full = Object.assign({ tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 45955,
+      registered_at: new Date().toISOString(), last_seen_at: new Date().toISOString(), in_turn: false }, row)
+    for (const f of ['current.json', 'default.json']) fs.writeFileSync(path.join(C, f), JSON.stringify(full))
+  }
+  putWorker('tab_eos', 'ttab_eos_1_1', false)     // the EOS-grants worker, still live
+  putWorker('tab_gmail', 'ttab_gmail_1_1', false) // the gmail-inbox-poll worker, live
+  putWorker('tab_corpse', 'ttab_corpse_1_1', true) // a finished worker's row
+
+  // (2d-1) The helper's own eviction: a prior a LIVE worker owns comes back null
+  // even on a branch that would otherwise return the prior untouched.
+  LIVE = [ tab('ttab_else_1_1', 'Something Else', true, 0) ]
+  r = await cap('Ecodia Site', 7457, 'ttab_eos_1_1')
+  assert(r.tabId === null && r.prior_evicted === 'ttab_eos_1_1' && r.reason === 'no_label_match',
+    'a prior id a LIVE worker owns is EVICTED, not carried (got ' + r.tabId + '/' + r.reason + ')')
+
+  // (2d-2) ...but a DEAD worker's claim is not grounds to evict. The bridge
+  // recycles ids by position, so a corpse's id can now name a human chat, and the
+  // slot holding it is what stops the orphan sweep closing that chat by the
+  // corpse's stored id. Leak over wrong-close.
+  r = await cap('Ecodia Site', 7457, 'ttab_corpse_1_1')
+  assert(r.tabId === 'ttab_corpse_1_1' && !r.prior_evicted,
+    'a prior only a TERMINATED worker claims is kept (recycled-id backstop) (got ' + r.tabId + ')')
+
+  // (2d-3) THE INCIDENT, end to end through the heartbeat. Slot id = the EOS
+  // worker's, slot label = the gmail worker's, both workers live, and the beat
+  // carries no label (the stored one is used).
+  const liveTabs = () => [
+    tab('ttab_human_1_1', 'Day crew backlog and Cap…', false, 0),
+    tab('ttab_eos_1_1', 'EOS grants lane G1 real …', false, 1),
+    tab('ttab_gmail_1_1', 'Gmail inbox poll mechani…', true, 2),
+  ]
+  LIVE = liveTabs()
+  putSlot({ title_match: 'Gmail inbox poll mechani…', stable_tab_id: 'ttab_eos_1_1' })
+  const before = JSON.parse(fs.readFileSync(path.join(C, 'current.json'), 'utf8'))
+  const eosBefore = guard.evaluateClose('stable_tab_id:ttab_eos_1_1', LIVE[1], before, { selfClose: true })
+  assert(eosBefore.allow === false && eosBefore.reason === 'conductor_stable_id_protected',
+    'premise: the poisoned slot refuses the EOS worker\'s own close (got ' + eosBefore.reason + ')')
+  await coord.conductor_heartbeat({})
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === null,
+    'the heartbeat EVICTS the live worker\'s id from the slot (got ' + st.conductor.stable_tab_id + ')')
+  assert(st.conductor.title_match === '',
+    'and DROPS a stored label that names only a live worker\'s tab (got ' + JSON.stringify(st.conductor.title_match) + ')')
+  const eosAfter = guard.evaluateClose('stable_tab_id:ttab_eos_1_1', LIVE[1], st.conductor, { selfClose: true })
+  const gmailAfter = guard.evaluateClose('stable_tab_id:ttab_gmail_1_1', LIVE[2], st.conductor, { selfClose: true })
+  assert(eosAfter.allow === true, 'the EOS worker can now close its own tab (got ' + eosAfter.reason + ')')
+  assert(gmailAfter.allow === true, 'the gmail worker can now close its own tab (got ' + gmailAfter.reason + ')')
+
+  // (2d-4) The heal a human chat gives: a beat carrying the human chat's own
+  // label from the poisoned state captures the human tab's id.
+  putSlot({ title_match: 'Gmail inbox poll mechani…', stable_tab_id: 'ttab_eos_1_1' })
+  await coord.conductor_heartbeat({ title_match: 'Day crew backlog and Cap…' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.stable_tab_id === 'ttab_human_1_1' && st.conductor.title_match === 'Day crew backlog and Cap…',
+    'a human chat\'s beat replaces the poison with its own id and label (got ' + st.conductor.stable_tab_id + ')')
+
+  // (2d-5) An INCOMING worker label is refused and the stored human label kept,
+  // the same fallback a worker-SHAPED label already gets.
+  await coord.conductor_heartbeat({ title_match: 'Gmail inbox poll mechani…' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.title_match === 'Day crew backlog and Cap…' && st.conductor.stable_tab_id === 'ttab_human_1_1',
+    'an incoming label naming a live worker is refused, the stored human label kept (got ' +
+    JSON.stringify(st.conductor.title_match) + '/' + st.conductor.stable_tab_id + ')')
+
+  // (2d-6) The register path, as it ran at 01:10:51.135Z: same chat (claude_port
+  // unchanged), stale slot, the label and prior id both the live EOS worker's.
+  putSlot({ title_match: 'EOS grants lane G1 real …', stable_tab_id: 'ttab_eos_1_1' })
+  res = await coord.register_conductor({
+    tab_id: 'conductor', ide: 'stable', ide_bridge_port: 7457, claude_port: 45955,
+    title_match: 'EOS grants lane G1 real …',
+  })
+  assert(res.conductor.stable_tab_id === null && res.conductor.title_match === '',
+    'register refuses the worker\'s label AND evicts its id (got ' +
+    JSON.stringify(res.conductor.title_match) + '/' + res.conductor.stable_tab_id + ')')
+
+  // (2d-7) A label only a DEAD worker's tab wears is not refused, for the same
+  // recycled-id reason as (2d-2).
+  LIVE = [ tab('ttab_corpse_1_1', 'Ecodia Site', true, 0) ]
+  putSlot({ title_match: 'Ecodia Site', stable_tab_id: 'ttab_corpse_1_1' })
+  await coord.conductor_heartbeat({ title_match: 'Ecodia Site' })
+  st = await coord.get_conductor_state({})
+  assert(st.conductor.title_match === 'Ecodia Site' && st.conductor.stable_tab_id === 'ttab_corpse_1_1',
+    'a label and id only a TERMINATED worker claims are kept (got ' +
+    JSON.stringify(st.conductor.title_match) + '/' + st.conductor.stable_tab_id + ')')
+
+  for (const f of ['tab_eos', 'tab_gmail', 'tab_corpse']) { try { fs.unlinkSync(path.join(W, f + '.json')) } catch (e) {} }
+  for (const f of ['current.json', 'default.json']) {
+    if (saved[f] != null) fs.writeFileSync(path.join(C, f), saved[f]); else { try { fs.unlinkSync(path.join(C, f)) } catch (e) {} }
+  }
+
   // ── Part 2c: a TAKEOVER must not inherit identity from the row it archives ──
   // The defect this part exists for (2026-08-29 lane W1 item 2). register_
   // conductor archives the old row when claude_port differs, and then seeded the
