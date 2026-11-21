@@ -26,6 +26,14 @@
   margin. Here a missed fire costs one day of a 10-day window, and every day inside the
   window is another attempt.
 
+  TATE'S HANDLE (2026-11-21, lane cowork.infra-lane-R2). Every iMessage to +61404247153 has
+  failed with error=22 since 2026-11-19T23:17Z, including the 11-20 authorize link, while
+  Tate writes from the Apple ID tate.donohoe@gmail.com, which still delivers. IMSG_SEND_TO
+  points this job's sends there (send-imessage.js: IMSG_SEND_TO, else the first handle) and
+  IMSG_TATE_HANDLES lets the code reader see replies from it (chatdb-read.js). A code from
+  either handle is only accepted if it carries this flow's own OAuth state. Drop
+  IMSG_SEND_TO once the +61 number delivers again (board a08e1b34).
+
   Install:
     cp launchd/au.ecodia.claude-relogin-guard.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/au.ecodia.claude-relogin-guard.plist
@@ -44,6 +52,8 @@
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key><string>/Users/ecodia</string>
     <key>DYLD_FALLBACK_LIBRARY_PATH</key><string>/Users/ecodia/.ecodiaos/node22-compat/lib</string>
+    <key>IMSG_SEND_TO</key><string>tate.donohoe@gmail.com</string>
+    <key>IMSG_TATE_HANDLES</key><string>+61404247153,tate.donohoe@gmail.com</string>
   </dict>
   <key>StartCalendarInterval</key><dict>
     <key>Hour</key><integer>17</integer><key>Minute</key><integer>43</integer>
