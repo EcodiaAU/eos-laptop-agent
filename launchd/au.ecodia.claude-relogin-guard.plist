@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Keeps the live Claude OAuth session from reaching its hard 30-day expiry.
+  Keeps the live Claude OAuth session from reaching its hard expiry (a fresh login is
+  granted about 28.5 days, measured on the 2026-11-22 renewal, not the 30 once assumed).
 
   The session expiry is claudeAiOauth.refreshTokenExpiresAt in the Keychain entry
   "Claude Code-credentials". Access-token refreshes never move it. When it lapsed on
   2026-10-29/30 the Mac sat logged out for ~2 days, because a logged-out machine cannot
   open a Claude tab to fix itself. This job reads that expiry once a day and, when fewer
-  than 10 days remain (session older than ~20 days), forces a fresh login via
+  than RELOGIN_DAYS_LEFT days remain (default 10), forces a fresh login via
   scripts/account-switch.sh tate (with force-relogin and pin-target), then proves the
   expiry moved out past 25 days. Failure texts Tate over the free iMessage path.
 
@@ -34,6 +35,14 @@
   either handle is only accepted if it carries this flow's own OAuth state. Drop
   IMSG_SEND_TO once the +61 number delivers again (board a08e1b34).
 
+  KILIMANJARO WINDOW (2026-11-23, lane cowork.infra-lane-R2, TEMPORARY). The 11-22 relogin
+  ends 2026-12-20T20:45Z (21 Dec 06:45 AEST). At the 10-day threshold the first link would
+  go out 11 Dec, leaving three fire-days before Tate climbs Kilimanjaro (14 to 22 Dec, home
+  23 Dec), and the login would lapse while he is on the mountain. RELOGIN_DAYS_LEFT=20 starts
+  the daily link on 1 Dec instead, thirteen fire-days before the climb; one tap gives a new
+  end near 30 Dec, past his return. Remove the key (back to 10) once that renewal lands, or
+  every renewal re-asks about 8.5 days later. Board d9fbf031.
+
   Install:
     cp launchd/au.ecodia.claude-relogin-guard.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/au.ecodia.claude-relogin-guard.plist
@@ -54,6 +63,7 @@
     <key>DYLD_FALLBACK_LIBRARY_PATH</key><string>/Users/ecodia/.ecodiaos/node22-compat/lib</string>
     <key>IMSG_SEND_TO</key><string>tate.donohoe@gmail.com</string>
     <key>IMSG_TATE_HANDLES</key><string>+61404247153,tate.donohoe@gmail.com</string>
+    <key>RELOGIN_DAYS_LEFT</key><string>20</string>
   </dict>
   <key>StartCalendarInterval</key><dict>
     <key>Hour</key><integer>17</integer><key>Minute</key><integer>43</integer>
