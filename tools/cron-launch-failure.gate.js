@@ -108,6 +108,21 @@ async function main() {
     //    refuse a bound relaunch can each be read directly. Reported LIVE below.
     const belt = await mkCron('bound-belt', '0 3 * * *', 0)
     await pool.query(`UPDATE os_scheduled_tasks SET bound_at = $2 WHERE id = $1`, [belt, old])
+    // 6-8. LONG CADENCE (lane C7, 2026-11-28). A genuine monthly expression whose next
+    //    slot is always more than 24h away: day-of-month is today + 10 (Brisbane),
+    //    wrapped into 1..28, so it is never today or tomorrow whatever day this runs.
+    const todayBne = Number(new Intl.DateTimeFormat('en-AU',
+      { timeZone: 'Australia/Brisbane', day: 'numeric' }).format(new Date()))
+    const dom = todayBne + 10 > 28 ? todayBne + 10 - 28 : todayBne + 10
+    const MONTHLY = '0 3 ' + dom + ' * *'
+    // 6. Fresh monthly: the base relaunch schedule is unchanged for long cadence.
+    const mFresh = await mkCron('monthly-fresh', MONTHLY, 0)
+    // 7. Monthly at the BASE ceiling: a daily cron gives the interval away here, a
+    //    monthly one must instead get a bounded retry in hours.
+    const mBase = await mkCron('monthly-base-ceiling', MONTHLY, settle.MAX_LAUNCH_RETRIES)
+    // 8. Monthly with every bounded retry spent: the last resort, the interval defer.
+    const mDone = await mkCron('monthly-bounded-exhausted', MONTHLY,
+      settle.MAX_LAUNCH_RETRIES + scheduler.LONG_CADENCE_BOUNDED_RETRIES)
 
     const target = new Set(ids.filter(id => String(id) !== String(belt)).map(String))
     const liveness = {
@@ -180,6 +195,9 @@ async function main() {
     check('the bound cron is NOT labelled a launch failure',
       b && !/leased but never bound/.test(b.last_error || ''),
       b && String(b.last_error).slice(0, 60))
+    check('the bound overrun defer does NOT carry the ceiling token (15b stays silent on it)',
+      b && (b.last_error || '').indexOf(scheduler.CRON_CEILING_INTERVAL_TOKEN) === -1,
+      b && String(b.last_error).slice(0, 60))
 
     // ---- 4. the ceiling: a cron is NEVER settled terminal, unlike a one-shot ----
     const c = g(ceiling)
@@ -191,9 +209,51 @@ async function main() {
       'MAX_LAUNCH_RETRIES=' + settle.MAX_LAUNCH_RETRIES)
     check('the ceiling defers to the interval rather than retrying again',
       c && mins(c) > 60, c && (mins(c) / 60).toFixed(2) + 'h out')
-    check('the ceiling does not burn another attempt',
-      c && c.launch_retry_count === settle.MAX_LAUNCH_RETRIES,
+    // Until lane C7 this asserted launch_retry_count stayed at MAX here, which encoded
+    // the bug: the next interval then opened already at the ceiling and got ZERO
+    // relaunches (monthly-architectural-review lost 2026-09-28 and 2026-10-28).
+    check('the ceiling interval defer RESETS launch_retry_count to 0, so the next interval keeps its relaunches',
+      c && c.launch_retry_count === 0,
       c && 'launch_retry_count=' + c.launch_retry_count)
+    check('the ceiling defer writes the token scheduler-health 15b reads, in the same write',
+      c && (c.last_error || '').indexOf(scheduler.CRON_CEILING_INTERVAL_TOKEN) !== -1,
+      c && String(c.last_error).slice(0, 90))
+    check('  pair: a daily ceiling is NOT reported as a long-cadence loss',
+      c && !/bounded long-cadence/.test(c.last_error || ''),
+      c && String(c.last_error).slice(0, 90))
+
+    // ---- 6-8. long cadence: a ceiling fallback costs hours, never a month ----
+    const mf = g(mFresh)
+    check('LONG: a fresh monthly launch failure takes the ordinary 5m relaunch',
+      mf && mf.status === 'active' && mf.launch_retry_count === 1 && mins(mf) > 4 && mins(mf) < 6,
+      mf && mf.status + ' lrc=' + mf.launch_retry_count + ' ' + mins(mf).toFixed(2) + 'm out (cron ' + MONTHLY + ')')
+    const mb = g(mBase)
+    check('LONG: a monthly at the base ceiling is RETRIED IN HOURS, not deferred a month',
+      mb && mb.status === 'active' && mins(mb) > 115 && mins(mb) < 125,
+      mb && mb.status + ' ' + (mins(mb) / 60).toFixed(2) + 'h out')
+    check('  pair: the daily cron at the same counter WAS deferred to its interval',
+      c && mb && mins(c) > mins(mb),
+      c && mb && 'daily=' + (mins(c) / 60).toFixed(2) + 'h monthly=' + (mins(mb) / 60).toFixed(2) + 'h')
+    check('LONG: the bounded retry counts the attempt (the streak climbs past the base ceiling)',
+      mb && mb.launch_retry_count === settle.MAX_LAUNCH_RETRIES + 1,
+      mb && 'launch_retry_count=' + mb.launch_retry_count)
+    check('LONG: the bounded retry says so in last_error, and carries NO ceiling token',
+      mb && /LONG-CADENCE BOUNDED RETRY 1 of 6/.test(mb.last_error || '') &&
+        (mb.last_error || '').indexOf(scheduler.CRON_CEILING_INTERVAL_TOKEN) === -1,
+      mb && String(mb.last_error).slice(0, 110))
+    check('LONG: a bounded retry is never settled or given a done_at',
+      mb && !mb.done_at && mb.settled_at === null && mb.settle_verdict === null)
+    const md = g(mDone)
+    check('LONG: with every bounded retry spent, the interval defer is the last resort',
+      md && md.status === 'active' && mins(md) > 24 * 60,
+      md && md.status + ' ' + (mins(md) / 60).toFixed(1) + 'h out')
+    check('LONG: that last-resort defer resets the counter AND carries the 15b token',
+      md && md.launch_retry_count === 0 &&
+        (md.last_error || '').indexOf(scheduler.CRON_CEILING_INTERVAL_TOKEN) !== -1,
+      md && 'lrc=' + md.launch_retry_count + ' ' + String(md.last_error).slice(0, 80))
+    check('LONG: the last-resort note names the bounded retries it already spent',
+      md && /including 6 bounded long-cadence retries/.test(md.last_error || ''),
+      md && String(md.last_error).slice(0, 140))
 
     // ---- safety: the pass could not have touched anything real ----
     check('the pass touched ONLY the fixtures (real running rows reported live)',

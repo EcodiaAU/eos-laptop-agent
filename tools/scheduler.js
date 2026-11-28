@@ -3793,8 +3793,9 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
           [lf.next_run_at, row.id, ('running orphan-timeout | ' + lf.reason).slice(0, 900)]
         )
         if (r.rowCount) {
-          process.stderr.write('[scheduler] CRON LAUNCH-FAILURE RELAUNCH ' + row.id + ' (' +
-            (row.name || '?') + ') attempt ' + lf.attempts + ' at ' + lf.next_run_at + '\n')
+          process.stderr.write('[scheduler] ' + (lf.bounded ? 'CRON LONG-CADENCE BOUNDED RETRY ' : 'CRON LAUNCH-FAILURE RELAUNCH ') +
+            row.id + ' (' + (row.name || '?') + ') attempt ' + lf.attempts + ' at ' + lf.next_run_at +
+            (lf.bounded ? ' -- past the relaunch ceiling, retrying in hours because the interval defer would lose a whole long interval' : '') + '\n')
           try { await exports.pruneWorktreeForRow(row) } catch (_e) {}
           continue
         }
@@ -3804,7 +3805,9 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
       if (lf && lf.ceiling) {
         process.stderr.write('[scheduler] CRON LAUNCH-FAILURE CEILING ' + row.id + ' (' +
           (row.name || '?') + '): ' + lf.attempts + ' launches never bound, deferring to the ' +
-          'next interval instead of retrying -- the Mac is out of launch capacity\n')
+          'next interval instead of retrying -- the Mac is out of launch capacity' +
+          (lf.long_cadence ? ' -- ' + CRON_CEILING_INTERVAL_TOKEN + ' on a LONG-CADENCE cron, the defer costs ' +
+            Math.round((lf.defer_cost_ms || 0) / 3600000) + 'h' : '') + '\n')
       }
       let nextRunAt = null
       try {
@@ -3812,19 +3815,24 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
       } catch (_e) {
         nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       }
+      // launch_retry_count = 0: the streak is per boundary, see cronLaunchRetry. The
+      // ceiling case also carries CRON_CEILING_INTERVAL_TOKEN for scheduler-health 15b.
       await pool.query(
         `UPDATE os_scheduled_tasks
-         SET status = 'active', retry_count = 0,
+         SET status = 'active', retry_count = 0, launch_retry_count = 0,
              last_run_at = CASE WHEN bound_at IS NULL THEN last_run_at ELSE NOW() END,
              next_run_at = $1,
-             last_error = 'running orphan-timeout (cron: deferred to next interval per doctrine)',
+             last_error = $3,
              leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
          WHERE id = $2
            AND status = 'running'
            AND done_at IS NULL
            AND archived_at IS NULL
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
-        [nextRunAt, row.id]
+        [nextRunAt, row.id,
+         (lf && lf.ceiling)
+           ? ('running orphan-timeout | ' + cronCeilingDeferNote(lf, nextRunAt)).slice(0, 900)
+           : 'running orphan-timeout (cron: deferred to next interval per doctrine)']
       )
     } else {
       await pool.query(
@@ -3882,29 +3890,89 @@ exports.staleLeaseRecovery = async function staleLeaseRecovery() {
 // clears alongside retry_count. Without that clear the counter is a LIFETIME tally and
 // a healthy daily cron would silently reach the ceiling after three unrelated launch
 // blips spread over months.
+//
+// THE STREAK IS PER BOUNDARY, AND THE INTERVAL DEFER NOW ENDS IT (2026-11-28 lane C7).
+// markComplete was the ONLY writer that cleared launch_retry_count, so a cron that hit
+// the ceiling entered its NEXT interval still at the ceiling, and this function returned
+// ceiling:true on that interval's first launch failure: zero relaunches, a second
+// interval lost to one blip. monthly-architectural-review lost 2026-09-28 (four launches
+// never bound) AND 2026-10-28 (zero relaunches, counter still at 3) exactly this way,
+// and its counter was hand-reset twice. Both interval-defer UPDATEs below now write
+// launch_retry_count = 0, and when the defer is a ceiling they write
+// CRON_CEILING_INTERVAL_TOKEN into last_error IN THE SAME WRITE. The token is what
+// scheduler-health check 15b reads (backend ecodiaos a9f20ea7c): its only signal used to
+// be the stale counter itself, which is why status_board 81a2587d said never to zero it.
+//
+// A CEILING FALLBACK MUST COST HOURS, NEVER A WHOLE LONG INTERVAL. The defer to the next
+// slot is cheap for a daily cron (at most a day) and catastrophic for a monthly,
+// quarterly or annual one. So when the defer would cost more than LONG_DEFER_COST_MS,
+// the ceiling does not defer yet: it grants LONG_CADENCE_BOUNDED_RETRIES more launches
+// on an escalating 2h, 2h, 4h, 4h, 8h, 8h schedule (28h of cover, sized against the
+// 2026-10-28..29 bind outage, 29.6h), each logged loudly, and only then gives the
+// interval away. The discriminator is the COST of the defer measured at reclaim time,
+// not the cron's nominal period, so a Mon/Wed/Fri cron failing on a Friday (72h to the
+// next slot) is protected, and an interval-kind 'every 168h' row reads correctly.
+// A long-cadence row also takes its retry when the fleet is capped: a relaunch into a
+// cap opens no tab (dispatchOne's capped arm defers it to the reset, which never moves
+// it a whole interval), so refusing would be the only path that loses the month.
+const CRON_CEILING_INTERVAL_TOKEN = 'LAUNCH-CEILING INTERVAL LOST'
+const LONG_DEFER_COST_MS = 24 * 60 * 60 * 1000
+const LONG_CADENCE_BOUNDED_RETRIES = 6
+const LONG_CADENCE_RETRY_BASE_MS = 2 * 60 * 60 * 1000
+const LONG_CADENCE_RETRY_MAX_MS = 8 * 60 * 60 * 1000
+function longCadenceRetryMs(k) {
+  return Math.min(LONG_CADENCE_RETRY_MAX_MS, LONG_CADENCE_RETRY_BASE_MS * Math.pow(2, Math.floor(Math.max(0, k) / 2)))
+}
+exports.CRON_CEILING_INTERVAL_TOKEN = CRON_CEILING_INTERVAL_TOKEN
+exports.LONG_DEFER_COST_MS = LONG_DEFER_COST_MS
+exports.LONG_CADENCE_BOUNDED_RETRIES = LONG_CADENCE_BOUNDED_RETRIES
+exports.longCadenceRetryMs = longCadenceRetryMs
+
+// The last_error a ceiling interval defer writes. Carries the token 15b matches.
+function cronCeilingDeferNote(lf, nextRunAt) {
+  return CRON_CEILING_INTERVAL_TOKEN + ': ' + lf.attempts + ' launches never bound' +
+    (lf.long_cadence ? ' (including ' + LONG_CADENCE_BOUNDED_RETRIES + ' bounded long-cadence retries)' : '') +
+    ', deferred to the next interval ' + nextRunAt +
+    '; launch_retry_count reset so that interval keeps its relaunches'
+}
+exports.cronCeilingDeferNote = cronCeilingDeferNote
+
 function cronLaunchRetry(row, opts) {
   opts = opts || {}
   if (row.bound_at) return null
   const settleMod = opts.settle || require('./dispatch-settle')
   const attempts = Number(row.launch_retry_count || 0)
-  if (attempts >= settleMod.MAX_LAUNCH_RETRIES) {
-    return { ceiling: true, attempts }
+  const nowMs = opts.now_ms || Date.now()
+  let naturalAt = null
+  try { naturalAt = Date.parse(exports.computeNextRunAt(row, new Date(nowMs))) } catch (_e) { naturalAt = null }
+  if (!Number.isFinite(naturalAt)) naturalAt = null
+  const deferCostMs = naturalAt !== null ? naturalAt - nowMs : null
+  const longCadence = deferCostMs !== null && deferCostMs > LONG_DEFER_COST_MS
+  const base = settleMod.MAX_LAUNCH_RETRIES
+  const ceilingAt = base + (longCadence ? LONG_CADENCE_BOUNDED_RETRIES : 0)
+  if (attempts >= ceilingAt) {
+    return { ceiling: true, attempts, long_cadence: longCadence, defer_cost_ms: deferCostMs }
   }
   const capped = (opts.capped !== undefined)
     ? opts.capped
     : exports._getCappedOutageState().firstDeferAt !== null
-  if (capped) return null
-  const nowMs = opts.now_ms || Date.now()
-  const backoffAt = nowMs + settleMod.launchBackoffMs(attempts)
-  let naturalAt = null
-  try { naturalAt = Date.parse(exports.computeNextRunAt(row)) } catch (_e) { naturalAt = null }
-  const at = (naturalAt && naturalAt < backoffAt) ? naturalAt : backoffAt
+  if (capped && !longCadence) return null
+  const bounded = attempts >= base
+  const backoffAt = nowMs + (bounded ? longCadenceRetryMs(attempts - base) : settleMod.launchBackoffMs(attempts))
+  const at = (naturalAt !== null && naturalAt < backoffAt) ? naturalAt : backoffAt
   return {
     ceiling: false,
+    bounded,
+    long_cadence: longCadence,
     attempts: attempts + 1,
     next_run_at: new Date(at).toISOString(),
-    reason: 'cron leased but never bound: launch failure, relaunch ' +
-            (attempts + 1) + ' of ' + settleMod.MAX_LAUNCH_RETRIES,
+    reason: bounded
+      ? 'cron leased but never bound: launch failure, LONG-CADENCE BOUNDED RETRY ' +
+        (attempts + 1 - base) + ' of ' + LONG_CADENCE_BOUNDED_RETRIES + ' in ' +
+        Math.round((at - nowMs) / 3600000) + 'h (the interval defer would cost ' +
+        Math.round(deferCostMs / 3600000) + 'h)'
+      : 'cron leased but never bound: launch failure, relaunch ' +
+        (attempts + 1) + ' of ' + base,
   }
 }
 exports.cronLaunchRetry = cronLaunchRetry
@@ -3940,7 +4008,7 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
   const liveness = opts.liveness || require('./worker-liveness')
   const dispatcher = opts.dispatcher || getDispatcher()
   const res = await pool.query(
-    `SELECT id, name, type, cron_expression, status, leased_at, dispatched_tab_id,
+    `SELECT id, name, type, cron_expression, tz, status, leased_at, dispatched_tab_id,
             bound_at, launch_retry_count
        FROM os_scheduled_tasks WHERE status = 'running' AND archived_at IS NULL`
   )
@@ -4018,8 +4086,9 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
           [lf.next_run_at, row.id, (lf.reason + ' | ' + why).slice(0, 900)]
         )
         if (r.rowCount) {
-          process.stderr.write('[scheduler] CRON LAUNCH-FAILURE RELAUNCH ' + row.id + ' (' +
-            (row.name || '?') + ') attempt ' + lf.attempts + ' at ' + lf.next_run_at + '\n')
+          process.stderr.write('[scheduler] ' + (lf.bounded ? 'CRON LONG-CADENCE BOUNDED RETRY ' : 'CRON LAUNCH-FAILURE RELAUNCH ') +
+            row.id + ' (' + (row.name || '?') + ') attempt ' + lf.attempts + ' at ' + lf.next_run_at +
+            (lf.bounded ? ' -- past the relaunch ceiling, retrying in hours because the interval defer would lose a whole long interval' : '') + '\n')
           reaped++
           continue
         }
@@ -4027,19 +4096,24 @@ exports.livenessReapPass = async function livenessReapPass(opts) {
       if (lf && lf.ceiling) {
         process.stderr.write('[scheduler] CRON LAUNCH-FAILURE CEILING ' + row.id + ' (' +
           (row.name || '?') + '): ' + lf.attempts + ' launches never bound, deferring to the ' +
-          'next interval instead of retrying -- the Mac is out of launch capacity\n')
+          'next interval instead of retrying -- the Mac is out of launch capacity' +
+          (lf.long_cadence ? ' -- ' + CRON_CEILING_INTERVAL_TOKEN + ' on a LONG-CADENCE cron, the defer costs ' +
+            Math.round((lf.defer_cost_ms || 0) / 3600000) + 'h' : '') + '\n')
       }
       let nextRunAt = null
       try { nextRunAt = exports.computeNextRunAt(row) }
       catch (_e) { nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() }
+      // launch_retry_count = 0: the streak is per boundary, see cronLaunchRetry. The
+      // ceiling case also carries CRON_CEILING_INTERVAL_TOKEN for scheduler-health 15b.
       await pool.query(
         `UPDATE os_scheduled_tasks
-         SET status = 'active', retry_count = 0, next_run_at = $1,
+         SET status = 'active', retry_count = 0, launch_retry_count = 0, next_run_at = $1,
              last_run_at = CASE WHEN bound_at IS NULL THEN last_run_at ELSE NOW() END,
              last_error = $3, leased_by = NULL, leased_at = NULL, ${tabFrag} updated_at = NOW()
          WHERE id = $2 AND status = 'running' AND archived_at IS NULL
            AND (last_status IS NULL OR last_status NOT IN ('paused', 'cancelled'))`,
-        [nextRunAt, row.id, why.slice(0, 900)]
+        [nextRunAt, row.id,
+         ((lf && lf.ceiling) ? cronCeilingDeferNote(lf, nextRunAt) + ' | ' + why : why).slice(0, 900)]
       )
     } else if (!row.bound_at) {
       // C-i, 2026-09-05 lane C1. A one-shot that leased and never bound never

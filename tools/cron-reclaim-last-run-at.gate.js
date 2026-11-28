@@ -99,8 +99,18 @@ async function main() {
     //    left OUT of `target`, so the liveness stub reports it live and livenessReapPass
     //    cannot touch it; staleLeaseRecovery is then driven against it separately below.
     const sweepFixture = await mkCron('stalelease', '0 3 * * *', 0)
+    // 4b/4c (lane C7, 2026-11-28). The same orphan-timeout arm at the CEILING: a daily
+    //    row must defer with launch_retry_count reset to 0 and the 15b token in last_error;
+    //    a long-cadence row (next slot always >24h away: day-of-month today+10 wrapped
+    //    into 1..28) must instead get a bounded retry in hours. Also excluded from target.
+    const todayBne = Number(new Intl.DateTimeFormat('en-AU',
+      { timeZone: 'Australia/Brisbane', day: 'numeric' }).format(new Date()))
+    const dom = todayBne + 10 > 28 ? todayBne + 10 - 28 : todayBne + 10
+    const sweepCeiling = await mkCron('stalelease-ceiling', '0 3 * * *', settle.MAX_LAUNCH_RETRIES)
+    const sweepMonthly = await mkCron('stalelease-monthly', '0 3 ' + dom + ' * *', settle.MAX_LAUNCH_RETRIES)
+    const sweepSet = new Set([sweepFixture, sweepCeiling, sweepMonthly].map(String))
 
-    const target = new Set(ids.filter(id => String(id) !== String(sweepFixture)).map(String))
+    const target = new Set(ids.filter(id => !sweepSet.has(String(id))).map(String))
     const liveness = {
       probeRows(rows) {
         return rows.map(r => target.has(String(r.id))
@@ -141,9 +151,13 @@ async function main() {
 
     // ---- 2. the ceiling defer arm: guarded by the CASE, not by bound_at IS NULL ----
     const c = g(ceiling)
+    // Lane C7: the defer now RESETS the streak (it used to leave it at MAX, which made the
+    // next interval open at the ceiling), and the ceiling token is what proves this row
+    // took the DEFER arm rather than the relaunch arm.
     check('DEFER arm: a never-bound cron at the ceiling defers to its interval',
-      c && c.status === 'active' && c.launch_retry_count === settle.MAX_LAUNCH_RETRIES,
-      c && c.status + ' launch_retry_count=' + c.launch_retry_count)
+      c && c.status === 'active' && c.launch_retry_count === 0 &&
+        (c.last_error || '').indexOf(scheduler.CRON_CEILING_INTERVAL_TOKEN) !== -1,
+      c && c.status + ' launch_retry_count=' + c.launch_retry_count + ' ' + String(c.last_error).slice(0, 60))
     check('DEFER arm: last_run_at did NOT advance either (the CASE covers this arm)',
       same(c), c && 'last_run_at=' + c.last_run_at)
 
@@ -206,6 +220,30 @@ async function main() {
     check('  pair: with last_run_at forced to now the guard refuses it, which is the 09-21 outcome',
       sw && scheduler.cronAlreadyRanThisPeriod(
         Object.assign({}, sw, { last_run_at: new Date().toISOString() }), new Date()) === true)
+
+    // ---- 6b. the ORPHAN-TIMEOUT arm at the ceiling, driven live (lane C7) ----
+    const sweepRows = (await pool.query(
+      `SELECT id, status, next_run_at, launch_retry_count, last_error, last_run_at
+         FROM os_scheduled_tasks WHERE id = ANY($1::uuid[])`, [[sweepCeiling, sweepMonthly]])).rows
+    const sc = sweepRows.find(x => String(x.id) === String(sweepCeiling))
+    const sm = sweepRows.find(x => String(x.id) === String(sweepMonthly))
+    const hoursOut = x => x && x.next_run_at ? (new Date(x.next_run_at).getTime() - Date.now()) / 3600000 : NaN
+    check('ORPHAN arm CEILING (daily): deferred to the interval with the streak RESET',
+      sc && sc.status === 'active' && sc.launch_retry_count === 0 && hoursOut(sc) > 1,
+      sc && sc.status + ' lrc=' + sc.launch_retry_count + ' ' + hoursOut(sc).toFixed(1) + 'h out')
+    check('ORPHAN arm CEILING (daily): last_error is the orphan prefix plus the 15b token',
+      sc && /^running orphan-timeout \| LAUNCH-CEILING INTERVAL LOST: 3 launches never bound/.test(sc.last_error || ''),
+      sc && String(sc.last_error).slice(0, 90))
+    check('ORPHAN arm CEILING (daily): last_run_at still did NOT advance',
+      sc && new Date(sc.last_run_at).getTime() === new Date(PRIOR_RUN).getTime())
+    check('ORPHAN arm LONG CADENCE: a monthly at the base ceiling is retried in ~2h, not a month',
+      sm && sm.status === 'active' && hoursOut(sm) > 1.9 && hoursOut(sm) < 2.1 &&
+        sm.launch_retry_count === settle.MAX_LAUNCH_RETRIES + 1,
+      sm && sm.status + ' lrc=' + sm.launch_retry_count + ' ' + hoursOut(sm).toFixed(2) + 'h out')
+    check('ORPHAN arm LONG CADENCE: its last_error names the bounded retry and carries no token',
+      sm && /LONG-CADENCE BOUNDED RETRY 1 of 6/.test(sm.last_error || '') &&
+        (sm.last_error || '').indexOf(scheduler.CRON_CEILING_INTERVAL_TOKEN) === -1,
+      sm && String(sm.last_error).slice(0, 110))
 
     // ---- 7. SOURCE BELT for staleLeaseRecovery ----
     // staleLeaseRecovery takes no opts, so driving it would consult the real coord
