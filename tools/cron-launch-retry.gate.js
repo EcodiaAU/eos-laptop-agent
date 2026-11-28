@@ -87,6 +87,42 @@ const slow = sched.cronLaunchRetry(cronRow(), { now_ms: realNow, capped: false, 
 ok('  pair: the daily cron does NOT keep its next slot, it takes the 5m backoff',
    !!slow && Date.parse(slow.next_run_at) === realNow + 5 * 60 * 1000, slow && slow.next_run_at)
 
+// 5b. LONG CADENCE (lane C7, 2026-11-28). A ceiling fallback must cost hours, never a
+//     whole long interval. The discriminator is the cost of the defer, measured against
+//     the injected clock, so these cases freeze NOW and use expressions whose next slot
+//     from that clock is known: monthly 28th 04:00Z is ~16 days out from 2026-09-12.
+const MONTHLY = { cron_expression: '0 4 28 * *', tz: 'UTC' }
+const atBase = sched.cronLaunchRetry(cronRow(Object.assign({ launch_retry_count: settle.MAX_LAUNCH_RETRIES }, MONTHLY)), CTX)
+ok('monthly at the base ceiling is NOT a ceiling, it is a bounded retry',
+   !!atBase && atBase.ceiling === false && atBase.bounded === true && atBase.long_cadence === true,
+   JSON.stringify(atBase))
+ok('  the first bounded retry is 2h out, not 16 days',
+   !!atBase && Date.parse(atBase.next_run_at) === NOW + 2 * 3600 * 1000, atBase && atBase.next_run_at)
+ok('  pair: the DAILY cron at the same counter IS a ceiling (daily keeps the interval defer)',
+   (function () { const d = sched.cronLaunchRetry(cronRow({ launch_retry_count: settle.MAX_LAUNCH_RETRIES }), CTX)
+     return !!d && d.ceiling === true && d.long_cadence === false })())
+ok('the bounded schedule escalates 2h, 2h, 4h, 4h, 8h, 8h',
+   [0, 1, 2, 3, 4, 5].map(k => {
+     const r = sched.cronLaunchRetry(cronRow(Object.assign({ launch_retry_count: settle.MAX_LAUNCH_RETRIES + k }, MONTHLY)), CTX)
+     return r && !r.ceiling ? (Date.parse(r.next_run_at) - NOW) / 3600000 : 'X'
+   }).join(',') === '2,2,4,4,8,8')
+const spent = sched.cronLaunchRetry(cronRow(Object.assign(
+  { launch_retry_count: settle.MAX_LAUNCH_RETRIES + sched.LONG_CADENCE_BOUNDED_RETRIES }, MONTHLY)), CTX)
+ok('with every bounded retry spent the monthly IS a ceiling (the interval defer is the last resort)',
+   !!spent && spent.ceiling === true && spent.long_cadence === true && spent.defer_cost_ms > 24 * 3600 * 1000,
+   JSON.stringify(spent))
+ok('an interval-kind every 168h row reads as long cadence too',
+   (function () { const r = sched.cronLaunchRetry(cronRow({ cron_expression: 'every 168h', launch_retry_count: settle.MAX_LAUNCH_RETRIES }), CTX)
+     return !!r && r.bounded === true })())
+ok('a capped fleet does NOT refuse a long-cadence retry (refusing is the only path that loses the month)',
+   !!sched.cronLaunchRetry(cronRow(MONTHLY), { now_ms: NOW, capped: true, settle }))
+ok('  pair: a capped fleet still refuses the DAILY relaunch, unchanged',
+   sched.cronLaunchRetry(cronRow(), { now_ms: NOW, capped: true, settle }) === null)
+ok('the ceiling note carries the token scheduler-health 15b reads',
+   sched.cronCeilingDeferNote({ attempts: 3, long_cadence: false }, 'x').indexOf('LAUNCH-CEILING INTERVAL LOST') === 0)
+ok('the token is the exact cross-repo contract string',
+   sched.CRON_CEILING_INTERVAL_TOKEN === 'LAUNCH-CEILING INTERVAL LOST')
+
 // 6. SOURCE ASSERTIONS. The helper is only correct if the callers use it and if the
 //    streak counter is cleared on a good fire. Without the clear, launch_retry_count
 //    is a LIFETIME tally and a healthy daily cron silently reaches the ceiling after
@@ -98,6 +134,12 @@ ok('both cron reclaim branches call cronLaunchRetry',
    (src.match(/const lf = cronLaunchRetry\(/g) || []).length === 2)
 ok('the relaunch write is guarded on bound_at IS NULL',
    (src.match(/launch_retry_count = COALESCE\(launch_retry_count, 0\) \+ 1/g) || []).length === 3)
+// Both interval-defer UPDATEs end the streak. Until lane C7 only markComplete cleared
+// launch_retry_count, so a ceiling-hit cron opened its next interval at the ceiling.
+ok('both cron interval-defer UPDATEs reset launch_retry_count',
+   (src.match(/SET status = 'active', retry_count = 0, launch_retry_count = 0,/g) || []).length === 2)
+ok('both interval defers write the ceiling note when the ceiling was hit',
+   (src.match(/\(lf && lf\.ceiling\)[\s\S]{0,80}cronCeilingDeferNote\(lf, nextRunAt\)/g) || []).length === 2)
 // The needle is written as an escape so this file itself carries no U+2014 byte:
 // a detector that must contain the thing it forbids fails its own grep.
 ok('no em-dash reached the file', src.indexOf('\u2014') === -1)
