@@ -62,7 +62,15 @@ const MIN = 60 * 1000
 
 async function main() {
   const pool = scheduler._poolForLiveness()
-  const old = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()
+  // 20 MINUTES, NOT HOURS (lane C7, 2026-11-28). The daemon runs staleLeaseRecovery
+  // every 60s against this same table, and its branch-3 sweep reclaims any cron row
+  // leased more than RUNNING_CRON_ORPHAN_MS (30m) ago. A fixture leased 3h ago was
+  // therefore fair game, and roughly one run in four the daemon reclaimed a fixture
+  // before this gate's own pass did: reaped=6 of 7 targeted, the safety check red,
+  // every outcome check green. Inside 30m the daemon's sweep ignores the fixtures, and
+  // its livenessReapPass reads them 'unknown' (no dispatched_tab_id), so only the
+  // stubbed pass below can touch them. livenessReapPass itself has no age floor.
+  const old = new Date(Date.now() - 20 * 60 * 1000).toISOString()
   const ids = []
   const realCapState = scheduler._getCappedOutageState
   let restoredCap = false
